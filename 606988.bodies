@@ -1,0 +1,133 @@
+class VideoEditorVideoDecoderSource
+!!!1807372.cpp!!!	VideoEditorVideoDecoderSource(in format : sp<MetaData>, in codecType : VIDEOEDITOR_CodecType, inout decoderShellContext : void)
+    mpDecShellContext = (VideoEditorVideoDecoder_Context*) decoderShellContext;
+!!!1807500.cpp!!!	start(inout params : MetaData = NULL) : status_t
+
+    if (!mStarted) {
+        if (mFormat->findInt32(kKeyMaxInputSize, &mMaxAUSize) == false) {
+            ALOGE("Could not find kKeyMaxInputSize");
+            return ERROR_MALFORMED;
+        }
+
+        mGroup = new MediaBufferGroup;
+        if (mGroup == NULL) {
+            ALOGE("FATAL: memory limitation ! ");
+            return NO_MEMORY;
+        }
+
+        mGroup->add_buffer(new MediaBuffer(mMaxAUSize));
+
+        mStarted = true;
+    }
+    return OK;
+!!!1807628.cpp!!!	stop() : status_t
+    if (mStarted) {
+        if (mBuffer != NULL) {
+
+            // FIXME:
+            // Why do we need to check on the ref count?
+            int ref_count = mBuffer->refcount();
+            ALOGV("MediaBuffer refcount is %d",ref_count);
+            for (int i = 0; i < ref_count; ++i) {
+                mBuffer->release();
+            }
+
+            mBuffer = NULL;
+        }
+        delete mGroup;
+        mGroup = NULL;
+        mStarted = false;
+    }
+    return OK;
+!!!1807756.cpp!!!	getFormat() : sp<MetaData>
+    Mutex::Autolock autolock(mLock);
+
+    return mFormat;
+!!!1807884.cpp!!!	read(inout buffer_out : MediaBuffer, in options : ReadOptions = NULL) : status_t
+
+    Mutex::Autolock autolock(mLock);
+    if (options != NULL) {
+        int64_t time_us;
+        MediaSource::ReadOptions::SeekMode mode;
+        options->getSeekTo(&time_us, &mode);
+        if (mode != MediaSource::ReadOptions::SEEK_PREVIOUS_SYNC) {
+            ALOGE("Unexpected read options");
+            return BAD_VALUE;
+        }
+
+        M4OSA_ERR err;
+        M4OSA_Int32 rapTime = time_us / 1000;
+
+        /*--- Retrieve the previous RAP time ---*/
+        err = mpDecShellContext->m_pReaderGlobal->m_pFctGetPrevRapTime(
+                  mpDecShellContext->m_pReader->m_readerContext,
+                  (M4_StreamHandler*)mpDecShellContext->m_pVideoStreamhandler,
+                  &rapTime);
+
+        if (err == M4WAR_READER_INFORMATION_NOT_PRESENT) {
+            /* No RAP table, jump backward and predecode */
+            rapTime -= 40000;
+            if(rapTime < 0) rapTime = 0;
+        } else if (err != OK) {
+            ALOGE("get rap time error = 0x%x\n", (uint32_t)err);
+            return UNKNOWN_ERROR;
+        }
+
+        err = mpDecShellContext->m_pReaderGlobal->m_pFctJump(
+                   mpDecShellContext->m_pReader->m_readerContext,
+                   (M4_StreamHandler*)mpDecShellContext->m_pVideoStreamhandler,
+                   &rapTime);
+
+        if (err != OK) {
+            ALOGE("jump err = 0x%x\n", (uint32_t)err);
+            return BAD_VALUE;
+        }
+    }
+
+    *buffer_out = NULL;
+
+    M4OSA_ERR lerr = mGroup->acquire_buffer(&mBuffer);
+    if (lerr != OK) {
+        return lerr;
+    }
+    mBuffer->meta_data()->clear();  // clear all the meta data
+
+    if (mStarted) {
+        //getNext AU from reader.
+        M4_AccessUnit* pAccessUnit = mpDecShellContext->m_pNextAccessUnitToDecode;
+        lerr = mpDecShellContext->m_pReader->m_pFctGetNextAu(
+                   mpDecShellContext->m_pReader->m_readerContext,
+                   (M4_StreamHandler*)mpDecShellContext->m_pVideoStreamhandler,
+                   pAccessUnit);
+        if (lerr == M4WAR_NO_DATA_YET || lerr == M4WAR_NO_MORE_AU) {
+            *buffer_out = NULL;
+            return ERROR_END_OF_STREAM;
+        }
+
+        //copy the reader AU buffer to mBuffer
+        M4OSA_UInt32 lSize  = (pAccessUnit->m_size > (M4OSA_UInt32)mMaxAUSize)\
+            ? (M4OSA_UInt32)mMaxAUSize : pAccessUnit->m_size;
+        memcpy((void *)mBuffer->data(),(void *)pAccessUnit->m_dataAddress,
+            lSize);
+
+        mBuffer->set_range(0, lSize);
+        int64_t frameTimeUs = (int64_t) (pAccessUnit->m_CTS * 1000);
+        mBuffer->meta_data()->setInt64(kKeyTime, frameTimeUs);
+
+        // Replace the AU start code for H264
+        if (VIDEOEDITOR_kH264VideoDec == mCodecType) {
+            uint8_t *data =(uint8_t *)mBuffer->data() + mBuffer->range_offset();
+            data[0]=0;
+            data[1]=0;
+            data[2]=0;
+            data[3]=1;
+        }
+        mBuffer->meta_data()->setInt32(kKeyIsSyncFrame,
+            (pAccessUnit->m_attribute == 0x04)? 1 : 0);
+        *buffer_out = mBuffer;
+    }
+    return OK;
+!!!1808012.cpp!!!	~VideoEditorVideoDecoderSource()
+    if (mStarted == true) {
+        stop();
+    }

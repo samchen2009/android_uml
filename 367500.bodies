@@ -1,0 +1,210 @@
+class TimedTextSRTSource
+!!!722828.cpp!!!	start() : status_t
+    status_t err = scanFile();
+    if (err != OK) {
+        reset();
+    }
+    // TODO: Need to detect the language, because SRT doesn't give language
+    // information explicitly.
+    mMetaData->setCString(kKeyMediaLanguage, "");
+    return err;
+!!!722956.cpp!!!	stop() : status_t
+    reset();
+    return OK;
+!!!723084.cpp!!!	read(inout startTimeUs : int64_t, inout endTimeUs : int64_t, inout parcel : Parcel, in options : ReadOptions = NULL) : status_t
+    AString text;
+    status_t err = getText(options, &text, startTimeUs, endTimeUs);
+    if (err != OK) {
+        return err;
+    }
+
+    CHECK_GE(*startTimeUs, 0);
+    extractAndAppendLocalDescriptions(*startTimeUs, text, parcel);
+    return OK;
+!!!723212.cpp!!!	getFormat() : sp<MetaData>
+    return mMetaData;
+!!!723468.cpp!!!	reset() : void
+    mMetaData->clear();
+    mTextVector.clear();
+    mIndex = 0;
+!!!723596.cpp!!!	scanFile() : status_t
+    off64_t offset = 0;
+    int64_t startTimeUs;
+    bool endOfFile = false;
+
+    while (!endOfFile) {
+        TextInfo info;
+        status_t err = getNextSubtitleInfo(&offset, &startTimeUs, &info);
+        switch (err) {
+            case OK:
+                mTextVector.add(startTimeUs, info);
+                break;
+            case ERROR_END_OF_STREAM:
+                endOfFile = true;
+                break;
+            default:
+                return err;
+        }
+    }
+    if (mTextVector.isEmpty()) {
+        return ERROR_MALFORMED;
+    }
+    return OK;
+!!!723724.cpp!!!	getNextSubtitleInfo(inout offset : off64_t, inout startTimeUs : int64_t, inout info : TextInfo) : status_t
+    AString data;
+    status_t err;
+
+    // To skip blank lines.
+    do {
+        if ((err = readNextLine(offset, &data)) != OK) {
+            return err;
+        }
+        data.trim();
+    } while (data.empty());
+
+    // Just ignore the first non-blank line which is subtitle sequence number.
+    if ((err = readNextLine(offset, &data)) != OK) {
+        return err;
+    }
+    int hour1, hour2, min1, min2, sec1, sec2, msec1, msec2;
+    // the start time format is: hours:minutes:seconds,milliseconds
+    // 00:00:24,600 --> 00:00:27,800
+    if (sscanf(data.c_str(), "%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d",
+               &hour1, &min1, &sec1, &msec1, &hour2, &min2, &sec2, &msec2) != 8) {
+        return ERROR_MALFORMED;
+    }
+
+    *startTimeUs = ((hour1 * 3600 + min1 * 60 + sec1) * 1000 + msec1) * 1000ll;
+    info->endTimeUs = ((hour2 * 3600 + min2 * 60 + sec2) * 1000 + msec2) * 1000ll;
+    if (info->endTimeUs <= *startTimeUs) {
+        return ERROR_MALFORMED;
+    }
+
+    info->offset = *offset;
+    bool needMoreData = true;
+    while (needMoreData) {
+        if ((err = readNextLine(offset, &data)) != OK) {
+            if (err == ERROR_END_OF_STREAM) {
+                break;
+            } else {
+                return err;
+            }
+        }
+
+        data.trim();
+        if (data.empty()) {
+            // it's an empty line used to separate two subtitles
+            needMoreData = false;
+        }
+    }
+    info->textLen = *offset - info->offset;
+    return OK;
+!!!723852.cpp!!!	readNextLine(inout offset : off64_t, inout data : AString) : status_t
+    data->clear();
+    while (true) {
+        ssize_t readSize;
+        char character;
+        if ((readSize = mSource->readAt(*offset, &character, 1)) < 1) {
+            if (readSize == 0) {
+                return ERROR_END_OF_STREAM;
+            }
+            return ERROR_IO;
+        }
+
+        (*offset)++;
+
+        // a line could end with CR, LF or CR + LF
+        if (character == 10) {
+            break;
+        } else if (character == 13) {
+            if ((readSize = mSource->readAt(*offset, &character, 1)) < 1) {
+                if (readSize == 0) {  // end of the stream
+                    return OK;
+                }
+                return ERROR_IO;
+            }
+
+            (*offset)++;
+            if (character != 10) {
+                (*offset)--;
+            }
+            break;
+        }
+        data->append(character);
+    }
+    return OK;
+!!!723980.cpp!!!	getText(in options : ReadOptions, inout text : AString, inout startTimeUs : int64_t, inout endTimeUs : int64_t) : status_t
+    if (mTextVector.size() == 0) {
+        return ERROR_END_OF_STREAM;
+    }
+    text->clear();
+    int64_t seekTimeUs;
+    MediaSource::ReadOptions::SeekMode mode;
+    if (options != NULL && options->getSeekTo(&seekTimeUs, &mode)) {
+        int64_t lastEndTimeUs =
+                mTextVector.valueAt(mTextVector.size() - 1).endTimeUs;
+        if (seekTimeUs < 0) {
+            return ERROR_OUT_OF_RANGE;
+        } else if (seekTimeUs >= lastEndTimeUs) {
+            return ERROR_END_OF_STREAM;
+        } else {
+            // binary search
+            size_t low = 0;
+            size_t high = mTextVector.size() - 1;
+            size_t mid = 0;
+
+            while (low <= high) {
+                mid = low + (high - low)/2;
+                int diff = compareExtendedRangeAndTime(mid, seekTimeUs);
+                if (diff == 0) {
+                    break;
+                } else if (diff < 0) {
+                    low = mid + 1;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            mIndex = mid;
+        }
+    }
+
+    if (mIndex >= mTextVector.size()) {
+        return ERROR_END_OF_STREAM;
+    }
+
+    const TextInfo &info = mTextVector.valueAt(mIndex);
+    *startTimeUs = mTextVector.keyAt(mIndex);
+    *endTimeUs = info.endTimeUs;
+    mIndex++;
+
+    char *str = new char[info.textLen];
+    if (mSource->readAt(info.offset, str, info.textLen) < info.textLen) {
+        delete[] str;
+        return ERROR_IO;
+    }
+    text->append(str, info.textLen);
+    delete[] str;
+    return OK;
+!!!724108.cpp!!!	extractAndAppendLocalDescriptions(in timeUs : int64_t, in text : AString, inout parcel : Parcel) : status_t
+    const void *data = text.c_str();
+    size_t size = text.size();
+    int32_t flag = TextDescriptions::LOCAL_DESCRIPTIONS |
+                   TextDescriptions::OUT_OF_BAND_TEXT_SRT;
+
+    if (size > 0) {
+        return TextDescriptions::getParcelOfDescriptions(
+                (const uint8_t *)data, size, flag, timeUs / 1000, parcel);
+    }
+    return OK;
+!!!724236.cpp!!!	compareExtendedRangeAndTime(in index : size_t, in timeUs : int64_t) : int
+    CHECK_LT(index, mTextVector.size());
+    int64_t endTimeUs = mTextVector.valueAt(index).endTimeUs;
+    int64_t startTimeUs = (index > 0) ?
+            mTextVector.valueAt(index - 1).endTimeUs : 0;
+    if (timeUs >= startTimeUs && timeUs < endTimeUs) {
+        return 0;
+    } else if (endTimeUs <= timeUs) {
+        return -1;
+    } else {
+        return 1;
+    }

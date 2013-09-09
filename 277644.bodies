@@ -1,0 +1,242 @@
+class SfDelegate
+!!!563724.cpp!!!	SfDelegate()
+    InitializeNetworkThreadIfNecessary();
+!!!563852.cpp!!!	~SfDelegate()
+    CHECK(mURLRequest == NULL);
+!!!563980.cpp!!!	initiateConnection(in uri : char, in headers : KeyedVector<String8, String8>, in offset : off64_t) : void
+    GURL url(uri);
+
+    MessageLoop *loop = gNetworkThread->message_loop();
+    loop->PostTask(
+            FROM_HERE,
+            NewRunnableFunction(
+                &SfDelegate::OnInitiateConnectionWrapper,
+                this,
+                url,
+                headers,
+                offset));
+
+!!!564108.cpp!!!	initiateDisconnect() : void
+    MessageLoop *loop = gNetworkThread->message_loop();
+    loop->PostTask(
+            FROM_HERE,
+            NewRunnableFunction(
+                &SfDelegate::OnInitiateDisconnectWrapper, this));
+!!!564236.cpp!!!	initiateRead(inout data : void, in size : size_t) : void
+    MessageLoop *loop = gNetworkThread->message_loop();
+    loop->PostTask(
+            FROM_HERE,
+            NewRunnableFunction(
+                &SfDelegate::OnInitiateReadWrapper, this, data, size));
+!!!564364.cpp!!!	setOwner(inout owner : ChromiumHTTPDataSource) : void
+    mOwner = owner;
+!!!564492.cpp!!!	getUID(inout uid : uid_t) : bool
+    return gReqContext->getUID(uid);
+!!!564620.cpp!!!	setUID(in uid : uid_t) : void
+    gReqContext->setUID(uid);
+!!!564748.cpp!!!	OnReceivedRedirect(inout request : net::URLRequest, in new_url : GURL, inout defer_redirect : bool) : void
+    MY_LOGV("OnReceivedRedirect");
+!!!564876.cpp!!!	OnAuthRequired(inout request : net::URLRequest, inout auth_info : net::AuthChallengeInfo) : void
+    MY_LOGV("OnAuthRequired");
+
+    inherited::OnAuthRequired(request, auth_info);
+!!!565004.cpp!!!	OnCertificateRequested(inout request : net::URLRequest, inout cert_request_info : net::SSLCertRequestInfo) : void
+    MY_LOGV("OnCertificateRequested");
+
+    inherited::OnCertificateRequested(request, cert_request_info);
+!!!565132.cpp!!!	OnSSLCertificateError(inout request : net::URLRequest, in cert_error : int, inout cert : net::X509Certificate) : void
+    fprintf(stderr, "OnSSLCertificateError cert_error=%d\n", cert_error);
+
+    inherited::OnSSLCertificateError(request, cert_error, cert);
+!!!565260.cpp!!!	OnGetCookies(inout request : net::URLRequest, in blocked_by_policy : bool) : void
+    MY_LOGV("OnGetCookies");
+!!!565388.cpp!!!	OnSetCookie(inout request : net::URLRequest, in cookie_line : std::string, in options : net::CookieOptions, in blocked_by_policy : bool) : void
+    MY_LOGV("OnSetCookie");
+!!!565516.cpp!!!	OnResponseStarted(inout request : net::URLRequest) : void
+    if (request->status().status() != net::URLRequestStatus::SUCCESS) {
+        MY_LOGI(StringPrintf(
+                    "Request failed with status %d and os_error %d",
+                    request->status().status(),
+                    request->status().os_error()).c_str());
+
+        delete mURLRequest;
+        mURLRequest = NULL;
+
+        mOwner->onConnectionFailed(ERROR_IO);
+        return;
+    } else if (mRangeRequested && request->GetResponseCode() != 206) {
+        MY_LOGI(StringPrintf(
+                    "We requested a content range, but server didn't "
+                    "support that. (responded with %d)",
+                    request->GetResponseCode()).c_str());
+
+        delete mURLRequest;
+        mURLRequest = NULL;
+
+        mOwner->onConnectionFailed(-EPIPE);
+        return;
+    } else if ((request->GetResponseCode() / 100) != 2) {
+        MY_LOGI(StringPrintf(
+                    "Server responded with http status %d",
+                    request->GetResponseCode()).c_str());
+
+        delete mURLRequest;
+        mURLRequest = NULL;
+
+        mOwner->onConnectionFailed(ERROR_IO);
+        return;
+    }
+
+    MY_LOGV("OnResponseStarted");
+
+    std::string headers;
+    request->GetAllResponseHeaders(&headers);
+
+    MY_LOGV(StringPrintf("response headers: %s", headers.c_str()).c_str());
+
+    std::string contentType;
+    request->GetResponseHeaderByName("Content-Type", &contentType);
+
+    mOwner->onConnectionEstablished(
+            request->GetExpectedContentSize(), contentType.c_str());
+!!!565644.cpp!!!	OnReadCompleted(inout request : net::URLRequest, in bytes_read : int) : void
+    if (bytes_read == -1) {
+        MY_LOGI(StringPrintf(
+                    "OnReadCompleted, read failed, status %d",
+                    request->status().status()).c_str());
+
+        mOwner->onReadCompleted(ERROR_IO);
+        return;
+    }
+
+    MY_LOGV(StringPrintf("OnReadCompleted, read %d bytes", bytes_read).c_str());
+
+    if (bytes_read < 0) {
+        MY_LOGI(StringPrintf(
+                    "Read failed w/ status %d\n",
+                    request->status().status()).c_str());
+
+        mOwner->onReadCompleted(ERROR_IO);
+        return;
+    } else if (bytes_read == 0) {
+        mAtEOS = true;
+        mOwner->onReadCompleted(mNumBytesRead);
+        return;
+    }
+
+    CHECK_GT(bytes_read, 0);
+    CHECK_LE(mNumBytesRead + bytes_read, mNumBytesTotal);
+
+    memcpy((uint8_t *)mDataDestination + mNumBytesRead,
+           mReadBuffer->data(),
+           bytes_read);
+
+    mNumBytesRead += bytes_read;
+
+    readMore(request);
+!!!565772.cpp!!!	readMore(inout request : net::URLRequest) : void
+    while (mNumBytesRead < mNumBytesTotal) {
+        size_t copy = mNumBytesTotal - mNumBytesRead;
+        if (copy > mReadBuffer->size()) {
+            copy = mReadBuffer->size();
+        }
+
+        int n;
+        if (request->Read(mReadBuffer, copy, &n)) {
+            MY_LOGV(StringPrintf("Read %d bytes directly.", n).c_str());
+
+            CHECK_LE((size_t)n, copy);
+
+            memcpy((uint8_t *)mDataDestination + mNumBytesRead,
+                   mReadBuffer->data(),
+                   n);
+
+            mNumBytesRead += n;
+
+            if (n == 0) {
+                mAtEOS = true;
+                break;
+            }
+        } else {
+            MY_LOGV("readMore pending read");
+
+            if (request->status().status() != net::URLRequestStatus::IO_PENDING) {
+                MY_LOGI(StringPrintf(
+                            "Direct read failed w/ status %d\n",
+                            request->status().status()).c_str());
+
+                mOwner->onReadCompleted(ERROR_IO);
+                return;
+            }
+
+            return;
+        }
+    }
+
+    mOwner->onReadCompleted(mNumBytesRead);
+!!!565900.cpp!!!	OnInitiateConnectionWrapper(inout me : SfDelegate, in url : GURL, in headers : KeyedVector<String8, String8>, in offset : off64_t) : void
+    me->onInitiateConnection(url, headers, offset);
+!!!566028.cpp!!!	OnInitiateDisconnectWrapper(inout me : SfDelegate) : void
+    me->onInitiateDisconnect();
+!!!566156.cpp!!!	OnInitiateReadWrapper(inout me : SfDelegate, inout data : void, in size : size_t) : void
+    me->onInitiateRead(data, size);
+!!!566284.cpp!!!	onInitiateConnection(in url : GURL, in extra : KeyedVector<String8, String8>, in offset : off64_t) : void
+    CHECK(mURLRequest == NULL);
+
+    mURLRequest = new net::URLRequest(url, this);
+    mAtEOS = false;
+
+    mRangeRequested = false;
+
+    if (offset != 0 || extra != NULL) {
+        net::HttpRequestHeaders headers =
+            mURLRequest->extra_request_headers();
+
+        if (offset != 0) {
+            headers.AddHeaderFromString(
+                    StringPrintf("Range: bytes=%lld-", offset).c_str());
+
+            mRangeRequested = true;
+        }
+
+        if (extra != NULL) {
+            for (size_t i = 0; i < extra->size(); ++i) {
+                AString s;
+                s.append(extra->keyAt(i).string());
+                s.append(": ");
+                s.append(extra->valueAt(i).string());
+
+                headers.AddHeaderFromString(s.c_str());
+            }
+        }
+
+        mURLRequest->SetExtraRequestHeaders(headers);
+    }
+
+    mURLRequest->set_context(gReqContext);
+
+    mURLRequest->Start();
+!!!566412.cpp!!!	onInitiateDisconnect() : void
+    if (mURLRequest == NULL) {
+        return;
+    }
+
+    mURLRequest->Cancel();
+
+    delete mURLRequest;
+    mURLRequest = NULL;
+
+    mOwner->onDisconnectComplete();
+!!!566540.cpp!!!	onInitiateRead(inout data : void, in size : size_t) : void
+    CHECK(mURLRequest != NULL);
+
+    mNumBytesRead = 0;
+    mNumBytesTotal = size;
+    mDataDestination = data;
+
+    if (mAtEOS) {
+        mOwner->onReadCompleted(0);
+        return;
+    }
+
+    readMore(mURLRequest);

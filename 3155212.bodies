@@ -1,0 +1,353 @@
+class MdcpService
+!!!13364876.java!!!	onBind(inout intent : Intent) : IBinder
+        String action = intent.getAction();
+        final String deviceId = MediaDevicesIntents.getDeviceId(intent);
+        if (MediaDevicesConstants.ACTION_ACQUIRE_DEVICE.equals(action)) {
+            return new IDeviceController.Stub() {
+
+                public void enableCaptionStream(boolean enable) {}
+
+                public void goTo(String location) {
+                    MdcpController controller = mControllers.get(deviceId);
+                    boolean success = controller.goTo(location);
+                    if (!success) {
+                        Uri tvUri = Uri.parse(location);
+                        if (TvUriUtils.isProgram(tvUri)
+                                && !TvUriUtils.isLiveProgram(tvUri)) {
+                            // Scheduling a recording.
+                            scheduleRecording(controller, tvUri);
+                        } else {
+                            ChannelNumber channelNumber = getChannelNumber(tvUri);
+                            if (LOCAL_LOGD) {
+                                Log.d(LOG_TAG, "Tuning to channel "
+                                        + channelNumber + " based on " + tvUri);
+                            }
+                            if (channelNumber != null) {
+                                controller.tuneChannel(channelNumber.toString());
+                            }
+                        }
+                    }
+                }
+
+                public void performAction(ActionEvent event) {
+                    MdcpController controller = mControllers.get(deviceId);
+                    controller.performAction(event);
+                }
+
+                public boolean onMediaStreamError(int errorCode) {
+                    // We don't handle these errors.
+                    return false;
+                }
+
+                @Override
+                public void onMediaStreamStarted(int duration) {
+                    // Not used.
+                }
+
+                public void onMediaStreamStopped(int position) {
+                    // Not used.
+                }
+
+                @Override
+                public void onMediaStreamEnded() {
+                    // Not used.
+                }
+
+                public void release() {}
+
+                public void setListener(IDeviceListener listener) {
+                    MdcpController controller = mControllers.get(deviceId);
+                    controller.setControlListener(listener);
+                }
+
+                public void onNewState(ClientState state) {}
+            };
+        } else {
+            return mBinder;
+        }
+!!!13365004.java!!!	onCreate() : void
+        mControllers = Collections
+                .synchronizedMap(new HashMap<String, MdcpController>());
+        mBinder = new MdcpBinder();
+        mDiscoveryMethod = DiscoveryMethodFactory
+                .getDiscoveryMethod(getApplicationContext());
+        setupDiscoveryMethod();
+        mSettings = SettingsFactory.getSettings(getApplicationContext());
+        mHandler = createHandler();
+        // TODO(justinkoh): add ConnectivityManager listener to handle
+        // connectivity events.
+!!!13365132.java!!!	onStartCommand(inout intent : Intent, in flags : int, in startId : int) : int
+        super.onStartCommand(intent, flags, startId);
+        if (intent != null) {
+            String action = intent.getAction();
+            if (MediaDevicesConstants.ACTION_START_DISCOVERY.equals(action)) {
+                startDiscovery();
+            } else if (MediaDevicesConstants.ACTION_STOP_DISCOVERY.equals(action)) {
+                stopDiscovery();
+            } else if (MediaDevicesConstants.ACTION_RECONNECT_TO_PAIRED_DEVICES
+                    .equals(action)) {
+                reconnectToPairedDevices();
+            } else if (MediaDevicesConstants.ACTION_PAIR_DEVICE.equals(action)) {
+                pairDevice(mSettings.getDevice(MediaDevicesIntents.getDeviceId(intent)));
+            } else if (MediaDevicesConstants.ACTION_UNPAIR_DEVICE.equals(action)) {
+                unpairDevice(mSettings.getDevice(MediaDevicesIntents.getDeviceId(intent)));
+            }
+        }
+        if (mSettings.getPairedDevices().size() > 0) {
+            startPollingControllerUpdates();
+            return START_STICKY;
+        }
+        return START_NOT_STICKY;
+!!!13365260.java!!!	onDestroy() : void
+        stopDiscovery();
+        stopPollingControllerUpdates();
+        super.onDestroy();
+!!!13365516.java!!!	createHandler() : Handler
+        return new Handler() {
+            @Override
+            public void handleMessage(Message msg) {
+                if (msg.what == MSG_UPDATE) {
+                    getControllerData();
+                }
+            }
+        };
+!!!13365644.java!!!	reconnectToPairedDevices() : void
+        for (DeviceRecord device : mSettings.getPairedDevices()) {
+            if (!mControllers.containsKey(device.getId())) {
+                getDeviceController(device);
+            }
+        }
+!!!13365772.java!!!	pairDevice(inout device : DeviceRecord) : void
+        mSettings.setPaired(device.getId(), true);
+        getDeviceController(device);
+!!!13365900.java!!!	unpairDevice(inout device : DeviceRecord) : void
+        removeLineup(device.getId());
+
+        mSettings.setPaired(device.getId(), false);
+        mSettings.setLastChannelUpdateTime(device.getId(),
+                ISettings.TIME_NOT_SET);
+        removeDeviceController(device.getId());
+!!!13366028.java!!!	removeLineup(in deviceId : String) : void
+        // TODO(mlindner): Reimplement using new APIs.
+!!!13366156.java!!!	removeDeviceController(in deviceId : String) : void
+        if (mControllers.containsKey(deviceId)) {
+            MdcpController controller = mControllers.get(deviceId);
+            controller.tearDown();
+            mControllers.remove(deviceId);
+        }
+!!!13366284.java!!!	setupDiscoveryMethod() : void
+        mDiscoveryMethod.setListener(new IDiscoveryMethod.Listener() {
+
+            public void onDeviceFound(DeviceRecord record) {
+                Device device = new Device.Builder(getPackageName(), record.getId())
+                        .setLabel(record.getLabel())
+                        .setSummary(getRecordSummary(record))
+                        .build();
+                Device.online(MdcpService.this, device);
+                updateDeviceSettings(record);
+                if (mSettings.isPaired(record.getId())) {
+                    getDeviceController(record);
+                }
+            }
+
+            public void onDeviceLost(DeviceRecord record) {
+                Device.offline(getApplicationContext(), record.getId());
+            }
+        });
+!!!13366412.java!!!	getRecordSummary(inout device : DeviceRecord) : String
+        return device.getAddress().toString();
+!!!13366540.java!!!	updateDeviceSettings(inout device : DeviceRecord) : void
+        DeviceRecord oldDevice = mSettings.getDevice(device.getId());
+        if (oldDevice == null) {
+            mSettings.addDevice(device);
+        } else {
+            mSettings.updateDevice(device);
+        }
+!!!13366668.java!!!	getDeviceController(inout device : DeviceRecord) : MdcpController
+        MdcpController oldController = mControllers.get(device.getId());
+        if (oldController == null) {
+            final MdcpController controller = new MdcpController(device);
+            controller.setListener(new MdcpController.Listener() {
+
+                public void onChannelListReceived(DeviceRecord device,
+                        List<Channel> channels) {
+                    updateChannelListProvider(device, channels);
+                }
+
+                public void onConnectionStateChanged(DeviceRecord device,
+                        ConnectionState state) {
+                    if (ConnectionState.CONNECTED.equals(state)) {
+                        controller.requestDeviceInformation();
+                        controller.requestDisplayStatus();
+                        updateChannelListIfNecessary(device, controller);
+                    }
+                }
+
+                public void onConnectionError(DeviceRecord device) {
+                    handleConnectionError(device);
+                }
+
+                public void onRecordingListReceived(DeviceRecord device,
+                        List<Recording> recordings) {
+                    updateRecordingListProvider(device, recordings);
+                }
+
+                public void onDeviceInfoReceived(DeviceRecord device,
+                        DeviceInformation info) {
+                    updateDeviceInformation(device, info);
+                }
+            });
+            mControllers.put(device.getId(), controller);
+            return controller;
+        } else {
+            return oldController;
+        }
+!!!13366796.java!!!	getDeviceRecord(in deviceId : String) : DeviceRecord
+        return mSettings.getDevice(deviceId);
+!!!13366924.java!!!	startDiscovery() : void
+        if (!mDiscoveryMethod.isListening()) {
+            mDiscoveryMethod.startDiscovery();
+        }
+        for (MdcpController controller : mControllers.values()) {
+            DeviceRecord record = controller.getDevice();
+            Device device = new Device.Builder(getPackageName(), record.getId())
+                    .setLabel(record.getLabel())
+                    .build();
+            Device.online(getApplicationContext(), device);
+        }
+!!!13367052.java!!!	stopDiscovery() : void
+        if (mDiscoveryMethod.isListening()) {
+            mDiscoveryMethod.stopDiscovery();
+        }
+!!!13367180.java!!!	startPollingControllerUpdates() : void
+        if (!mPollingControllerUpdates) {
+            // Need to do this before calling update, or else future executions
+            // are not kicked off.
+            mPollingControllerUpdates = true;
+            getControllerData();
+        }
+!!!13367308.java!!!	stopPollingControllerUpdates() : void
+        if (mPollingControllerUpdates) {
+            mHandler.removeMessages(MSG_UPDATE);
+            mPollingControllerUpdates = false;
+        }
+!!!13367436.java!!!	getControllerData() : void
+        if (isNetworkConnected()) {
+            for (MdcpController controller : mControllers.values()) {
+                if (LOCAL_LOGD) {
+                    Log.d(LOG_TAG, "Requesting recording list.");
+                }
+                controller.requestRecordingList();
+            }
+        }
+        if (mPollingControllerUpdates) {
+            mHandler.sendMessageDelayed(Message.obtain(mHandler, MSG_UPDATE),
+                    UPDATE_INTERVAL_MS);
+        }
+!!!13367564.java!!!	updateChannelListIfNecessary(inout device : DeviceRecord, inout controller : MdcpController) : void
+        long lastChannelUpdateTime = mSettings.getLastChannelUpdateTime(device
+                .getId());
+        long now = SystemClock.elapsedRealtime();
+        if (lastChannelUpdateTime == ISettings.TIME_NOT_SET
+                || now < lastChannelUpdateTime  // This happens after boot
+                || (now - lastChannelUpdateTime) > MAX_CHANNEL_LIST_AGE) {
+            if (LOCAL_LOGD) {
+                Log.d(LOG_TAG, "Requesting channel list.");
+            }
+            controller.requestChannelList();
+        }
+!!!13367692.java!!!	updateChannelListProvider(inout device : DeviceRecord, inout channels : List<Channel>) : void
+        if (LOCAL_LOGD) {
+            Log.d(LOG_TAG, "Updating with " + channels.size() + " channels.");
+        }
+        ArrayList<ChannelStream> streams = new ArrayList<ChannelStream>();
+        for (Channel channel : channels) {
+            streams.add(new ChannelStream(getApplicationContext(),
+                    device.getId(), channel));
+        }
+        StreamUtils.processListResults(getContentResolver(), device.getId(),
+                Streams.STREAM_TYPE_CHANNEL, streams);
+        mSettings.setLastChannelUpdateTime(device.getId(),
+                SystemClock.elapsedRealtime());
+!!!13367820.java!!!	getChannelNumber(inout tvUri : Uri) : ChannelNumber
+        // First check if the number is set.
+        ChannelNumber channel = TvUriUtils.getChannelNumber(tvUri);
+        if (channel == null) {
+            // Otherwise, look for it in the table.
+            channel = StreamUtils.getChannelNumber(getContentResolver(), tvUri);
+        }
+        return channel;
+!!!13367948.java!!!	updateRecordingListProvider(inout device : DeviceRecord, inout recordings : List<Recording>) : void
+        if (LOCAL_LOGD) {
+            Log.d(LOG_TAG, "Updating with " + recordings.size()
+                    + " recordings.");
+        }
+        ArrayList<RecordingStream> streams = new ArrayList<RecordingStream>();
+        for (Recording recording : recordings) {
+            streams.add(new RecordingStream(getApplicationContext(),
+                    device.getId(), recording));
+        }
+        StreamUtils.processListResults(getContentResolver(), device.getId(),
+                Streams.STREAM_TYPE_FILE, streams);
+!!!13368076.java!!!	scheduleRecording(inout controller : MdcpController, inout tvUri : Uri) : void
+        if (LOCAL_LOGD) {
+            Log.d(LOG_TAG, "Scheduling recording for " + tvUri);
+        }
+        Intent intent = new Intent()
+                .setData(tvUri)
+                .putExtra("deviceId", controller.getDevice().getId())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .setClass(this, ScheduleRecordingActivity.class);
+        startActivity(intent);
+!!!13368204.java!!!	updateDeviceInformation(inout device : DeviceRecord, inout info : DeviceInformation) : void
+        if (!device.getLabel().equals(info.getName())) {
+            // TODO(justinkoh): support other info fields as necessary.
+            device.setLabel(info.getName());
+            mSettings.updateDevice(device);
+        }
+!!!13368332.java!!!	isNetworkConnected() : boolean
+        ConnectivityManager connectivity = (ConnectivityManager)
+                getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (connectivity != null) {
+            NetworkInfo info = connectivity.getActiveNetworkInfo();
+            return (info != null && info.isConnected());
+        }
+        return false;
+!!!13368460.java!!!	handleConnectionError(inout device : DeviceRecord) : void
+        notifyError(device,
+                getString(R.string.notification_title_cannot_connect),
+                getString(R.string.notification_body_cannot_connect));
+!!!13368588.java!!!	notifyError(inout device : DeviceRecord, inout title : CharSequence, inout content : CharSequence) : void
+        NotificationManager notifier = (NotificationManager)
+                getSystemService(Context.NOTIFICATION_SERVICE);
+        Notification notification = new Notification();
+        String boxLabel = device.getLabel();
+        Intent repairContentIntent = new Intent()
+                .setClass(getApplicationContext(), MdcpService.class)
+                .setAction(MediaDevicesConstants.ACTION_RECONNECT_TO_PAIRED_DEVICES);
+        PendingIntent repairIntent = PendingIntent.getService(
+                getApplicationContext(),
+                0 /* unused */,
+                repairContentIntent,
+                0 /* no flags */);
+        notification.icon = R.drawable.notification_error_icon;
+        notification.flags = Notification.FLAG_AUTO_CANCEL;
+        notification.tickerText = title;
+        notification.setLatestEventInfo(getApplicationContext(),
+                title, content, repairIntent);
+        notifier.notify(device.getId(), NOTIFICATION_ERROR_ID, notification);
+
+        // TODO(rbragg): remove this once the notification code above starts
+        // working again.
+        notifyErrorToast(title);
+!!!13368716.java!!!	notifyErrorToast(in message : CharSequence) : void
+        mHandler.post(new Runnable() {
+            public void run() {
+                if (mErrorToast != null) {
+                    mErrorToast.cancel();
+                }
+                mErrorToast = Toast.makeText(MdcpService.this, message,
+                        Toast.LENGTH_LONG);
+                mErrorToast.show();
+            }
+        });

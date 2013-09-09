@@ -1,0 +1,254 @@
+class JpegProcessor
+!!!929420.cpp!!!	~JpegProcessor()
+    ALOGV("%s: Exit", __FUNCTION__);
+    deleteStream();
+!!!929548.cpp!!!	onFrameAvailable() : void
+    Mutex::Autolock l(mInputMutex);
+    if (!mCaptureAvailable) {
+        mCaptureAvailable = true;
+        mCaptureAvailableSignal.signal();
+    }
+!!!929676.cpp!!!	updateStream(in params : Parameters) : status_t
+    ATRACE_CALL();
+    ALOGV("%s", __FUNCTION__);
+    status_t res;
+
+    Mutex::Autolock l(mInputMutex);
+
+    sp<Camera2Client> client = mClient.promote();
+    if (client == 0) return OK;
+    sp<Camera2Device> device = client->getCameraDevice();
+
+    // Find out buffer size for JPEG
+    camera_metadata_ro_entry_t maxJpegSize =
+            params.staticInfo(ANDROID_JPEG_MAX_SIZE);
+    if (maxJpegSize.count == 0) {
+        ALOGE("%s: Camera %d: Can't find ANDROID_JPEG_MAX_SIZE!",
+                __FUNCTION__, client->getCameraId());
+        return INVALID_OPERATION;
+    }
+
+    if (mCaptureConsumer == 0) {
+        // Create CPU buffer queue endpoint
+        mCaptureConsumer = new CpuConsumer(1);
+        mCaptureConsumer->setFrameAvailableListener(this);
+        mCaptureConsumer->setName(String8("Camera2Client::CaptureConsumer"));
+        mCaptureWindow = new SurfaceTextureClient(
+            mCaptureConsumer->getProducerInterface());
+        // Create memory for API consumption
+        mCaptureHeap = new MemoryHeapBase(maxJpegSize.data.i32[0], 0,
+                                       "Camera2Client::CaptureHeap");
+        if (mCaptureHeap->getSize() == 0) {
+            ALOGE("%s: Camera %d: Unable to allocate memory for capture",
+                    __FUNCTION__, client->getCameraId());
+            return NO_MEMORY;
+        }
+    }
+
+    if (mCaptureStreamId != NO_STREAM) {
+        // Check if stream parameters have to change
+        uint32_t currentWidth, currentHeight;
+        res = device->getStreamInfo(mCaptureStreamId,
+                &currentWidth, &currentHeight, 0);
+        if (res != OK) {
+            ALOGE("%s: Camera %d: Error querying capture output stream info: "
+                    "%s (%d)", __FUNCTION__,
+                    client->getCameraId(), strerror(-res), res);
+            return res;
+        }
+        if (currentWidth != (uint32_t)params.pictureWidth ||
+                currentHeight != (uint32_t)params.pictureHeight) {
+            ALOGV("%s: Camera %d: Deleting stream %d since the buffer dimensions changed",
+                __FUNCTION__, client->getCameraId(), mCaptureStreamId);
+            res = device->deleteStream(mCaptureStreamId);
+            if (res != OK) {
+                ALOGE("%s: Camera %d: Unable to delete old output stream "
+                        "for capture: %s (%d)", __FUNCTION__,
+                        client->getCameraId(), strerror(-res), res);
+                return res;
+            }
+            mCaptureStreamId = NO_STREAM;
+        }
+    }
+
+    if (mCaptureStreamId == NO_STREAM) {
+        // Create stream for HAL production
+        res = device->createStream(mCaptureWindow,
+                params.pictureWidth, params.pictureHeight,
+                HAL_PIXEL_FORMAT_BLOB, maxJpegSize.data.i32[0],
+                &mCaptureStreamId);
+        if (res != OK) {
+            ALOGE("%s: Camera %d: Can't create output stream for capture: "
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
+                    strerror(-res), res);
+            return res;
+        }
+
+    }
+    return OK;
+!!!929804.cpp!!!	deleteStream() : status_t
+    ATRACE_CALL();
+    status_t res;
+
+    Mutex::Autolock l(mInputMutex);
+
+    if (mCaptureStreamId != NO_STREAM) {
+        sp<Camera2Client> client = mClient.promote();
+        if (client == 0) return OK;
+        sp<Camera2Device> device = client->getCameraDevice();
+
+        device->deleteStream(mCaptureStreamId);
+
+        mCaptureHeap.clear();
+        mCaptureWindow.clear();
+        mCaptureConsumer.clear();
+
+        mCaptureStreamId = NO_STREAM;
+    }
+    return OK;
+!!!929932.cpp!!!	getStreamId() : int
+    Mutex::Autolock l(mInputMutex);
+    return mCaptureStreamId;
+!!!930188.cpp!!!	threadLoop() : bool
+    status_t res;
+
+    {
+        Mutex::Autolock l(mInputMutex);
+        while (!mCaptureAvailable) {
+            res = mCaptureAvailableSignal.waitRelative(mInputMutex,
+                    kWaitDuration);
+            if (res == TIMED_OUT) return true;
+        }
+        mCaptureAvailable = false;
+    }
+
+    do {
+        sp<Camera2Client> client = mClient.promote();
+        if (client == 0) return false;
+        res = processNewCapture(client);
+    } while (res == OK);
+
+    return true;
+!!!930316.cpp!!!	processNewCapture(inout client : sp<Camera2Client>) : status_t
+    ATRACE_CALL();
+    status_t res;
+    sp<Camera2Heap> captureHeap;
+
+    CpuConsumer::LockedBuffer imgBuffer;
+
+    res = mCaptureConsumer->lockNextBuffer(&imgBuffer);
+    if (res != OK) {
+        if (res != BAD_VALUE) {
+            ALOGE("%s: Camera %d: Error receiving still image buffer: "
+                    "%s (%d)", __FUNCTION__,
+                    client->getCameraId(), strerror(-res), res);
+        }
+        return res;
+    }
+
+    ALOGV("%s: Camera %d: Still capture available", __FUNCTION__,
+            client->getCameraId());
+
+    if (imgBuffer.format != HAL_PIXEL_FORMAT_BLOB) {
+        ALOGE("%s: Camera %d: Unexpected format for still image: "
+                "%x, expected %x", __FUNCTION__, client->getCameraId(),
+                imgBuffer.format,
+                HAL_PIXEL_FORMAT_BLOB);
+        mCaptureConsumer->unlockBuffer(imgBuffer);
+        return OK;
+    }
+
+    // Find size of JPEG image
+    size_t jpegSize = findJpegSize(imgBuffer.data, imgBuffer.width);
+    if (jpegSize == 0) { // failed to find size, default to whole buffer
+        jpegSize = imgBuffer.width;
+    }
+    size_t heapSize = mCaptureHeap->getSize();
+    if (jpegSize > heapSize) {
+        ALOGW("%s: JPEG image is larger than expected, truncating "
+                "(got %d, expected at most %d bytes)",
+                __FUNCTION__, jpegSize, heapSize);
+        jpegSize = heapSize;
+    }
+
+    // TODO: Optimize this to avoid memcopy
+    sp<MemoryBase> captureBuffer = new MemoryBase(mCaptureHeap, 0, jpegSize);
+    void* captureMemory = mCaptureHeap->getBase();
+    memcpy(captureMemory, imgBuffer.data, jpegSize);
+
+    mCaptureConsumer->unlockBuffer(imgBuffer);
+
+    sp<CaptureSequencer> sequencer = mSequencer.promote();
+    if (sequencer != 0) {
+        sequencer->onCaptureAvailable(imgBuffer.timestamp, captureBuffer);
+    }
+
+    return OK;
+!!!930444.cpp!!!	findJpegSize(inout jpegBuffer : uint8_t, in maxSize : size_t) : size_t
+    size_t size;
+
+    // First check for JPEG transport header at the end of the buffer
+    uint8_t *header = jpegBuffer + (maxSize - sizeof(struct camera2_jpeg_blob));
+    struct camera2_jpeg_blob *blob = (struct camera2_jpeg_blob*)(header);
+    if (blob->jpeg_blob_id == CAMERA2_JPEG_BLOB_ID) {
+        size = blob->jpeg_size;
+        if (size > 0 && size <= maxSize - sizeof(struct camera2_jpeg_blob)) {
+            // Verify SOI and EOI markers
+            size_t offset = size - MARKER_LENGTH;
+            uint8_t *end = jpegBuffer + offset;
+            if (checkJpegStart(jpegBuffer) && checkJpegEnd(end)) {
+                ALOGV("Found JPEG transport header, img size %d", size);
+                return size;
+            } else {
+                ALOGW("Found JPEG transport header with bad Image Start/End");
+            }
+        } else {
+            ALOGW("Found JPEG transport header with bad size %d", size);
+        }
+    }
+
+    // Check Start of Image
+    if ( !checkJpegStart(jpegBuffer) ) {
+        ALOGE("Could not find start of JPEG marker");
+        return 0;
+    }
+
+    // Read JFIF segment markers, skip over segment data
+    size = 0;
+    while (size <= maxSize - MARKER_LENGTH) {
+        segment_t *segment = (segment_t*)(jpegBuffer + size);
+        uint8_t type = checkJpegMarker(segment->marker);
+        if (type == 0) { // invalid marker, no more segments, begin JPEG data
+            ALOGV("JPEG stream found beginning at offset %d", size);
+            break;
+        }
+        if (type == EOI || size > maxSize - sizeof(segment_t)) {
+            ALOGE("Got premature End before JPEG data, offset %d", size);
+            return 0;
+        }
+        size_t length = ntohs(segment->length);
+        ALOGV("JFIF Segment, type %x length %x", type, length);
+        size += length + MARKER_LENGTH;
+    }
+
+    // Find End of Image
+    // Scan JPEG buffer until End of Image (EOI)
+    bool foundEnd = false;
+    for (size; size <= maxSize - MARKER_LENGTH; size++) {
+        if ( checkJpegEnd(jpegBuffer + size) ) {
+            foundEnd = true;
+            size += MARKER_LENGTH;
+            break;
+        }
+    }
+    if (!foundEnd) {
+        ALOGE("Could not find end of JPEG marker");
+        return 0;
+    }
+
+    if (size > maxSize) {
+        ALOGW("JPEG size %d too large, reducing to maxSize %d", size, maxSize);
+        size = maxSize;
+    }
+    ALOGV("Final JPEG size %d", size);
+    return size;

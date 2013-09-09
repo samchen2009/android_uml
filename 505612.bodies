@@ -1,0 +1,707 @@
+class IPCThreadState
+!!!1455244.cpp!!!	self() : IPCThreadState
+    if (gHaveTLS) {
+restart:
+        const pthread_key_t k = gTLS;
+        IPCThreadState* st = (IPCThreadState*)pthread_getspecific(k);
+        if (st) return st;
+        return new IPCThreadState;
+    }
+    
+    if (gShutdown) return NULL;
+    
+    pthread_mutex_lock(&gTLSMutex);
+    if (!gHaveTLS) {
+        if (pthread_key_create(&gTLS, threadDestructor) != 0) {
+            pthread_mutex_unlock(&gTLSMutex);
+            return NULL;
+        }
+        gHaveTLS = true;
+    }
+    pthread_mutex_unlock(&gTLSMutex);
+    goto restart;
+!!!1455372.cpp!!!	selfOrNull() : IPCThreadState
+    if (gHaveTLS) {
+        const pthread_key_t k = gTLS;
+        IPCThreadState* st = (IPCThreadState*)pthread_getspecific(k);
+        return st;
+    }
+    return NULL;
+!!!1455500.cpp!!!	process() : sp<ProcessState>
+    return mProcess;
+!!!1455628.cpp!!!	clearLastError() : status_t
+    const status_t err = mLastError;
+    mLastError = NO_ERROR;
+    return err;
+!!!1455756.cpp!!!	getCallingPid() : int
+    return mCallingPid;
+!!!1455884.cpp!!!	getCallingUid() : int
+    return mCallingUid;
+!!!1456012.cpp!!!	setStrictModePolicy(in policy : int32_t) : void
+    mStrictModePolicy = policy;
+!!!1456140.cpp!!!	getStrictModePolicy() : int32_t
+    return mStrictModePolicy;
+!!!1456268.cpp!!!	setLastTransactionBinderFlags(in flags : int32_t) : void
+    mLastTransactionBinderFlags = flags;
+!!!1456396.cpp!!!	getLastTransactionBinderFlags() : int32_t
+    return mLastTransactionBinderFlags;
+!!!1456524.cpp!!!	clearCallingIdentity() : int64_t
+    int64_t token = ((int64_t)mCallingUid<<32) | mCallingPid;
+    clearCaller();
+    return token;
+!!!1456652.cpp!!!	restoreCallingIdentity(in token : int64_t) : void
+    mCallingUid = (int)(token>>32);
+    mCallingPid = (int)token;
+!!!1456780.cpp!!!	flushCommands() : void
+    if (mProcess->mDriverFD <= 0)
+        return;
+    talkWithDriver(false);
+!!!1456908.cpp!!!	joinThreadPool(in isMain : bool = true) : void
+    LOG_THREADPOOL("**** THREAD %p (PID %d) IS JOINING THE THREAD POOL\n", (void*)pthread_self(), getpid());
+
+    mOut.writeInt32(isMain ? BC_ENTER_LOOPER : BC_REGISTER_LOOPER);
+    
+    // This thread may have been spawned by a thread that was in the background
+    // scheduling group, so first we will make sure it is in the foreground
+    // one to avoid performing an initial transaction in the background.
+    set_sched_policy(mMyThreadId, SP_FOREGROUND);
+        
+    status_t result;
+    do {
+        int32_t cmd;
+        
+        // When we've cleared the incoming command queue, process any pending derefs
+        if (mIn.dataPosition() >= mIn.dataSize()) {
+            size_t numPending = mPendingWeakDerefs.size();
+            if (numPending > 0) {
+                for (size_t i = 0; i < numPending; i++) {
+                    RefBase::weakref_type* refs = mPendingWeakDerefs[i];
+                    refs->decWeak(mProcess.get());
+                }
+                mPendingWeakDerefs.clear();
+            }
+
+            numPending = mPendingStrongDerefs.size();
+            if (numPending > 0) {
+                for (size_t i = 0; i < numPending; i++) {
+                    BBinder* obj = mPendingStrongDerefs[i];
+                    obj->decStrong(mProcess.get());
+                }
+                mPendingStrongDerefs.clear();
+            }
+        }
+
+        // now get the next command to be processed, waiting if necessary
+        result = talkWithDriver();
+        if (result >= NO_ERROR) {
+            size_t IN = mIn.dataAvail();
+            if (IN < sizeof(int32_t)) continue;
+            cmd = mIn.readInt32();
+            IF_LOG_COMMANDS() {
+                alog << "Processing top-level Command: "
+                    << getReturnString(cmd) << endl;
+            }
+
+
+            result = executeCommand(cmd);
+        }
+        
+        // After executing the command, ensure that the thread is returned to the
+        // foreground cgroup before rejoining the pool.  The driver takes care of
+        // restoring the priority, but doesn't do anything with cgroups so we
+        // need to take care of that here in userspace.  Note that we do make
+        // sure to go in the foreground after executing a transaction, but
+        // there are other callbacks into user code that could have changed
+        // our group so we want to make absolutely sure it is put back.
+        set_sched_policy(mMyThreadId, SP_FOREGROUND);
+
+        // Let this thread exit the thread pool if it is no longer
+        // needed and it is not the main process thread.
+        if(result == TIMED_OUT && !isMain) {
+            break;
+        }
+    } while (result != -ECONNREFUSED && result != -EBADF);
+
+    LOG_THREADPOOL("**** THREAD %p (PID %d) IS LEAVING THE THREAD POOL err=%p\n",
+        (void*)pthread_self(), getpid(), (void*)result);
+    
+    mOut.writeInt32(BC_EXIT_LOOPER);
+    talkWithDriver(false);
+!!!1457036.cpp!!!	stopProcess(in immediate : bool = true) : void
+    //ALOGI("**** STOPPING PROCESS");
+    flushCommands();
+    int fd = mProcess->mDriverFD;
+    mProcess->mDriverFD = -1;
+    close(fd);
+    //kill(getpid(), SIGKILL);
+!!!1457164.cpp!!!	transact(in handle : int32_t, in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t) : status_t
+    status_t err = data.errorCheck();
+
+    flags |= TF_ACCEPT_FDS;
+
+    IF_LOG_TRANSACTIONS() {
+        TextOutput::Bundle _b(alog);
+        alog << "BC_TRANSACTION thr " << (void*)pthread_self() << " / hand "
+            << handle << " / code " << TypeCode(code) << ": "
+            << indent << data << dedent << endl;
+    }
+    
+    if (err == NO_ERROR) {
+        LOG_ONEWAY(">>>> SEND from pid %d uid %d %s", getpid(), getuid(),
+            (flags & TF_ONE_WAY) == 0 ? "READ REPLY" : "ONE WAY");
+        err = writeTransactionData(BC_TRANSACTION, flags, handle, code, data, NULL);
+    }
+    
+    if (err != NO_ERROR) {
+        if (reply) reply->setError(err);
+        return (mLastError = err);
+    }
+    
+    if ((flags & TF_ONE_WAY) == 0) {
+        #if 0
+        if (code == 4) { // relayout
+            ALOGI(">>>>>> CALLING transaction 4");
+        } else {
+            ALOGI(">>>>>> CALLING transaction %d", code);
+        }
+        #endif
+        if (reply) {
+            err = waitForResponse(reply);
+        } else {
+            Parcel fakeReply;
+            err = waitForResponse(&fakeReply);
+        }
+        #if 0
+        if (code == 4) { // relayout
+            ALOGI("<<<<<< RETURNING transaction 4");
+        } else {
+            ALOGI("<<<<<< RETURNING transaction %d", code);
+        }
+        #endif
+        
+        IF_LOG_TRANSACTIONS() {
+            TextOutput::Bundle _b(alog);
+            alog << "BR_REPLY thr " << (void*)pthread_self() << " / hand "
+                << handle << ": ";
+            if (reply) alog << indent << *reply << dedent << endl;
+            else alog << "(none requested)" << endl;
+        }
+    } else {
+        err = waitForResponse(NULL, NULL);
+    }
+    
+    return err;
+!!!1457292.cpp!!!	incStrongHandle(in handle : int32_t) : void
+    LOG_REMOTEREFS("IPCThreadState::incStrongHandle(%d)\n", handle);
+    mOut.writeInt32(BC_ACQUIRE);
+    mOut.writeInt32(handle);
+!!!1457420.cpp!!!	decStrongHandle(in handle : int32_t) : void
+    LOG_REMOTEREFS("IPCThreadState::decStrongHandle(%d)\n", handle);
+    mOut.writeInt32(BC_RELEASE);
+    mOut.writeInt32(handle);
+!!!1457548.cpp!!!	incWeakHandle(in handle : int32_t) : void
+    LOG_REMOTEREFS("IPCThreadState::incWeakHandle(%d)\n", handle);
+    mOut.writeInt32(BC_INCREFS);
+    mOut.writeInt32(handle);
+!!!1457676.cpp!!!	decWeakHandle(in handle : int32_t) : void
+    LOG_REMOTEREFS("IPCThreadState::decWeakHandle(%d)\n", handle);
+    mOut.writeInt32(BC_DECREFS);
+    mOut.writeInt32(handle);
+!!!1457804.cpp!!!	attemptIncStrongHandle(in handle : int32_t) : status_t
+    LOG_REMOTEREFS("IPCThreadState::attemptIncStrongHandle(%d)\n", handle);
+    mOut.writeInt32(BC_ATTEMPT_ACQUIRE);
+    mOut.writeInt32(0); // xxx was thread priority
+    mOut.writeInt32(handle);
+    status_t result = UNKNOWN_ERROR;
+    
+    waitForResponse(NULL, &result);
+    
+#if LOG_REFCOUNTS
+    printf("IPCThreadState::attemptIncStrongHandle(%ld) = %s\n",
+        handle, result == NO_ERROR ? "SUCCESS" : "FAILURE");
+#endif
+    
+    return result;
+!!!1457932.cpp!!!	expungeHandle(in handle : int32_t, inout binder : IBinder) : void
+#if LOG_REFCOUNTS
+    printf("IPCThreadState::expungeHandle(%ld)\n", handle);
+#endif
+    self()->mProcess->expungeHandle(handle, binder);
+!!!1458060.cpp!!!	requestDeathNotification(in handle : int32_t, inout proxy : BpBinder) : status_t
+    mOut.writeInt32(BC_REQUEST_DEATH_NOTIFICATION);
+    mOut.writeInt32((int32_t)handle);
+    mOut.writeInt32((int32_t)proxy);
+    return NO_ERROR;
+!!!1458188.cpp!!!	clearDeathNotification(in handle : int32_t, inout proxy : BpBinder) : status_t
+    mOut.writeInt32(BC_CLEAR_DEATH_NOTIFICATION);
+    mOut.writeInt32((int32_t)handle);
+    mOut.writeInt32((int32_t)proxy);
+    return NO_ERROR;
+!!!1458316.cpp!!!	shutdown() : void
+    gShutdown = true;
+    
+    if (gHaveTLS) {
+        // XXX Need to wait for all thread pool threads to exit!
+        IPCThreadState* st = (IPCThreadState*)pthread_getspecific(gTLS);
+        if (st) {
+            delete st;
+            pthread_setspecific(gTLS, NULL);
+        }
+        gHaveTLS = false;
+    }
+!!!1458444.cpp!!!	disableBackgroundScheduling(in disable : bool) : void
+    gDisableBackgroundScheduling = disable;
+!!!1458572.cpp!!!	IPCThreadState()
+    pthread_setspecific(gTLS, this);
+    clearCaller();
+    mIn.setDataCapacity(256);
+    mOut.setDataCapacity(256);
+!!!1458828.cpp!!!	sendReply(in reply : Parcel, in flags : uint32_t) : status_t
+    status_t err;
+    status_t statusBuffer;
+    err = writeTransactionData(BC_REPLY, flags, -1, 0, reply, &statusBuffer);
+    if (err < NO_ERROR) return err;
+    
+    return waitForResponse(NULL, NULL);
+!!!1458956.cpp!!!	waitForResponse(inout reply : Parcel, inout acquireResult : status_t = NULL) : status_t
+    int32_t cmd;
+    int32_t err;
+
+    while (1) {
+        if ((err=talkWithDriver()) < NO_ERROR) break;
+        err = mIn.errorCheck();
+        if (err < NO_ERROR) break;
+        if (mIn.dataAvail() == 0) continue;
+        
+        cmd = mIn.readInt32();
+        
+        IF_LOG_COMMANDS() {
+            alog << "Processing waitForResponse Command: "
+                << getReturnString(cmd) << endl;
+        }
+
+        switch (cmd) {
+        case BR_TRANSACTION_COMPLETE:
+            if (!reply && !acquireResult) goto finish;
+            break;
+        
+        case BR_DEAD_REPLY:
+            err = DEAD_OBJECT;
+            goto finish;
+
+        case BR_FAILED_REPLY:
+            err = FAILED_TRANSACTION;
+            goto finish;
+        
+        case BR_ACQUIRE_RESULT:
+            {
+                ALOG_ASSERT(acquireResult != NULL, "Unexpected brACQUIRE_RESULT");
+                const int32_t result = mIn.readInt32();
+                if (!acquireResult) continue;
+                *acquireResult = result ? NO_ERROR : INVALID_OPERATION;
+            }
+            goto finish;
+        
+        case BR_REPLY:
+            {
+                binder_transaction_data tr;
+                err = mIn.read(&tr, sizeof(tr));
+                ALOG_ASSERT(err == NO_ERROR, "Not enough command data for brREPLY");
+                if (err != NO_ERROR) goto finish;
+
+                if (reply) {
+                    if ((tr.flags & TF_STATUS_CODE) == 0) {
+                        reply->ipcSetDataReference(
+                            reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+                            tr.data_size,
+                            reinterpret_cast<const size_t*>(tr.data.ptr.offsets),
+                            tr.offsets_size/sizeof(size_t),
+                            freeBuffer, this);
+                    } else {
+                        err = *static_cast<const status_t*>(tr.data.ptr.buffer);
+                        freeBuffer(NULL,
+                            reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+                            tr.data_size,
+                            reinterpret_cast<const size_t*>(tr.data.ptr.offsets),
+                            tr.offsets_size/sizeof(size_t), this);
+                    }
+                } else {
+                    freeBuffer(NULL,
+                        reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+                        tr.data_size,
+                        reinterpret_cast<const size_t*>(tr.data.ptr.offsets),
+                        tr.offsets_size/sizeof(size_t), this);
+                    continue;
+                }
+            }
+            goto finish;
+
+        default:
+            err = executeCommand(cmd);
+            if (err != NO_ERROR) goto finish;
+            break;
+        }
+    }
+
+finish:
+    if (err != NO_ERROR) {
+        if (acquireResult) *acquireResult = err;
+        if (reply) reply->setError(err);
+        mLastError = err;
+    }
+    
+    return err;
+!!!1459084.cpp!!!	talkWithDriver(in doReceive : bool = true) : status_t
+    if (mProcess->mDriverFD <= 0) {
+        return -EBADF;
+    }
+    
+    binder_write_read bwr;
+    
+    // Is the read buffer empty?
+    const bool needRead = mIn.dataPosition() >= mIn.dataSize();
+    
+    // We don't want to write anything if we are still reading
+    // from data left in the input buffer and the caller
+    // has requested to read the next data.
+    const size_t outAvail = (!doReceive || needRead) ? mOut.dataSize() : 0;
+    
+    bwr.write_size = outAvail;
+    bwr.write_buffer = (long unsigned int)mOut.data();
+
+    // This is what we'll read.
+    if (doReceive && needRead) {
+        bwr.read_size = mIn.dataCapacity();
+        bwr.read_buffer = (long unsigned int)mIn.data();
+    } else {
+        bwr.read_size = 0;
+        bwr.read_buffer = 0;
+    }
+
+    IF_LOG_COMMANDS() {
+        TextOutput::Bundle _b(alog);
+        if (outAvail != 0) {
+            alog << "Sending commands to driver: " << indent;
+            const void* cmds = (const void*)bwr.write_buffer;
+            const void* end = ((const uint8_t*)cmds)+bwr.write_size;
+            alog << HexDump(cmds, bwr.write_size) << endl;
+            while (cmds < end) cmds = printCommand(alog, cmds);
+            alog << dedent;
+        }
+        alog << "Size of receive buffer: " << bwr.read_size
+            << ", needRead: " << needRead << ", doReceive: " << doReceive << endl;
+    }
+    
+    // Return immediately if there is nothing to do.
+    if ((bwr.write_size == 0) && (bwr.read_size == 0)) return NO_ERROR;
+
+    bwr.write_consumed = 0;
+    bwr.read_consumed = 0;
+    status_t err;
+    do {
+        IF_LOG_COMMANDS() {
+            alog << "About to read/write, write size = " << mOut.dataSize() << endl;
+        }
+#if defined(HAVE_ANDROID_OS)
+        if (ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr) >= 0)
+            err = NO_ERROR;
+        else
+            err = -errno;
+#else
+        err = INVALID_OPERATION;
+#endif
+        if (mProcess->mDriverFD <= 0) {
+            err = -EBADF;
+        }
+        IF_LOG_COMMANDS() {
+            alog << "Finished read/write, write size = " << mOut.dataSize() << endl;
+        }
+    } while (err == -EINTR);
+
+    IF_LOG_COMMANDS() {
+        alog << "Our err: " << (void*)err << ", write consumed: "
+            << bwr.write_consumed << " (of " << mOut.dataSize()
+			<< "), read consumed: " << bwr.read_consumed << endl;
+    }
+
+    if (err >= NO_ERROR) {
+        if (bwr.write_consumed > 0) {
+            if (bwr.write_consumed < (ssize_t)mOut.dataSize())
+                mOut.remove(0, bwr.write_consumed);
+            else
+                mOut.setDataSize(0);
+        }
+        if (bwr.read_consumed > 0) {
+            mIn.setDataSize(bwr.read_consumed);
+            mIn.setDataPosition(0);
+        }
+        IF_LOG_COMMANDS() {
+            TextOutput::Bundle _b(alog);
+            alog << "Remaining data size: " << mOut.dataSize() << endl;
+            alog << "Received commands from driver: " << indent;
+            const void* cmds = mIn.data();
+            const void* end = mIn.data() + mIn.dataSize();
+            alog << HexDump(cmds, mIn.dataSize()) << endl;
+            while (cmds < end) cmds = printReturnCommand(alog, cmds);
+            alog << dedent;
+        }
+        return NO_ERROR;
+    }
+    
+    return err;
+!!!1459212.cpp!!!	writeTransactionData(in cmd : int32_t, in binderFlags : uint32_t, in handle : int32_t, in code : uint32_t, in data : Parcel, inout statusBuffer : status_t) : status_t
+    binder_transaction_data tr;
+
+    tr.target.handle = handle;
+    tr.code = code;
+    tr.flags = binderFlags;
+    tr.cookie = 0;
+    tr.sender_pid = 0;
+    tr.sender_euid = 0;
+    
+    const status_t err = data.errorCheck();
+    if (err == NO_ERROR) {
+        tr.data_size = data.ipcDataSize();
+        tr.data.ptr.buffer = data.ipcData();
+        tr.offsets_size = data.ipcObjectsCount()*sizeof(size_t);
+        tr.data.ptr.offsets = data.ipcObjects();
+    } else if (statusBuffer) {
+        tr.flags |= TF_STATUS_CODE;
+        *statusBuffer = err;
+        tr.data_size = sizeof(status_t);
+        tr.data.ptr.buffer = statusBuffer;
+        tr.offsets_size = 0;
+        tr.data.ptr.offsets = NULL;
+    } else {
+        return (mLastError = err);
+    }
+    
+    mOut.writeInt32(cmd);
+    mOut.write(&tr, sizeof(tr));
+    
+    return NO_ERROR;
+!!!1459340.cpp!!!	executeCommand(in cmd : int32_t) : status_t
+    BBinder* obj;
+    RefBase::weakref_type* refs;
+    status_t result = NO_ERROR;
+    
+    switch (cmd) {
+    case BR_ERROR:
+        result = mIn.readInt32();
+        break;
+        
+    case BR_OK:
+        break;
+        
+    case BR_ACQUIRE:
+        refs = (RefBase::weakref_type*)mIn.readInt32();
+        obj = (BBinder*)mIn.readInt32();
+        ALOG_ASSERT(refs->refBase() == obj,
+                   "BR_ACQUIRE: object %p does not match cookie %p (expected %p)",
+                   refs, obj, refs->refBase());
+        obj->incStrong(mProcess.get());
+        IF_LOG_REMOTEREFS() {
+            LOG_REMOTEREFS("BR_ACQUIRE from driver on %p", obj);
+            obj->printRefs();
+        }
+        mOut.writeInt32(BC_ACQUIRE_DONE);
+        mOut.writeInt32((int32_t)refs);
+        mOut.writeInt32((int32_t)obj);
+        break;
+        
+    case BR_RELEASE:
+        refs = (RefBase::weakref_type*)mIn.readInt32();
+        obj = (BBinder*)mIn.readInt32();
+        ALOG_ASSERT(refs->refBase() == obj,
+                   "BR_RELEASE: object %p does not match cookie %p (expected %p)",
+                   refs, obj, refs->refBase());
+        IF_LOG_REMOTEREFS() {
+            LOG_REMOTEREFS("BR_RELEASE from driver on %p", obj);
+            obj->printRefs();
+        }
+        mPendingStrongDerefs.push(obj);
+        break;
+        
+    case BR_INCREFS:
+        refs = (RefBase::weakref_type*)mIn.readInt32();
+        obj = (BBinder*)mIn.readInt32();
+        refs->incWeak(mProcess.get());
+        mOut.writeInt32(BC_INCREFS_DONE);
+        mOut.writeInt32((int32_t)refs);
+        mOut.writeInt32((int32_t)obj);
+        break;
+        
+    case BR_DECREFS:
+        refs = (RefBase::weakref_type*)mIn.readInt32();
+        obj = (BBinder*)mIn.readInt32();
+        // NOTE: This assertion is not valid, because the object may no
+        // longer exist (thus the (BBinder*)cast above resulting in a different
+        // memory address).
+        //ALOG_ASSERT(refs->refBase() == obj,
+        //           "BR_DECREFS: object %p does not match cookie %p (expected %p)",
+        //           refs, obj, refs->refBase());
+        mPendingWeakDerefs.push(refs);
+        break;
+        
+    case BR_ATTEMPT_ACQUIRE:
+        refs = (RefBase::weakref_type*)mIn.readInt32();
+        obj = (BBinder*)mIn.readInt32();
+         
+        {
+            const bool success = refs->attemptIncStrong(mProcess.get());
+            ALOG_ASSERT(success && refs->refBase() == obj,
+                       "BR_ATTEMPT_ACQUIRE: object %p does not match cookie %p (expected %p)",
+                       refs, obj, refs->refBase());
+            
+            mOut.writeInt32(BC_ACQUIRE_RESULT);
+            mOut.writeInt32((int32_t)success);
+        }
+        break;
+    
+    case BR_TRANSACTION:
+        {
+            binder_transaction_data tr;
+            result = mIn.read(&tr, sizeof(tr));
+            ALOG_ASSERT(result == NO_ERROR,
+                "Not enough command data for brTRANSACTION");
+            if (result != NO_ERROR) break;
+            
+            Parcel buffer;
+            buffer.ipcSetDataReference(
+                reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+                tr.data_size,
+                reinterpret_cast<const size_t*>(tr.data.ptr.offsets),
+                tr.offsets_size/sizeof(size_t), freeBuffer, this);
+            
+            const pid_t origPid = mCallingPid;
+            const uid_t origUid = mCallingUid;
+            
+            mCallingPid = tr.sender_pid;
+            mCallingUid = tr.sender_euid;
+            
+            int curPrio = getpriority(PRIO_PROCESS, mMyThreadId);
+            if (gDisableBackgroundScheduling) {
+                if (curPrio > ANDROID_PRIORITY_NORMAL) {
+                    // We have inherited a reduced priority from the caller, but do not
+                    // want to run in that state in this process.  The driver set our
+                    // priority already (though not our scheduling class), so bounce
+                    // it back to the default before invoking the transaction.
+                    setpriority(PRIO_PROCESS, mMyThreadId, ANDROID_PRIORITY_NORMAL);
+                }
+            } else {
+                if (curPrio >= ANDROID_PRIORITY_BACKGROUND) {
+                    // We want to use the inherited priority from the caller.
+                    // Ensure this thread is in the background scheduling class,
+                    // since the driver won't modify scheduling classes for us.
+                    // The scheduling group is reset to default by the caller
+                    // once this method returns after the transaction is complete.
+                    set_sched_policy(mMyThreadId, SP_BACKGROUND);
+                }
+            }
+
+            //ALOGI(">>>> TRANSACT from pid %d uid %d\n", mCallingPid, mCallingUid);
+            
+            Parcel reply;
+            IF_LOG_TRANSACTIONS() {
+                TextOutput::Bundle _b(alog);
+                alog << "BR_TRANSACTION thr " << (void*)pthread_self()
+                    << " / obj " << tr.target.ptr << " / code "
+                    << TypeCode(tr.code) << ": " << indent << buffer
+                    << dedent << endl
+                    << "Data addr = "
+                    << reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer)
+                    << ", offsets addr="
+                    << reinterpret_cast<const size_t*>(tr.data.ptr.offsets) << endl;
+            }
+            if (tr.target.ptr) {
+                sp<BBinder> b((BBinder*)tr.cookie);
+                const status_t error = b->transact(tr.code, buffer, &reply, tr.flags);
+                if (error < NO_ERROR) reply.setError(error);
+
+            } else {
+                const status_t error = the_context_object->transact(tr.code, buffer, &reply, tr.flags);
+                if (error < NO_ERROR) reply.setError(error);
+            }
+            
+            //ALOGI("<<<< TRANSACT from pid %d restore pid %d uid %d\n",
+            //     mCallingPid, origPid, origUid);
+            
+            if ((tr.flags & TF_ONE_WAY) == 0) {
+                LOG_ONEWAY("Sending reply to %d!", mCallingPid);
+                sendReply(reply, 0);
+            } else {
+                LOG_ONEWAY("NOT sending reply to %d!", mCallingPid);
+            }
+            
+            mCallingPid = origPid;
+            mCallingUid = origUid;
+
+            IF_LOG_TRANSACTIONS() {
+                TextOutput::Bundle _b(alog);
+                alog << "BC_REPLY thr " << (void*)pthread_self() << " / obj "
+                    << tr.target.ptr << ": " << indent << reply << dedent << endl;
+            }
+            
+        }
+        break;
+    
+    case BR_DEAD_BINDER:
+        {
+            BpBinder *proxy = (BpBinder*)mIn.readInt32();
+            proxy->sendObituary();
+            mOut.writeInt32(BC_DEAD_BINDER_DONE);
+            mOut.writeInt32((int32_t)proxy);
+        } break;
+        
+    case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+        {
+            BpBinder *proxy = (BpBinder*)mIn.readInt32();
+            proxy->getWeakRefs()->decWeak(proxy);
+        } break;
+        
+    case BR_FINISHED:
+        result = TIMED_OUT;
+        break;
+        
+    case BR_NOOP:
+        break;
+        
+    case BR_SPAWN_LOOPER:
+        mProcess->spawnPooledThread(false);
+        break;
+        
+    default:
+        printf("*** BAD COMMAND %d received from Binder driver\n", cmd);
+        result = UNKNOWN_ERROR;
+        break;
+    }
+
+    if (result != NO_ERROR) {
+        mLastError = result;
+    }
+    
+    return result;
+!!!1459468.cpp!!!	clearCaller() : void
+    mCallingPid = getpid();
+    mCallingUid = getuid();
+!!!1459596.cpp!!!	threadDestructor(inout st : void) : void
+	IPCThreadState* const self = static_cast<IPCThreadState*>(st);
+	if (self) {
+		self->flushCommands();
+#if defined(HAVE_ANDROID_OS)
+        if (self->mProcess->mDriverFD > 0) {
+            ioctl(self->mProcess->mDriverFD, BINDER_THREAD_EXIT, 0);
+        }
+#endif
+		delete self;
+	}
+!!!1459724.cpp!!!	freeBuffer(inout parcel : Parcel, in data : uint8_t, in dataSize : size_t, in objects : size_t, in objectsSize : size_t, inout cookie : void) : void
+    //ALOGI("Freeing parcel %p", &parcel);
+    IF_LOG_COMMANDS() {
+        alog << "Writing BC_FREE_BUFFER for " << data << endl;
+    }
+    ALOG_ASSERT(data != NULL, "Called with NULL data");
+    if (parcel != NULL) parcel->closeFileDescriptors();
+    IPCThreadState* state = self();
+    state->mOut.writeInt32(BC_FREE_BUFFER);
+    state->mOut.writeInt32((int32_t)data);

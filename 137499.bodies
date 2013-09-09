@@ -1,0 +1,654 @@
+class ObjectStreamClass
+!!!234139.java!!!	setConstructor(in newConstructor : long) : void
+        constructor = newConstructor;
+!!!234267.java!!!	getConstructor() : long
+        return constructor;
+!!!234395.java!!!	getReflectionField(inout osf : ObjectStreamField) : Field
+        synchronized (reflectionFields) {
+            Field field = reflectionFields.get(osf);
+            if (field != null) {
+                return field;
+            }
+        }
+
+        try {
+            Class<?> declaringClass = forClass();
+            Field field = declaringClass.getDeclaredField(osf.getName());
+            field.setAccessible(true);
+            synchronized (reflectionFields) {
+                reflectionFields.put(osf, field);
+            }
+            return reflectionFields.get(osf);
+        } catch (NoSuchFieldException ex) {
+            // The caller messed up. We'll return null and won't try to resolve this again.
+            return null;
+        }
+!!!234651.java!!!	createClassDesc(inout cl : Class) : ObjectStreamClass
+
+        ObjectStreamClass result = new ObjectStreamClass();
+
+        boolean isArray = cl.isArray();
+        boolean serializable = isSerializable(cl);
+        boolean externalizable = isExternalizable(cl);
+
+        result.isSerializable = serializable;
+        result.isExternalizable = externalizable;
+
+        // Now we fill in the values
+        result.setName(cl.getName());
+        result.setClass(cl);
+        Class<?> superclass = cl.getSuperclass();
+        if (superclass != null) {
+            result.setSuperclass(lookup(superclass));
+        }
+
+        Field[] declaredFields = null;
+
+        // Compute the SUID
+        if (serializable || externalizable) {
+            if (result.isEnum() || result.isProxy()) {
+                result.setSerialVersionUID(0L);
+            } else {
+                declaredFields = cl.getDeclaredFields();
+                result.setSerialVersionUID(computeSerialVersionUID(cl, declaredFields));
+            }
+        }
+
+        // Serializables need field descriptors
+        if (serializable && !isArray) {
+            if (declaredFields == null) {
+                declaredFields = cl.getDeclaredFields();
+            }
+            result.buildFieldDescriptors(declaredFields);
+        } else {
+            // Externalizables or arrays do not need FieldDesc info
+            result.setFields(NO_FIELDS);
+        }
+
+        // Copy all fields to loadFields - they should be read by default in
+        // ObjectInputStream.defaultReadObject() method
+        ObjectStreamField[] fields = result.getFields();
+
+        if (fields != null) {
+            ObjectStreamField[] loadFields = new ObjectStreamField[fields.length];
+
+            for (int i = 0; i < fields.length; ++i) {
+                loadFields[i] = new ObjectStreamField(fields[i].getName(),
+                        fields[i].getType(), fields[i].isUnshared());
+
+                // resolve type string to init typeString field in
+                // ObjectStreamField
+                loadFields[i].getTypeString();
+            }
+            result.setLoadFields(loadFields);
+        }
+
+        byte flags = 0;
+        if (externalizable) {
+            flags |= ObjectStreamConstants.SC_EXTERNALIZABLE;
+            flags |= ObjectStreamConstants.SC_BLOCK_DATA; // use protocol version 2 by default
+        } else if (serializable) {
+            flags |= ObjectStreamConstants.SC_SERIALIZABLE;
+        }
+        result.methodWriteReplace = findMethod(cl, "writeReplace");
+        result.methodReadResolve = findMethod(cl, "readResolve");
+        result.methodWriteObject = findPrivateMethod(cl, "writeObject", WRITE_PARAM_TYPES);
+        result.methodReadObject = findPrivateMethod(cl, "readObject", READ_PARAM_TYPES);
+        result.methodReadObjectNoData = findPrivateMethod(cl, "readObjectNoData", EmptyArray.CLASS);
+        if (result.hasMethodWriteObject()) {
+            flags |= ObjectStreamConstants.SC_WRITE_METHOD;
+        }
+        result.setFlags(flags);
+
+        return result;
+!!!234779.java!!!	buildFieldDescriptors(inout declaredFields : Field) : void
+        // We could find the field ourselves in the collection, but calling
+        // reflect is easier. Optimize if needed.
+        final Field f = ObjectStreamClass.fieldSerialPersistentFields(this.forClass());
+        // If we could not find the emulated fields, we'll have to compute
+        // dumpable fields from reflect fields
+        boolean useReflectFields = f == null; // Assume we will compute the
+        // fields to dump based on the
+        // reflect fields
+
+        ObjectStreamField[] _fields = null;
+        if (!useReflectFields) {
+            // The user declared a collection of emulated fields. Use them.
+            // We have to be able to fetch its value, even if it is private
+            f.setAccessible(true);
+            try {
+                // static field, pass null
+                _fields = (ObjectStreamField[]) f.get(null);
+            } catch (IllegalAccessException ex) {
+                throw new AssertionError(ex);
+            }
+        } else {
+            // Compute collection of dumpable fields based on reflect fields
+            List<ObjectStreamField> serializableFields =
+                    new ArrayList<ObjectStreamField>(declaredFields.length);
+            // Filter, we are only interested in fields that are serializable
+            for (Field declaredField : declaredFields) {
+                int modifiers = declaredField.getModifiers();
+                if (!Modifier.isStatic(modifiers) && !Modifier.isTransient(modifiers)) {
+                    ObjectStreamField field = new ObjectStreamField(declaredField.getName(),
+                            declaredField.getType());
+                    serializableFields.add(field);
+                }
+            }
+
+            if (serializableFields.size() == 0) {
+                _fields = NO_FIELDS; // If no serializable fields, share the
+                // special value so that users can test
+            } else {
+                _fields = serializableFields.toArray(new ObjectStreamField[serializableFields.size()]);
+            }
+        }
+        Arrays.sort(_fields);
+        // assign offsets
+        int primOffset = 0, objectOffset = 0;
+        for (int i = 0; i < _fields.length; i++) {
+            Class<?> type = _fields[i].getType();
+            if (type.isPrimitive()) {
+                _fields[i].offset = primOffset;
+                primOffset += primitiveSize(type);
+            } else {
+                _fields[i].offset = objectOffset++;
+            }
+        }
+        fields = _fields;
+!!!234907.java!!!	computeSerialVersionUID(inout cl : Class, inout fields : Field) : long
+        /*
+         * First we should try to fetch the static slot 'static final long
+         * serialVersionUID'. If it is defined, return it. If not defined, we
+         * really need to compute SUID using SHAOutputStream
+         */
+        for (int i = 0; i < fields.length; i++) {
+            final Field field = fields[i];
+            if (field.getType() == long.class) {
+                int modifiers = field.getModifiers();
+                if (Modifier.isStatic(modifiers) && Modifier.isFinal(modifiers)) {
+                    if (UID_FIELD_NAME.equals(field.getName())) {
+                        /*
+                         * We need to be able to see it even if we have no
+                         * visibility. That is why we set accessible first (new
+                         * API in reflect 1.2)
+                         */
+                        field.setAccessible(true);
+                        try {
+                            // Static field, parameter is ignored
+                            return field.getLong(null);
+                        } catch (IllegalAccessException iae) {
+                            throw new RuntimeException("Error fetching SUID: " + iae);
+                        }
+                    }
+                }
+            }
+        }
+
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA");
+        } catch (NoSuchAlgorithmException e) {
+            throw new Error(e);
+        }
+        ByteArrayOutputStream sha = new ByteArrayOutputStream();
+        try {
+            DataOutputStream output = new DataOutputStream(sha);
+            output.writeUTF(cl.getName());
+            int classModifiers = CLASS_MODIFIERS_MASK & cl.getModifiers();
+            /*
+             * Workaround for 1F9LOQO. Arrays are ABSTRACT in JDK, but that is
+             * not in the specification. Since we want to be compatible for
+             * X-loading, we have to pretend we have the same shape
+             */
+            boolean isArray = cl.isArray();
+            if (isArray) {
+                classModifiers |= Modifier.ABSTRACT;
+            }
+            // Required for JDK UID compatibility
+            if (cl.isInterface() && !Modifier.isPublic(classModifiers)) {
+                classModifiers &= ~Modifier.ABSTRACT;
+            }
+            output.writeInt(classModifiers);
+
+            /*
+             * In JDK1.2 arrays implement Cloneable and Serializable but not in
+             * JDK 1.1.7. So, JDK 1.2 "pretends" arrays have no interfaces when
+             * computing SHA-1 to be compatible.
+             */
+            if (!isArray) {
+                // Interface information
+                Class<?>[] interfaces = cl.getInterfaces();
+                if (interfaces.length > 1) {
+                    // Only attempt to sort if really needed (saves object
+                    // creation, etc)
+                    Comparator<Class<?>> interfaceComparator = new Comparator<Class<?>>() {
+                        public int compare(Class<?> itf1, Class<?> itf2) {
+                            return itf1.getName().compareTo(itf2.getName());
+                        }
+                    };
+                    Arrays.sort(interfaces, interfaceComparator);
+                }
+
+                // Dump them
+                for (int i = 0; i < interfaces.length; i++) {
+                    output.writeUTF(interfaces[i].getName());
+                }
+            }
+
+            // Field information
+            if (fields.length > 1) {
+                // Only attempt to sort if really needed (saves object creation,
+                // etc)
+                Comparator<Field> fieldComparator = new Comparator<Field>() {
+                    public int compare(Field field1, Field field2) {
+                        return field1.getName().compareTo(field2.getName());
+                    }
+                };
+                Arrays.sort(fields, fieldComparator);
+            }
+
+            // Dump them
+            for (int i = 0; i < fields.length; i++) {
+                Field field = fields[i];
+                int modifiers = field.getModifiers() & FIELD_MODIFIERS_MASK;
+
+                boolean skip = Modifier.isPrivate(modifiers) &&
+                        (Modifier.isTransient(modifiers) || Modifier.isStatic(modifiers));
+                if (!skip) {
+                    // write name, modifier & "descriptor" of all but private
+                    // static and private transient
+                    output.writeUTF(field.getName());
+                    output.writeInt(modifiers);
+                    output.writeUTF(descriptorForFieldSignature(getFieldSignature(field)));
+                }
+            }
+
+            /*
+             * Normally constructors come before methods (because <init> <
+             * anyMethodName). However, <clinit> is an exception. Besides,
+             * reflect will not let us get to it.
+             */
+            if (hasClinit(cl)) {
+                // write name, modifier & "descriptor"
+                output.writeUTF(CLINIT_NAME);
+                output.writeInt(CLINIT_MODIFIERS);
+                output.writeUTF(CLINIT_SIGNATURE);
+            }
+
+            // Constructor information
+            Constructor<?>[] constructors = cl.getDeclaredConstructors();
+            if (constructors.length > 1) {
+                // Only attempt to sort if really needed (saves object creation,
+                // etc)
+                Comparator<Constructor<?>> constructorComparator = new Comparator<Constructor<?>>() {
+                    public int compare(Constructor<?> ctr1, Constructor<?> ctr2) {
+                        // All constructors have same name, so we sort based on
+                        // signature
+                        return (getConstructorSignature(ctr1)
+                                .compareTo(getConstructorSignature(ctr2)));
+                    }
+                };
+                Arrays.sort(constructors, constructorComparator);
+            }
+
+            // Dump them
+            for (int i = 0; i < constructors.length; i++) {
+                Constructor<?> constructor = constructors[i];
+                int modifiers = constructor.getModifiers()
+                        & METHOD_MODIFIERS_MASK;
+                boolean isPrivate = Modifier.isPrivate(modifiers);
+                if (!isPrivate) {
+                    /*
+                     * write name, modifier & "descriptor" of all but private
+                     * ones
+                     *
+                     * constructor.getName() returns the constructor name as
+                     * typed, not the VM name
+                     */
+                    output.writeUTF("<init>");
+                    output.writeInt(modifiers);
+                    output.writeUTF(descriptorForSignature(
+                            getConstructorSignature(constructor)).replace('/',
+                            '.'));
+                }
+            }
+
+            // Method information
+            Method[] methods = cl.getDeclaredMethods();
+            if (methods.length > 1) {
+                Comparator<Method> methodComparator = new Comparator<Method>() {
+                    public int compare(Method m1, Method m2) {
+                        int result = m1.getName().compareTo(m2.getName());
+                        if (result == 0) {
+                            // same name, signature will tell which one comes
+                            // first
+                            return getMethodSignature(m1).compareTo(
+                                    getMethodSignature(m2));
+                        }
+                        return result;
+                    }
+                };
+                Arrays.sort(methods, methodComparator);
+            }
+
+            // Dump them
+            for (int i = 0; i < methods.length; i++) {
+                Method method = methods[i];
+                int modifiers = method.getModifiers() & METHOD_MODIFIERS_MASK;
+                boolean isPrivate = Modifier.isPrivate(modifiers);
+                if (!isPrivate) {
+                    // write name, modifier & "descriptor" of all but private
+                    // ones
+                    output.writeUTF(method.getName());
+                    output.writeInt(modifiers);
+                    output.writeUTF(descriptorForSignature(
+                            getMethodSignature(method)).replace('/', '.'));
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e + " computing SHA-1/SUID");
+        }
+
+        // now compute the UID based on the SHA
+        byte[] hash = digest.digest(sha.toByteArray());
+        return Memory.peekLong(hash, 0, ByteOrder.LITTLE_ENDIAN);
+!!!235035.java!!!	descriptorForFieldSignature(inout signature : String) : String
+        return signature.replace('.', '/');
+!!!235163.java!!!	descriptorForSignature(inout signature : String) : String
+        return signature.substring(signature.indexOf("("));
+!!!235291.java!!!	fieldSerialPersistentFields(inout cl : Class) : Field
+        try {
+            Field f = cl.getDeclaredField("serialPersistentFields");
+            int modifiers = f.getModifiers();
+            if (Modifier.isStatic(modifiers) && Modifier.isPrivate(modifiers)
+                    && Modifier.isFinal(modifiers)) {
+                if (f.getType() == ARRAY_OF_FIELDS) {
+                    return f;
+                }
+            }
+        } catch (NoSuchFieldException nsm) {
+            // Ignored
+        }
+        return null;
+!!!235419.java!!!	forClass() : Class
+        return resolvedClass;
+!!!235547.java!!!	newInstance(inout instantiationClass : Class) : Object
+        resolveConstructorClass(instantiationClass);
+        return newInstance(instantiationClass, resolvedConstructorMethodId);
+!!!235803.java!!!	resolveConstructorClass(inout objectClass : Class) : Class
+        if (resolvedConstructorClass != null) {
+            return resolvedConstructorClass;
+        }
+
+        // The class of the instance may not be the same as the class of the
+        // constructor to run
+        // This is the constructor to run if Externalizable
+        Class<?> constructorClass = objectClass;
+
+        // WARNING - What if the object is serializable and externalizable ?
+        // Is that possible ?
+        boolean wasSerializable = (flags & ObjectStreamConstants.SC_SERIALIZABLE) != 0;
+        if (wasSerializable) {
+            // Now we must run the constructor of the class just above the
+            // one that implements Serializable so that slots that were not
+            // dumped can be initialized properly
+            while (constructorClass != null && ObjectStreamClass.isSerializable(constructorClass)) {
+                constructorClass = constructorClass.getSuperclass();
+            }
+        }
+
+        // Fetch the empty constructor, or null if none.
+        Constructor<?> constructor = null;
+        if (constructorClass != null) {
+            try {
+                constructor = constructorClass.getDeclaredConstructor(EmptyArray.CLASS);
+            } catch (NoSuchMethodException ignored) {
+            }
+        }
+
+        // Has to have an empty constructor
+        if (constructor == null) {
+            String className = constructorClass != null ? constructorClass.getName() : null;
+            throw new InvalidClassException(className, "IllegalAccessException");
+        }
+
+        int constructorModifiers = constructor.getModifiers();
+        boolean isPublic = Modifier.isPublic(constructorModifiers);
+        boolean isProtected = Modifier.isProtected(constructorModifiers);
+        boolean isPrivate = Modifier.isPrivate(constructorModifiers);
+
+        // Now we must check if the empty constructor is visible to the
+        // instantiation class
+        boolean wasExternalizable = (flags & ObjectStreamConstants.SC_EXTERNALIZABLE) != 0;
+        if (isPrivate || (wasExternalizable && !isPublic)) {
+            throw new InvalidClassException(constructorClass.getName(), "IllegalAccessException");
+        }
+
+        // We know we are testing from a subclass, so the only other case
+        // where the visibility is not allowed is when the constructor has
+        // default visibility and the instantiation class is in a different
+        // package than the constructor class
+        if (!isPublic && !isProtected) {
+            // Not public, not private and not protected...means default
+            // visibility. Check if same package
+            if (!inSamePackage(constructorClass, objectClass)) {
+                throw new InvalidClassException(constructorClass.getName(), "IllegalAccessException");
+            }
+        }
+
+        resolvedConstructorClass = constructorClass;
+        resolvedConstructorMethodId = getConstructorId(resolvedConstructorClass);
+        return constructorClass;
+!!!236059.java!!!	inSamePackage(inout c1 : Class, inout c2 : Class) : boolean
+        String nameC1 = c1.getName();
+        String nameC2 = c2.getName();
+        int indexDotC1 = nameC1.lastIndexOf('.');
+        int indexDotC2 = nameC2.lastIndexOf('.');
+        if (indexDotC1 != indexDotC2) {
+            return false; // cannot be in the same package if indices are not the same
+        }
+        if (indexDotC1 == -1) {
+            return true; // both of them are in default package
+        }
+        return nameC1.regionMatches(0, nameC2, 0, indexDotC1);
+!!!236315.java!!!	getField(inout name : String) : ObjectStreamField
+        ObjectStreamField[] allFields = getFields();
+        for (int i = 0; i < allFields.length; i++) {
+            ObjectStreamField f = allFields[i];
+            if (f.getName().equals(name)) {
+                return f;
+            }
+        }
+        return null;
+!!!236443.java!!!	fields() : ObjectStreamField
+        if (fields == null) {
+            Class<?> forCl = forClass();
+            if (forCl != null && isSerializable() && !forCl.isArray()) {
+                buildFieldDescriptors(forCl.getDeclaredFields());
+            } else {
+                // Externalizables or arrays do not need FieldDesc info
+                setFields(NO_FIELDS);
+            }
+        }
+        return fields;
+!!!236571.java!!!	getFields() : ObjectStreamField
+        copyFieldAttributes();
+        return loadFields == null ? fields().clone() : loadFields.clone();
+!!!236699.java!!!	getHierarchy() : List
+        List<ObjectStreamClass> result = cachedHierarchy;
+        if (result == null) {
+            cachedHierarchy = result = makeHierarchy();
+        }
+        return result;
+!!!236827.java!!!	makeHierarchy() : List
+        ArrayList<ObjectStreamClass> result = new ArrayList<ObjectStreamClass>();
+        for (ObjectStreamClass osc = this; osc != null; osc = osc.getSuperclass()) {
+            result.add(0, osc);
+        }
+        return result;
+!!!236955.java!!!	copyFieldAttributes() : void
+        if ((loadFields == null) || fields == null) {
+            return;
+        }
+
+        for (int i = 0; i < loadFields.length; i++) {
+            ObjectStreamField loadField = loadFields[i];
+            String name = loadField.getName();
+            for (int j = 0; j < fields.length; j++) {
+                ObjectStreamField field = fields[j];
+                if (name.equals(field.getName())) {
+                    loadField.setUnshared(field.isUnshared());
+                    loadField.setOffset(field.getOffset());
+                    break;
+                }
+            }
+        }
+!!!237083.java!!!	getLoadFields() : ObjectStreamField
+        return loadFields;
+!!!237339.java!!!	getFlags() : byte
+        return flags;
+!!!237595.java!!!	getName() : String
+        return className;
+!!!237723.java!!!	getSerialVersionUID() : long
+        return svUID;
+!!!237851.java!!!	getSuperclass() : ObjectStreamClass
+        return superclass;
+!!!238107.java!!!	isExternalizable(inout cl : Class) : boolean
+        return EXTERNALIZABLE.isAssignableFrom(cl);
+!!!238235.java!!!	isPrimitiveType(in typecode : char) : boolean
+        return !(typecode == '[' || typecode == 'L');
+!!!238363.java!!!	isSerializable(inout cl : Class) : boolean
+        return SERIALIZABLE.isAssignableFrom(cl);
+!!!238491.java!!!	resolveProperties() : void
+        if (arePropertiesResolved) {
+            return;
+        }
+
+        Class<?> cl = forClass();
+        isProxy = Proxy.isProxyClass(cl);
+        isEnum = Enum.class.isAssignableFrom(cl);
+        isSerializable = isSerializable(cl);
+        isExternalizable = isExternalizable(cl);
+
+        arePropertiesResolved = true;
+!!!238619.java!!!	isSerializable() : boolean
+        resolveProperties();
+        return isSerializable;
+!!!238747.java!!!	isExternalizable() : boolean
+        resolveProperties();
+        return isExternalizable;
+!!!238875.java!!!	isProxy() : boolean
+        resolveProperties();
+        return isProxy;
+!!!239003.java!!!	isEnum() : boolean
+        resolveProperties();
+        return isEnum;
+!!!239131.java!!!	lookup(inout cl : Class) : ObjectStreamClass
+        ObjectStreamClass osc = lookupStreamClass(cl);
+        return (osc.isSerializable() || osc.isExternalizable()) ? osc : null;
+!!!239259.java!!!	lookupAny(inout cl : Class) : ObjectStreamClass
+        return lookupStreamClass(cl);
+!!!239387.java!!!	lookupStreamClass(inout cl : Class) : ObjectStreamClass
+        WeakHashMap<Class<?>, ObjectStreamClass> tlc = getCache();
+        ObjectStreamClass cachedValue = tlc.get(cl);
+        if (cachedValue == null) {
+            cachedValue = createClassDesc(cl);
+            tlc.put(cl, cachedValue);
+        }
+        return cachedValue;
+
+!!!239515.java!!!	getCache() : WeakHashMap
+        ThreadLocal<WeakHashMap<Class<?>, ObjectStreamClass>> tls = storage.get();
+        if (tls == null) {
+            tls = new ThreadLocal<WeakHashMap<Class<?>, ObjectStreamClass>>() {
+                public WeakHashMap<Class<?>, ObjectStreamClass> initialValue() {
+                    return new WeakHashMap<Class<?>, ObjectStreamClass>();
+                }
+            };
+            storage = new SoftReference<ThreadLocal<WeakHashMap<Class<?>, ObjectStreamClass>>>(tls);
+        }
+        return tls.get();
+!!!239643.java!!!	findMethod(inout cl : Class, inout methodName : String) : Method
+        Class<?> search = cl;
+        Method method = null;
+        while (search != null) {
+            try {
+                method = search.getDeclaredMethod(methodName, (Class[]) null);
+                if (search == cl
+                        || (method.getModifiers() & Modifier.PRIVATE) == 0) {
+                    method.setAccessible(true);
+                    return method;
+                }
+            } catch (NoSuchMethodException nsm) {
+            }
+            search = search.getSuperclass();
+        }
+        return null;
+!!!239771.java!!!	findPrivateMethod(inout cl : Class, inout methodName : String, inout param : Class) : Method
+        try {
+            Method method = cl.getDeclaredMethod(methodName, param);
+            if (Modifier.isPrivate(method.getModifiers()) && method.getReturnType() == void.class) {
+                method.setAccessible(true);
+                return method;
+            }
+        } catch (NoSuchMethodException nsm) {
+            // Ignored
+        }
+        return null;
+!!!239899.java!!!	hasMethodWriteReplace() : boolean
+        return (methodWriteReplace != null);
+!!!240027.java!!!	getMethodWriteReplace() : Method
+        return methodWriteReplace;
+!!!240155.java!!!	hasMethodReadResolve() : boolean
+        return (methodReadResolve != null);
+!!!240283.java!!!	getMethodReadResolve() : Method
+        return methodReadResolve;
+!!!240411.java!!!	hasMethodWriteObject() : boolean
+        return (methodWriteObject != null);
+!!!240539.java!!!	getMethodWriteObject() : Method
+        return methodWriteObject;
+!!!240667.java!!!	hasMethodReadObject() : boolean
+        return (methodReadObject != null);
+!!!240795.java!!!	getMethodReadObject() : Method
+        return methodReadObject;
+!!!240923.java!!!	hasMethodReadObjectNoData() : boolean
+        return (methodReadObjectNoData != null);
+!!!241051.java!!!	getMethodReadObjectNoData() : Method
+        return methodReadObjectNoData;
+!!!241179.java!!!	initPrivateFields(inout desc : ObjectStreamClass) : void
+        methodWriteReplace = desc.methodWriteReplace;
+        methodReadResolve = desc.methodReadResolve;
+        methodWriteObject = desc.methodWriteObject;
+        methodReadObject = desc.methodReadObject;
+        methodReadObjectNoData = desc.methodReadObjectNoData;
+!!!241307.java!!!	setClass(inout c : Class) : void
+        resolvedClass = c;
+!!!241435.java!!!	setFields(inout f : ObjectStreamField) : void
+        fields = f;
+!!!241563.java!!!	setLoadFields(inout f : ObjectStreamField) : void
+        loadFields = f;
+!!!241691.java!!!	setFlags(in b : byte) : void
+        flags = b;
+!!!241819.java!!!	setName(inout newName : String) : void
+        className = newName;
+!!!241947.java!!!	setSerialVersionUID(in l : long) : void
+        svUID = l;
+!!!242075.java!!!	setSuperclass(inout c : ObjectStreamClass) : void
+        superclass = c;
+!!!242203.java!!!	primitiveSize(inout type : Class) : int
+        if (type == byte.class || type == boolean.class) {
+            return 1;
+        }
+        if (type == short.class || type == char.class) {
+            return 2;
+        }
+        if (type == int.class || type == float.class) {
+            return 4;
+        }
+        if (type == long.class || type == double.class) {
+            return 8;
+        }
+        throw new AssertionError();
+!!!242331.java!!!	toString() : String
+        return getName() + ": static final long serialVersionUID =" + getSerialVersionUID() + "L;";

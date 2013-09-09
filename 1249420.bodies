@@ -1,0 +1,154 @@
+class SurfaceRenderFilter
+!!!7110028.java!!!	SurfaceRenderFilter(in name : String)
+        super(name);
+
+        mLogVerbose = Log.isLoggable(TAG, Log.VERBOSE);
+!!!7110156.java!!!	setupPorts() : void
+        // Make sure we have a SurfaceView
+        if (mSurfaceView == null) {
+            throw new RuntimeException("NULL SurfaceView passed to SurfaceRenderFilter");
+        }
+
+        // Add input port
+        addMaskedInputPort("frame", ImageFormat.create(ImageFormat.COLORSPACE_RGBA));
+!!!7110284.java!!!	updateRenderMode() : void
+        if (mRenderModeString != null) {
+            if (mRenderModeString.equals("stretch")) {
+                mRenderMode = RENDERMODE_STRETCH;
+            } else if (mRenderModeString.equals("fit")) {
+                mRenderMode = RENDERMODE_FIT;
+            } else if (mRenderModeString.equals("fill_crop")) {
+                mRenderMode = RENDERMODE_FILL_CROP;
+            } else {
+                throw new RuntimeException("Unknown render mode '" + mRenderModeString + "'!");
+            }
+        }
+        updateTargetRect();
+!!!7110412.java!!!	prepare(inout context : FilterContext) : void
+        // Create identity shader to render, and make sure to render upside-down, as textures
+        // are stored internally bottom-to-top.
+        mProgram = ShaderProgram.createIdentity(context);
+        mProgram.setSourceRect(0, 1, 1, -1);
+        mProgram.setClearsOutput(true);
+        mProgram.setClearColor(0.0f, 0.0f, 0.0f);
+
+        updateRenderMode();
+
+        // Create a frame representing the screen
+        MutableFrameFormat screenFormat = ImageFormat.create(mSurfaceView.getWidth(),
+                                                             mSurfaceView.getHeight(),
+                                                             ImageFormat.COLORSPACE_RGBA,
+                                                             FrameFormat.TARGET_GPU);
+        mScreen = (GLFrame)context.getFrameManager().newBoundFrame(screenFormat,
+                                                                   GLFrame.EXISTING_FBO_BINDING,
+                                                                   0);
+!!!7110540.java!!!	open(inout context : FilterContext) : void
+        // Bind surface view to us. This will emit a surfaceCreated and surfaceChanged call that
+        // will update our screen width and height.
+        mSurfaceView.unbind();
+        mSurfaceView.bindToListener(this, context.getGLEnvironment());
+!!!7110668.java!!!	process(inout context : FilterContext) : void
+        // Make sure we are bound to a surface before rendering
+        if (!mIsBound) {
+            Log.w("SurfaceRenderFilter",
+                  this + ": Ignoring frame as there is no surface to render to!");
+            return;
+        }
+
+        if (mLogVerbose) Log.v(TAG, "Starting frame processing");
+
+        GLEnvironment glEnv = mSurfaceView.getGLEnv();
+        if (glEnv != context.getGLEnvironment()) {
+            throw new RuntimeException("Surface created under different GLEnvironment!");
+        }
+
+
+        // Get input frame
+        Frame input = pullInput("frame");
+        boolean createdFrame = false;
+
+        float currentAspectRatio = (float)input.getFormat().getWidth() / input.getFormat().getHeight();
+        if (currentAspectRatio != mAspectRatio) {
+            if (mLogVerbose) Log.v(TAG, "New aspect ratio: " + currentAspectRatio +", previously: " + mAspectRatio);
+            mAspectRatio = currentAspectRatio;
+            updateTargetRect();
+        }
+
+        // See if we need to copy to GPU
+        Frame gpuFrame = null;
+        if (mLogVerbose) Log.v("SurfaceRenderFilter", "Got input format: " + input.getFormat());
+        int target = input.getFormat().getTarget();
+        if (target != FrameFormat.TARGET_GPU) {
+            gpuFrame = context.getFrameManager().duplicateFrameToTarget(input,
+                                                                        FrameFormat.TARGET_GPU);
+            createdFrame = true;
+        } else {
+            gpuFrame = input;
+        }
+
+        // Activate our surface
+        glEnv.activateSurfaceWithId(mSurfaceView.getSurfaceId());
+
+        // Process
+        mProgram.process(gpuFrame, mScreen);
+
+        // And swap buffers
+        glEnv.swapBuffers();
+
+        if (createdFrame) {
+            gpuFrame.release();
+        }
+!!!7110796.java!!!	fieldPortValueUpdated(in name : String, inout context : FilterContext) : void
+        updateTargetRect();
+!!!7110924.java!!!	close(inout context : FilterContext) : void
+        mSurfaceView.unbind();
+!!!7111052.java!!!	tearDown(inout context : FilterContext) : void
+        if (mScreen != null) {
+            mScreen.release();
+        }
+!!!7111180.java!!!	surfaceCreated(inout holder : SurfaceHolder) : void
+        mIsBound = true;
+!!!7111308.java!!!	surfaceChanged(inout holder : SurfaceHolder, in format : int, in width : int, in height : int) : void
+        // If the screen is null, we do not care about surface changes (yet). Once we have a
+        // screen object, we need to keep track of these changes.
+        if (mScreen != null) {
+            mScreenWidth = width;
+            mScreenHeight = height;
+            mScreen.setViewport(0, 0, mScreenWidth, mScreenHeight);
+            updateTargetRect();
+        }
+!!!7111436.java!!!	surfaceDestroyed(inout holder : SurfaceHolder) : void
+        mIsBound = false;
+!!!7111564.java!!!	updateTargetRect() : void
+        if (mScreenWidth > 0 && mScreenHeight > 0 && mProgram != null) {
+            float screenAspectRatio = (float)mScreenWidth / mScreenHeight;
+            float relativeAspectRatio = screenAspectRatio / mAspectRatio;
+
+            switch (mRenderMode) {
+                case RENDERMODE_STRETCH:
+                    mProgram.setTargetRect(0, 0, 1, 1);
+                    break;
+                case RENDERMODE_FIT:
+                    if (relativeAspectRatio > 1.0f) {
+                        // Screen is wider than the camera, scale down X
+                        mProgram.setTargetRect(0.5f - 0.5f / relativeAspectRatio, 0.0f,
+                                               1.0f / relativeAspectRatio, 1.0f);
+                    } else {
+                        // Screen is taller than the camera, scale down Y
+                        mProgram.setTargetRect(0.0f, 0.5f - 0.5f * relativeAspectRatio,
+                                               1.0f, relativeAspectRatio);
+                    }
+                    break;
+                case RENDERMODE_FILL_CROP:
+                    if (relativeAspectRatio > 1) {
+                        // Screen is wider than the camera, crop in Y
+                        mProgram.setTargetRect(0.0f, 0.5f - 0.5f * relativeAspectRatio,
+                                               1.0f, relativeAspectRatio);
+                    } else {
+                        // Screen is taller than the camera, crop in X
+                        mProgram.setTargetRect(0.5f - 0.5f / relativeAspectRatio, 0.0f,
+                                               1.0f / relativeAspectRatio, 1.0f);
+                    }
+                    break;
+            }
+        }

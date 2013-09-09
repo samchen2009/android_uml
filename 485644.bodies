@@ -1,0 +1,284 @@
+class ZipEntry
+!!!1397516.cpp!!!	getModWhen(in  : void) : time_t
+    struct tm parts;
+
+    parts.tm_sec = (mCDE.mLastModFileTime & 0x001f) << 1;
+    parts.tm_min = (mCDE.mLastModFileTime & 0x07e0) >> 5;
+    parts.tm_hour = (mCDE.mLastModFileTime & 0xf800) >> 11;
+    parts.tm_mday = (mCDE.mLastModFileDate & 0x001f);
+    parts.tm_mon = ((mCDE.mLastModFileDate & 0x01e0) >> 5) -1;
+    parts.tm_year = ((mCDE.mLastModFileDate & 0xfe00) >> 9) + 80;
+    parts.tm_wday = parts.tm_yday = 0;
+    parts.tm_isdst = -1;        // DST info "not available"
+
+    return mktime(&parts);
+!!!1398668.cpp!!!	initFromCDE(inout fp : FILE) : status_t
+    status_t result;
+    long posn;
+    bool hasDD;
+
+    //ALOGV("initFromCDE ---\n");
+
+    /* read the CDE */
+    result = mCDE.read(fp);
+    if (result != NO_ERROR) {
+        ALOGD("mCDE.read failed\n");
+        return result;
+    }
+
+    //mCDE.dump();
+
+    /* using the info in the CDE, go load up the LFH */
+    posn = ftell(fp);
+    if (fseek(fp, mCDE.mLocalHeaderRelOffset, SEEK_SET) != 0) {
+        ALOGD("local header seek failed (%ld)\n",
+            mCDE.mLocalHeaderRelOffset);
+        return UNKNOWN_ERROR;
+    }
+
+    result = mLFH.read(fp);
+    if (result != NO_ERROR) {
+        ALOGD("mLFH.read failed\n");
+        return result;
+    }
+
+    if (fseek(fp, posn, SEEK_SET) != 0)
+        return UNKNOWN_ERROR;
+
+    //mLFH.dump();
+
+    /*
+     * We *might* need to read the Data Descriptor at this point and
+     * integrate it into the LFH.  If this bit is set, the CRC-32,
+     * compressed size, and uncompressed size will be zero.  In practice
+     * these seem to be rare.
+     */
+    hasDD = (mLFH.mGPBitFlag & kUsesDataDescr) != 0;
+    if (hasDD) {
+        // do something clever
+        //ALOGD("+++ has data descriptor\n");
+    }
+
+    /*
+     * Sanity-check the LFH.  Note that this will fail if the "kUsesDataDescr"
+     * flag is set, because the LFH is incomplete.  (Not a problem, since we
+     * prefer the CDE values.)
+     */
+    if (!hasDD && !compareHeaders()) {
+        ALOGW("warning: header mismatch\n");
+        // keep going?
+    }
+
+    /*
+     * If the mVersionToExtract is greater than 20, we may have an
+     * issue unpacking the record -- could be encrypted, compressed
+     * with something we don't support, or use Zip64 extensions.  We
+     * can defer worrying about that to when we're extracting data.
+     */
+
+    return NO_ERROR;
+!!!1398796.cpp!!!	initNew(in fileName : char, in comment : char) : void
+    assert(fileName != NULL && *fileName != '\0');  // name required
+
+    /* most fields are properly initialized by constructor */
+    mCDE.mVersionMadeBy = kDefaultMadeBy;
+    mCDE.mVersionToExtract = kDefaultVersion;
+    mCDE.mCompressionMethod = kCompressStored;
+    mCDE.mFileNameLength = strlen(fileName);
+    if (comment != NULL)
+        mCDE.mFileCommentLength = strlen(comment);
+    mCDE.mExternalAttrs = 0x81b60020;   // matches what WinZip does
+
+    if (mCDE.mFileNameLength > 0) {
+        mCDE.mFileName = new unsigned char[mCDE.mFileNameLength+1];
+        strcpy((char*) mCDE.mFileName, fileName);
+    }
+    if (mCDE.mFileCommentLength > 0) {
+        /* TODO: stop assuming null-terminated ASCII here? */
+        mCDE.mFileComment = new unsigned char[mCDE.mFileCommentLength+1];
+        strcpy((char*) mCDE.mFileComment, comment);
+    }
+
+    copyCDEtoLFH();
+!!!1398924.cpp!!!	initFromExternal(in pZipFile : ZipFile, in pEntry : ZipEntry) : status_t
+    /*
+     * Copy everything in the CDE over, then fix up the hairy bits.
+     */
+    memcpy(&mCDE, &pEntry->mCDE, sizeof(mCDE));
+
+    if (mCDE.mFileNameLength > 0) {
+        mCDE.mFileName = new unsigned char[mCDE.mFileNameLength+1];
+        if (mCDE.mFileName == NULL)
+            return NO_MEMORY;
+        strcpy((char*) mCDE.mFileName, (char*)pEntry->mCDE.mFileName);
+    }
+    if (mCDE.mFileCommentLength > 0) {
+        mCDE.mFileComment = new unsigned char[mCDE.mFileCommentLength+1];
+        if (mCDE.mFileComment == NULL)
+            return NO_MEMORY;
+        strcpy((char*) mCDE.mFileComment, (char*)pEntry->mCDE.mFileComment);
+    }
+    if (mCDE.mExtraFieldLength > 0) {
+        /* we null-terminate this, though it may not be a string */
+        mCDE.mExtraField = new unsigned char[mCDE.mExtraFieldLength+1];
+        if (mCDE.mExtraField == NULL)
+            return NO_MEMORY;
+        memcpy(mCDE.mExtraField, pEntry->mCDE.mExtraField,
+            mCDE.mExtraFieldLength+1);
+    }
+
+    /* construct the LFH from the CDE */
+    copyCDEtoLFH();
+
+    /*
+     * The LFH "extra" field is independent of the CDE "extra", so we
+     * handle it here.
+     */
+    assert(mLFH.mExtraField == NULL);
+    mLFH.mExtraFieldLength = pEntry->mLFH.mExtraFieldLength;
+    if (mLFH.mExtraFieldLength > 0) {
+        mLFH.mExtraField = new unsigned char[mLFH.mExtraFieldLength+1];
+        if (mLFH.mExtraField == NULL)
+            return NO_MEMORY;
+        memcpy(mLFH.mExtraField, pEntry->mLFH.mExtraField,
+            mLFH.mExtraFieldLength+1);
+    }
+
+    return NO_ERROR;
+!!!1399052.cpp!!!	addPadding(in padding : int) : status_t
+    if (padding <= 0)
+        return INVALID_OPERATION;
+
+    //ALOGI("HEY: adding %d pad bytes to existing %d in %s\n",
+    //    padding, mLFH.mExtraFieldLength, mCDE.mFileName);
+
+    if (mLFH.mExtraFieldLength > 0) {
+        /* extend existing field */
+        unsigned char* newExtra;
+
+        newExtra = new unsigned char[mLFH.mExtraFieldLength + padding];
+        if (newExtra == NULL)
+            return NO_MEMORY;
+        memset(newExtra + mLFH.mExtraFieldLength, 0, padding);
+        memcpy(newExtra, mLFH.mExtraField, mLFH.mExtraFieldLength);
+
+        delete[] mLFH.mExtraField;
+        mLFH.mExtraField = newExtra;
+        mLFH.mExtraFieldLength += padding;
+    } else {
+        /* create new field */
+        mLFH.mExtraField = new unsigned char[padding];
+        memset(mLFH.mExtraField, 0, padding);
+        mLFH.mExtraFieldLength = padding;
+    }
+
+    return NO_ERROR;
+!!!1399180.cpp!!!	setDataInfo(in uncompLen : long, in compLen : long, in crc32 : ulong, in compressionMethod : int) : void
+    mCDE.mCompressionMethod = compressionMethod;
+    mCDE.mCRC32 = crc32;
+    mCDE.mCompressedSize = compLen;
+    mCDE.mUncompressedSize = uncompLen;
+    mCDE.mCompressionMethod = compressionMethod;
+    if (compressionMethod == kCompressDeflated) {
+        mCDE.mGPBitFlag |= 0x0002;      // indicates maximum compression used
+    }
+    copyCDEtoLFH();
+!!!1399308.cpp!!!	setModWhen(in when : time_t) : void
+#ifdef HAVE_LOCALTIME_R
+    struct tm tmResult;
+#endif
+    time_t even;
+    unsigned short zdate, ztime;
+
+    struct tm* ptm;
+
+    /* round up to an even number of seconds */
+    even = (time_t)(((unsigned long)(when) + 1) & (~1));
+
+    /* expand */
+#ifdef HAVE_LOCALTIME_R
+    ptm = localtime_r(&even, &tmResult);
+#else
+    ptm = localtime(&even);
+#endif
+
+    int year;
+    year = ptm->tm_year;
+    if (year < 80)
+        year = 80;
+
+    zdate = (year - 80) << 9 | (ptm->tm_mon+1) << 5 | ptm->tm_mday;
+    ztime = ptm->tm_hour << 11 | ptm->tm_min << 5 | ptm->tm_sec >> 1;
+
+    mCDE.mLastModFileTime = mLFH.mLastModFileTime = ztime;
+    mCDE.mLastModFileDate = mLFH.mLastModFileDate = zdate;
+!!!1399948.cpp!!!	compareHeaders(in  : void) : bool
+    if (mCDE.mVersionToExtract != mLFH.mVersionToExtract) {
+        ALOGV("cmp: VersionToExtract\n");
+        return false;
+    }
+    if (mCDE.mGPBitFlag != mLFH.mGPBitFlag) {
+        ALOGV("cmp: GPBitFlag\n");
+        return false;
+    }
+    if (mCDE.mCompressionMethod != mLFH.mCompressionMethod) {
+        ALOGV("cmp: CompressionMethod\n");
+        return false;
+    }
+    if (mCDE.mLastModFileTime != mLFH.mLastModFileTime) {
+        ALOGV("cmp: LastModFileTime\n");
+        return false;
+    }
+    if (mCDE.mLastModFileDate != mLFH.mLastModFileDate) {
+        ALOGV("cmp: LastModFileDate\n");
+        return false;
+    }
+    if (mCDE.mCRC32 != mLFH.mCRC32) {
+        ALOGV("cmp: CRC32\n");
+        return false;
+    }
+    if (mCDE.mCompressedSize != mLFH.mCompressedSize) {
+        ALOGV("cmp: CompressedSize\n");
+        return false;
+    }
+    if (mCDE.mUncompressedSize != mLFH.mUncompressedSize) {
+        ALOGV("cmp: UncompressedSize\n");
+        return false;
+    }
+    if (mCDE.mFileNameLength != mLFH.mFileNameLength) {
+        ALOGV("cmp: FileNameLength\n");
+        return false;
+    }
+#if 0       // this seems to be used for padding, not real data
+    if (mCDE.mExtraFieldLength != mLFH.mExtraFieldLength) {
+        ALOGV("cmp: ExtraFieldLength\n");
+        return false;
+    }
+#endif
+    if (mCDE.mFileName != NULL) {
+        if (strcmp((char*) mCDE.mFileName, (char*) mLFH.mFileName) != 0) {
+            ALOGV("cmp: FileName\n");
+            return false;
+        }
+    }
+
+    return true;
+!!!1400076.cpp!!!	copyCDEtoLFH(in  : void) : void
+    mLFH.mVersionToExtract  = mCDE.mVersionToExtract;
+    mLFH.mGPBitFlag         = mCDE.mGPBitFlag;
+    mLFH.mCompressionMethod = mCDE.mCompressionMethod;
+    mLFH.mLastModFileTime   = mCDE.mLastModFileTime;
+    mLFH.mLastModFileDate   = mCDE.mLastModFileDate;
+    mLFH.mCRC32             = mCDE.mCRC32;
+    mLFH.mCompressedSize    = mCDE.mCompressedSize;
+    mLFH.mUncompressedSize  = mCDE.mUncompressedSize;
+    mLFH.mFileNameLength    = mCDE.mFileNameLength;
+    // the "extra field" is independent
+
+    delete[] mLFH.mFileName;
+    if (mLFH.mFileNameLength > 0) {
+        mLFH.mFileName = new unsigned char[mLFH.mFileNameLength+1];
+        strcpy((char*) mLFH.mFileName, (const char*) mCDE.mFileName);
+    } else {
+        mLFH.mFileName = NULL;
+    }

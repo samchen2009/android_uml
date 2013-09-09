@@ -1,0 +1,282 @@
+class DataRecorder
+!!!8273932.java!!!	DataRecorder(inout context : Context, inout parent : ThrottleService)
+            mContext = context;
+            mParent = parent;
+
+            mTelephonyManager = (TelephonyManager)mContext.getSystemService(
+                    Context.TELEPHONY_SERVICE);
+
+            synchronized (mParent) {
+                mPeriodCount = 6;
+                mPeriodRxData = new long[mPeriodCount];
+                mPeriodTxData = new long[mPeriodCount];
+
+                mPeriodStart = Calendar.getInstance();
+                mPeriodEnd = Calendar.getInstance();
+
+                retrieve();
+            }
+!!!8274060.java!!!	setNextPeriod(inout start : Calendar, inout end : Calendar) : boolean
+            // TODO - how would we deal with a dual-IMSI device?
+            checkForSubscriberId();
+            boolean startNewPeriod = true;
+
+            if (start.equals(mPeriodStart) && end.equals(mPeriodEnd)) {
+                // same endpoints - keep collecting
+                if (VDBG) {
+                    Slog.d(TAG, "same period (" + start.getTimeInMillis() + "," +
+                            end.getTimeInMillis() +") - ammending data");
+                }
+                startNewPeriod = false;
+            } else {
+                if (VDBG) {
+                    if(start.equals(mPeriodEnd) || start.after(mPeriodEnd)) {
+                        Slog.d(TAG, "next period (" + start.getTimeInMillis() + "," +
+                                end.getTimeInMillis() + ") - old end was " +
+                                mPeriodEnd.getTimeInMillis() + ", following");
+                    } else {
+                        Slog.d(TAG, "new period (" + start.getTimeInMillis() + "," +
+                                end.getTimeInMillis() + ") replacing old (" +
+                                mPeriodStart.getTimeInMillis() + "," +
+                                mPeriodEnd.getTimeInMillis() + ")");
+                    }
+                }
+                synchronized (mParent) {
+                    ++mCurrentPeriod;
+                    if (mCurrentPeriod >= mPeriodCount) mCurrentPeriod = 0;
+                    mPeriodRxData[mCurrentPeriod] = 0;
+                    mPeriodTxData[mCurrentPeriod] = 0;
+                }
+            }
+            setPeriodStart(start);
+            setPeriodEnd(end);
+            record();
+            return startNewPeriod;
+!!!8274188.java!!!	getPeriodEnd() : long
+            synchronized (mParent) {
+                return mPeriodEnd.getTimeInMillis();
+            }
+!!!8274316.java!!!	setPeriodEnd(inout end : Calendar) : void
+            synchronized (mParent) {
+                mPeriodEnd = end;
+            }
+!!!8274444.java!!!	getPeriodStart() : long
+            synchronized (mParent) {
+                return mPeriodStart.getTimeInMillis();
+            }
+!!!8274572.java!!!	setPeriodStart(inout start : Calendar) : void
+            synchronized (mParent) {
+                mPeriodStart = start;
+            }
+!!!8274700.java!!!	getPeriodCount() : int
+            synchronized (mParent) {
+                return mPeriodCount;
+            }
+!!!8274828.java!!!	zeroData(in field : int) : void
+            synchronized (mParent) {
+                for(int period = 0; period<mPeriodCount; period++) {
+                    mPeriodRxData[period] = 0;
+                    mPeriodTxData[period] = 0;
+                }
+                mCurrentPeriod = 0;
+            }
+
+!!!8274956.java!!!	addData(in bytesRead : long, in bytesWritten : long) : void
+            checkForSubscriberId();
+
+            synchronized (mParent) {
+                mPeriodRxData[mCurrentPeriod] += bytesRead;
+                mPeriodTxData[mCurrentPeriod] += bytesWritten;
+            }
+            record();
+!!!8275084.java!!!	getDataFile() : File
+            File dataDir = Environment.getDataDirectory();
+            File throttleDir = new File(dataDir, "system/throttle");
+            throttleDir.mkdirs();
+            String mImsi = mTelephonyManager.getSubscriberId();
+            File dataFile;
+            if (mImsi == null) {
+                dataFile = useMRUFile(throttleDir);
+                if (VDBG) Slog.v(TAG, "imsi not available yet, using " + dataFile);
+            } else {
+                String imsiHash = Integer.toString(mImsi.hashCode());
+                dataFile = new File(throttleDir, imsiHash);
+            }
+            // touch the file so it's not LRU
+            dataFile.setLastModified(System.currentTimeMillis());
+            checkAndDeleteLRUDataFile(throttleDir);
+            return dataFile;
+!!!8275212.java!!!	checkForSubscriberId() : void
+            if (mImsi != null) return;
+
+            mImsi = mTelephonyManager.getSubscriberId();
+            if (mImsi == null) return;
+
+            if (VDBG) Slog.d(TAG, "finally have imsi - retreiving data");
+            retrieve();
+!!!8275340.java!!!	checkAndDeleteLRUDataFile(inout dir : File) : void
+            File[] files = dir.listFiles();
+
+            if (files == null || files.length <= MAX_SIMS_SUPPORTED) return;
+            if (DBG) Slog.d(TAG, "Too many data files");
+            do {
+                File oldest = null;
+                for (File f : files) {
+                    if ((oldest == null) || (oldest.lastModified() > f.lastModified())) {
+                        oldest = f;
+                    }
+                }
+                if (oldest == null) return;
+                if (DBG) Slog.d(TAG, " deleting " + oldest);
+                oldest.delete();
+                files = dir.listFiles();
+            } while (files.length > MAX_SIMS_SUPPORTED);
+!!!8275468.java!!!	useMRUFile(inout dir : File) : File
+            File newest = null;
+            File[] files = dir.listFiles();
+
+            if (files != null) {
+                for (File f : files) {
+                    if ((newest == null) || (newest.lastModified() < f.lastModified())) {
+                        newest = f;
+                    }
+                }
+            }
+            if (newest == null) {
+                newest = new File(dir, "temp");
+            }
+            return newest;
+!!!8275596.java!!!	record() : void
+            // 1 int version
+            // 1 int mPeriodCount
+            // 13*6 long[PERIOD_COUNT] mPeriodRxData
+            // 13*6 long[PERIOD_COUNT] mPeriodTxData
+            // 1  int mCurrentPeriod
+            // 13 long periodStartMS
+            // 13 long periodEndMS
+            // 200 chars max
+            StringBuilder builder = new StringBuilder();
+            builder.append(DATA_FILE_VERSION);
+            builder.append(":");
+            builder.append(mPeriodCount);
+            builder.append(":");
+            for(int i = 0; i < mPeriodCount; i++) {
+                builder.append(mPeriodRxData[i]);
+                builder.append(":");
+            }
+            for(int i = 0; i < mPeriodCount; i++) {
+                builder.append(mPeriodTxData[i]);
+                builder.append(":");
+            }
+            builder.append(mCurrentPeriod);
+            builder.append(":");
+            builder.append(mPeriodStart.getTimeInMillis());
+            builder.append(":");
+            builder.append(mPeriodEnd.getTimeInMillis());
+
+            BufferedWriter out = null;
+            try {
+                out = new BufferedWriter(new FileWriter(getDataFile()), 256);
+                out.write(builder.toString());
+            } catch (IOException e) {
+                Slog.e(TAG, "Error writing data file");
+                return;
+            } finally {
+                if (out != null) {
+                    try {
+                        out.close();
+                    } catch (Exception e) {}
+                }
+            }
+!!!8275724.java!!!	retrieve() : void
+            // clean out any old data first.  If we fail to read we don't want old stuff
+            zeroData(0);
+
+            File f = getDataFile();
+            byte[] buffer;
+            FileInputStream s = null;
+            try {
+                buffer = new byte[(int)f.length()];
+                s = new FileInputStream(f);
+                s.read(buffer);
+            } catch (IOException e) {
+                Slog.e(TAG, "Error reading data file");
+                return;
+            } finally {
+                if (s != null) {
+                    try {
+                        s.close();
+                    } catch (Exception e) {}
+                }
+            }
+            String data = new String(buffer);
+            if (data == null || data.length() == 0) {
+                if (DBG) Slog.d(TAG, "data file empty");
+                return;
+            }
+            String[] parsed = data.split(":");
+            int parsedUsed = 0;
+            if (parsed.length < 6) {
+                Slog.e(TAG, "reading data file with insufficient length - ignoring");
+                return;
+            }
+
+            int periodCount;
+            long[] periodRxData;
+            long[] periodTxData;
+            int currentPeriod;
+            Calendar periodStart;
+            Calendar periodEnd;
+            try {
+                if (Integer.parseInt(parsed[parsedUsed++]) != DATA_FILE_VERSION) {
+                    Slog.e(TAG, "reading data file with bad version - ignoring");
+                    return;
+                }
+
+                periodCount = Integer.parseInt(parsed[parsedUsed++]);
+                if (parsed.length != 5 + (2 * periodCount)) {
+                    Slog.e(TAG, "reading data file with bad length (" + parsed.length +
+                            " != " + (5 + (2 * periodCount)) + ") - ignoring");
+                    return;
+                }
+                periodRxData = new long[periodCount];
+                for (int i = 0; i < periodCount; i++) {
+                    periodRxData[i] = Long.parseLong(parsed[parsedUsed++]);
+                }
+                periodTxData = new long[periodCount];
+                for (int i = 0; i < periodCount; i++) {
+                    periodTxData[i] = Long.parseLong(parsed[parsedUsed++]);
+                }
+
+                currentPeriod = Integer.parseInt(parsed[parsedUsed++]);
+
+                periodStart = new GregorianCalendar();
+                periodStart.setTimeInMillis(Long.parseLong(parsed[parsedUsed++]));
+                periodEnd = new GregorianCalendar();
+                periodEnd.setTimeInMillis(Long.parseLong(parsed[parsedUsed++]));
+            } catch (Exception e) {
+                Slog.e(TAG, "Error parsing data file - ignoring");
+                return;
+            }
+            synchronized (mParent) {
+                mPeriodCount = periodCount;
+                mPeriodRxData = periodRxData;
+                mPeriodTxData = periodTxData;
+                mCurrentPeriod = currentPeriod;
+                mPeriodStart = periodStart;
+                mPeriodEnd = periodEnd;
+            }
+!!!8275852.java!!!	getPeriodRx(in which : int) : long
+            synchronized (mParent) {
+                if (which > mPeriodCount) return 0;
+                which = mCurrentPeriod - which;
+                if (which < 0) which += mPeriodCount;
+                return mPeriodRxData[which];
+            }
+!!!8275980.java!!!	getPeriodTx(in which : int) : long
+            synchronized (mParent) {
+                if (which > mPeriodCount) return 0;
+                which = mCurrentPeriod - which;
+                if (which < 0) which += mPeriodCount;
+                return mPeriodTxData[which];
+            }

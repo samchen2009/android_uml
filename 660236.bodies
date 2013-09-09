@@ -1,0 +1,146 @@
+class DeviceThread
+!!!2036364.cpp!!!	threadLoop() : bool
+    int mode = mGroup->mMode;
+    int sampleRate = mGroup->mSampleRate;
+    int sampleCount = mGroup->mSampleCount;
+    int deviceSocket = mGroup->mDeviceSocket;
+
+    // Find out the frame count for AudioTrack and AudioRecord.
+    int output = 0;
+    int input = 0;
+    if (AudioTrack::getMinFrameCount(&output, AUDIO_STREAM_VOICE_CALL,
+        sampleRate) != NO_ERROR || output <= 0 ||
+        AudioRecord::getMinFrameCount(&input, sampleRate,
+        AUDIO_FORMAT_PCM_16_BIT, AUDIO_CHANNEL_IN_MONO) != NO_ERROR || input <= 0) {
+        ALOGE("cannot compute frame count");
+        return false;
+    }
+    ALOGD("reported frame count: output %d, input %d", output, input);
+
+    if (output < sampleCount * 2) {
+        output = sampleCount * 2;
+    }
+    if (input < sampleCount * 2) {
+        input = sampleCount * 2;
+    }
+    ALOGD("adjusted frame count: output %d, input %d", output, input);
+
+    // Initialize AudioTrack and AudioRecord.
+    AudioTrack track;
+    AudioRecord record;
+    if (track.set(AUDIO_STREAM_VOICE_CALL, sampleRate, AUDIO_FORMAT_PCM_16_BIT,
+                AUDIO_CHANNEL_OUT_MONO, output) != NO_ERROR ||
+            record.set(AUDIO_SOURCE_VOICE_COMMUNICATION, sampleRate, AUDIO_FORMAT_PCM_16_BIT,
+                AUDIO_CHANNEL_IN_MONO, input) != NO_ERROR) {
+        ALOGE("cannot initialize audio device");
+        return false;
+    }
+    ALOGD("latency: output %d, input %d", track.latency(), record.latency());
+
+    // Give device socket a reasonable buffer size.
+    setsockopt(deviceSocket, SOL_SOCKET, SO_RCVBUF, &output, sizeof(output));
+    setsockopt(deviceSocket, SOL_SOCKET, SO_SNDBUF, &output, sizeof(output));
+
+    // Drain device socket.
+    char c;
+    while (recv(deviceSocket, &c, 1, MSG_DONTWAIT) == 1);
+
+    // check if platform supports echo cancellation and do not active local echo suppression in
+    // this case
+    EchoSuppressor *echo = NULL;
+    AudioEffect *aec = NULL;
+    if (mode == ECHO_SUPPRESSION) {
+        if (mGroup->platformHasAec()) {
+            aec = new AudioEffect(FX_IID_AEC,
+                                    NULL,
+                                    0,
+                                    0,
+                                    0,
+                                    record.getSessionId(),
+                                    record.getInput());
+            status_t status = aec->initCheck();
+            if (status == NO_ERROR || status == ALREADY_EXISTS) {
+                aec->setEnabled(true);
+            } else {
+                delete aec;
+                aec = NULL;
+            }
+        }
+        // Create local echo suppressor if platform AEC cannot be used.
+        if (aec == NULL) {
+             echo = new EchoSuppressor(sampleCount,
+                                       (track.latency() + record.latency()) * sampleRate / 1000);
+        }
+    }
+    // Start AudioRecord before AudioTrack. This prevents AudioTrack from being
+    // disabled due to buffer underrun while waiting for AudioRecord.
+    if (mode != MUTED) {
+        record.start();
+        int16_t one;
+        record.read(&one, sizeof(one));
+    }
+    track.start();
+
+    while (!exitPending()) {
+        int16_t output[sampleCount];
+        if (recv(deviceSocket, output, sizeof(output), 0) <= 0) {
+            memset(output, 0, sizeof(output));
+        }
+
+        int16_t input[sampleCount];
+        int toWrite = sampleCount;
+        int toRead = (mode == MUTED) ? 0 : sampleCount;
+        int chances = 100;
+
+        while (--chances > 0 && (toWrite > 0 || toRead > 0)) {
+            if (toWrite > 0) {
+                AudioTrack::Buffer buffer;
+                buffer.frameCount = toWrite;
+
+                status_t status = track.obtainBuffer(&buffer, 1);
+                if (status == NO_ERROR) {
+                    int offset = sampleCount - toWrite;
+                    memcpy(buffer.i8, &output[offset], buffer.size);
+                    toWrite -= buffer.frameCount;
+                    track.releaseBuffer(&buffer);
+                } else if (status != TIMED_OUT && status != WOULD_BLOCK) {
+                    ALOGE("cannot write to AudioTrack");
+                    goto exit;
+                }
+            }
+
+            if (toRead > 0) {
+                AudioRecord::Buffer buffer;
+                buffer.frameCount = toRead;
+
+                status_t status = record.obtainBuffer(&buffer, 1);
+                if (status == NO_ERROR) {
+                    int offset = sampleCount - toRead;
+                    memcpy(&input[offset], buffer.i8, buffer.size);
+                    toRead -= buffer.frameCount;
+                    record.releaseBuffer(&buffer);
+                } else if (status != TIMED_OUT && status != WOULD_BLOCK) {
+                    ALOGE("cannot read from AudioRecord");
+                    goto exit;
+                }
+            }
+        }
+
+        if (chances <= 0) {
+            ALOGW("device loop timeout");
+            while (recv(deviceSocket, &c, 1, MSG_DONTWAIT) == 1);
+        }
+
+        if (mode != MUTED) {
+            if (echo != NULL) {
+                ALOGV("echo->run()");
+                echo->run(output, input);
+            }
+            send(deviceSocket, input, sizeof(input), MSG_DONTWAIT);
+        }
+    }
+
+exit:
+    delete echo;
+    delete aec;
+    return true;

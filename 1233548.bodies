@@ -1,0 +1,145 @@
+class SyncRunner
+!!!7050636.java!!!	SyncRunner(inout context : FilterContext, inout graph : FilterGraph, inout schedulerClass : Class)
+        super(context);
+
+        mLogVerbose = Log.isLoggable(TAG, Log.VERBOSE);
+
+        if (mLogVerbose) Log.v(TAG, "Initializing SyncRunner");
+
+        // Create the scheduler
+        if (Scheduler.class.isAssignableFrom(schedulerClass)) {
+            try {
+                Constructor schedulerConstructor = schedulerClass.getConstructor(FilterGraph.class);
+                mScheduler = (Scheduler)schedulerConstructor.newInstance(graph);
+            } catch (NoSuchMethodException e) {
+                throw new RuntimeException("Scheduler does not have constructor <init>(FilterGraph)!", e);
+            } catch (InstantiationException e) {
+                throw new RuntimeException("Could not instantiate the Scheduler instance!", e);
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException("Cannot access Scheduler constructor!", e);
+            } catch (InvocationTargetException e) {
+                throw new RuntimeException("Scheduler constructor threw an exception", e);
+            } catch (Exception e) {
+                throw new RuntimeException("Could not instantiate Scheduler", e);
+            }
+        } else {
+            throw new IllegalArgumentException("Class provided is not a Scheduler subclass!");
+        }
+
+        // Associate this runner and the graph with the context
+        mFilterContext = context;
+        mFilterContext.addGraph(graph);
+
+        mTimer = new StopWatchMap();
+
+        if (mLogVerbose) Log.v(TAG, "Setting up filters");
+
+        // Setup graph filters
+        graph.setupFilters();
+!!!7050764.java!!!	getGraph() : FilterGraph
+        return mScheduler != null ? mScheduler.getGraph() : null;
+!!!7050892.java!!!	step() : int
+        assertReadyToStep();
+        if (!getGraph().isReady() ) {
+            throw new RuntimeException("Trying to process graph that is not open!");
+        }
+        return performStep() ? RESULT_RUNNING : determinePostRunState();
+!!!7051020.java!!!	beginProcessing() : void
+        mScheduler.reset();
+        getGraph().beginProcessing();
+!!!7051148.java!!!	close() : void
+        // Close filters
+        if (mLogVerbose) Log.v(TAG, "Closing graph.");
+        getGraph().closeFilters(mFilterContext);
+        mScheduler.reset();
+!!!7051276.java!!!	run() : void
+        if (mLogVerbose) Log.v(TAG, "Beginning run.");
+
+        assertReadyToStep();
+
+        // Preparation
+        beginProcessing();
+        boolean glActivated = activateGlContext();
+
+        // Run
+        boolean keepRunning = true;
+        while (keepRunning) {
+            keepRunning = performStep();
+        }
+
+        // Cleanup
+        if (glActivated) {
+            deactivateGlContext();
+        }
+
+        // Call completion callback if set
+        if (mDoneListener != null) {
+            if (mLogVerbose) Log.v(TAG, "Calling completion listener.");
+            mDoneListener.onRunnerDone(determinePostRunState());
+        }
+        if (mLogVerbose) Log.v(TAG, "Run complete");
+!!!7051404.java!!!	isRunning() : boolean
+        return false;
+!!!7051532.java!!!	setDoneCallback(inout listener : OnRunnerDoneListener) : void
+        mDoneListener = listener;
+!!!7051660.java!!!	stop() : void
+        throw new RuntimeException("SyncRunner does not support stopping a graph!");
+!!!7051788.java!!!	getError() : Exception
+        return null;
+!!!7051916.java!!!	waitUntilWake() : void
+        mWakeCondition.block();
+!!!7052044.java!!!	processFilterNode(inout filter : Filter) : void
+        if (mLogVerbose) Log.v(TAG, "Processing filter node");
+        filter.performProcess(mFilterContext);
+        if (filter.getStatus() == Filter.STATUS_ERROR) {
+            throw new RuntimeException("There was an error executing " + filter + "!");
+        } else if (filter.getStatus() == Filter.STATUS_SLEEPING) {
+            if (mLogVerbose) Log.v(TAG, "Scheduling filter wakeup");
+            scheduleFilterWake(filter, filter.getSleepDelay());
+        }
+!!!7052172.java!!!	scheduleFilterWake(inout filter : Filter, in delay : int) : void
+        // Close the wake condition
+        mWakeCondition.close();
+
+        // Schedule the wake-up
+        final Filter filterToSchedule = filter;
+        final ConditionVariable conditionToWake = mWakeCondition;
+
+        mWakeExecutor.schedule(new Runnable() {
+          @Override
+          public void run() {
+                filterToSchedule.unsetStatus(Filter.STATUS_SLEEPING);
+                conditionToWake.open();
+            }
+        }, delay, TimeUnit.MILLISECONDS);
+!!!7052300.java!!!	determinePostRunState() : int
+        boolean isBlocked = false;
+        for (Filter filter : mScheduler.getGraph().getFilters()) {
+            if (filter.isOpen()) {
+                if (filter.getStatus() == Filter.STATUS_SLEEPING) {
+                    // If ANY node is sleeping, we return our state as sleeping
+                    return RESULT_SLEEPING;
+                } else {
+                    // If a node is still open, it is blocked (by input or output)
+                    return RESULT_BLOCKED;
+                }
+            }
+        }
+        return RESULT_FINISHED;
+!!!7052428.java!!!	performStep() : boolean
+        if (mLogVerbose) Log.v(TAG, "Performing one step.");
+        Filter filter = mScheduler.scheduleNextNode();
+        if (filter != null) {
+            mTimer.start(filter.getName());
+            processFilterNode(filter);
+            mTimer.stop(filter.getName());
+            return true;
+        } else {
+            return false;
+        }
+!!!7052556.java!!!	assertReadyToStep() : void
+        if (mScheduler == null) {
+            throw new RuntimeException("Attempting to run schedule with no scheduler in place!");
+        } else if (getGraph() == null) {
+            throw new RuntimeException("Calling step on scheduler with no graph in place!");
+        }

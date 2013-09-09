@@ -1,0 +1,418 @@
+class OutputFinisher
+!!!14564492.java!!!	OutputFinisher(in initialCapacity : int, in regCount : int)
+        this.unreservedRegCount = regCount;
+        this.insns = new ArrayList<DalvInsn>(initialCapacity);
+        this.reservedCount = -1;
+        this.hasAnyPositionInfo = false;
+        this.hasAnyLocalInfo = false;
+!!!14564620.java!!!	hasAnyPositionInfo() : boolean
+        return hasAnyPositionInfo;
+!!!14564748.java!!!	hasAnyLocalInfo() : boolean
+        return hasAnyLocalInfo;
+!!!14564876.java!!!	hasLocalInfo(inout insn : DalvInsn) : boolean
+        if (insn instanceof LocalSnapshot) {
+            RegisterSpecSet specs = ((LocalSnapshot) insn).getLocals();
+            int size = specs.size();
+            for (int i = 0; i < size; i++) {
+                if (hasLocalInfo(specs.get(i))) {
+                    return true;
+                }
+            }
+        } else if (insn instanceof LocalStart) {
+            RegisterSpec spec = ((LocalStart) insn).getLocal();
+            if (hasLocalInfo(spec)) {
+                return true;
+            }
+        }
+
+        return false;
+!!!14565004.java!!!	hasLocalInfo(inout spec : RegisterSpec) : boolean
+        return (spec != null)
+            && (spec.getLocalItem().getName() != null);
+!!!14565132.java!!!	getAllConstants() : Constant
+        HashSet<Constant> result = new HashSet<Constant>(20);
+
+        for (DalvInsn insn : insns) {
+            addConstants(result, insn);
+        }
+
+        return result;
+!!!14565260.java!!!	addConstants(inout result : HashSet<Constant>, inout insn : DalvInsn) : void
+        if (insn instanceof CstInsn) {
+            Constant cst = ((CstInsn) insn).getConstant();
+            result.add(cst);
+        } else if (insn instanceof LocalSnapshot) {
+            RegisterSpecSet specs = ((LocalSnapshot) insn).getLocals();
+            int size = specs.size();
+            for (int i = 0; i < size; i++) {
+                addConstants(result, specs.get(i));
+            }
+        } else if (insn instanceof LocalStart) {
+            RegisterSpec spec = ((LocalStart) insn).getLocal();
+            addConstants(result, spec);
+        }
+!!!14565388.java!!!	addConstants(inout result : HashSet<Constant>, inout spec : RegisterSpec) : void
+        if (spec == null) {
+            return;
+        }
+
+        LocalItem local = spec.getLocalItem();
+        CstUtf8 name = local.getName();
+        CstUtf8 signature = local.getSignature();
+        Type type = spec.getType();
+
+        if (type != Type.KNOWN_NULL) {
+            result.add(CstType.intern(type));
+        }
+
+        if (name != null) {
+            result.add(name);
+        }
+
+        if (signature != null) {
+            result.add(signature);
+        }
+!!!14565516.java!!!	add(inout insn : DalvInsn) : void
+        insns.add(insn);
+        updateInfo(insn);
+!!!14565644.java!!!	insert(in at : int, inout insn : DalvInsn) : void
+        insns.add(at, insn);
+        updateInfo(insn);
+!!!14565772.java!!!	updateInfo(inout insn : DalvInsn) : void
+        if (! hasAnyPositionInfo) {
+            SourcePosition pos = insn.getPosition();
+            if (pos.getLine() >= 0) {
+                hasAnyPositionInfo = true;
+            }
+        }
+
+        if (! hasAnyLocalInfo) {
+            if (hasLocalInfo(insn)) {
+                hasAnyLocalInfo = true;
+            }
+        }
+!!!14565900.java!!!	reverseBranch(in which : int, inout newTarget : CodeAddress) : void
+        int size = insns.size();
+        int index = size - which - 1;
+        TargetInsn targetInsn;
+
+        try {
+            targetInsn = (TargetInsn) insns.get(index);
+        } catch (IndexOutOfBoundsException ex) {
+            // Translate the exception.
+            throw new IllegalArgumentException("too few instructions");
+        } catch (ClassCastException ex) {
+            // Translate the exception.
+            throw new IllegalArgumentException("non-reversible instruction");
+        }
+
+        /*
+         * No need to call this.set(), since the format and other info
+         * are the same.
+         */
+        insns.set(index, targetInsn.withNewTargetAndReversed(newTarget));
+!!!14566028.java!!!	assignIndices(inout callback : AssignIndicesCallback) : void
+        for (DalvInsn insn : insns) {
+            if (insn instanceof CstInsn) {
+                assignIndices((CstInsn) insn, callback);
+            }
+        }
+!!!14566156.java!!!	assignIndices(inout insn : CstInsn, inout callback : AssignIndicesCallback) : void
+        Constant cst = insn.getConstant();
+        int index = callback.getIndex(cst);
+
+        if (index >= 0) {
+            insn.setIndex(index);
+        }
+
+        if (cst instanceof CstMemberRef) {
+            CstMemberRef member = (CstMemberRef) cst;
+            CstType definer = member.getDefiningClass();
+            index = callback.getIndex(definer);
+            if (index >= 0) {
+                insn.setClassIndex(index);
+            }
+        }
+!!!14566284.java!!!	finishProcessingAndGetList() : DalvInsnList
+        if (reservedCount >= 0) {
+            throw new UnsupportedOperationException("already processed");
+        }
+
+        InsnFormat[] formats = makeFormatsArray();
+        reserveRegisters(formats);
+        massageInstructions(formats);
+        assignAddressesAndFixBranches();
+
+        return DalvInsnList.makeImmutable(insns,
+                reservedCount + unreservedRegCount);
+!!!14566412.java!!!	makeFormatsArray() : InsnFormat
+        int size = insns.size();
+        InsnFormat[] result = new InsnFormat[size];
+
+        for (int i = 0; i < size; i++) {
+            result[i] = insns.get(i).getOpcode().getFormat();
+        }
+
+        return result;
+!!!14566540.java!!!	reserveRegisters(inout formats : InsnFormat) : void
+        int oldReservedCount = (reservedCount < 0) ? 0 : reservedCount;
+
+        /*
+         * Call calculateReservedCount() and then perform register
+         * reservation, repeatedly until no new reservations happen.
+         */
+        for (;;) {
+            int newReservedCount = calculateReservedCount(formats);
+            if (oldReservedCount >= newReservedCount) {
+                break;
+            }
+
+            int reservedDifference = newReservedCount - oldReservedCount;
+            int size = insns.size();
+
+            for (int i = 0; i < size; i++) {
+                /*
+                 * CodeAddress instance identity is used to link
+                 * TargetInsns to their targets, so it is
+                 * inappropriate to make replacements, and they don't
+                 * have registers in any case. Hence, the instanceof
+                 * test below.
+                 */
+                DalvInsn insn = insns.get(i);
+                if (!(insn instanceof CodeAddress)) {
+                    /*
+                     * No need to call this.set() since the format and
+                     * other info are the same.
+                     */
+                    insns.set(i, insn.withRegisterOffset(reservedDifference));
+                }
+            }
+
+            oldReservedCount = newReservedCount;
+        }
+
+        reservedCount = oldReservedCount;
+!!!14566668.java!!!	calculateReservedCount(inout formats : InsnFormat) : int
+        int size = insns.size();
+
+        /*
+         * Potential new value of reservedCount, which gets updated in the
+         * following loop. It starts out with the existing reservedCount
+         * and gets increased if it turns out that additional registers
+         * need to be reserved.
+         */
+        int newReservedCount = reservedCount;
+
+        for (int i = 0; i < size; i++) {
+            DalvInsn insn = insns.get(i);
+            InsnFormat originalFormat = formats[i];
+            InsnFormat newFormat = findFormatForInsn(insn, originalFormat);
+
+            if (originalFormat == newFormat) {
+                continue;
+            }
+
+            if (newFormat == null) {
+                /*
+                 * The instruction will need to be expanded, so reserve
+                 * registers for it.
+                 */
+                int reserve = insn.getMinimumRegisterRequirement();
+                if (reserve > newReservedCount) {
+                    newReservedCount = reserve;
+                }
+            }
+
+            formats[i] = newFormat;
+        }
+
+        return newReservedCount;
+!!!14566796.java!!!	findFormatForInsn(inout insn : DalvInsn, inout format : InsnFormat) : InsnFormat
+        if (format == null) {
+            // The instruction is already known not to fit any simple format.
+            return format;
+        }
+
+        if (format.isCompatible(insn)) {
+            // The instruction already fits in the current best-known format.
+            return format;
+        }
+
+        Dop dop = insn.getOpcode();
+        int family = dop.getFamily();
+
+        for (;;) {
+            format = format.nextUp();
+            if ((format == null) ||
+                    (format.isCompatible(insn) &&
+                     (Dops.getOrNull(family, format) != null))) {
+                break;
+            }
+        }
+
+        return format;
+!!!14566924.java!!!	massageInstructions(inout formats : InsnFormat) : void
+        if (reservedCount == 0) {
+            /*
+             * The easy common case: No registers were reserved, so we
+             * merely need to replace any instructions whose format changed
+             * during the reservation pass, but all instructions will stay
+             * at their original indices, and the instruction list doesn't
+             * grow.
+             */
+            int size = insns.size();
+
+            for (int i = 0; i < size; i++) {
+                DalvInsn insn = insns.get(i);
+                Dop dop = insn.getOpcode();
+                InsnFormat format = formats[i];
+
+                if (format != dop.getFormat()) {
+                    dop = Dops.getOrNull(dop.getFamily(), format);
+                    insns.set(i, insn.withOpcode(dop));
+                }
+            }
+        } else {
+            /*
+             * The difficult uncommon case: Some instructions have to be
+             * expanded to deal with high registers.
+             */
+            insns = performExpansion(formats);
+        }
+!!!14567052.java!!!	performExpansion(inout formats : InsnFormat) : DalvInsn
+        int size = insns.size();
+        ArrayList<DalvInsn> result = new ArrayList<DalvInsn>(size * 2);
+
+        for (int i = 0; i < size; i++) {
+            DalvInsn insn = insns.get(i);
+            Dop dop = insn.getOpcode();
+            InsnFormat originalFormat = dop.getFormat();
+            InsnFormat currentFormat = formats[i];
+            DalvInsn prefix;
+            DalvInsn suffix;
+
+            if (currentFormat != null) {
+                // No expansion is necessary.
+                prefix = null;
+                suffix = null;
+            } else {
+                // Expansion is required.
+                prefix = insn.hrPrefix();
+                suffix = insn.hrSuffix();
+
+                /*
+                 * Get the initial guess as to the hr version, but then
+                 * let findFormatForInsn() pick a better format, if any.
+                 */
+                insn = insn.hrVersion();
+                originalFormat = insn.getOpcode().getFormat();
+                currentFormat = findFormatForInsn(insn, originalFormat);
+            }
+
+            if (prefix != null) {
+                result.add(prefix);
+            }
+
+            if (currentFormat != originalFormat) {
+                dop = Dops.getOrNull(dop.getFamily(), currentFormat);
+                insn = insn.withOpcode(dop);
+            }
+            result.add(insn);
+
+            if (suffix != null) {
+                result.add(suffix);
+            }
+        }
+
+        return result;
+!!!14567180.java!!!	assignAddressesAndFixBranches() : void
+        for (;;) {
+            assignAddresses();
+            if (!fixBranches()) {
+                break;
+            }
+        }
+!!!14567308.java!!!	assignAddresses() : void
+        int address = 0;
+        int size = insns.size();
+
+        for (int i = 0; i < size; i++) {
+            DalvInsn insn = insns.get(i);
+            insn.setAddress(address);
+            address += insn.codeSize();
+        }
+!!!14567436.java!!!	fixBranches() : boolean
+        int size = insns.size();
+        boolean anyFixed = false;
+
+        for (int i = 0; i < size; i++) {
+            DalvInsn insn = insns.get(i);
+            if (!(insn instanceof TargetInsn)) {
+                // This loop only needs to inspect TargetInsns.
+                continue;
+            }
+
+            Dop dop = insn.getOpcode();
+            InsnFormat format = dop.getFormat();
+            TargetInsn target = (TargetInsn) insn;
+
+            if (format.branchFits(target)) {
+                continue;
+            }
+
+            if (dop.getFamily() == DalvOps.GOTO) {
+                // It is a goto; widen it if possible.
+                InsnFormat newFormat = findFormatForInsn(insn, format);
+                if (newFormat == null) {
+                    /*
+                     * The branch is already maximally large. This should
+                     * only be possible if a method somehow manages to have
+                     * more than 2^31 code units.
+                     */
+                    throw new UnsupportedOperationException("method too long");
+                }
+                dop = Dops.getOrNull(dop.getFamily(), newFormat);
+                insn = insn.withOpcode(dop);
+                insns.set(i, insn);
+            } else {
+                /*
+                 * It is a conditional: Reverse its sense, and arrange for
+                 * it to branch around an absolute goto to the original
+                 * branch target.
+                 *
+                 * Note: An invariant of the list being processed is
+                 * that every TargetInsn is followed by a CodeAddress.
+                 * Hence, it is always safe to get the next element
+                 * after a TargetInsn and cast it to CodeAddress, as
+                 * is happening a few lines down.
+                 *
+                 * Also note: Size gets incremented by one here, as we
+                 * have -- in the net -- added one additional element
+                 * to the list, so we increment i to match. The added
+                 * and changed elements will be inspected by a repeat
+                 * call to this method after this invocation returns.
+                 */
+                CodeAddress newTarget;
+                try {
+                    newTarget = (CodeAddress) insns.get(i + 1);
+                } catch (IndexOutOfBoundsException ex) {
+                    // The TargetInsn / CodeAddress invariant was violated.
+                    throw new IllegalStateException(
+                            "unpaired TargetInsn (dangling)");
+                } catch (ClassCastException ex) {
+                    // The TargetInsn / CodeAddress invariant was violated.
+                    throw new IllegalStateException("unpaired TargetInsn");
+                }
+                TargetInsn gotoInsn =
+                    new TargetInsn(Dops.GOTO, target.getPosition(),
+                            RegisterSpecList.EMPTY, target.getTarget());
+                insns.set(i, gotoInsn);
+                insns.add(i, target.withNewTargetAndReversed(newTarget));
+                size++;
+                i++;
+            }
+
+            anyFixed = true;
+        }
+
+        return anyFixed;

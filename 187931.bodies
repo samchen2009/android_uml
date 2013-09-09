@@ -1,0 +1,199 @@
+class SelectorImpl
+!!!758427.java!!!	SelectorImpl(inout selectorProvider : SelectorProvider)
+        super(selectorProvider);
+
+        /*
+         * Create a pipes to trigger wakeup. We can't use a NIO pipe because it
+         * would be closed if the selecting thread is interrupted. Also
+         * configure the pipe so we can fully drain it without blocking.
+         */
+        try {
+            FileDescriptor[] pipeFds = Libcore.os.pipe();
+            wakeupIn = pipeFds[0];
+            wakeupOut = pipeFds[1];
+            IoUtils.setBlocking(wakeupIn, false);
+            pollFds.add(new StructPollfd());
+            setPollFd(0, wakeupIn, POLLIN, null);
+        } catch (ErrnoException errnoException) {
+            throw errnoException.rethrowAsIOException();
+        }
+!!!758555.java!!!	implCloseSelector() : void
+        wakeup();
+        synchronized (this) {
+            synchronized (unmodifiableKeys) {
+                synchronized (selectedKeys) {
+                    IoUtils.close(wakeupIn);
+                    IoUtils.close(wakeupOut);
+                    doCancel();
+                    for (SelectionKey sk : mutableKeys) {
+                        deregister((AbstractSelectionKey) sk);
+                    }
+                }
+            }
+        }
+!!!758683.java!!!	register(inout channel : AbstractSelectableChannel, in operations : int, inout attachment : Object) : SelectionKey
+        if (!provider().equals(channel.provider())) {
+            throw new IllegalSelectorException();
+        }
+        synchronized (this) {
+            synchronized (unmodifiableKeys) {
+                SelectionKeyImpl selectionKey = new SelectionKeyImpl(channel, operations,
+                        attachment, this);
+                mutableKeys.add(selectionKey);
+                ensurePollFdsCapacity();
+                return selectionKey;
+            }
+        }
+!!!758811.java!!!	keys() : Set
+        checkClosed();
+        return unmodifiableKeys;
+!!!758939.java!!!	checkClosed() : void
+        if (!isOpen()) {
+            throw new ClosedSelectorException();
+        }
+!!!759067.java!!!	select() : int
+        // Blocks until some fd is ready.
+        return selectInternal(-1);
+!!!759195.java!!!	select(in timeout : long) : int
+        if (timeout < 0) {
+            throw new IllegalArgumentException("timeout < 0: " + timeout);
+        }
+        // Our timeout is interpreted differently to Unix's --- 0 means block. See selectNow.
+        return selectInternal((timeout == 0) ? -1 : timeout);
+!!!759323.java!!!	selectNow() : int
+        return selectInternal(0);
+!!!759451.java!!!	selectInternal(in timeout : long) : int
+        checkClosed();
+        synchronized (this) {
+            synchronized (unmodifiableKeys) {
+                synchronized (selectedKeys) {
+                    doCancel();
+                    boolean isBlock = (timeout != 0);
+                    synchronized (keysLock) {
+                        preparePollFds();
+                    }
+                    int rc = -1;
+                    try {
+                        if (isBlock) {
+                            begin();
+                        }
+                        try {
+                            rc = Libcore.os.poll(pollFds.array(), (int) timeout);
+                        } catch (ErrnoException errnoException) {
+                            if (errnoException.errno != EINTR) {
+                                throw errnoException.rethrowAsIOException();
+                            }
+                        }
+                    } finally {
+                        if (isBlock) {
+                            end();
+                        }
+                    }
+
+                    int readyCount = (rc > 0) ? processPollFds() : 0;
+                    readyCount -= doCancel();
+                    return readyCount;
+                }
+            }
+        }
+!!!759579.java!!!	setPollFd(in i : int, inout fd : FileDescriptor, in events : int, inout object : Object) : void
+        StructPollfd pollFd = pollFds.get(i);
+        pollFd.fd = fd;
+        pollFd.events = (short) events;
+        pollFd.userData = object;
+!!!759707.java!!!	preparePollFds() : void
+        int i = 1; // Our wakeup pipe comes before all the user's fds.
+        for (SelectionKeyImpl key : mutableKeys) {
+            int interestOps = key.interestOpsNoCheck();
+            short eventMask = 0;
+            if (((OP_ACCEPT | OP_READ) & interestOps) != 0) {
+                eventMask |= POLLIN;
+            }
+            if (((OP_CONNECT | OP_WRITE) & interestOps) != 0) {
+                eventMask |= POLLOUT;
+            }
+            if (eventMask != 0) {
+                setPollFd(i++, ((FileDescriptorChannel) key.channel()).getFD(), eventMask, key);
+            }
+        }
+!!!759835.java!!!	ensurePollFdsCapacity() : void
+        // We need one slot for each element of mutableKeys, plus one for the wakeup pipe.
+        while (pollFds.size() < mutableKeys.size() + 1) {
+            pollFds.add(new StructPollfd());
+        }
+!!!759963.java!!!	processPollFds() : int
+        if (pollFds.get(0).revents == POLLIN) {
+            // Read bytes from the wakeup pipe until the pipe is empty.
+            byte[] buffer = new byte[8];
+            while (IoBridge.read(wakeupIn, buffer, 0, 1) > 0) {
+            }
+        }
+
+        int readyKeyCount = 0;
+        for (int i = 1; i < pollFds.size(); ++i) {
+            StructPollfd pollFd = pollFds.get(i);
+            if (pollFd.revents == 0) {
+                continue;
+            }
+            if (pollFd.fd == null) {
+                break;
+            }
+
+            SelectionKeyImpl key = (SelectionKeyImpl) pollFd.userData;
+
+            pollFd.fd = null;
+            pollFd.userData = null;
+
+            int ops = key.interestOpsNoCheck();
+            int selectedOp = 0;
+            if ((pollFd.revents & POLLIN) != 0) {
+                selectedOp = ops & (OP_ACCEPT | OP_READ);
+            } else if ((pollFd.revents & POLLOUT) != 0) {
+                if (key.isConnected()) {
+                    selectedOp = ops & OP_WRITE;
+                } else {
+                    selectedOp = ops & OP_CONNECT;
+                }
+            }
+
+            if (selectedOp != 0) {
+                boolean wasSelected = mutableSelectedKeys.contains(key);
+                if (wasSelected && key.readyOps() != selectedOp) {
+                    key.setReadyOps(key.readyOps() | selectedOp);
+                    ++readyKeyCount;
+                } else if (!wasSelected) {
+                    key.setReadyOps(selectedOp);
+                    mutableSelectedKeys.add(key);
+                    ++readyKeyCount;
+                }
+            }
+        }
+
+        return readyKeyCount;
+!!!760091.java!!!	selectedKeys() : Set
+        checkClosed();
+        return selectedKeys;
+!!!760219.java!!!	doCancel() : int
+        int deselected = 0;
+
+        Set<SelectionKey> cancelledKeys = cancelledKeys();
+        synchronized (cancelledKeys) {
+            if (cancelledKeys.size() > 0) {
+                for (SelectionKey currentKey : cancelledKeys) {
+                    mutableKeys.remove(currentKey);
+                    deregister((AbstractSelectionKey) currentKey);
+                    if (mutableSelectedKeys.remove(currentKey)) {
+                        deselected++;
+                    }
+                }
+                cancelledKeys.clear();
+            }
+        }
+
+        return deselected;
+!!!760347.java!!!	wakeup() : Selector
+        try {
+            Libcore.os.write(wakeupOut, new byte[] { 1 }, 0, 1);
+        } catch (ErrnoException ignored) {
+        }
+        return this;

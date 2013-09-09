@@ -1,0 +1,452 @@
+class ServerOperation
+!!!7301516.java!!!	ServerOperation(inout p : ServerSession, inout in : InputStream, in request : int, in maxSize : int, inout listen : ServerRequestHandler)
+
+        isAborted = false;
+        mParent = p;
+        mInput = in;
+        mMaxPacketLength = maxSize;
+        mClosed = false;
+        requestHeader = new HeaderSet();
+        replyHeader = new HeaderSet();
+        mPrivateInput = new PrivateInputStream(this);
+        mResponseSize = 3;
+        mListener = listen;
+        mRequestFinished = false;
+        mPrivateOutputOpen = false;
+        mHasBody = false;
+        int bytesReceived;
+
+        /*
+         * Determine if this is a PUT request
+         */
+        if ((request == 0x02) || (request == 0x82)) {
+            /*
+             * It is a PUT request.
+             */
+            mGetOperation = false;
+
+            /*
+             * Determine if the final bit is set
+             */
+            if ((request & 0x80) == 0) {
+                finalBitSet = false;
+            } else {
+                finalBitSet = true;
+                mRequestFinished = true;
+            }
+        } else if ((request == 0x03) || (request == 0x83)) {
+            /*
+             * It is a GET request.
+             */
+            mGetOperation = true;
+
+            // For Get request, final bit set is decided by server side logic
+            finalBitSet = false;
+
+            if (request == 0x83) {
+                mRequestFinished = true;
+            }
+        } else {
+            throw new IOException("ServerOperation can not handle such request");
+        }
+
+        int length = in.read();
+        length = (length << 8) + in.read();
+
+        /*
+         * Determine if the packet length is larger than this device can receive
+         */
+        if (length > ObexHelper.MAX_PACKET_SIZE_INT) {
+            mParent.sendResponse(ResponseCodes.OBEX_HTTP_REQ_TOO_LARGE, null);
+            throw new IOException("Packet received was too large");
+        }
+
+        /*
+         * Determine if any headers were sent in the initial request
+         */
+        if (length > 3) {
+            byte[] data = new byte[length - 3];
+            bytesReceived = in.read(data);
+
+            while (bytesReceived != data.length) {
+                bytesReceived += in.read(data, bytesReceived, data.length - bytesReceived);
+            }
+
+            byte[] body = ObexHelper.updateHeaderSet(requestHeader, data);
+
+            if (body != null) {
+                mHasBody = true;
+            }
+
+            if (mListener.getConnectionId() != -1 && requestHeader.mConnectionID != null) {
+                mListener.setConnectionId(ObexHelper.convertToLong(requestHeader.mConnectionID));
+            } else {
+                mListener.setConnectionId(1);
+            }
+
+            if (requestHeader.mAuthResp != null) {
+                if (!mParent.handleAuthResp(requestHeader.mAuthResp)) {
+                    mExceptionString = "Authentication Failed";
+                    mParent.sendResponse(ResponseCodes.OBEX_HTTP_UNAUTHORIZED, null);
+                    mClosed = true;
+                    requestHeader.mAuthResp = null;
+                    return;
+                }
+            }
+
+            if (requestHeader.mAuthChall != null) {
+                mParent.handleAuthChall(requestHeader);
+                // send the  authResp to the client
+                replyHeader.mAuthResp = new byte[requestHeader.mAuthResp.length];
+                System.arraycopy(requestHeader.mAuthResp, 0, replyHeader.mAuthResp, 0,
+                        replyHeader.mAuthResp.length);
+                requestHeader.mAuthResp = null;
+                requestHeader.mAuthChall = null;
+
+            }
+
+            if (body != null) {
+                mPrivateInput.writeBytes(body, 1);
+            } else {
+                while ((!mGetOperation) && (!finalBitSet)) {
+                    sendReply(ResponseCodes.OBEX_HTTP_CONTINUE);
+                    if (mPrivateInput.available() > 0) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        while ((!mGetOperation) && (!finalBitSet) && (mPrivateInput.available() == 0)) {
+            sendReply(ResponseCodes.OBEX_HTTP_CONTINUE);
+            if (mPrivateInput.available() > 0) {
+                break;
+            }
+        }
+
+        // wait for get request finished !!!!
+        while (mGetOperation && !mRequestFinished) {
+            sendReply(ResponseCodes.OBEX_HTTP_CONTINUE);
+        }
+!!!7301644.java!!!	isValidBody() : boolean
+        return mHasBody;
+!!!7301772.java!!!	continueOperation(inout sendEmpty : boolean, inout inStream : boolean) : boolean
+        if (!mGetOperation) {
+            if (!finalBitSet) {
+                if (sendEmpty) {
+                    sendReply(ResponseCodes.OBEX_HTTP_CONTINUE);
+                    return true;
+                } else {
+                    if ((mResponseSize > 3) || (mPrivateOutput.size() > 0)) {
+                        sendReply(ResponseCodes.OBEX_HTTP_CONTINUE);
+                        return true;
+                    } else {
+                        return false;
+                    }
+                }
+            } else {
+                return false;
+            }
+        } else {
+            sendReply(ResponseCodes.OBEX_HTTP_CONTINUE);
+            return true;
+        }
+!!!7301900.java!!!	sendReply(in type : int) : boolean
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int bytesReceived;
+
+        long id = mListener.getConnectionId();
+        if (id == -1) {
+            replyHeader.mConnectionID = null;
+        } else {
+            replyHeader.mConnectionID = ObexHelper.convertToByteArray(id);
+        }
+
+        byte[] headerArray = ObexHelper.createHeader(replyHeader, true);
+        int bodyLength = -1;
+        int orginalBodyLength = -1;
+
+        if (mPrivateOutput != null) {
+            bodyLength = mPrivateOutput.size();
+            orginalBodyLength = bodyLength;
+        }
+
+        if ((ObexHelper.BASE_PACKET_LENGTH + headerArray.length) > mMaxPacketLength) {
+
+            int end = 0;
+            int start = 0;
+
+            while (end != headerArray.length) {
+                end = ObexHelper.findHeaderEnd(headerArray, start, mMaxPacketLength
+                        - ObexHelper.BASE_PACKET_LENGTH);
+                if (end == -1) {
+
+                    mClosed = true;
+
+                    if (mPrivateInput != null) {
+                        mPrivateInput.close();
+                    }
+
+                    if (mPrivateOutput != null) {
+                        mPrivateOutput.close();
+                    }
+                    mParent.sendResponse(ResponseCodes.OBEX_HTTP_INTERNAL_ERROR, null);
+                    throw new IOException("OBEX Packet exceeds max packet size");
+                }
+                byte[] sendHeader = new byte[end - start];
+                System.arraycopy(headerArray, start, sendHeader, 0, sendHeader.length);
+
+                mParent.sendResponse(type, sendHeader);
+                start = end;
+            }
+
+            if (bodyLength > 0) {
+                return true;
+            } else {
+                return false;
+            }
+
+        } else {
+            out.write(headerArray);
+        }
+
+        // For Get operation: if response code is OBEX_HTTP_OK, then this is the
+        // last packet; so set finalBitSet to true.
+        if (mGetOperation && type == ResponseCodes.OBEX_HTTP_OK) {
+            finalBitSet = true;
+        }
+
+        if ((finalBitSet) || (headerArray.length < (mMaxPacketLength - 20))) {
+            if (bodyLength > 0) {
+                /*
+                 * Determine if I can send the whole body or just part of
+                 * the body.  Remember that there is the 3 bytes for the
+                 * response message and 3 bytes for the header ID and length
+                 */
+                if (bodyLength > (mMaxPacketLength - headerArray.length - 6)) {
+                    bodyLength = mMaxPacketLength - headerArray.length - 6;
+                }
+
+                byte[] body = mPrivateOutput.readBytes(bodyLength);
+
+                /*
+                 * Since this is a put request if the final bit is set or
+                 * the output stream is closed we need to send the 0x49
+                 * (End of Body) otherwise, we need to send 0x48 (Body)
+                 */
+                if ((finalBitSet) || (mPrivateOutput.isClosed())) {
+                    out.write(0x49);
+                } else {
+                    out.write(0x48);
+                }
+
+                bodyLength += 3;
+                out.write((byte)(bodyLength >> 8));
+                out.write((byte)bodyLength);
+                out.write(body);
+            }
+        }
+
+        if ((finalBitSet) && (type == ResponseCodes.OBEX_HTTP_OK) && (orginalBodyLength <= 0)) {
+            out.write(0x49);
+            orginalBodyLength = 3;
+            out.write((byte)(orginalBodyLength >> 8));
+            out.write((byte)orginalBodyLength);
+
+        }
+
+        mResponseSize = 3;
+        mParent.sendResponse(type, out.toByteArray());
+
+        if (type == ResponseCodes.OBEX_HTTP_CONTINUE) {
+            int headerID = mInput.read();
+            int length = mInput.read();
+            length = (length << 8) + mInput.read();
+            if ((headerID != ObexHelper.OBEX_OPCODE_PUT)
+                    && (headerID != ObexHelper.OBEX_OPCODE_PUT_FINAL)
+                    && (headerID != ObexHelper.OBEX_OPCODE_GET)
+                    && (headerID != ObexHelper.OBEX_OPCODE_GET_FINAL)) {
+
+                if (length > 3) {
+                    byte[] temp = new byte[length - 3];
+                    // First three bytes already read, compensating for this
+                    bytesReceived = mInput.read(temp);
+
+                    while (bytesReceived != temp.length) {
+                        bytesReceived += mInput.read(temp, bytesReceived,
+                                temp.length - bytesReceived);
+                    }
+                }
+
+                /*
+                 * Determine if an ABORT was sent as the reply
+                 */
+                if (headerID == ObexHelper.OBEX_OPCODE_ABORT) {
+                    mParent.sendResponse(ResponseCodes.OBEX_HTTP_OK, null);
+                    mClosed = true;
+                    isAborted = true;
+                    mExceptionString = "Abort Received";
+                    throw new IOException("Abort Received");
+                } else {
+                    mParent.sendResponse(ResponseCodes.OBEX_HTTP_BAD_REQUEST, null);
+                    mClosed = true;
+                    mExceptionString = "Bad Request Received";
+                    throw new IOException("Bad Request Received");
+                }
+            } else {
+
+                if ((headerID == ObexHelper.OBEX_OPCODE_PUT_FINAL)) {
+                    finalBitSet = true;
+                } else if (headerID == ObexHelper.OBEX_OPCODE_GET_FINAL) {
+                    mRequestFinished = true;
+                }
+
+                /*
+                 * Determine if the packet length is larger then this device can receive
+                 */
+                if (length > ObexHelper.MAX_PACKET_SIZE_INT) {
+                    mParent.sendResponse(ResponseCodes.OBEX_HTTP_REQ_TOO_LARGE, null);
+                    throw new IOException("Packet received was too large");
+                }
+
+                /*
+                 * Determine if any headers were sent in the initial request
+                 */
+                if (length > 3) {
+                    byte[] data = new byte[length - 3];
+                    bytesReceived = mInput.read(data);
+
+                    while (bytesReceived != data.length) {
+                        bytesReceived += mInput.read(data, bytesReceived, data.length
+                                - bytesReceived);
+                    }
+                    byte[] body = ObexHelper.updateHeaderSet(requestHeader, data);
+                    if (body != null) {
+                        mHasBody = true;
+                    }
+                    if (mListener.getConnectionId() != -1 && requestHeader.mConnectionID != null) {
+                        mListener.setConnectionId(ObexHelper
+                                .convertToLong(requestHeader.mConnectionID));
+                    } else {
+                        mListener.setConnectionId(1);
+                    }
+
+                    if (requestHeader.mAuthResp != null) {
+                        if (!mParent.handleAuthResp(requestHeader.mAuthResp)) {
+                            mExceptionString = "Authentication Failed";
+                            mParent.sendResponse(ResponseCodes.OBEX_HTTP_UNAUTHORIZED, null);
+                            mClosed = true;
+                            requestHeader.mAuthResp = null;
+                            return false;
+                        }
+                        requestHeader.mAuthResp = null;
+                    }
+
+                    if (requestHeader.mAuthChall != null) {
+                        mParent.handleAuthChall(requestHeader);
+                        // send the auhtResp to the client
+                        replyHeader.mAuthResp = new byte[requestHeader.mAuthResp.length];
+                        System.arraycopy(requestHeader.mAuthResp, 0, replyHeader.mAuthResp, 0,
+                                replyHeader.mAuthResp.length);
+                        requestHeader.mAuthResp = null;
+                        requestHeader.mAuthChall = null;
+                    }
+
+                    if (body != null) {
+                        mPrivateInput.writeBytes(body, 1);
+                    }
+                }
+            }
+            return true;
+        } else {
+            return false;
+        }
+!!!7302028.java!!!	abort() : void
+        throw new IOException("Called from a server");
+!!!7302156.java!!!	getReceivedHeader() : HeaderSet
+        ensureOpen();
+        return requestHeader;
+!!!7302284.java!!!	sendHeaders(inout headers : HeaderSet) : void
+        ensureOpen();
+
+        if (headers == null) {
+            throw new IOException("Headers may not be null");
+        }
+
+        int[] headerList = headers.getHeaderList();
+        if (headerList != null) {
+            for (int i = 0; i < headerList.length; i++) {
+                replyHeader.setHeader(headerList[i], headers.getHeader(headerList[i]));
+            }
+
+        }
+!!!7302412.java!!!	getResponseCode() : int
+        throw new IOException("Called from a server");
+!!!7302540.java!!!	getEncoding() : String
+        return null;
+!!!7302668.java!!!	getType() : String
+        try {
+            return (String)requestHeader.getHeader(HeaderSet.TYPE);
+        } catch (IOException e) {
+            return null;
+        }
+!!!7302796.java!!!	getLength() : long
+        try {
+            Long temp = (Long)requestHeader.getHeader(HeaderSet.LENGTH);
+
+            if (temp == null) {
+                return -1;
+            } else {
+                return temp.longValue();
+            }
+        } catch (IOException e) {
+            return -1;
+        }
+!!!7302924.java!!!	getMaxPacketSize() : int
+        return mMaxPacketLength - 6 - getHeaderLength();
+!!!7303052.java!!!	getHeaderLength() : int
+        long id = mListener.getConnectionId();
+        if (id == -1) {
+            replyHeader.mConnectionID = null;
+        } else {
+            replyHeader.mConnectionID = ObexHelper.convertToByteArray(id);
+        }
+
+        byte[] headerArray = ObexHelper.createHeader(replyHeader, false);
+
+        return headerArray.length;
+!!!7303180.java!!!	openInputStream() : InputStream
+        ensureOpen();
+        return mPrivateInput;
+!!!7303308.java!!!	openDataInputStream() : DataInputStream
+        return new DataInputStream(openInputStream());
+!!!7303436.java!!!	openOutputStream() : OutputStream
+        ensureOpen();
+
+        if (mPrivateOutputOpen) {
+            throw new IOException("no more input streams available, stream already opened");
+        }
+
+        if (!mRequestFinished) {
+            throw new IOException("no  output streams available ,request not finished");
+        }
+
+        if (mPrivateOutput == null) {
+            mPrivateOutput = new PrivateOutputStream(this, getMaxPacketSize());
+        }
+        mPrivateOutputOpen = true;
+        return mPrivateOutput;
+!!!7303564.java!!!	openDataOutputStream() : DataOutputStream
+        return new DataOutputStream(openOutputStream());
+!!!7303692.java!!!	close() : void
+        ensureOpen();
+        mClosed = true;
+!!!7303820.java!!!	ensureOpen() : void
+        if (mExceptionString != null) {
+            throw new IOException(mExceptionString);
+        }
+        if (mClosed) {
+            throw new IOException("Operation has already ended");
+        }
+!!!7304076.java!!!	streamClosed(inout inStream : boolean) : void
+

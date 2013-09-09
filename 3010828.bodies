@@ -1,0 +1,639 @@
+class FrameworkEventListener
+!!!12293516.java!!!	FrameworkEventListener()
+        mUSDTVMessageQueue = USDTVMessageQueue.getMsgQueueInstance();
+        mEvtMgrServiceConnection = new ServiceConnection() {
+
+            @Override
+            public void onServiceConnected(ComponentName name,
+                    IBinder service) {
+                mEventManagerService = ((EventManagerBinder) service).getServiceBinder();
+
+                if (mPendingSourceId != INVALID_PENDING_SOURCE_ID) {
+                    onSourceSwitched(mPendingSourceId);
+                    // must reset value after calling onSourceSwitched
+                    mPendingSourceId = INVALID_PENDING_SOURCE_ID;
+                }
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+                mEventManagerService = null;
+            }
+
+        };
+
+        mHandler = new Handler(Looper.getMainLooper());
+!!!12293644.java!!!	getFrameworkEventListenerInstance() : FrameworkEventListener
+        if (mFrameworkEventListener == null) {
+            mFrameworkEventListener = new FrameworkEventListener();
+        }
+        return mFrameworkEventListener;
+!!!12293772.java!!!	registerAppListener(in context : Context) : void
+        if (!isRegistered || mContext == null) {
+            Log.d(TAG, "*****************************registerAppListener******************");
+            mContext = context;
+            isRegistered = true;
+
+            // Register's the Service listener to get the Service availability
+            // status events
+            TvFramework.registerServiceListener(this);
+
+            // The AVSettings ObserverHandler need to be in main looper
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    TvFramework.getInstance().initEventListener(
+                            context.getApplicationInfo().processName,
+                            FrameworkEventListener.this);
+                }
+            });
+
+            bindEvtMgrService(context);
+
+            Utils.bindTvRemoteService(context);
+
+            // set initial value when register
+            mPendingSourceId = INVALID_PENDING_SOURCE_ID;
+        }
+!!!12293900.java!!!	unregisterAppListener() : void
+        if (isRegistered) {
+            Log.d(TAG, "*****************************unregisterAppListener******************");
+            TvFramework.getInstance().unregisterEventListener();
+
+            if (mUSDTVMessageQueue != null) {
+                mUSDTVMessageQueue.removeEventGroup(USDTVMessageQueue.EventGroup.EVENT_GROUP_ALL);
+            }
+
+            unbindEvtMgrService(mContext);
+            Utils.unbindTvRemoteService(mContext);
+            isRegistered = false;
+        }
+!!!12294028.java!!!	serviceNotAvailable() : void
+        // try {
+        // Thread.sleep(5000);
+        // }
+        // catch (InterruptedException e) {
+        // Log.d(TAG, "Thread Interrupted Exception" + e);
+        // }
+        // Wrapper.getWrapperInstance().runInNonUiThread(new Runnable() {
+        //
+        // public void run () {
+        // new ToastCreator(mContext, "USDTV Service Not Available",
+        // R.drawable.info).showToast();
+        // }
+        // }, 0);
+!!!12294156.java!!!	onUSDTVEvent(inout event : Events) : void
+        if (event == Events.ATV_AUDIO_FORMAT_CHANGE
+                || event == Events.DTV_AUDIO_FORMAT_CHANGE) {
+            event = Events.AUDIO_FORMAT_UPDATE;
+        }
+
+        // fill empty info to replace the info of non-RF source
+        if (mEventManagerService != null) {
+            switch (event) {
+                case RF_RESOLUTION_CHANGE:
+                case ASPECT_RATIO_CHANGE:
+                    VideoInfoUpdate videoInfo = new VideoInfoUpdate();
+                    videoInfo.setSourceId(Wrapper.getWrapperInstance().getCurrentSource());
+                    mEventManagerService.setVideoInfoStatus(videoInfo);
+                    break;
+                case AUDIO_FORMAT_UPDATE:
+                    AudioInfoUpdate audioInfo = new AudioInfoUpdate();
+                    audioInfo.setSourceId(Wrapper.getWrapperInstance().getCurrentSource());
+                    mEventManagerService.setAudioInfoStatus(audioInfo);
+                    break;
+                default:
+                    ;
+            }
+        }
+
+        platFormStateChanged(event);
+!!!12294284.java!!!	onAVSettingsEvent(in event : int, inout detailInfo : Parcelable) : void
+        Log.d(TAG, "onAVSettingsEvent: event=" + event);
+        Events convertedEvent = null;
+        if (event == TvAvsettingEvent.TV_AVIN_CONNECT_STATUS.value()) {
+            AvInConnectStatus connectStatus = (AvInConnectStatus) detailInfo;
+            if (connectStatus != null && mEventManagerService != null) {
+                boolean currentStatus = mEventManagerService
+                        .getSourceConnectStatus(connectStatus.getSourceId());
+                boolean newStatus = connectStatus.getConnectStatus() == 1;
+                if (currentStatus != newStatus) {
+                    mEventManagerService.setSourceConnectStatus(
+                            connectStatus.getSourceId(), newStatus);
+
+                    // Cedar bug1760 clear AV info when unplug current source signal cable,
+                    // then resolution info can be shown whatever ResolutionNotification
+                    // is true or not
+                    if (connectStatus.getSourceId()
+                            == Wrapper.getWrapperInstance().getCurrentSource()
+                        && !newStatus) {
+                        mEventManagerService.clearAVInfoStatus();
+                    }
+
+                    Intent intent = new Intent(TvIntents.INTENT_SOURCE_CONNECT_CHANGE);
+                    intent.putExtra(TvIntents.KEY_SOURCE_ID, connectStatus.getSourceId());
+                    mContext.sendBroadcast(intent);
+                }
+            }
+        } else if (event == TvAvsettingEvent.TV_AVIN_LOCK_STATUS.value()) {
+            AvInLockStatus lockStatus = (AvInLockStatus) detailInfo;
+            if (lockStatus != null && mEventManagerService != null
+                    && lockStatus.getSourceId()
+                        == Wrapper.getWrapperInstance().getCurrentSource()) {
+                int lock = lockStatus.getLockStatus();
+                boolean resNotify = Wrapper.getWrapperInstance()
+                        .getResolutionNotification(lockStatus.getSourceId());
+                if (lock == TvAvinLockStatus.TV_AVIN_LOCK_NoSignal.value()) {
+                    convertedEvent = Events.SCM_NON_RF_NO_SIGNAL;
+                    if (resNotify) {
+                        // clear AV info status when signal not stable
+                        mEventManagerService.clearAVInfoStatus();
+                    } else {
+                        // must clear AV info when source switched
+                        VideoInfoUpdate currentVideoInfo =
+                                mEventManagerService.getVideoInfoStatus();
+                        AudioInfoUpdate currentAudioInfo =
+                                mEventManagerService.getAudioInfoStatus();
+                        if (currentVideoInfo != null
+                               && currentVideoInfo.getSourceId() != lockStatus.getSourceId()) {
+                            mEventManagerService.setVideoInfoStatus(null);
+                        }
+                        if (currentAudioInfo != null
+                               && currentAudioInfo.getSourceId() != lockStatus.getSourceId()) {
+                            mEventManagerService.setAudioInfoStatus(null);
+                        }
+                    }
+                } else if (lock == TvAvinLockStatus.TV_AVIN_LOCK_NotSupported.value()) {
+                    convertedEvent = Events.NON_RF_INVALID_FORMAT;
+                    if (resNotify) {
+                        // clear AV info status when signal not stable
+                        mEventManagerService.clearAVInfoStatus();
+                    }
+                } else if (lock == TvAvinLockStatus.TV_AVIN_LOCK_Stable.value()) {
+                    convertedEvent = Events.SCM_NON_RF_INPUT_STABLE;
+                }
+            }
+        } else if (event == TvAvsettingEvent.TV_VIDEO_INFO_UPDATE.value()) {
+            VideoInfoUpdate videoInfo = (VideoInfoUpdate) detailInfo;
+            if (videoInfo != null && mEventManagerService != null
+                    && videoInfo.getSourceId()
+                        == Wrapper.getWrapperInstance().getCurrentSource()) {
+                VideoInfoUpdate currentVideoInfo = mEventManagerService.getVideoInfoStatus();
+                mEventManagerService.setVideoInfoStatus(videoInfo);
+
+                // fix Cedar 1760 don't display info frequently when resolution changed
+                // on HDMI/Component inputs
+                boolean resNotify = Wrapper.getWrapperInstance()
+                        .getResolutionNotification(videoInfo.getSourceId());
+
+                if (currentVideoInfo == null
+                        || videoInfo.getSourceId() != currentVideoInfo.getSourceId()) {
+                    convertedEvent = Events.SCM_VIDEO_RESOLUTION_CHANGE;
+
+                } else if (resNotify
+                        && (videoInfo.getActiveHeight() != currentVideoInfo.getActiveHeight()
+                        || videoInfo.getActiveWidth() != currentVideoInfo.getActiveWidth()
+                        || videoInfo.getIsInterlaced() != currentVideoInfo.getIsInterlaced())) {
+                    convertedEvent = Events.SCM_VIDEO_RESOLUTION_CHANGE;
+
+                } else if (resNotify
+                        && (Float.compare(videoInfo.getFrameRate(),
+                                currentVideoInfo.getFrameRate()) != 0)) {
+                    convertedEvent = Events.SCM_VIDEO_FRAME_RATE_CHANGE;
+
+                } else if (videoInfo.getAspectHeight() != currentVideoInfo.getAspectHeight()
+                        || videoInfo.getAspectWidth() != currentVideoInfo.getAspectWidth()) {
+                    convertedEvent = Events.SCM_VIDEO_AR_CHANGE;
+
+                } else if (videoInfo.get3DFormat() != currentVideoInfo.get3DFormat()) {
+                    convertedEvent = Events.SCM_3DMODE_CHANGE;
+                }
+            }
+        } else if (event == TvAvsettingEvent.TV_AUDIO_INFO_UPDATE.value()) {
+            AudioInfoUpdate audioInfo = (AudioInfoUpdate) detailInfo;
+            if (audioInfo != null && mEventManagerService != null
+                    && audioInfo.getSourceId()
+                    == Wrapper.getWrapperInstance().getCurrentSource()) {
+                AudioInfoUpdate currentAudioInfo = mEventManagerService.getAudioInfoStatus();
+                mEventManagerService.setAudioInfoStatus(audioInfo);
+
+                if (currentAudioInfo == null
+                        || audioInfo.getSourceId() != currentAudioInfo.getSourceId()
+                        || audioInfo.getStreamFormat() != currentAudioInfo.getStreamFormat()) {
+                    convertedEvent = Events.AUDIO_FORMAT_UPDATE;
+
+                }
+            }
+        } else if (event == TvAvsettingEvent.TV_HEADPHONE_PLUGIN.value()) {
+            HeadphonePluginStatus headphoneStatus = (HeadphonePluginStatus) detailInfo;
+            boolean status = TvFramework.getInstance().getAudioInstance().isHeadphonePlugin();
+            if (headphoneStatus != null) {
+                new ToastCreator(mContext, mContext.getResources().getString(
+                        R.string.headphone_plugin, status?"":"NOT "),
+                        R.drawable.info).showToast();
+            }
+        } else if (event == TvAvsettingEvent.TV_AVIN_INPUT_LOCK.value()) {
+            AvInInputLock inputLock = (AvInInputLock) detailInfo;
+            if (inputLock != null && mEventManagerService != null
+                    && inputLock.getSourceId()
+                        == Wrapper.getWrapperInstance().getCurrentSource()) {
+                int locked = inputLock.getLockStatus();
+                if (locked == TvCommonLevel.TV_COMMON_LEVEL_On.value()) {
+                    convertedEvent = Events.CURRENT_INPUT_LOCKED;
+                } else if (locked == TvCommonLevel.TV_COMMON_LEVEL_Off.value()) {
+                    convertedEvent = Events.CURRENT_INPUT_UNLOCKED;
+                }
+            }
+        } else if (event == PlatformEventListener.SOURCE_EXT_BIND_CHANNEL) {
+            SourceBindChannel srcBindChannel = (SourceBindChannel) detailInfo;
+            if (srcBindChannel != null) {
+                Intent intent = new Intent(TvIntents.INTENT_SOURCE_CONNECT_CHANGE);
+                intent.putExtra(TvIntents.KEY_SOURCE_ID, srcBindChannel.getSourceId());
+                intent.putExtra(TvIntents.KEY_VIDEO_CHANNEL_ID, srcBindChannel.getVideoChannel());
+                mContext.sendBroadcast(intent);
+            }
+        }
+
+        // abandon AV event for tuner input, taken care by onUSDTVEvent
+        if (convertedEvent != null && !Wrapper.getWrapperInstance().isTunerInput()) {
+            platFormStateChanged(convertedEvent);
+        }
+!!!12294412.java!!!	platFormStateChanged(in event : Events) : void
+        Log.d(TAG,
+                "*****************************stateChanged**************** : "
+                        + event.name());
+
+        // Holds the instance of USDTVBaseUtility
+        ToastCreator toast = null;
+
+        // local variable as buffer for Context
+        final Context context = mContext;
+
+        // broadcast USDTV event to other applications
+        Intent frmkEventIntent = new Intent(TvIntents.ACTION_TV_EVENT);
+        frmkEventIntent.putExtra(TvIntents.EXTRA_USDTV_EVENT, event.ordinal());
+        context.sendBroadcast(frmkEventIntent);
+
+        switch (event) {
+        /**
+         * The following event are sent from USDTV service
+         */
+            case DCCM_EVENT:
+                // toast = new ToastCreator(context, "DCCM EVENT",
+                // R.drawable.info);
+                break;
+            case DCCM_REDIRECT_CHANNEL:
+                Log.d(TAG, "DCCM REDIRECT CHANNEL");
+                // final Bundle bundleRedirect = new Bundle();
+                // bundleRedirect.putString("dccm_tune_event",
+                // "DCCM_REDIRECT_CHANNEL");
+                // mBaseUtility.createHotEventActivity(DCCMVdsDisplayText.class,
+                // bundleRedirect, context);
+                break;
+            case DCCM_TEMP_TUNE_START:
+                Log.d(TAG, "DCCM TEMP TUNE START");
+                // final Bundle bundleStart = new Bundle();
+                // bundleStart.putString("dccm_tune_event",
+                // "DCCM_TEMP_TUNE_START");
+                // mBaseUtility.createHotEventActivity(DCCMVdsDisplayText.class,
+                // bundleStart, context);
+                break;
+            case DCCM_TEMP_TUNE_END:
+                Log.d(TAG, "DCCM TEMP TUNE END");
+                // final Bundle bundleEnd = new Bundle();
+                // bundleEnd.putString("dccm_tune_event", "DCCM_TEMP_TUNE_END");
+                // mBaseUtility.createHotEventActivity(DCCMVdsDisplayText.class,
+                // bundleEnd, context);
+                break;
+            case DCCM_DEPARTING_DESC_AVAILABLE:
+                Log.d(TAG, "DCCM DEPARTING DESC AVAILABLE");
+                final Bundle bundleDesc = new Bundle();
+                bundleDesc.putString("dccm_tune_event", "DCCM_DEPARTING_DESC_AVAILABLE");
+                // mBaseUtility.createHotEventActivity(DCCMVdsDisplayText.class,
+                // bundleDesc, context);
+                break;
+            case DCCM_VDS_OPTIONS_AVAILABLE:
+                Log.d(TAG, "DCCM VDS OPTIONS AVAILABLE");
+                break;
+
+            case EAS_EVENT:
+                // TODO not sure what needs to be done
+                // toast = new ToastCreator(context, "EAS EVENT",
+                // R.drawable.info);
+                break;
+            case EAS_START_BLOCKING:
+                toast = new ToastCreator(context, "EAS START BLOCKING", R.drawable.info);
+                WidgetManager.createSingleTopActivity(TvIntents.ACTION_SHOW_EASACTIVITY, null,
+                        context);
+                break;
+            case EAS_START_NON_BLOCKING:
+                toast = new ToastCreator(context, "EAS START NON BLOCKING", R.drawable.info);
+                WidgetManager.createSingleTopActivity(TvIntents.ACTION_SHOW_EASACTIVITY, null,
+                        context);
+                break;
+            case EAS_STOP_EVENT:
+                WidgetManager.exitFromApp(context);
+                PCUtility.playCurrentSource(context, true, false);
+                break;
+
+            case DBB_SERVICE_BUILD_COMPLETED_EVENT:
+                // toast = new ToastCreator(context,
+                // "DBB SERVICE BUILD COMPLETED EVENT", R.drawable.info);
+                break;
+
+            case XDS_EVENT:
+                // toast = new ToastCreator(context, "XDS EVENT",
+                // R.drawable.info);
+                break;
+
+            case RRT_DWNLD_UPDATE_EVENT:
+                toast = new ToastCreator(context, "DRRT table has been updated", R.drawable.info);
+                break;
+
+            case STT_UPDATE_EVENT:
+                isTimeUpdated = true;
+                break; // This event may be sent every seconds, so do nothing
+
+            case SERVICE_DELETED_EVENT:
+            case CURRENT_CHANNEL_DELETED_EVENT:
+                // toast = new ToastCreator(context, "SERVICE DELETED EVENT",
+                // R.drawable.info);
+                Wrapper.getWrapperInstance().updateChanneListToGTVDb(1000);
+                break;
+            case SERVICE_UPDATE_EVENT:
+                // toast = new ToastCreator(context, "SERVICE UPDATE EVENT",
+                // R.drawable.info);
+                Wrapper.getWrapperInstance().updateChanneListToGTVDb(1000);
+                break;
+            case SERVICE_ADDED_EVENT:
+                // toast = new ToastCreator(context, "SERVICE ADDED EVENT",
+                // R.drawable.info);
+                Wrapper.getWrapperInstance().updateChanneListToGTVDb(1000);
+                break;
+
+            case TUNER_UNLOCKED_EVENT:
+                Wrapper.getWrapperInstance().pauseCC();
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+
+                // reset the flag, have to wait for STT to show time on banner
+                isTimeUpdated = false;
+                break;
+            case TUNER_LOCKED_EVENT:
+                // reset the flag, have to wait for STT to show time on banner
+                isTimeUpdated = false;
+
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                checkCC();
+                break;
+            case TUNER_LOCKING_PROGRESS_EVENT:
+                // toast = new ToastCreator(context,
+                // "TUNER_LOCKING_PROGRESS_EVENT", R.drawable.info);
+                break;
+            case CURRENT_CHANNEL_PLAY_SUCCESS:
+                mUSDTVMessageQueue.removeEvent(Events.AUDIO_FORMAT_UPDATE);
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+            case CURRENT_CHANNEL_PLAY_FAILURE:
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+
+            case CURRENT_CHANNEL_LOCKED:
+            case PARENTAL_BLOCKED_EVENT:
+            case CURRENT_INPUT_LOCKED:
+                handleEvent(event, EventGroup.EVENT_GROUP_BLOCK);
+                break;
+            case PARENTAL_UNBLOCKED_EVENT:
+            case CURRENT_CHANNEL_UNLOCKED:
+            case CURRENT_INPUT_UNLOCKED:
+                handleEvent(event, EventGroup.EVENT_GROUP_BLOCK);
+                break;
+
+            case TS_DELETED_SERVICE_EVENT:
+                // toast = new ToastCreator(context, "Current service deleted",
+                // R.drawable.info);
+                // toast.setToastDuration(Toast.LENGTH_SHORT);
+                Log.d(TAG, "TS_DELETED_SERVICE_EVENT");
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+
+            case NO_AV_COMPONENT:
+                // new ToastCreator(context, "No Audio Video Signal",
+                // R.drawable.info).showToast();
+                // break;
+            case NO_VIDEO_COMPONENT:
+                // new ToastCreator(context, "No Video Signal",
+                // R.drawable.info).showToast();
+                // break;
+            case NO_AUDIO_COMPONENT:
+                // new ToastCreator(context, "No Audio Signal",
+                // R.drawable.info).showToast();
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+
+            case TIME_CHANGE_EVENT:
+                isTimeUpdated = true;
+                Utils.syncPSIPDateTime(context);
+                // break; // also need to update channel banner
+            case CC_STATUS_EVENT:
+            case ETT_UPDATE_EVENT:
+            case EVENT_TRANSITION_EVENT:
+            case EPG_UPDATE_EVENT:
+            case EPG_COMPLETE_EVENT:
+                break;
+
+            case STOP_SOURCE_DONE:
+                // This event is intermediate event which indicate source
+                // switch.
+                // It will be override by other event such as no signal or
+                // signal stable.
+                // Since no signal event will be sent every time TvPlayer is
+                // resumed after OSD is dismissed,
+                // this event is a good trigger to display input banner as well
+                // as CURRENT_CHANNEL_PLAY_SUCCESS
+                // for tuner input
+
+                // When switching source, remove RESOLUTION CHANGE
+                // event from queue, then when the event come again,
+                // we know resolution info is valid and can be shown in
+                // InputBanner
+                mUSDTVMessageQueue.removeEvent(Events.SCM_VIDEO_RESOLUTION_CHANGE);
+                mUSDTVMessageQueue.removeEvent(Events.RF_RESOLUTION_CHANGE);
+
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+
+            /***********************************************************
+             * The following event are sent from AVSettings
+             ***********************************************************/
+            case SCM_NON_RF_NO_SIGNAL:
+                Wrapper.getWrapperInstance().pauseCC();
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+            case NON_TS_LOCKING_EVENT:
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+            case SCM_NON_RF_INPUT_STABLE:
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+            case NON_RF_INVALID_FORMAT:
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                break;
+
+            case SCM_VIDEO_RESOLUTION_CHANGE:
+            case RF_RESOLUTION_CHANGE:
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                checkCC();
+                break;
+            case SCM_VIDEO_AR_CHANGE:
+                // Fix bug30664: Move to SCM_VIDEO_RESOLUTION_CHANGE case,
+                // because SCM_VIDEO_AR_CHANGE sometimes won't come
+                // checkCC();
+                break;
+            case SCM_VIDEO_FRAME_RATE_CHANGE:
+                mUSDTVMessageQueue.addEvent(event);
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (Wrapper.getWrapperInstance().isAnalogVideoInput()
+                                && WidgetManager.TV_PLAYER_ACTIVITY_NAME
+                                        .equals(WidgetManager.getTopActivityAtStack(mContext))) {
+                            WidgetManager.showInputBanner(mContext, true, false);
+                        }
+                    }
+                });
+                break;
+
+            case AUDIO_FORMAT_UPDATE:
+                handleEvent(event, EventGroup.EVENT_GROUP_SIGNAL);
+                mUSDTVMessageQueue.addEvent(event);
+
+                // display Dolby D+ when channel banner is not displayed
+                if (!WidgetManager.checkActivityRunning(mContext, ChannelBanner.class.getName())) {
+                    mHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            int audio_stream_format = Wrapper.getWrapperInstance()
+                                .getAudioStreamFormat(Wrapper.getWrapperInstance().isTunerInput(),
+                                                 Wrapper.getWrapperInstance().isDigitalChannel());
+                            if (audio_stream_format == TvAudioFormat
+                                    .TV_AUDIO_FORMAT_DD_PLUS.value()) {
+                                new ToastCreator(context, mContext.getResources().getString(
+                                        R.string.dolby_plus_detected),
+                                        R.drawable.info).showToast();
+                            }
+                        }
+                    }, 500);
+                }
+                break;
+
+            case SCM_3DMODE_CHANGE:
+                VideoInfoUpdate videoInfo = mEventManagerService.getVideoInfoStatus();
+                if (videoInfo != null ) {
+                    int format = videoInfo.get3DFormat();
+                    String[] formatStrArray = mContext.getResources().getStringArray(
+                            R.array.detected_3d_format);
+                    if (format >= 0 && format < formatStrArray.length) {
+                        new ToastCreator(context, mContext.getResources().getString(
+                                R.string.format_3D_detected)
+                                + formatStrArray[format],
+                                R.drawable.info).showToast();
+                    }
+                }
+                break;
+
+            default:
+                break;
+        }
+        if (toast != null) {
+            toast.showToast();
+        }
+!!!12294540.java!!!	checkCC() : void
+
+        Wrapper.getWrapperInstance().pauseCC();
+
+        // If TvPlayer is full screen and CC is allowed
+        if (ControllerBase.isFullScreen()
+                && Wrapper.getWrapperInstance().allowRatingOrCaption()) {
+            Wrapper.getWrapperInstance().resumeCC();
+        }
+!!!12294668.java!!!	bindEvtMgrService(inout context : Context) : void
+        Intent intent = new Intent(context, EventManagerService.class);
+        context.bindService(intent, mEvtMgrServiceConnection, Context.BIND_AUTO_CREATE);
+!!!12294796.java!!!	unbindEvtMgrService(inout context : Context) : void
+        if (mEvtMgrServiceConnection != null) {
+            try {
+                context.unbindService(mEvtMgrServiceConnection);
+            } catch (IllegalArgumentException e) {
+                mEvtMgrServiceConnection = null;
+            }
+        }
+!!!12294924.java!!!	handleEvent(inout event : Events, inout eventType : EventGroup) : void
+        if (eventType == EventGroup.EVENT_GROUP_SIGNAL) {
+            boolean isTuner = false;
+            boolean isVideoInput = false;
+            if (Wrapper.getWrapperInstance().isTunerInput()) {
+                isTuner = true;
+            } else if (Wrapper.getWrapperInstance().isAnalogVideoInput()) {
+                isVideoInput = true;
+            }
+
+            if (!isEventValid(isTuner, isVideoInput, event))
+                return;
+        }
+
+        mUSDTVMessageQueue.addEventToGroup(event, eventType);
+        if (mEventManagerService != null) {
+            mEventManagerService.checkEvent(eventType);
+        }
+!!!12295052.java!!!	isEventValid(inout isTuner : boolean, inout isVideoInput : boolean, inout event : Events) : boolean
+        Log.d(TAG, "isEventValid isTuner=" + isTuner + " isVideoInput=" + isVideoInput + " event="
+                + event);
+        switch (event) {
+            // Put events only valid for Tuner source here
+            case CURRENT_CHANNEL_PLAY_SUCCESS:
+            case CURRENT_CHANNEL_PLAY_FAILURE:
+            case TUNER_UNLOCKED_EVENT:
+            case TS_DELETED_SERVICE_EVENT:
+            case TUNER_LOCKED_EVENT:
+            case RF_RESOLUTION_CHANGE:
+            case NO_AV_COMPONENT:
+            case NO_VIDEO_COMPONENT:
+            case NO_AUDIO_COMPONENT:
+            case AUDIO_FORMAT_UPDATE: // For audio only channel, don't show no signal
+                return isTuner;
+
+            // Put events only valid for Video input source here
+            case NON_TS_LOCKING_EVENT:
+            case SCM_NON_RF_NO_SIGNAL:
+            case SCM_NON_RF_INPUT_STABLE:
+            case NON_RF_INVALID_FORMAT:
+            case SCM_VIDEO_RESOLUTION_CHANGE:
+                return isVideoInput;
+
+            // Put events valid for both Tuner and Video input source here
+            case STOP_SOURCE_DONE:
+                return isTuner || isVideoInput;
+
+            default:
+                ;
+        }
+
+        return false;
+!!!12295180.java!!!	onSourceSwitched(in source : int) : void
+        if (mEventManagerService == null) {
+            mPendingSourceId = source; // save pending source id for later
+            return;
+        }
+        VideoInfoUpdate currentVideoInfo = mEventManagerService.getVideoInfoStatus();
+        if (currentVideoInfo == null
+                || currentVideoInfo.getSourceId() != source) {
+            // clear event registration
+            platFormStateChanged(Events.STOP_SOURCE_DONE);
+
+            if (Wrapper.getWrapperInstance().isAnalogVideoInput(source)) {
+                // If not connect, emulate lock status as no signal
+                AvInLockStatus lockStatus = new AvInLockStatus(source,
+                        TvAvinLockStatus.TV_AVIN_LOCK_NoSignal.value());
+                onAVSettingsEvent(TvAvsettingEvent.TV_AVIN_LOCK_STATUS.value(), lockStatus);
+            }
+        }

@@ -1,0 +1,260 @@
+class SampleIterator
+!!!653580.cpp!!!	SampleIterator(inout table : SampleTable)
+    reset();
+!!!653708.cpp!!!	seekTo(in sampleIndex : uint32_t) : status_t
+    ALOGV("seekTo(%d)", sampleIndex);
+
+    if (sampleIndex >= mTable->mNumSampleSizes) {
+        return ERROR_END_OF_STREAM;
+    }
+
+    if (mTable->mSampleToChunkOffset < 0
+            || mTable->mChunkOffsetOffset < 0
+            || mTable->mSampleSizeOffset < 0
+            || mTable->mTimeToSampleCount == 0) {
+
+        return ERROR_MALFORMED;
+    }
+
+    if (mInitialized && mCurrentSampleIndex == sampleIndex) {
+        return OK;
+    }
+
+    if (!mInitialized || sampleIndex < mFirstChunkSampleIndex) {
+        reset();
+    }
+
+    if (sampleIndex >= mStopChunkSampleIndex) {
+        status_t err;
+        if ((err = findChunkRange(sampleIndex)) != OK) {
+            ALOGE("findChunkRange failed");
+            return err;
+        }
+    }
+
+    CHECK(sampleIndex < mStopChunkSampleIndex);
+
+    uint32_t chunk =
+        (sampleIndex - mFirstChunkSampleIndex) / mSamplesPerChunk
+        + mFirstChunk;
+
+    if (!mInitialized || chunk != mCurrentChunkIndex) {
+        mCurrentChunkIndex = chunk;
+
+        status_t err;
+        if ((err = getChunkOffset(chunk, &mCurrentChunkOffset)) != OK) {
+            ALOGE("getChunkOffset return error");
+            return err;
+        }
+
+        mCurrentChunkSampleSizes.clear();
+
+        uint32_t firstChunkSampleIndex =
+            mFirstChunkSampleIndex
+                + mSamplesPerChunk * (mCurrentChunkIndex - mFirstChunk);
+
+        for (uint32_t i = 0; i < mSamplesPerChunk; ++i) {
+            size_t sampleSize;
+            if ((err = getSampleSizeDirect(
+                            firstChunkSampleIndex + i, &sampleSize)) != OK) {
+                ALOGE("getSampleSizeDirect return error");
+                return err;
+            }
+
+            mCurrentChunkSampleSizes.push(sampleSize);
+        }
+    }
+
+    uint32_t chunkRelativeSampleIndex =
+        (sampleIndex - mFirstChunkSampleIndex) % mSamplesPerChunk;
+
+    mCurrentSampleOffset = mCurrentChunkOffset;
+    for (uint32_t i = 0; i < chunkRelativeSampleIndex; ++i) {
+        mCurrentSampleOffset += mCurrentChunkSampleSizes[i];
+    }
+
+    mCurrentSampleSize = mCurrentChunkSampleSizes[chunkRelativeSampleIndex];
+    if (sampleIndex < mTTSSampleIndex) {
+        mTimeToSampleIndex = 0;
+        mTTSSampleIndex = 0;
+        mTTSSampleTime = 0;
+        mTTSCount = 0;
+        mTTSDuration = 0;
+    }
+
+    status_t err;
+    if ((err = findSampleTime(sampleIndex, &mCurrentSampleTime)) != OK) {
+        ALOGE("findSampleTime return error");
+        return err;
+    }
+
+    mCurrentSampleIndex = sampleIndex;
+
+    mInitialized = true;
+
+    return OK;
+!!!654476.cpp!!!	getSampleSizeDirect(in sampleIndex : uint32_t, inout size : size_t) : status_t
+    *size = 0;
+
+    if (sampleIndex >= mTable->mNumSampleSizes) {
+        return ERROR_OUT_OF_RANGE;
+    }
+
+    if (mTable->mDefaultSampleSize > 0) {
+        *size = mTable->mDefaultSampleSize;
+        return OK;
+    }
+
+    switch (mTable->mSampleSizeFieldSize) {
+        case 32:
+        {
+            if (mTable->mDataSource->readAt(
+                        mTable->mSampleSizeOffset + 12 + 4 * sampleIndex,
+                        size, sizeof(*size)) < (ssize_t)sizeof(*size)) {
+                return ERROR_IO;
+            }
+
+            *size = ntohl(*size);
+            break;
+        }
+
+        case 16:
+        {
+            uint16_t x;
+            if (mTable->mDataSource->readAt(
+                        mTable->mSampleSizeOffset + 12 + 2 * sampleIndex,
+                        &x, sizeof(x)) < (ssize_t)sizeof(x)) {
+                return ERROR_IO;
+            }
+
+            *size = ntohs(x);
+            break;
+        }
+
+        case 8:
+        {
+            uint8_t x;
+            if (mTable->mDataSource->readAt(
+                        mTable->mSampleSizeOffset + 12 + sampleIndex,
+                        &x, sizeof(x)) < (ssize_t)sizeof(x)) {
+                return ERROR_IO;
+            }
+
+            *size = x;
+            break;
+        }
+
+        default:
+        {
+            CHECK_EQ(mTable->mSampleSizeFieldSize, 4);
+
+            uint8_t x;
+            if (mTable->mDataSource->readAt(
+                        mTable->mSampleSizeOffset + 12 + sampleIndex / 2,
+                        &x, sizeof(x)) < (ssize_t)sizeof(x)) {
+                return ERROR_IO;
+            }
+
+            *size = (sampleIndex & 1) ? x & 0x0f : x >> 4;
+            break;
+        }
+    }
+
+    return OK;
+!!!654604.cpp!!!	reset() : void
+    mSampleToChunkIndex = 0;
+    mFirstChunk = 0;
+    mFirstChunkSampleIndex = 0;
+    mStopChunk = 0;
+    mStopChunkSampleIndex = 0;
+    mSamplesPerChunk = 0;
+    mChunkDesc = 0;
+!!!654732.cpp!!!	findChunkRange(in sampleIndex : uint32_t) : status_t
+    CHECK(sampleIndex >= mFirstChunkSampleIndex);
+
+    while (sampleIndex >= mStopChunkSampleIndex) {
+        if (mSampleToChunkIndex == mTable->mNumSampleToChunkOffsets) {
+            return ERROR_OUT_OF_RANGE;
+        }
+
+        mFirstChunkSampleIndex = mStopChunkSampleIndex;
+
+        const SampleTable::SampleToChunkEntry *entry =
+            &mTable->mSampleToChunkEntries[mSampleToChunkIndex];
+
+        mFirstChunk = entry->startChunk;
+        mSamplesPerChunk = entry->samplesPerChunk;
+        mChunkDesc = entry->chunkDesc;
+
+        if (mSampleToChunkIndex + 1 < mTable->mNumSampleToChunkOffsets) {
+            mStopChunk = entry[1].startChunk;
+
+            mStopChunkSampleIndex =
+                mFirstChunkSampleIndex
+                    + (mStopChunk - mFirstChunk) * mSamplesPerChunk;
+        } else {
+            mStopChunk = 0xffffffff;
+            mStopChunkSampleIndex = 0xffffffff;
+        }
+
+        ++mSampleToChunkIndex;
+    }
+
+    return OK;
+!!!654860.cpp!!!	getChunkOffset(in chunk : uint32_t, inout offset : off64_t) : status_t
+    *offset = 0;
+
+    if (chunk >= mTable->mNumChunkOffsets) {
+        return ERROR_OUT_OF_RANGE;
+    }
+
+    if (mTable->mChunkOffsetType == SampleTable::kChunkOffsetType32) {
+        uint32_t offset32;
+
+        if (mTable->mDataSource->readAt(
+                    mTable->mChunkOffsetOffset + 8 + 4 * chunk,
+                    &offset32,
+                    sizeof(offset32)) < (ssize_t)sizeof(offset32)) {
+            return ERROR_IO;
+        }
+
+        *offset = ntohl(offset32);
+    } else {
+        CHECK_EQ(mTable->mChunkOffsetType, SampleTable::kChunkOffsetType64);
+
+        uint64_t offset64;
+        if (mTable->mDataSource->readAt(
+                    mTable->mChunkOffsetOffset + 8 + 8 * chunk,
+                    &offset64,
+                    sizeof(offset64)) < (ssize_t)sizeof(offset64)) {
+            return ERROR_IO;
+        }
+
+        *offset = ntoh64(offset64);
+    }
+
+    return OK;
+!!!654988.cpp!!!	findSampleTime(in sampleIndex : uint32_t, inout time : uint32_t) : status_t
+    if (sampleIndex >= mTable->mNumSampleSizes) {
+        return ERROR_OUT_OF_RANGE;
+    }
+
+    while (sampleIndex >= mTTSSampleIndex + mTTSCount) {
+        if (mTimeToSampleIndex == mTable->mTimeToSampleCount) {
+            return ERROR_OUT_OF_RANGE;
+        }
+
+        mTTSSampleIndex += mTTSCount;
+        mTTSSampleTime += mTTSCount * mTTSDuration;
+
+        mTTSCount = mTable->mTimeToSample[2 * mTimeToSampleIndex];
+        mTTSDuration = mTable->mTimeToSample[2 * mTimeToSampleIndex + 1];
+
+        ++mTimeToSampleIndex;
+    }
+
+    *time = mTTSSampleTime + mTTSDuration * (sampleIndex - mTTSSampleIndex);
+
+    *time += mTable->getCompositionTimeOffset(sampleIndex);
+
+    return OK;

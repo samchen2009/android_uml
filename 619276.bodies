@@ -1,0 +1,103 @@
+class AMRSource
+!!!1852940.cpp!!!	AMRSource(in source : sp<DataSource>, in meta : sp<MetaData>, in isWide : bool, in offset_table : off64_t, in offset_table_length : size_t)
+    if (mOffsetTableLength > 0 && mOffsetTableLength <= OFFSET_TABLE_LEN) {
+        memcpy ((char*)mOffsetTable, (char*)offset_table, sizeof(off64_t) * mOffsetTableLength);
+    }
+!!!1853068.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    CHECK(!mStarted);
+
+    mOffset = mIsWide ? 9 : 6;
+    mCurrentTimeUs = 0;
+    mGroup = new MediaBufferGroup;
+    mGroup->add_buffer(new MediaBuffer(128));
+    mStarted = true;
+
+    return OK;
+!!!1853196.cpp!!!	stop() : status_t
+    CHECK(mStarted);
+
+    delete mGroup;
+    mGroup = NULL;
+
+    mStarted = false;
+    return OK;
+!!!1853324.cpp!!!	getFormat() : sp<MetaData>
+    return mMeta;
+!!!1853452.cpp!!!	read(inout out : MediaBuffer, in options : ReadOptions = NULL) : status_t
+    *out = NULL;
+
+    int64_t seekTimeUs;
+    ReadOptions::SeekMode mode;
+    if (options && options->getSeekTo(&seekTimeUs, &mode)) {
+        size_t size;
+        int64_t seekFrame = seekTimeUs / 20000ll;  // 20ms per frame.
+        mCurrentTimeUs = seekFrame * 20000ll;
+
+        int index = seekFrame / 50;
+        if (index >= mOffsetTableLength) {
+            index = mOffsetTableLength - 1;
+        }
+
+        mOffset = mOffsetTable[index] + (mIsWide ? 9 : 6);
+
+        for (int i = 0; i< seekFrame - index * 50; i++) {
+            status_t err;
+            if ((err = getFrameSizeByOffset(mDataSource, mOffset,
+                            mIsWide, &size)) != OK) {
+                return err;
+            }
+            mOffset += size;
+        }
+    }
+
+    uint8_t header;
+    ssize_t n = mDataSource->readAt(mOffset, &header, 1);
+
+    if (n < 1) {
+        return ERROR_END_OF_STREAM;
+    }
+
+    if (header & 0x83) {
+        // Padding bits must be 0.
+
+        ALOGE("padding bits must be 0, header is 0x%02x", header);
+
+        return ERROR_MALFORMED;
+    }
+
+    unsigned FT = (header >> 3) & 0x0f;
+
+    size_t frameSize = getFrameSize(mIsWide, FT);
+    if (frameSize == 0) {
+        return ERROR_MALFORMED;
+    }
+
+    MediaBuffer *buffer;
+    status_t err = mGroup->acquire_buffer(&buffer);
+    if (err != OK) {
+        return err;
+    }
+
+    n = mDataSource->readAt(mOffset, buffer->data(), frameSize);
+
+    if (n != (ssize_t)frameSize) {
+        buffer->release();
+        buffer = NULL;
+
+        return ERROR_IO;
+    }
+
+    buffer->set_range(0, frameSize);
+    buffer->meta_data()->setInt64(kKeyTime, mCurrentTimeUs);
+    buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+
+    mOffset += frameSize;
+    mCurrentTimeUs += 20000;  // Each frame is 20ms
+
+    *out = buffer;
+
+    return OK;
+!!!1853580.cpp!!!	~AMRSource()
+    if (mStarted) {
+        stop();
+    }

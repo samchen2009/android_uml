@@ -1,0 +1,779 @@
+class ForkJoinPool
+!!!1541787.java!!!	checkPermission() : void
+        SecurityManager security = System.getSecurityManager();
+        if (security != null)
+            security.checkPermission(modifyThreadPermission);
+!!!1541915.java!!!	work(inout w : ForkJoinWorkerThread) : void
+        boolean swept = false;                // true on empty scans
+        long c;
+        while (!w.terminate && (int)(c = ctl) >= 0) {
+            int a;                            // active count
+            if (!swept && (a = (int)(c >> AC_SHIFT)) <= 0)
+                swept = scan(w, a);
+            else if (tryAwaitWork(w, c))
+                swept = false;
+        }
+!!!1542043.java!!!	signalWork() : void
+        /*
+         * The while condition is true if: (there is are too few total
+         * workers OR there is at least one waiter) AND (there are too
+         * few active workers OR the pool is terminating).  The value
+         * of e distinguishes the remaining cases: zero (no waiters)
+         * for create, negative if terminating (in which case do
+         * nothing), else release a waiter. The secondary checks for
+         * release (non-null array etc) can fail if the pool begins
+         * terminating after the test, and don't impose any added cost
+         * because JVMs must perform null and bounds checks anyway.
+         */
+        long c; int e, u;
+        while ((((e = (int)(c = ctl)) | (u = (int)(c >>> 32))) &
+                (INT_SIGN|SHORT_SIGN)) == (INT_SIGN|SHORT_SIGN) && e >= 0) {
+            if (e > 0) {                         // release a waiting worker
+                int i; ForkJoinWorkerThread w; ForkJoinWorkerThread[] ws;
+                if ((ws = workers) == null ||
+                    (i = ~e & SMASK) >= ws.length ||
+                    (w = ws[i]) == null)
+                    break;
+                long nc = (((long)(w.nextWait & E_MASK)) |
+                           ((long)(u + UAC_UNIT) << 32));
+                if (w.eventCount == e &&
+                    UNSAFE.compareAndSwapLong(this, ctlOffset, c, nc)) {
+                    w.eventCount = (e + EC_UNIT) & E_MASK;
+                    if (w.parked)
+                        UNSAFE.unpark(w);
+                    break;
+                }
+            }
+            else if (UNSAFE.compareAndSwapLong
+                     (this, ctlOffset, c,
+                      (long)(((u + UTC_UNIT) & UTC_MASK) |
+                             ((u + UAC_UNIT) & UAC_MASK)) << 32)) {
+                addWorker();
+                break;
+            }
+        }
+!!!1542171.java!!!	tryReleaseWaiter() : boolean
+        long c; int e, i; ForkJoinWorkerThread w; ForkJoinWorkerThread[] ws;
+        if ((e = (int)(c = ctl)) > 0 &&
+            (int)(c >> AC_SHIFT) < 0 &&
+            (ws = workers) != null &&
+            (i = ~e & SMASK) < ws.length &&
+            (w = ws[i]) != null) {
+            long nc = ((long)(w.nextWait & E_MASK) |
+                       ((c + AC_UNIT) & (AC_MASK|TC_MASK)));
+            if (w.eventCount != e ||
+                !UNSAFE.compareAndSwapLong(this, ctlOffset, c, nc))
+                return false;
+            w.eventCount = (e + EC_UNIT) & E_MASK;
+            if (w.parked)
+                UNSAFE.unpark(w);
+        }
+        return true;
+!!!1542299.java!!!	scan(inout w : ForkJoinWorkerThread, in a : int) : boolean
+        int g = scanGuard; // mask 0 avoids useless scans if only one active
+        int m = (parallelism == 1 - a && blockedCount == 0) ? 0 : g & SMASK;
+        ForkJoinWorkerThread[] ws = workers;
+        if (ws == null || ws.length <= m)         // staleness check
+            return false;
+        for (int r = w.seed, k = r, j = -(m + m); j <= m + m; ++j) {
+            ForkJoinTask<?> t; ForkJoinTask<?>[] q; int b, i;
+            ForkJoinWorkerThread v = ws[k & m];
+            if (v != null && (b = v.queueBase) != v.queueTop &&
+                (q = v.queue) != null && (i = (q.length - 1) & b) >= 0) {
+                long u = (i << ASHIFT) + ABASE;
+                if ((t = q[i]) != null && v.queueBase == b &&
+                    UNSAFE.compareAndSwapObject(q, u, t, null)) {
+                    int d = (v.queueBase = b + 1) - v.queueTop;
+                    v.stealHint = w.poolIndex;
+                    if (d != 0)
+                        signalWork();             // propagate if nonempty
+                    w.execTask(t);
+                }
+                r ^= r << 13; r ^= r >>> 17; w.seed = r ^ (r << 5);
+                return false;                     // store next seed
+            }
+            else if (j < 0) {                     // xorshift
+                r ^= r << 13; r ^= r >>> 17; k = r ^= r << 5;
+            }
+            else
+                ++k;
+        }
+        if (scanGuard != g)                       // staleness check
+            return false;
+        else {                                    // try to take submission
+            ForkJoinTask<?> t; ForkJoinTask<?>[] q; int b, i;
+            if ((b = queueBase) != queueTop &&
+                (q = submissionQueue) != null &&
+                (i = (q.length - 1) & b) >= 0) {
+                long u = (i << ASHIFT) + ABASE;
+                if ((t = q[i]) != null && queueBase == b &&
+                    UNSAFE.compareAndSwapObject(q, u, t, null)) {
+                    queueBase = b + 1;
+                    w.execTask(t);
+                }
+                return false;
+            }
+            return true;                         // all queues empty
+        }
+!!!1542427.java!!!	tryAwaitWork(inout w : ForkJoinWorkerThread, in c : long) : boolean
+        int v = w.eventCount;
+        w.nextWait = (int)c;                      // w's successor record
+        long nc = (long)(v & E_MASK) | ((c - AC_UNIT) & (AC_MASK|TC_MASK));
+        if (ctl != c || !UNSAFE.compareAndSwapLong(this, ctlOffset, c, nc)) {
+            long d = ctl; // return true if lost to a deq, to force scan
+            return (int)d != (int)c && (d & AC_MASK) >= (c & AC_MASK);
+        }
+        for (int sc = w.stealCount; sc != 0;) {   // accumulate stealCount
+            long s = stealCount;
+            if (UNSAFE.compareAndSwapLong(this, stealCountOffset, s, s + sc))
+                sc = w.stealCount = 0;
+            else if (w.eventCount != v)
+                return true;                      // update next time
+        }
+        if ((!shutdown || !tryTerminate(false)) &&
+            (int)c != 0 && parallelism + (int)(nc >> AC_SHIFT) == 0 &&
+            blockedCount == 0 && quiescerCount == 0)
+            idleAwaitWork(w, nc, c, v);           // quiescent
+        for (boolean rescanned = false;;) {
+            if (w.eventCount != v)
+                return true;
+            if (!rescanned) {
+                int g = scanGuard, m = g & SMASK;
+                ForkJoinWorkerThread[] ws = workers;
+                if (ws != null && m < ws.length) {
+                    rescanned = true;
+                    for (int i = 0; i <= m; ++i) {
+                        ForkJoinWorkerThread u = ws[i];
+                        if (u != null) {
+                            if (u.queueBase != u.queueTop &&
+                                !tryReleaseWaiter())
+                                rescanned = false; // contended
+                            if (w.eventCount != v)
+                                return true;
+                        }
+                    }
+                }
+                if (scanGuard != g ||              // stale
+                    (queueBase != queueTop && !tryReleaseWaiter()))
+                    rescanned = false;
+                if (!rescanned)
+                    Thread.yield();                // reduce contention
+                else
+                    Thread.interrupted();          // clear before park
+            }
+            else {
+                w.parked = true;                   // must recheck
+                if (w.eventCount != v) {
+                    w.parked = false;
+                    return true;
+                }
+                LockSupport.park(this);
+                rescanned = w.parked = false;
+            }
+        }
+!!!1542555.java!!!	idleAwaitWork(inout w : ForkJoinWorkerThread, in currentCtl : long, in prevCtl : long, in v : int) : void
+        if (w.eventCount == v) {
+            if (shutdown)
+                tryTerminate(false);
+            ForkJoinTask.helpExpungeStaleExceptions(); // help clean weak refs
+            while (ctl == currentCtl) {
+                long startTime = System.nanoTime();
+                w.parked = true;
+                if (w.eventCount == v)             // must recheck
+                    LockSupport.parkNanos(this, SHRINK_RATE);
+                w.parked = false;
+                if (w.eventCount != v)
+                    break;
+                else if (System.nanoTime() - startTime <
+                         SHRINK_RATE - (SHRINK_RATE / 10)) // timing slop
+                    Thread.interrupted();          // spurious wakeup
+                else if (UNSAFE.compareAndSwapLong(this, ctlOffset,
+                                                   currentCtl, prevCtl)) {
+                    w.terminate = true;            // restore previous
+                    w.eventCount = ((int)currentCtl + EC_UNIT) & E_MASK;
+                    break;
+                }
+            }
+        }
+!!!1542683.java!!!	addSubmission(inout t : ForkJoinTask) : void
+        final ReentrantLock lock = this.submissionLock;
+        lock.lock();
+        try {
+            ForkJoinTask<?>[] q; int s, m;
+            if ((q = submissionQueue) != null) {    // ignore if queue removed
+                long u = (((s = queueTop) & (m = q.length-1)) << ASHIFT)+ABASE;
+                UNSAFE.putOrderedObject(q, u, t);
+                queueTop = s + 1;
+                if (s - queueBase == m)
+                    growSubmissionQueue();
+            }
+        } finally {
+            lock.unlock();
+        }
+        signalWork();
+!!!1542811.java!!!	growSubmissionQueue() : void
+        ForkJoinTask<?>[] oldQ = submissionQueue;
+        int size = oldQ != null ? oldQ.length << 1 : INITIAL_QUEUE_CAPACITY;
+        if (size > MAXIMUM_QUEUE_CAPACITY)
+            throw new RejectedExecutionException("Queue capacity exceeded");
+        if (size < INITIAL_QUEUE_CAPACITY)
+            size = INITIAL_QUEUE_CAPACITY;
+        ForkJoinTask<?>[] q = submissionQueue = new ForkJoinTask<?>[size];
+        int mask = size - 1;
+        int top = queueTop;
+        int oldMask;
+        if (oldQ != null && (oldMask = oldQ.length - 1) >= 0) {
+            for (int b = queueBase; b != top; ++b) {
+                long u = ((b & oldMask) << ASHIFT) + ABASE;
+                Object x = UNSAFE.getObjectVolatile(oldQ, u);
+                if (x != null && UNSAFE.compareAndSwapObject(oldQ, u, x, null))
+                    UNSAFE.putObjectVolatile
+                        (q, ((b & mask) << ASHIFT) + ABASE, x);
+            }
+        }
+!!!1542939.java!!!	tryPreBlock() : boolean
+        int b = blockedCount;
+        if (UNSAFE.compareAndSwapInt(this, blockedCountOffset, b, b + 1)) {
+            int pc = parallelism;
+            do {
+                ForkJoinWorkerThread[] ws; ForkJoinWorkerThread w;
+                int e, ac, tc, i;
+                long c = ctl;
+                int u = (int)(c >>> 32);
+                if ((e = (int)c) < 0) {
+                                                 // skip -- terminating
+                }
+                else if ((ac = (u >> UAC_SHIFT)) <= 0 && e != 0 &&
+                         (ws = workers) != null &&
+                         (i = ~e & SMASK) < ws.length &&
+                         (w = ws[i]) != null) {
+                    long nc = ((long)(w.nextWait & E_MASK) |
+                               (c & (AC_MASK|TC_MASK)));
+                    if (w.eventCount == e &&
+                        UNSAFE.compareAndSwapLong(this, ctlOffset, c, nc)) {
+                        w.eventCount = (e + EC_UNIT) & E_MASK;
+                        if (w.parked)
+                            UNSAFE.unpark(w);
+                        return true;             // release an idle worker
+                    }
+                }
+                else if ((tc = (short)(u >>> UTC_SHIFT)) >= 0 && ac + pc > 1) {
+                    long nc = ((c - AC_UNIT) & AC_MASK) | (c & ~AC_MASK);
+                    if (UNSAFE.compareAndSwapLong(this, ctlOffset, c, nc))
+                        return true;             // no compensation needed
+                }
+                else if (tc + pc < MAX_ID) {
+                    long nc = ((c + TC_UNIT) & TC_MASK) | (c & ~TC_MASK);
+                    if (UNSAFE.compareAndSwapLong(this, ctlOffset, c, nc)) {
+                        addWorker();
+                        return true;            // create a replacement
+                    }
+                }
+                // try to back out on any failure and let caller retry
+            } while (!UNSAFE.compareAndSwapInt(this, blockedCountOffset,
+                                               b = blockedCount, b - 1));
+        }
+        return false;
+!!!1543067.java!!!	postBlock() : void
+        long c;
+        do {} while (!UNSAFE.compareAndSwapLong(this, ctlOffset,  // no mask
+                                                c = ctl, c + AC_UNIT));
+        int b;
+        do {} while (!UNSAFE.compareAndSwapInt(this, blockedCountOffset,
+                                               b = blockedCount, b - 1));
+!!!1543195.java!!!	tryAwaitJoin(inout joinMe : ForkJoinTask) : void
+        Thread.interrupted(); // clear interrupts before checking termination
+        if (joinMe.status >= 0) {
+            if (tryPreBlock()) {
+                joinMe.tryAwaitDone(0L);
+                postBlock();
+            }
+            else if ((ctl & STOP_BIT) != 0L)
+                joinMe.cancelIgnoringExceptions();
+        }
+!!!1543323.java!!!	timedAwaitJoin(inout joinMe : ForkJoinTask, in nanos : long) : void
+        while (joinMe.status >= 0) {
+            Thread.interrupted();
+            if ((ctl & STOP_BIT) != 0L) {
+                joinMe.cancelIgnoringExceptions();
+                break;
+            }
+            if (tryPreBlock()) {
+                long last = System.nanoTime();
+                while (joinMe.status >= 0) {
+                    long millis = TimeUnit.NANOSECONDS.toMillis(nanos);
+                    if (millis <= 0)
+                        break;
+                    joinMe.tryAwaitDone(millis);
+                    if (joinMe.status < 0)
+                        break;
+                    if ((ctl & STOP_BIT) != 0L) {
+                        joinMe.cancelIgnoringExceptions();
+                        break;
+                    }
+                    long now = System.nanoTime();
+                    nanos -= now - last;
+                    last = now;
+                }
+                postBlock();
+                break;
+            }
+        }
+!!!1543451.java!!!	awaitBlocker(inout blocker : ManagedBlocker) : void
+        while (!blocker.isReleasable()) {
+            if (tryPreBlock()) {
+                try {
+                    do {} while (!blocker.isReleasable() && !blocker.block());
+                } finally {
+                    postBlock();
+                }
+                break;
+            }
+        }
+!!!1543579.java!!!	addWorker() : void
+        Throwable ex = null;
+        ForkJoinWorkerThread t = null;
+        try {
+            t = factory.newThread(this);
+        } catch (Throwable e) {
+            ex = e;
+        }
+        if (t == null) {  // null or exceptional factory return
+            long c;       // adjust counts
+            do {} while (!UNSAFE.compareAndSwapLong
+                         (this, ctlOffset, c = ctl,
+                          (((c - AC_UNIT) & AC_MASK) |
+                           ((c - TC_UNIT) & TC_MASK) |
+                           (c & ~(AC_MASK|TC_MASK)))));
+            // Propagate exception if originating from an external caller
+            if (!tryTerminate(false) && ex != null &&
+                !(Thread.currentThread() instanceof ForkJoinWorkerThread))
+                SneakyThrow.sneakyThrow(ex); // android-changed
+        }
+        else
+            t.start();
+!!!1543707.java!!!	nextWorkerName() : String
+        for (int n;;) {
+            if (UNSAFE.compareAndSwapInt(this, nextWorkerNumberOffset,
+                                         n = nextWorkerNumber, ++n))
+                return workerNamePrefix + n;
+        }
+!!!1543835.java!!!	registerWorker(inout w : ForkJoinWorkerThread) : int
+        /*
+         * In the typical case, a new worker acquires the lock, uses
+         * next available index and returns quickly.  Since we should
+         * not block callers (ultimately from signalWork or
+         * tryPreBlock) waiting for the lock needed to do this, we
+         * instead help release other workers while waiting for the
+         * lock.
+         */
+        for (int g;;) {
+            ForkJoinWorkerThread[] ws;
+            if (((g = scanGuard) & SG_UNIT) == 0 &&
+                UNSAFE.compareAndSwapInt(this, scanGuardOffset,
+                                         g, g | SG_UNIT)) {
+                int k = nextWorkerIndex;
+                try {
+                    if ((ws = workers) != null) { // ignore on shutdown
+                        int n = ws.length;
+                        if (k < 0 || k >= n || ws[k] != null) {
+                            for (k = 0; k < n && ws[k] != null; ++k)
+                                ;
+                            if (k == n)
+                                ws = workers = Arrays.copyOf(ws, n << 1);
+                        }
+                        ws[k] = w;
+                        nextWorkerIndex = k + 1;
+                        int m = g & SMASK;
+                        g = (k > m) ? ((m << 1) + 1) & SMASK : g + (SG_UNIT<<1);
+                    }
+                } finally {
+                    scanGuard = g;
+                }
+                return k;
+            }
+            else if ((ws = workers) != null) { // help release others
+                for (ForkJoinWorkerThread u : ws) {
+                    if (u != null && u.queueBase != u.queueTop) {
+                        if (tryReleaseWaiter())
+                            break;
+                    }
+                }
+            }
+        }
+!!!1543963.java!!!	deregisterWorker(inout w : ForkJoinWorkerThread, inout ex : Throwable) : void
+        int idx = w.poolIndex;
+        int sc = w.stealCount;
+        int steps = 0;
+        // Remove from array, adjust worker counts and collect steal count.
+        // We can intermix failed removes or adjusts with steal updates
+        do {
+            long s, c;
+            int g;
+            if (steps == 0 && ((g = scanGuard) & SG_UNIT) == 0 &&
+                UNSAFE.compareAndSwapInt(this, scanGuardOffset,
+                                         g, g |= SG_UNIT)) {
+                ForkJoinWorkerThread[] ws = workers;
+                if (ws != null && idx >= 0 &&
+                    idx < ws.length && ws[idx] == w)
+                    ws[idx] = null;    // verify
+                nextWorkerIndex = idx;
+                scanGuard = g + SG_UNIT;
+                steps = 1;
+            }
+            if (steps == 1 &&
+                UNSAFE.compareAndSwapLong(this, ctlOffset, c = ctl,
+                                          (((c - AC_UNIT) & AC_MASK) |
+                                           ((c - TC_UNIT) & TC_MASK) |
+                                           (c & ~(AC_MASK|TC_MASK)))))
+                steps = 2;
+            if (sc != 0 &&
+                UNSAFE.compareAndSwapLong(this, stealCountOffset,
+                                          s = stealCount, s + sc))
+                sc = 0;
+        } while (steps != 2 || sc != 0);
+        if (!tryTerminate(false)) {
+            if (ex != null)   // possibly replace if died abnormally
+                signalWork();
+            else
+                tryReleaseWaiter();
+        }
+!!!1544091.java!!!	tryTerminate(inout now : boolean) : boolean
+        long c;
+        while (((c = ctl) & STOP_BIT) == 0) {
+            if (!now) {
+                if ((int)(c >> AC_SHIFT) != -parallelism)
+                    return false;
+                if (!shutdown || blockedCount != 0 || quiescerCount != 0 ||
+                    queueBase != queueTop) {
+                    if (ctl == c) // staleness check
+                        return false;
+                    continue;
+                }
+            }
+            if (UNSAFE.compareAndSwapLong(this, ctlOffset, c, c | STOP_BIT))
+                startTerminating();
+        }
+        if ((short)(c >>> TC_SHIFT) == -parallelism) { // signal when 0 workers
+            final ReentrantLock lock = this.submissionLock;
+            lock.lock();
+            try {
+                termination.signalAll();
+            } finally {
+                lock.unlock();
+            }
+        }
+        return true;
+!!!1544219.java!!!	startTerminating() : void
+        cancelSubmissions();
+        for (int pass = 0; pass < 3; ++pass) {
+            ForkJoinWorkerThread[] ws = workers;
+            if (ws != null) {
+                for (ForkJoinWorkerThread w : ws) {
+                    if (w != null) {
+                        w.terminate = true;
+                        if (pass > 0) {
+                            w.cancelTasks();
+                            if (pass > 1 && !w.isInterrupted()) {
+                                try {
+                                    w.interrupt();
+                                } catch (SecurityException ignore) {
+                                }
+                            }
+                        }
+                    }
+                }
+                terminateWaiters();
+            }
+        }
+!!!1544347.java!!!	cancelSubmissions() : void
+        while (queueBase != queueTop) {
+            ForkJoinTask<?> task = pollSubmission();
+            if (task != null) {
+                try {
+                    task.cancel(false);
+                } catch (Throwable ignore) {
+                }
+            }
+        }
+!!!1544475.java!!!	terminateWaiters() : void
+        ForkJoinWorkerThread[] ws = workers;
+        if (ws != null) {
+            ForkJoinWorkerThread w; long c; int i, e;
+            int n = ws.length;
+            while ((i = ~(e = (int)(c = ctl)) & SMASK) < n &&
+                   (w = ws[i]) != null && w.eventCount == (e & E_MASK)) {
+                if (UNSAFE.compareAndSwapLong(this, ctlOffset, c,
+                                              (long)(w.nextWait & E_MASK) |
+                                              ((c + AC_UNIT) & AC_MASK) |
+                                              (c & (TC_MASK|STOP_BIT)))) {
+                    w.terminate = true;
+                    w.eventCount = e + EC_UNIT;
+                    if (w.parked)
+                        UNSAFE.unpark(w);
+                }
+            }
+        }
+!!!1544603.java!!!	addQuiescerCount(in delta : int) : void
+        int c;
+        do {} while (!UNSAFE.compareAndSwapInt(this, quiescerCountOffset,
+                                               c = quiescerCount, c + delta));
+!!!1544731.java!!!	addActiveCount(in delta : int) : void
+        long d = (long)delta << AC_SHIFT;
+        long c;
+        do {} while (!UNSAFE.compareAndSwapLong(this, ctlOffset,
+                                                c = ctl, c + d));
+!!!1544859.java!!!	idlePerActive() : int
+        // Approximate at powers of two for small values, saturate past 4
+        int p = parallelism;
+        int a = p + (int)(ctl >> AC_SHIFT);
+        return (a > (p >>>= 1) ? 0 :
+                a > (p >>>= 1) ? 1 :
+                a > (p >>>= 1) ? 2 :
+                a > (p >>>= 1) ? 4 :
+                8);
+!!!1544987.java!!!	ForkJoinPool()
+        this(Runtime.getRuntime().availableProcessors(),
+             defaultForkJoinWorkerThreadFactory, null, false);
+!!!1545115.java!!!	ForkJoinPool(in parallelism : int)
+        this(parallelism, defaultForkJoinWorkerThreadFactory, null, false);
+!!!1545243.java!!!	ForkJoinPool(in parallelism : int, inout factory : ForkJoinWorkerThreadFactory, inout handler : UncaughtExceptionHandler, inout asyncMode : boolean)
+        checkPermission();
+        if (factory == null)
+            throw new NullPointerException();
+        if (parallelism <= 0 || parallelism > MAX_ID)
+            throw new IllegalArgumentException();
+        this.parallelism = parallelism;
+        this.factory = factory;
+        this.ueh = handler;
+        this.locallyFifo = asyncMode;
+        long np = (long)(-parallelism); // offset ctl counts
+        this.ctl = ((np << AC_SHIFT) & AC_MASK) | ((np << TC_SHIFT) & TC_MASK);
+        this.submissionQueue = new ForkJoinTask<?>[INITIAL_QUEUE_CAPACITY];
+        // initialize workers array with room for 2*parallelism if possible
+        int n = parallelism << 1;
+        if (n >= MAX_ID)
+            n = MAX_ID;
+        else { // See Hackers Delight, sec 3.2, where n < (1 << 16)
+            n |= n >>> 1; n |= n >>> 2; n |= n >>> 4; n |= n >>> 8;
+        }
+        workers = new ForkJoinWorkerThread[n + 1];
+        this.submissionLock = new ReentrantLock();
+        this.termination = submissionLock.newCondition();
+        StringBuilder sb = new StringBuilder("ForkJoinPool-");
+        sb.append(poolNumberGenerator.incrementAndGet());
+        sb.append("-worker-");
+        this.workerNamePrefix = sb.toString();
+!!!1545371.java!!!	invoke(inout task : ForkJoinTask) : T
+        Thread t = Thread.currentThread();
+        if (task == null)
+            throw new NullPointerException();
+        if (shutdown)
+            throw new RejectedExecutionException();
+        if ((t instanceof ForkJoinWorkerThread) &&
+            ((ForkJoinWorkerThread)t).pool == this)
+            return task.invoke();  // bypass submit if in same pool
+        else {
+            addSubmission(task);
+            return task.join();
+        }
+!!!1545499.java!!!	forkOrSubmit(inout task : ForkJoinTask) : void
+        ForkJoinWorkerThread w;
+        Thread t = Thread.currentThread();
+        if (shutdown)
+            throw new RejectedExecutionException();
+        if ((t instanceof ForkJoinWorkerThread) &&
+            (w = (ForkJoinWorkerThread)t).pool == this)
+            w.pushTask(task);
+        else
+            addSubmission(task);
+!!!1545627.java!!!	execute(inout task : ForkJoinTask) : void
+        if (task == null)
+            throw new NullPointerException();
+        forkOrSubmit(task);
+!!!1545755.java!!!	execute(inout task : Runnable) : void
+        if (task == null)
+            throw new NullPointerException();
+        ForkJoinTask<?> job;
+        if (task instanceof ForkJoinTask<?>) // avoid re-wrap
+            job = (ForkJoinTask<?>) task;
+        else
+            job = ForkJoinTask.adapt(task, null);
+        forkOrSubmit(job);
+!!!1545883.java!!!	submit(inout task : ForkJoinTask) : ForkJoinTask
+        if (task == null)
+            throw new NullPointerException();
+        forkOrSubmit(task);
+        return task;
+!!!1546011.java!!!	submit(inout task : Callable) : ForkJoinTask
+        if (task == null)
+            throw new NullPointerException();
+        ForkJoinTask<T> job = ForkJoinTask.adapt(task);
+        forkOrSubmit(job);
+        return job;
+!!!1546139.java!!!	submit(inout task : Runnable, inout result : T) : ForkJoinTask
+        if (task == null)
+            throw new NullPointerException();
+        ForkJoinTask<T> job = ForkJoinTask.adapt(task, result);
+        forkOrSubmit(job);
+        return job;
+!!!1546267.java!!!	submit(inout task : Runnable) : ForkJoinTask
+        if (task == null)
+            throw new NullPointerException();
+        ForkJoinTask<?> job;
+        if (task instanceof ForkJoinTask<?>) // avoid re-wrap
+            job = (ForkJoinTask<?>) task;
+        else
+            job = ForkJoinTask.adapt(task, null);
+        forkOrSubmit(job);
+        return job;
+!!!1546395.java!!!	invokeAll(inout tasks : Collection) : List
+        ArrayList<ForkJoinTask<T>> forkJoinTasks =
+            new ArrayList<ForkJoinTask<T>>(tasks.size());
+        for (Callable<T> task : tasks)
+            forkJoinTasks.add(ForkJoinTask.adapt(task));
+        invoke(new InvokeAll<T>(forkJoinTasks));
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+            List<Future<T>> futures = (List<Future<T>>) (List) forkJoinTasks;
+        return futures;
+!!!1555099.java!!!	getFactory() : ForkJoinWorkerThreadFactory
+        return factory;
+!!!1555227.java!!!	getUncaughtExceptionHandler() : UncaughtExceptionHandler
+        return ueh;
+!!!1555355.java!!!	getParallelism() : int
+        return parallelism;
+!!!1555483.java!!!	getPoolSize() : int
+        return parallelism + (short)(ctl >>> TC_SHIFT);
+!!!1555611.java!!!	getAsyncMode() : boolean
+        return locallyFifo;
+!!!1555739.java!!!	getRunningThreadCount() : int
+        int r = parallelism + (int)(ctl >> AC_SHIFT);
+        return (r <= 0) ? 0 : r; // suppress momentarily negative values
+!!!1555867.java!!!	getActiveThreadCount() : int
+        int r = parallelism + (int)(ctl >> AC_SHIFT) + blockedCount;
+        return (r <= 0) ? 0 : r; // suppress momentarily negative values
+!!!1555995.java!!!	isQuiescent() : boolean
+        return parallelism + (int)(ctl >> AC_SHIFT) + blockedCount == 0;
+!!!1556123.java!!!	getStealCount() : long
+        return stealCount;
+!!!1556251.java!!!	getQueuedTaskCount() : long
+        long count = 0;
+        ForkJoinWorkerThread[] ws;
+        if ((short)(ctl >>> TC_SHIFT) > -parallelism &&
+            (ws = workers) != null) {
+            for (ForkJoinWorkerThread w : ws)
+                if (w != null)
+                    count -= w.queueBase - w.queueTop; // must read base first
+        }
+        return count;
+!!!1556379.java!!!	getQueuedSubmissionCount() : int
+        return -queueBase + queueTop;
+!!!1556507.java!!!	hasQueuedSubmissions() : boolean
+        return queueBase != queueTop;
+!!!1556635.java!!!	pollSubmission() : ForkJoinTask
+        ForkJoinTask<?> t; ForkJoinTask<?>[] q; int b, i;
+        while ((b = queueBase) != queueTop &&
+               (q = submissionQueue) != null &&
+               (i = (q.length - 1) & b) >= 0) {
+            long u = (i << ASHIFT) + ABASE;
+            if ((t = q[i]) != null &&
+                queueBase == b &&
+                UNSAFE.compareAndSwapObject(q, u, t, null)) {
+                queueBase = b + 1;
+                return t;
+            }
+        }
+        return null;
+!!!1556763.java!!!	drainTasksTo(inout c : Collection) : int
+        int count = 0;
+        while (queueBase != queueTop) {
+            ForkJoinTask<?> t = pollSubmission();
+            if (t != null) {
+                c.add(t);
+                ++count;
+            }
+        }
+        ForkJoinWorkerThread[] ws;
+        if ((short)(ctl >>> TC_SHIFT) > -parallelism &&
+            (ws = workers) != null) {
+            for (ForkJoinWorkerThread w : ws)
+                if (w != null)
+                    count += w.drainTasksTo(c);
+        }
+        return count;
+!!!1556891.java!!!	toString() : String
+        long st = getStealCount();
+        long qt = getQueuedTaskCount();
+        long qs = getQueuedSubmissionCount();
+        int pc = parallelism;
+        long c = ctl;
+        int tc = pc + (short)(c >>> TC_SHIFT);
+        int rc = pc + (int)(c >> AC_SHIFT);
+        if (rc < 0) // ignore transient negative
+            rc = 0;
+        int ac = rc + blockedCount;
+        String level;
+        if ((c & STOP_BIT) != 0)
+            level = (tc == 0) ? "Terminated" : "Terminating";
+        else
+            level = shutdown ? "Shutting down" : "Running";
+        return super.toString() +
+            "[" + level +
+            ", parallelism = " + pc +
+            ", size = " + tc +
+            ", active = " + ac +
+            ", running = " + rc +
+            ", steals = " + st +
+            ", tasks = " + qt +
+            ", submissions = " + qs +
+            "]";
+!!!1557019.java!!!	shutdown() : void
+        checkPermission();
+        shutdown = true;
+        tryTerminate(false);
+!!!1557147.java!!!	shutdownNow() : List
+        checkPermission();
+        shutdown = true;
+        tryTerminate(true);
+        return Collections.emptyList();
+!!!1557275.java!!!	isTerminated() : boolean
+        long c = ctl;
+        return ((c & STOP_BIT) != 0L &&
+                (short)(c >>> TC_SHIFT) == -parallelism);
+!!!1557403.java!!!	isTerminating() : boolean
+        long c = ctl;
+        return ((c & STOP_BIT) != 0L &&
+                (short)(c >>> TC_SHIFT) != -parallelism);
+!!!1557531.java!!!	isAtLeastTerminating() : boolean
+        return (ctl & STOP_BIT) != 0L;
+!!!1557659.java!!!	isShutdown() : boolean
+        return shutdown;
+!!!1557787.java!!!	awaitTermination(in timeout : long, inout unit : TimeUnit) : boolean
+        long nanos = unit.toNanos(timeout);
+        final ReentrantLock lock = this.submissionLock;
+        lock.lock();
+        try {
+            for (;;) {
+                if (isTerminated())
+                    return true;
+                if (nanos <= 0)
+                    return false;
+                nanos = termination.awaitNanos(nanos);
+            }
+        } finally {
+            lock.unlock();
+        }
+!!!1558171.java!!!	managedBlock(inout blocker : ManagedBlocker) : void
+        Thread t = Thread.currentThread();
+        if (t instanceof ForkJoinWorkerThread) {
+            ForkJoinWorkerThread w = (ForkJoinWorkerThread) t;
+            w.pool.awaitBlocker(blocker);
+        }
+        else {
+            do {} while (!blocker.isReleasable() && !blocker.block());
+        }
+!!!1558299.java!!!	newTaskFor(inout runnable : Runnable, inout value : T) : RunnableFuture
+        return (RunnableFuture<T>) ForkJoinTask.adapt(runnable, value);
+!!!1558427.java!!!	newTaskFor(inout callable : Callable) : RunnableFuture
+        return (RunnableFuture<T>) ForkJoinTask.adapt(callable);

@@ -1,0 +1,371 @@
+class ForkJoinWorkerThread
+!!!1558555.java!!!	ForkJoinWorkerThread(inout pool : ForkJoinPool)
+        super(pool.nextWorkerName());
+        this.pool = pool;
+        int k = pool.registerWorker(this);
+        poolIndex = k;
+        eventCount = ~k & SMASK; // clear wait count
+        locallyFifo = pool.locallyFifo;
+        Thread.UncaughtExceptionHandler ueh = pool.ueh;
+        if (ueh != null)
+            setUncaughtExceptionHandler(ueh);
+        setDaemon(true);
+!!!1558683.java!!!	getPool() : ForkJoinPool
+        return pool;
+!!!1558811.java!!!	getPoolIndex() : int
+        return poolIndex;
+!!!1558939.java!!!	nextSeed() : int
+        int r = seed;
+        r ^= r << 13;
+        r ^= r >>> 17;
+        r ^= r << 5;
+        return seed = r;
+!!!1559067.java!!!	onStart() : void
+        queue = new ForkJoinTask<?>[INITIAL_QUEUE_CAPACITY];
+        int r = ForkJoinPool.workerSeedGenerator.nextInt();
+        seed = (r == 0) ? 1 : r; //  must be nonzero
+!!!1559195.java!!!	onTermination(inout exception : Throwable) : void
+        try {
+            terminate = true;
+            cancelTasks();
+            pool.deregisterWorker(this, exception);
+        } catch (Throwable ex) {        // Shouldn't ever happen
+            if (exception == null)      // but if so, at least rethrown
+                exception = ex;
+        } finally {
+            if (exception != null)
+                SneakyThrow.sneakyThrow(exception); // android-changed
+        }
+!!!1559323.java!!!	run() : void
+        Throwable exception = null;
+        try {
+            onStart();
+            pool.work(this);
+        } catch (Throwable ex) {
+            exception = ex;
+        } finally {
+            onTermination(exception);
+        }
+!!!1559451.java!!!	casSlotNull(inout q : ForkJoinTask, in i : int, inout t : ForkJoinTask) : boolean
+        return UNSAFE.compareAndSwapObject(q, (i << ASHIFT) + ABASE, t, null);
+!!!1559579.java!!!	writeSlot(inout q : ForkJoinTask, in i : int, inout t : ForkJoinTask) : void
+        UNSAFE.putObjectVolatile(q, (i << ASHIFT) + ABASE, t);
+!!!1559707.java!!!	pushTask(inout t : ForkJoinTask) : void
+        ForkJoinTask<?>[] q; int s, m;
+        if ((q = queue) != null) {    // ignore if queue removed
+            long u = (((s = queueTop) & (m = q.length - 1)) << ASHIFT) + ABASE;
+            UNSAFE.putOrderedObject(q, u, t);
+            queueTop = s + 1;         // or use putOrderedInt
+            if ((s -= queueBase) <= 2)
+                pool.signalWork();
+            else if (s == m)
+                growQueue();
+        }
+!!!1559835.java!!!	growQueue() : void
+        ForkJoinTask<?>[] oldQ = queue;
+        int size = oldQ != null ? oldQ.length << 1 : INITIAL_QUEUE_CAPACITY;
+        if (size > MAXIMUM_QUEUE_CAPACITY)
+            throw new RejectedExecutionException("Queue capacity exceeded");
+        if (size < INITIAL_QUEUE_CAPACITY)
+            size = INITIAL_QUEUE_CAPACITY;
+        ForkJoinTask<?>[] q = queue = new ForkJoinTask<?>[size];
+        int mask = size - 1;
+        int top = queueTop;
+        int oldMask;
+        if (oldQ != null && (oldMask = oldQ.length - 1) >= 0) {
+            for (int b = queueBase; b != top; ++b) {
+                long u = ((b & oldMask) << ASHIFT) + ABASE;
+                Object x = UNSAFE.getObjectVolatile(oldQ, u);
+                if (x != null && UNSAFE.compareAndSwapObject(oldQ, u, x, null))
+                    UNSAFE.putObjectVolatile
+                        (q, ((b & mask) << ASHIFT) + ABASE, x);
+            }
+        }
+!!!1559963.java!!!	deqTask() : ForkJoinTask
+        ForkJoinTask<?> t; ForkJoinTask<?>[] q; int b, i;
+        if (queueTop != (b = queueBase) &&
+            (q = queue) != null && // must read q after b
+            (i = (q.length - 1) & b) >= 0 &&
+            (t = q[i]) != null && queueBase == b &&
+            UNSAFE.compareAndSwapObject(q, (i << ASHIFT) + ABASE, t, null)) {
+            queueBase = b + 1;
+            return t;
+        }
+        return null;
+!!!1560091.java!!!	locallyDeqTask() : ForkJoinTask
+        ForkJoinTask<?> t; int m, b, i;
+        ForkJoinTask<?>[] q = queue;
+        if (q != null && (m = q.length - 1) >= 0) {
+            while (queueTop != (b = queueBase)) {
+                if ((t = q[i = m & b]) != null &&
+                    queueBase == b &&
+                    UNSAFE.compareAndSwapObject(q, (i << ASHIFT) + ABASE,
+                                                t, null)) {
+                    queueBase = b + 1;
+                    return t;
+                }
+            }
+        }
+        return null;
+!!!1560219.java!!!	popTask() : ForkJoinTask
+        int m;
+        ForkJoinTask<?>[] q = queue;
+        if (q != null && (m = q.length - 1) >= 0) {
+            for (int s; (s = queueTop) != queueBase;) {
+                int i = m & --s;
+                long u = (i << ASHIFT) + ABASE; // raw offset
+                ForkJoinTask<?> t = q[i];
+                if (t == null)   // lost to stealer
+                    break;
+                if (UNSAFE.compareAndSwapObject(q, u, t, null)) {
+                    queueTop = s; // or putOrderedInt
+                    return t;
+                }
+            }
+        }
+        return null;
+!!!1560347.java!!!	unpushTask(inout t : ForkJoinTask) : boolean
+        ForkJoinTask<?>[] q;
+        int s;
+        if ((q = queue) != null && (s = queueTop) != queueBase &&
+            UNSAFE.compareAndSwapObject
+            (q, (((q.length - 1) & --s) << ASHIFT) + ABASE, t, null)) {
+            queueTop = s; // or putOrderedInt
+            return true;
+        }
+        return false;
+!!!1560475.java!!!	peekTask() : ForkJoinTask
+        int m;
+        ForkJoinTask<?>[] q = queue;
+        if (q == null || (m = q.length - 1) < 0)
+            return null;
+        int i = locallyFifo ? queueBase : (queueTop - 1);
+        return q[i & m];
+!!!1560603.java!!!	execTask(inout t : ForkJoinTask) : void
+        currentSteal = t;
+        for (;;) {
+            if (t != null)
+                t.doExec();
+            if (queueTop == queueBase)
+                break;
+            t = locallyFifo ? locallyDeqTask() : popTask();
+        }
+        ++stealCount;
+        currentSteal = null;
+!!!1560731.java!!!	cancelTasks() : void
+        ForkJoinTask<?> cj = currentJoin; // try to cancel ongoing tasks
+        if (cj != null && cj.status >= 0)
+            cj.cancelIgnoringExceptions();
+        ForkJoinTask<?> cs = currentSteal;
+        if (cs != null && cs.status >= 0)
+            cs.cancelIgnoringExceptions();
+        while (queueBase != queueTop) {
+            ForkJoinTask<?> t = deqTask();
+            if (t != null)
+                t.cancelIgnoringExceptions();
+        }
+!!!1560859.java!!!	drainTasksTo(inout c : Collection) : int
+        int n = 0;
+        while (queueBase != queueTop) {
+            ForkJoinTask<?> t = deqTask();
+            if (t != null) {
+                c.add(t);
+                ++n;
+            }
+        }
+        return n;
+!!!1560987.java!!!	getQueueSize() : int
+        return queueTop - queueBase;
+!!!1561115.java!!!	pollLocalTask() : ForkJoinTask
+        return locallyFifo ? locallyDeqTask() : popTask();
+!!!1561243.java!!!	pollTask() : ForkJoinTask
+        ForkJoinWorkerThread[] ws;
+        ForkJoinTask<?> t = pollLocalTask();
+        if (t != null || (ws = pool.workers) == null)
+            return t;
+        int n = ws.length; // cheap version of FJP.scan
+        int steps = n << 1;
+        int r = nextSeed();
+        int i = 0;
+        while (i < steps) {
+            ForkJoinWorkerThread w = ws[(i++ + r) & (n - 1)];
+            if (w != null && w.queueBase != w.queueTop && w.queue != null) {
+                if ((t = w.deqTask()) != null)
+                    return t;
+                i = 0;
+            }
+        }
+        return null;
+!!!1561371.java!!!	joinTask(inout joinMe : ForkJoinTask) : int
+        ForkJoinTask<?> prevJoin = currentJoin;
+        currentJoin = joinMe;
+        for (int s, retries = MAX_HELP;;) {
+            if ((s = joinMe.status) < 0) {
+                currentJoin = prevJoin;
+                return s;
+            }
+            if (retries > 0) {
+                if (queueTop != queueBase) {
+                    if (!localHelpJoinTask(joinMe))
+                        retries = 0;           // cannot help
+                }
+                else if (retries == MAX_HELP >>> 1) {
+                    --retries;                 // check uncommon case
+                    if (tryDeqAndExec(joinMe) >= 0)
+                        Thread.yield();        // for politeness
+                }
+                else
+                    retries = helpJoinTask(joinMe) ? MAX_HELP : retries - 1;
+            }
+            else {
+                retries = MAX_HELP;           // restart if not done
+                pool.tryAwaitJoin(joinMe);
+            }
+        }
+!!!1561499.java!!!	localHelpJoinTask(inout joinMe : ForkJoinTask) : boolean
+        int s, i; ForkJoinTask<?>[] q; ForkJoinTask<?> t;
+        if ((s = queueTop) != queueBase && (q = queue) != null &&
+            (i = (q.length - 1) & --s) >= 0 &&
+            (t = q[i]) != null) {
+            if (t != joinMe && t.status >= 0)
+                return false;
+            if (UNSAFE.compareAndSwapObject
+                (q, (i << ASHIFT) + ABASE, t, null)) {
+                queueTop = s;           // or putOrderedInt
+                t.doExec();
+            }
+        }
+        return true;
+!!!1561627.java!!!	helpJoinTask(inout joinMe : ForkJoinTask) : boolean
+        boolean helped = false;
+        int m = pool.scanGuard & SMASK;
+        ForkJoinWorkerThread[] ws = pool.workers;
+        if (ws != null && ws.length > m && joinMe.status >= 0) {
+            int levels = MAX_HELP;              // remaining chain length
+            ForkJoinTask<?> task = joinMe;      // base of chain
+            outer:for (ForkJoinWorkerThread thread = this;;) {
+                // Try to find v, the stealer of task, by first using hint
+                ForkJoinWorkerThread v = ws[thread.stealHint & m];
+                if (v == null || v.currentSteal != task) {
+                    for (int j = 0; ;) {        // search array
+                        if ((v = ws[j]) != null && v.currentSteal == task) {
+                            thread.stealHint = j;
+                            break;              // save hint for next time
+                        }
+                        if (++j > m)
+                            break outer;        // can't find stealer
+                    }
+                }
+                // Try to help v, using specialized form of deqTask
+                for (;;) {
+                    ForkJoinTask<?>[] q; int b, i;
+                    if (joinMe.status < 0)
+                        break outer;
+                    if ((b = v.queueBase) == v.queueTop ||
+                        (q = v.queue) == null ||
+                        (i = (q.length-1) & b) < 0)
+                        break;                  // empty
+                    long u = (i << ASHIFT) + ABASE;
+                    ForkJoinTask<?> t = q[i];
+                    if (task.status < 0)
+                        break outer;            // stale
+                    if (t != null && v.queueBase == b &&
+                        UNSAFE.compareAndSwapObject(q, u, t, null)) {
+                        v.queueBase = b + 1;
+                        v.stealHint = poolIndex;
+                        ForkJoinTask<?> ps = currentSteal;
+                        currentSteal = t;
+                        t.doExec();
+                        currentSteal = ps;
+                        helped = true;
+                    }
+                }
+                // Try to descend to find v's stealer
+                ForkJoinTask<?> next = v.currentJoin;
+                if (--levels > 0 && task.status >= 0 &&
+                    next != null && next != task) {
+                    task = next;
+                    thread = v;
+                }
+                else
+                    break;  // max levels, stale, dead-end, or cyclic
+            }
+        }
+        return helped;
+!!!1561755.java!!!	tryDeqAndExec(inout t : ForkJoinTask) : int
+        int m = pool.scanGuard & SMASK;
+        ForkJoinWorkerThread[] ws = pool.workers;
+        if (ws != null && ws.length > m && t.status >= 0) {
+            for (int j = 0; j <= m; ++j) {
+                ForkJoinTask<?>[] q; int b, i;
+                ForkJoinWorkerThread v = ws[j];
+                if (v != null &&
+                    (b = v.queueBase) != v.queueTop &&
+                    (q = v.queue) != null &&
+                    (i = (q.length - 1) & b) >= 0 &&
+                    q[i] ==  t) {
+                    long u = (i << ASHIFT) + ABASE;
+                    if (v.queueBase == b &&
+                        UNSAFE.compareAndSwapObject(q, u, t, null)) {
+                        v.queueBase = b + 1;
+                        v.stealHint = poolIndex;
+                        ForkJoinTask<?> ps = currentSteal;
+                        currentSteal = t;
+                        t.doExec();
+                        currentSteal = ps;
+                    }
+                    break;
+                }
+            }
+        }
+        return t.status;
+!!!1561883.java!!!	getEstimatedSurplusTaskCount() : int
+        return queueTop - queueBase - pool.idlePerActive();
+!!!1562011.java!!!	helpQuiescePool() : void
+        boolean active = true;
+        ForkJoinTask<?> ps = currentSteal; // to restore below
+        ForkJoinPool p = pool;
+        p.addQuiescerCount(1);
+        for (;;) {
+            ForkJoinWorkerThread[] ws = p.workers;
+            ForkJoinWorkerThread v = null;
+            int n;
+            if (queueTop != queueBase)
+                v = this;
+            else if (ws != null && (n = ws.length) > 1) {
+                ForkJoinWorkerThread w;
+                int r = nextSeed(); // cheap version of FJP.scan
+                int steps = n << 1;
+                for (int i = 0; i < steps; ++i) {
+                    if ((w = ws[(i + r) & (n - 1)]) != null &&
+                        w.queueBase != w.queueTop) {
+                        v = w;
+                        break;
+                    }
+                }
+            }
+            if (v != null) {
+                ForkJoinTask<?> t;
+                if (!active) {
+                    active = true;
+                    p.addActiveCount(1);
+                }
+                if ((t = (v != this) ? v.deqTask() :
+                     locallyFifo ? locallyDeqTask() : popTask()) != null) {
+                    currentSteal = t;
+                    t.doExec();
+                    currentSteal = ps;
+                }
+            }
+            else {
+                if (active) {
+                    active = false;
+                    p.addActiveCount(-1);
+                }
+                if (p.isQuiescent()) {
+                    p.addActiveCount(1);
+                    p.addQuiescerCount(-1);
+                    break;
+                }
+            }
+        }

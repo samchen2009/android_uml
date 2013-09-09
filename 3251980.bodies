@@ -1,0 +1,137 @@
+class MeasurementHandler
+!!!14026508.java!!!	MeasurementHandler(inout context : Context, inout looper : Looper)
+            super(looper);
+            mContext = new WeakReference<Context>(context);
+!!!14026636.java!!!	handleMessage(inout msg : Message) : void
+            switch (msg.what) {
+                case MSG_MEASURE: {
+                    if (mCached != null) {
+                        sendExactUpdate(mCached);
+                        break;
+                    }
+
+                    final Context context = (mContext != null) ? mContext.get() : null;
+                    if (context == null) {
+                        return;
+                    }
+
+                    synchronized (mLock) {
+                        if (mBound) {
+                            removeMessages(MSG_DISCONNECT);
+                            sendMessage(obtainMessage(MSG_CONNECTED, mDefaultContainer));
+                        } else {
+                            Intent service = new Intent().setComponent(DEFAULT_CONTAINER_COMPONENT);
+                            context.bindService(service, mDefContainerConn, Context.BIND_AUTO_CREATE,
+                                    UserHandle.USER_OWNER);
+                        }
+                    }
+                    break;
+                }
+                case MSG_CONNECTED: {
+                    IMediaContainerService imcs = (IMediaContainerService) msg.obj;
+                    measureApproximateStorage(imcs);
+                    measureExactStorage(imcs);
+                    break;
+                }
+                case MSG_DISCONNECT: {
+                    synchronized (mLock) {
+                        if (mBound) {
+                            final Context context = (mContext != null) ? mContext.get() : null;
+                            if (context == null) {
+                                return;
+                            }
+
+                            mBound = false;
+                            context.unbindService(mDefContainerConn);
+                        }
+                    }
+                    break;
+                }
+                case MSG_COMPLETED: {
+                    mCached = (MeasurementDetails) msg.obj;
+                    sendExactUpdate(mCached);
+                    break;
+                }
+                case MSG_INVALIDATE: {
+                    mCached = null;
+                    break;
+                }
+            }
+!!!14026764.java!!!	measureApproximateStorage(inout imcs : IMediaContainerService) : void
+            final String path = mVolume != null ? mVolume.getPath()
+                    : Environment.getDataDirectory().getPath();
+            try {
+                final long[] stats = imcs.getFileSystemStats(path);
+                mTotalSize = stats[0];
+                mAvailSize = stats[1];
+            } catch (Exception e) {
+                Log.w(TAG, "Problem in container service", e);
+            }
+
+            sendInternalApproximateUpdate();
+!!!14026892.java!!!	measureExactStorage(inout imcs : IMediaContainerService) : void
+            final Context context = mContext != null ? mContext.get() : null;
+            if (context == null) {
+                return;
+            }
+
+            final MeasurementDetails details = new MeasurementDetails();
+            final Message finished = obtainMessage(MSG_COMPLETED, details);
+
+            details.totalSize = mTotalSize;
+            details.availSize = mAvailSize;
+
+            final UserManager userManager = (UserManager) context.getSystemService(
+                    Context.USER_SERVICE);
+            final List<UserInfo> users = userManager.getUsers();
+
+            final int currentUser = ActivityManager.getCurrentUser();
+            final UserEnvironment currentEnv = new UserEnvironment(currentUser);
+
+            // Measure media types for emulated storage, or for primary physical
+            // external volume
+            final boolean measureMedia = (mIsInternal && Environment.isExternalStorageEmulated())
+                    || mIsPrimary;
+            if (measureMedia) {
+                for (String type : sMeasureMediaTypes) {
+                    final File path = currentEnv.getExternalStoragePublicDirectory(type);
+                    final long size = getDirectorySize(imcs, path);
+                    details.mediaSize.put(type, size);
+                }
+            }
+
+            // Measure misc files not counted under media
+            if (measureMedia) {
+                final File path = mIsInternal ? currentEnv.getExternalStorageDirectory()
+                        : mVolume.getPathFile();
+                details.miscSize = measureMisc(imcs, path);
+            }
+
+            // Measure total emulated storage of all users; internal apps data
+            // will be spliced in later
+            for (UserInfo user : users) {
+                final UserEnvironment userEnv = new UserEnvironment(user.id);
+                final long size = getDirectorySize(imcs, userEnv.getExternalStorageDirectory());
+                addValue(details.usersSize, user.id, size);
+            }
+
+            // Measure all apps for all users
+            final PackageManager pm = context.getPackageManager();
+            if (mIsInternal || mIsPrimary) {
+                final List<ApplicationInfo> apps = pm.getInstalledApplications(
+                        PackageManager.GET_UNINSTALLED_PACKAGES
+                        | PackageManager.GET_DISABLED_COMPONENTS);
+
+                final int count = users.size() * apps.size();
+                final StatsObserver observer = new StatsObserver(
+                        mIsInternal, details, currentUser, finished, count);
+
+                for (UserInfo user : users) {
+                    for (ApplicationInfo app : apps) {
+                        pm.getPackageSizeInfo(app.packageName, user.id, observer);
+                    }
+                }
+
+            } else {
+                finished.sendToTarget();
+            }

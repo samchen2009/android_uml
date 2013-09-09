@@ -1,0 +1,518 @@
+class RemoteViewsAdapter
+!!!2745484.java!!!	RemoteViewsAdapter(inout context : Context, inout intent : Intent, inout callback : RemoteAdapterConnectionCallback)
+        mContext = context;
+        mIntent = intent;
+        mAppWidgetId = intent.getIntExtra(RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID, -1);
+        mLayoutInflater = LayoutInflater.from(context);
+        if (mIntent == null) {
+            throw new IllegalArgumentException("Non-null Intent must be specified.");
+        }
+        mRequestedViews = new RemoteViewsFrameLayoutRefSet();
+
+        if (Process.myUid() == Process.SYSTEM_UID) {
+            mUserId = new LockPatternUtils(context).getCurrentUser();
+        } else {
+            mUserId = UserHandle.myUserId();
+        }
+        // Strip the previously injected app widget id from service intent
+        if (intent.hasExtra(RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID)) {
+            intent.removeExtra(RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID);
+        }
+
+        // Initialize the worker thread
+        mWorkerThread = new HandlerThread("RemoteViewsCache-loader");
+        mWorkerThread.start();
+        mWorkerQueue = new Handler(mWorkerThread.getLooper());
+        mMainQueue = new Handler(Looper.myLooper(), this);
+
+        if (sCacheRemovalThread == null) {
+            sCacheRemovalThread = new HandlerThread("RemoteViewsAdapter-cachePruner");
+            sCacheRemovalThread.start();
+            sCacheRemovalQueue = new Handler(sCacheRemovalThread.getLooper());
+        }
+
+        // Initialize the cache and the service connection on startup
+        mCallback = new WeakReference<RemoteAdapterConnectionCallback>(callback);
+        mServiceConnection = new RemoteViewsAdapterServiceConnection(this);
+
+        RemoteViewsCacheKey key = new RemoteViewsCacheKey(new Intent.FilterComparison(mIntent),
+                mAppWidgetId, mUserId);
+
+        synchronized(sCachedRemoteViewsCaches) {
+            if (sCachedRemoteViewsCaches.containsKey(key)) {
+                mCache = sCachedRemoteViewsCaches.get(key);
+                synchronized (mCache.mMetaData) {
+                    if (mCache.mMetaData.count > 0) {
+                        // As a precautionary measure, we verify that the meta data indicates a
+                        // non-zero count before declaring that data is ready.
+                        mDataReady = true;
+                    }
+                }
+            } else {
+                mCache = new FixedSizeRemoteViewsCache(sDefaultCacheSize);
+            }
+            if (!mDataReady) {
+                requestBindService();
+            }
+        }
+!!!2745612.java!!!	finalize() : void
+        try {
+            if (mWorkerThread != null) {
+                mWorkerThread.quit();
+            }
+        } finally {
+            super.finalize();
+        }
+!!!2745740.java!!!	isDataReady() : boolean
+        return mDataReady;
+!!!2745868.java!!!	setRemoteViewsOnClickHandler(inout handler : OnClickHandler) : void
+        mRemoteViewsOnClickHandler = handler;
+!!!2745996.java!!!	saveRemoteViewsCache() : void
+        final RemoteViewsCacheKey key = new RemoteViewsCacheKey(
+                new Intent.FilterComparison(mIntent), mAppWidgetId, mUserId);
+
+        synchronized(sCachedRemoteViewsCaches) {
+            // If we already have a remove runnable posted for this key, remove it.
+            if (sRemoteViewsCacheRemoveRunnables.containsKey(key)) {
+                sCacheRemovalQueue.removeCallbacks(sRemoteViewsCacheRemoveRunnables.get(key));
+                sRemoteViewsCacheRemoveRunnables.remove(key);
+            }
+
+            int metaDataCount = 0;
+            int numRemoteViewsCached = 0;
+            synchronized (mCache.mMetaData) {
+                metaDataCount = mCache.mMetaData.count;
+            }
+            synchronized (mCache) {
+                numRemoteViewsCached = mCache.mIndexRemoteViews.size();
+            }
+            if (metaDataCount > 0 && numRemoteViewsCached > 0) {
+                sCachedRemoteViewsCaches.put(key, mCache);
+            }
+
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    synchronized (sCachedRemoteViewsCaches) {
+                        if (sCachedRemoteViewsCaches.containsKey(key)) {
+                            sCachedRemoteViewsCaches.remove(key);
+                        }
+                        if (sRemoteViewsCacheRemoveRunnables.containsKey(key)) {
+                            sRemoteViewsCacheRemoveRunnables.remove(key);
+                        }
+                    }
+                }
+            };
+            sRemoteViewsCacheRemoveRunnables.put(key, r);
+            sCacheRemovalQueue.postDelayed(r, REMOTE_VIEWS_CACHE_DURATION);
+        }
+!!!2746124.java!!!	loadNextIndexInBackground() : void
+        mWorkerQueue.post(new Runnable() {
+            @Override
+            public void run() {
+                if (mServiceConnection.isConnected()) {
+                    // Get the next index to load
+                    int position = -1;
+                    synchronized (mCache) {
+                        int[] res = mCache.getNextIndexToLoad();
+                        position = res[0];
+                    }
+                    if (position > -1) {
+                        // Load the item, and notify any existing RemoteViewsFrameLayouts
+                        updateRemoteViews(position, true);
+
+                        // Queue up for the next one to load
+                        loadNextIndexInBackground();
+                    } else {
+                        // No more items to load, so queue unbind
+                        enqueueDeferredUnbindServiceMessage();
+                    }
+                }
+            }
+        });
+!!!2746252.java!!!	processException(in method : String, inout e : Exception) : void
+        Log.e("RemoteViewsAdapter", "Error in " + method + ": " + e.getMessage());
+
+        // If we encounter a crash when updating, we should reset the metadata & cache and trigger
+        // a notifyDataSetChanged to update the widget accordingly
+        final RemoteViewsMetaData metaData = mCache.getMetaData();
+        synchronized (metaData) {
+            metaData.reset();
+        }
+        synchronized (mCache) {
+            mCache.reset();
+        }
+        mMainQueue.post(new Runnable() {
+            @Override
+            public void run() {
+                superNotifyDataSetChanged();
+            }
+        });
+!!!2746380.java!!!	updateTemporaryMetaData() : void
+        IRemoteViewsFactory factory = mServiceConnection.getRemoteViewsFactory();
+
+        try {
+            // get the properties/first view (so that we can use it to
+            // measure our dummy views)
+            boolean hasStableIds = factory.hasStableIds();
+            int viewTypeCount = factory.getViewTypeCount();
+            int count = factory.getCount();
+            RemoteViews loadingView = factory.getLoadingView();
+            RemoteViews firstView = null;
+            if ((count > 0) && (loadingView == null)) {
+                firstView = factory.getViewAt(0);
+            }
+            final RemoteViewsMetaData tmpMetaData = mCache.getTemporaryMetaData();
+            synchronized (tmpMetaData) {
+                tmpMetaData.hasStableIds = hasStableIds;
+                // We +1 because the base view type is the loading view
+                tmpMetaData.viewTypeCount = viewTypeCount + 1;
+                tmpMetaData.count = count;
+                tmpMetaData.setLoadingViewTemplates(loadingView, firstView);
+            }
+        } catch(RemoteException e) {
+            processException("updateMetaData", e);
+        } catch(RuntimeException e) {
+            processException("updateMetaData", e);
+        }
+!!!2746508.java!!!	updateRemoteViews(in position : int, inout notifyWhenLoaded : boolean) : void
+        IRemoteViewsFactory factory = mServiceConnection.getRemoteViewsFactory();
+
+        // Load the item information from the remote service
+        RemoteViews remoteViews = null;
+        long itemId = 0;
+        try {
+            remoteViews = factory.getViewAt(position);
+            remoteViews.setUser(new UserHandle(mUserId));
+            itemId = factory.getItemId(position);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Error in updateRemoteViews(" + position + "): " + e.getMessage());
+
+            // Return early to prevent additional work in re-centering the view cache, and
+            // swapping from the loading view
+            return;
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Error in updateRemoteViews(" + position + "): " + e.getMessage());
+            return;
+        }
+
+        if (remoteViews == null) {
+            // If a null view was returned, we break early to prevent it from getting
+            // into our cache and causing problems later. The effect is that the child  at this
+            // position will remain as a loading view until it is updated.
+            Log.e(TAG, "Error in updateRemoteViews(" + position + "): " + " null RemoteViews " +
+                    "returned from RemoteViewsFactory.");
+            return;
+        }
+
+        int layoutId = remoteViews.getLayoutId();
+        RemoteViewsMetaData metaData = mCache.getMetaData();
+        boolean viewTypeInRange;
+        int cacheCount;
+        synchronized (metaData) {
+            viewTypeInRange = metaData.isViewTypeInRange(layoutId);
+            cacheCount = mCache.mMetaData.count;
+        }
+        synchronized (mCache) {
+            if (viewTypeInRange) {
+                ArrayList<Integer> visibleWindow = getVisibleWindow(mVisibleWindowLowerBound,
+                        mVisibleWindowUpperBound, cacheCount);
+                // Cache the RemoteViews we loaded
+                mCache.insert(position, remoteViews, itemId, visibleWindow);
+
+                // Notify all the views that we have previously returned for this index that
+                // there is new data for it.
+                final RemoteViews rv = remoteViews;
+                if (notifyWhenLoaded) {
+                    mMainQueue.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            mRequestedViews.notifyOnRemoteViewsLoaded(position, rv);
+                        }
+                    });
+                }
+            } else {
+                // We need to log an error here, as the the view type count specified by the
+                // factory is less than the number of view types returned. We don't return this
+                // view to the AdapterView, as this will cause an exception in the hosting process,
+                // which contains the associated AdapterView.
+                Log.e(TAG, "Error: widget's RemoteViewsFactory returns more view types than " +
+                        " indicated by getViewTypeCount() ");
+            }
+        }
+!!!2746636.java!!!	getRemoteViewsServiceIntent() : Intent
+        return mIntent;
+!!!2746764.java!!!	getCount() : int
+        final RemoteViewsMetaData metaData = mCache.getMetaData();
+        synchronized (metaData) {
+            return metaData.count;
+        }
+!!!2746892.java!!!	getItem(in position : int) : Object
+        // Disallow arbitrary object to be associated with an item for the time being
+        return null;
+!!!2747020.java!!!	getItemId(in position : int) : long
+        synchronized (mCache) {
+            if (mCache.containsMetaDataAt(position)) {
+                return mCache.getMetaDataAt(position).itemId;
+            }
+            return 0;
+        }
+!!!2747148.java!!!	getItemViewType(in position : int) : int
+        int typeId = 0;
+        synchronized (mCache) {
+            if (mCache.containsMetaDataAt(position)) {
+                typeId = mCache.getMetaDataAt(position).typeId;
+            } else {
+                return 0;
+            }
+        }
+
+        final RemoteViewsMetaData metaData = mCache.getMetaData();
+        synchronized (metaData) {
+            return metaData.getMappedViewType(typeId);
+        }
+!!!2747276.java!!!	getConvertViewTypeId(inout convertView : View) : int
+        int typeId = -1;
+        if (convertView != null) {
+            Object tag = convertView.getTag(com.android.internal.R.id.rowTypeId);
+            if (tag != null) {
+                typeId = (Integer) tag;
+            }
+        }
+        return typeId;
+!!!2747404.java!!!	setVisibleRangeHint(in lowerBound : int, in upperBound : int) : void
+        mVisibleWindowLowerBound = lowerBound;
+        mVisibleWindowUpperBound = upperBound;
+!!!2747532.java!!!	getView(in position : int, inout convertView : View, inout parent : ViewGroup) : View
+        // "Request" an index so that we can queue it for loading, initiate subsequent
+        // preloading, etc.
+        synchronized (mCache) {
+            boolean isInCache = mCache.containsRemoteViewAt(position);
+            boolean isConnected = mServiceConnection.isConnected();
+            boolean hasNewItems = false;
+
+            if (convertView != null && convertView instanceof RemoteViewsFrameLayout) {
+                mRequestedViews.removeView((RemoteViewsFrameLayout) convertView);
+            }
+
+            if (!isInCache && !isConnected) {
+                // Requesting bind service will trigger a super.notifyDataSetChanged(), which will
+                // in turn trigger another request to getView()
+                requestBindService();
+            } else {
+                // Queue up other indices to be preloaded based on this position
+                hasNewItems = mCache.queuePositionsToBePreloadedFromRequestedPosition(position);
+            }
+
+            if (isInCache) {
+                View convertViewChild = null;
+                int convertViewTypeId = 0;
+                RemoteViewsFrameLayout layout = null;
+
+                if (convertView instanceof RemoteViewsFrameLayout) {
+                    layout = (RemoteViewsFrameLayout) convertView;
+                    convertViewChild = layout.getChildAt(0);
+                    convertViewTypeId = getConvertViewTypeId(convertViewChild);
+                }
+
+                // Second, we try and retrieve the RemoteViews from the cache, returning a loading
+                // view and queueing it to be loaded if it has not already been loaded.
+                Context context = parent.getContext();
+                RemoteViews rv = mCache.getRemoteViewsAt(position);
+                RemoteViewsIndexMetaData indexMetaData = mCache.getMetaDataAt(position);
+                int typeId = indexMetaData.typeId;
+
+                try {
+                    // Reuse the convert view where possible
+                    if (layout != null) {
+                        if (convertViewTypeId == typeId) {
+                            rv.reapply(context, convertViewChild, mRemoteViewsOnClickHandler);
+                            return layout;
+                        }
+                        layout.removeAllViews();
+                    } else {
+                        layout = new RemoteViewsFrameLayout(context);
+                    }
+
+                    // Otherwise, create a new view to be returned
+                    View newView = rv.apply(context, parent, mRemoteViewsOnClickHandler);
+                    newView.setTagInternal(com.android.internal.R.id.rowTypeId,
+                            new Integer(typeId));
+                    layout.addView(newView);
+                    return layout;
+
+                } catch (Exception e){
+                    // We have to make sure that we successfully inflated the RemoteViews, if not
+                    // we return the loading view instead.
+                    Log.w(TAG, "Error inflating RemoteViews at position: " + position + ", using" +
+                            "loading view instead" + e);
+
+                    RemoteViewsFrameLayout loadingView = null;
+                    final RemoteViewsMetaData metaData = mCache.getMetaData();
+                    synchronized (metaData) {
+                        loadingView = metaData.createLoadingView(position, convertView, parent,
+                                mCache, mLayoutInflater, mRemoteViewsOnClickHandler);
+                    }
+                    return loadingView;
+                } finally {
+                    if (hasNewItems) loadNextIndexInBackground();
+                }
+            } else {
+                // If the cache does not have the RemoteViews at this position, then create a
+                // loading view and queue the actual position to be loaded in the background
+                RemoteViewsFrameLayout loadingView = null;
+                final RemoteViewsMetaData metaData = mCache.getMetaData();
+                synchronized (metaData) {
+                    loadingView = metaData.createLoadingView(position, convertView, parent,
+                            mCache, mLayoutInflater, mRemoteViewsOnClickHandler);
+                }
+
+                mRequestedViews.add(position, loadingView);
+                mCache.queueRequestedPositionToLoad(position);
+                loadNextIndexInBackground();
+
+                return loadingView;
+            }
+        }
+!!!2747660.java!!!	getViewTypeCount() : int
+        final RemoteViewsMetaData metaData = mCache.getMetaData();
+        synchronized (metaData) {
+            return metaData.viewTypeCount;
+        }
+!!!2747788.java!!!	hasStableIds() : boolean
+        final RemoteViewsMetaData metaData = mCache.getMetaData();
+        synchronized (metaData) {
+            return metaData.hasStableIds;
+        }
+!!!2747916.java!!!	isEmpty() : boolean
+        return getCount() <= 0;
+!!!2748044.java!!!	onNotifyDataSetChanged() : void
+        // Complete the actual notifyDataSetChanged() call initiated earlier
+        IRemoteViewsFactory factory = mServiceConnection.getRemoteViewsFactory();
+        try {
+            factory.onDataSetChanged();
+        } catch (RemoteException e) {
+            Log.e(TAG, "Error in updateNotifyDataSetChanged(): " + e.getMessage());
+
+            // Return early to prevent from further being notified (since nothing has
+            // changed)
+            return;
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Error in updateNotifyDataSetChanged(): " + e.getMessage());
+            return;
+        }
+
+        // Flush the cache so that we can reload new items from the service
+        synchronized (mCache) {
+            mCache.reset();
+        }
+
+        // Re-request the new metadata (only after the notification to the factory)
+        updateTemporaryMetaData();
+        int newCount;
+        ArrayList<Integer> visibleWindow;
+        synchronized(mCache.getTemporaryMetaData()) {
+            newCount = mCache.getTemporaryMetaData().count;
+            visibleWindow = getVisibleWindow(mVisibleWindowLowerBound,
+                    mVisibleWindowUpperBound, newCount);
+        }
+
+        // Pre-load (our best guess of) the views which are currently visible in the AdapterView.
+        // This mitigates flashing and flickering of loading views when a widget notifies that
+        // its data has changed.
+        for (int i: visibleWindow) {
+            // Because temporary meta data is only ever modified from this thread (ie.
+            // mWorkerThread), it is safe to assume that count is a valid representation.
+            if (i < newCount) {
+                updateRemoteViews(i, false);
+            }
+        }
+
+        // Propagate the notification back to the base adapter
+        mMainQueue.post(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (mCache) {
+                    mCache.commitTemporaryMetaData();
+                }
+
+                superNotifyDataSetChanged();
+                enqueueDeferredUnbindServiceMessage();
+            }
+        });
+
+        // Reset the notify flagflag
+        mNotifyDataSetChangedAfterOnServiceConnected = false;
+!!!2748172.java!!!	getVisibleWindow(in lower : int, in upper : int, in count : int) : ArrayList<Integer>
+        ArrayList<Integer> window = new ArrayList<Integer>();
+
+        // In the case that the window is invalid or uninitialized, return an empty window.
+        if ((lower == 0 && upper == 0) || lower < 0 || upper < 0) {
+            return window;
+        }
+
+        if (lower <= upper) {
+            for (int i = lower;  i <= upper; i++){
+                window.add(i);
+            }
+        } else {
+            // If the upper bound is less than the lower bound it means that the visible window
+            // wraps around.
+            for (int i = lower; i < count; i++) {
+                window.add(i);
+            }
+            for (int i = 0; i <= upper; i++) {
+                window.add(i);
+            }
+        }
+        return window;
+!!!2748300.java!!!	notifyDataSetChanged() : void
+        // Dequeue any unbind messages
+        mMainQueue.removeMessages(sUnbindServiceMessageType);
+
+        // If we are not connected, queue up the notifyDataSetChanged to be handled when we do
+        // connect
+        if (!mServiceConnection.isConnected()) {
+            if (mNotifyDataSetChangedAfterOnServiceConnected) {
+                return;
+            }
+
+            mNotifyDataSetChangedAfterOnServiceConnected = true;
+            requestBindService();
+            return;
+        }
+
+        mWorkerQueue.post(new Runnable() {
+            @Override
+            public void run() {
+                onNotifyDataSetChanged();
+            }
+        });
+!!!2748428.java!!!	superNotifyDataSetChanged() : void
+        super.notifyDataSetChanged();
+!!!2748556.java!!!	handleMessage(inout msg : Message) : boolean
+        boolean result = false;
+        switch (msg.what) {
+        case sUnbindServiceMessageType:
+            if (mServiceConnection.isConnected()) {
+                mServiceConnection.unbind(mContext, mAppWidgetId, mIntent);
+            }
+            result = true;
+            break;
+        default:
+            break;
+        }
+        return result;
+!!!2748684.java!!!	enqueueDeferredUnbindServiceMessage() : void
+        // Remove any existing deferred-unbind messages
+        mMainQueue.removeMessages(sUnbindServiceMessageType);
+        mMainQueue.sendEmptyMessageDelayed(sUnbindServiceMessageType, sUnbindServiceDelay);
+!!!2748812.java!!!	requestBindService() : boolean
+        // Try binding the service (which will start it if it's not already running)
+        if (!mServiceConnection.isConnected()) {
+            mServiceConnection.bind(mContext, mAppWidgetId, mIntent);
+        }
+
+        // Remove any existing deferred-unbind messages
+        mMainQueue.removeMessages(sUnbindServiceMessageType);
+        return mServiceConnection.isConnected();

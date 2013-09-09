@@ -1,0 +1,123 @@
+class VBRISeeker
+!!!671884.cpp!!!	CreateFromSource(in source : sp<DataSource>, in post_id3_pos : off64_t) : sp<VBRISeeker>
+    off64_t pos = post_id3_pos;
+
+    uint8_t header[4];
+    ssize_t n = source->readAt(pos, header, sizeof(header));
+    if (n < (ssize_t)sizeof(header)) {
+        return NULL;
+    }
+
+    uint32_t tmp = U32_AT(&header[0]);
+    size_t frameSize;
+    int sampleRate;
+    if (!GetMPEGAudioFrameSize(tmp, &frameSize, &sampleRate)) {
+        return NULL;
+    }
+
+    // VBRI header follows 32 bytes after the header _ends_.
+    pos += sizeof(header) + 32;
+
+    uint8_t vbriHeader[26];
+    n = source->readAt(pos, vbriHeader, sizeof(vbriHeader));
+    if (n < (ssize_t)sizeof(vbriHeader)) {
+        return NULL;
+    }
+
+    if (memcmp(vbriHeader, "VBRI", 4)) {
+        return NULL;
+    }
+
+    size_t numFrames = U32_AT(&vbriHeader[14]);
+
+    int64_t durationUs =
+        numFrames * 1000000ll * (sampleRate >= 32000 ? 1152 : 576) / sampleRate;
+
+    ALOGV("duration = %.2f secs", durationUs / 1E6);
+
+    size_t numEntries = U16_AT(&vbriHeader[18]);
+    size_t entrySize = U16_AT(&vbriHeader[22]);
+    size_t scale = U16_AT(&vbriHeader[20]);
+
+    ALOGV("%d entries, scale=%d, size_per_entry=%d",
+         numEntries,
+         scale,
+         entrySize);
+
+    size_t totalEntrySize = numEntries * entrySize;
+    uint8_t *buffer = new uint8_t[totalEntrySize];
+
+    n = source->readAt(pos + sizeof(vbriHeader), buffer, totalEntrySize);
+    if (n < (ssize_t)totalEntrySize) {
+        delete[] buffer;
+        buffer = NULL;
+
+        return NULL;
+    }
+
+    sp<VBRISeeker> seeker = new VBRISeeker;
+    seeker->mBasePos = post_id3_pos + frameSize;
+    // only update mDurationUs if the calculated duration is valid (non zero)
+    // otherwise, leave duration at -1 so that getDuration() and getOffsetForTime()
+    // return false when called, to indicate that this vbri tag does not have the
+    // requested information
+    if (durationUs) {
+        seeker->mDurationUs = durationUs;
+    }
+
+    off64_t offset = post_id3_pos;
+    for (size_t i = 0; i < numEntries; ++i) {
+        uint32_t numBytes;
+        switch (entrySize) {
+            case 1: numBytes = buffer[i]; break;
+            case 2: numBytes = U16_AT(buffer + 2 * i); break;
+            case 3: numBytes = U24_AT(buffer + 3 * i); break;
+            default:
+            {
+                CHECK_EQ(entrySize, 4u);
+                numBytes = U32_AT(buffer + 4 * i); break;
+            }
+        }
+
+        numBytes *= scale;
+
+        seeker->mSegments.push(numBytes);
+
+        ALOGV("entry #%d: %d offset 0x%08lx", i, numBytes, offset);
+        offset += numBytes;
+    }
+
+    delete[] buffer;
+    buffer = NULL;
+
+    ALOGI("Found VBRI header.");
+
+    return seeker;
+!!!672012.cpp!!!	getDuration(inout durationUs : int64_t) : bool
+    if (mDurationUs < 0) {
+        return false;
+    }
+
+    *durationUs = mDurationUs;
+
+    return true;
+!!!672140.cpp!!!	getOffsetForTime(inout timeUs : int64_t, inout pos : off64_t) : bool
+    if (mDurationUs < 0) {
+        return false;
+    }
+
+    int64_t segmentDurationUs = mDurationUs / mSegments.size();
+
+    int64_t nowUs = 0;
+    *pos = mBasePos;
+    size_t segmentIndex = 0;
+    while (segmentIndex < mSegments.size() && nowUs < *timeUs) {
+        nowUs += segmentDurationUs;
+        *pos += mSegments.itemAt(segmentIndex++);
+    }
+
+    ALOGV("getOffsetForTime %lld us => 0x%08lx", *timeUs, *pos);
+
+    *timeUs = nowUs;
+
+    return true;

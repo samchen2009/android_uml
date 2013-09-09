@@ -1,0 +1,679 @@
+class RunningState
+!!!13942284.java!!!	makeLabel(inout pm : PackageManager, in className : String, inout item : PackageItemInfo) : CharSequence
+        if (item != null && (item.labelRes != 0
+                || item.nonLocalizedLabel != null)) {
+            CharSequence label = item.loadLabel(pm);
+            if (label != null) {
+                return label;
+            }
+        }
+        
+        String label = className;
+        int tail = label.lastIndexOf('.');
+        if (tail >= 0) {
+            label = label.substring(tail+1, label.length());
+        }
+        return label;
+!!!13942412.java!!!	getInstance(inout context : Context) : RunningState
+        synchronized (sGlobalLock) {
+            if (sInstance == null) {
+                sInstance = new RunningState(context);
+            }
+            return sInstance;
+        }
+!!!13942540.java!!!	RunningState(inout context : Context)
+        mApplicationContext = context.getApplicationContext();
+        mAm = (ActivityManager)mApplicationContext.getSystemService(Context.ACTIVITY_SERVICE);
+        mPm = mApplicationContext.getPackageManager();
+        mUm = (UserManager)mApplicationContext.getSystemService(Context.USER_SERVICE);
+        mMyUserId = UserHandle.myUserId();
+        mResumed = false;
+        mBackgroundThread = new HandlerThread("RunningState:Background");
+        mBackgroundThread.start();
+        mBackgroundHandler = new BackgroundHandler(mBackgroundThread.getLooper());
+!!!13942668.java!!!	resume(inout listener : OnRefreshUiListener) : void
+        synchronized (mLock) {
+            mResumed = true;
+            mRefreshUiListener = listener;
+            if (mInterestingConfigChanges.applyNewConfig(mApplicationContext.getResources())) {
+                mHaveData = false;
+                mBackgroundHandler.removeMessages(MSG_RESET_CONTENTS);
+                mBackgroundHandler.removeMessages(MSG_UPDATE_CONTENTS);
+                mBackgroundHandler.sendEmptyMessage(MSG_RESET_CONTENTS);
+            }
+            if (!mBackgroundHandler.hasMessages(MSG_UPDATE_CONTENTS)) {
+                mBackgroundHandler.sendEmptyMessage(MSG_UPDATE_CONTENTS);
+            }
+            mHandler.sendEmptyMessage(MSG_UPDATE_TIME);
+        }
+!!!13942796.java!!!	updateNow() : void
+        synchronized (mLock) {
+            mBackgroundHandler.removeMessages(MSG_UPDATE_CONTENTS);
+            mBackgroundHandler.sendEmptyMessage(MSG_UPDATE_CONTENTS);
+        }
+!!!13942924.java!!!	hasData() : boolean
+        synchronized (mLock) {
+            return mHaveData;
+        }
+!!!13943052.java!!!	waitForData() : void
+        synchronized (mLock) {
+            while (!mHaveData) {
+                try {
+                    mLock.wait(0);
+                } catch (InterruptedException e) {
+                }
+            }
+        }
+!!!13943180.java!!!	pause() : void
+        synchronized (mLock) {
+            mResumed = false;
+            mRefreshUiListener = null;
+            mHandler.removeMessages(MSG_UPDATE_TIME);
+        }
+!!!13943308.java!!!	isInterestingProcess(inout pi : RunningAppProcessInfo) : boolean
+        if ((pi.flags&ActivityManager.RunningAppProcessInfo.FLAG_CANT_SAVE_STATE) != 0) {
+            return true;
+        }
+        if ((pi.flags&ActivityManager.RunningAppProcessInfo.FLAG_PERSISTENT) == 0
+                && pi.importance >= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+                && pi.importance < ActivityManager.RunningAppProcessInfo.IMPORTANCE_CANT_SAVE_STATE
+                && pi.importanceReasonCode
+                        == ActivityManager.RunningAppProcessInfo.REASON_UNKNOWN) {
+            return true;
+        }
+        return false;
+!!!13943436.java!!!	reset() : void
+        mServiceProcessesByName.clear();
+        mServiceProcessesByPid.clear();
+        mInterestingProcesses.clear();
+        mRunningProcesses.clear();
+        mProcessItems.clear();
+        mAllProcessItems.clear();
+        mUsers.clear();
+!!!13943564.java!!!	addOtherUserItem(inout context : Context, inout newMergedItems : ArrayList<MergedItem>, inout userItems : SparseArray, inout newItem : MergedItem) : void
+        MergedItem userItem = userItems.get(newItem.mUserId);
+        boolean first = userItem == null || userItem.mCurSeq != mSequence;
+        if (first) {
+            if (userItem == null) {
+                userItem = new MergedItem(newItem.mUserId);
+                userItems.put(newItem.mUserId, userItem);
+            } else {
+                userItem.mChildren.clear();
+            }
+            userItem.mCurSeq = mSequence;
+            if ((userItem.mUser=mUsers.get(newItem.mUserId)) == null) {
+                userItem.mUser = new UserState();
+                UserInfo info = mUm.getUserInfo(newItem.mUserId);
+                userItem.mUser.mInfo = info;
+                if (info != null) {
+                    userItem.mUser.mIcon = UserUtils.getUserIcon(mUm, info,
+                            context.getResources());
+                }
+                String name = info != null ? info.name : null;
+                if (name == null) {
+                    name = Integer.toString(info.id);
+                }
+                userItem.mUser.mLabel = context.getResources().getString(
+                        R.string.running_process_item_user_label, name);
+            }
+            newMergedItems.add(userItem);
+        }
+        userItem.mChildren.add(newItem);
+!!!13943692.java!!!	update(inout context : Context, inout am : ActivityManager) : boolean
+        final PackageManager pm = context.getPackageManager();
+        
+        mSequence++;
+        
+        boolean changed = false;
+
+        // Retrieve list of services, filtering out anything that definitely
+        // won't be shown in the UI.
+        List<ActivityManager.RunningServiceInfo> services 
+                = am.getRunningServices(MAX_SERVICES);
+        int NS = services != null ? services.size() : 0;
+        for (int i=0; i<NS; i++) {
+            ActivityManager.RunningServiceInfo si = services.get(i);
+            // We are not interested in services that have not been started
+            // and don't have a known client, because
+            // there is nothing the user can do about them.
+            if (!si.started && si.clientLabel == 0) {
+                services.remove(i);
+                i--;
+                NS--;
+                continue;
+            }
+            // We likewise don't care about services running in a
+            // persistent process like the system or phone.
+            if ((si.flags&ActivityManager.RunningServiceInfo.FLAG_PERSISTENT_PROCESS)
+                    != 0) {
+                services.remove(i);
+                i--;
+                NS--;
+                continue;
+            }
+        }
+
+        // Retrieve list of running processes, organizing them into a sparse
+        // array for easy retrieval.
+        List<ActivityManager.RunningAppProcessInfo> processes
+                = am.getRunningAppProcesses();
+        final int NP = processes != null ? processes.size() : 0;
+        mTmpAppProcesses.clear();
+        for (int i=0; i<NP; i++) {
+            ActivityManager.RunningAppProcessInfo pi = processes.get(i);
+            mTmpAppProcesses.put(pi.pid, new AppProcessInfo(pi));
+        }
+
+        // Initial iteration through running services to collect per-process
+        // info about them.
+        for (int i=0; i<NS; i++) {
+            ActivityManager.RunningServiceInfo si = services.get(i);
+            if (si.restarting == 0 && si.pid > 0) {
+                AppProcessInfo ainfo = mTmpAppProcesses.get(si.pid);
+                if (ainfo != null) {
+                    ainfo.hasServices = true;
+                    if (si.foreground) {
+                        ainfo.hasForegroundServices = true;
+                    }
+                }
+            }
+        }
+
+        // Update state we are maintaining about process that are running services.
+        for (int i=0; i<NS; i++) {
+            ActivityManager.RunningServiceInfo si = services.get(i);
+
+            // If this service's process is in use at a higher importance
+            // due to another process bound to one of its services, then we
+            // won't put it in the top-level list of services.  Instead we
+            // want it to be included in the set of processes that the other
+            // process needs.
+            if (si.restarting == 0 && si.pid > 0) {
+                AppProcessInfo ainfo = mTmpAppProcesses.get(si.pid);
+                if (ainfo != null && !ainfo.hasForegroundServices) {
+                    // This process does not have any foreground services.
+                    // If its importance is greater than the service importance
+                    // then there is something else more significant that is
+                    // keeping it around that it should possibly be included as
+                    // a part of instead of being shown by itself.
+                    if (ainfo.info.importance
+                            < ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE) {
+                        // Follow process chain to see if there is something
+                        // else that could be shown
+                        boolean skip = false;
+                        ainfo = mTmpAppProcesses.get(ainfo.info.importanceReasonPid);
+                        while (ainfo != null) {
+                            if (ainfo.hasServices || isInterestingProcess(ainfo.info)) {
+                                skip = true;
+                                break;
+                            }
+                            ainfo = mTmpAppProcesses.get(ainfo.info.importanceReasonPid);
+                        }
+                        if (skip) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            HashMap<String, ProcessItem> procs = mServiceProcessesByName.get(si.uid);
+            if (procs == null) {
+                procs = new HashMap<String, ProcessItem>();
+                mServiceProcessesByName.put(si.uid, procs);
+            }
+            ProcessItem proc = procs.get(si.process);
+            if (proc == null) {
+                changed = true;
+                proc = new ProcessItem(context, si.uid, si.process);
+                procs.put(si.process, proc);
+            }
+            
+            if (proc.mCurSeq != mSequence) {
+                int pid = si.restarting == 0 ? si.pid : 0;
+                if (pid != proc.mPid) {
+                    changed = true;
+                    if (proc.mPid != pid) {
+                        if (proc.mPid != 0) {
+                            mServiceProcessesByPid.remove(proc.mPid);
+                        }
+                        if (pid != 0) {
+                            mServiceProcessesByPid.put(pid, proc);
+                        }
+                        proc.mPid = pid;
+                    }
+                }
+                proc.mDependentProcesses.clear();
+                proc.mCurSeq = mSequence;
+            }
+            changed |= proc.updateService(context, si);
+        }
+        
+        // Now update the map of other processes that are running (but
+        // don't have services actively running inside them).
+        for (int i=0; i<NP; i++) {
+            ActivityManager.RunningAppProcessInfo pi = processes.get(i);
+            ProcessItem proc = mServiceProcessesByPid.get(pi.pid);
+            if (proc == null) {
+                // This process is not one that is a direct container
+                // of a service, so look for it in the secondary
+                // running list.
+                proc = mRunningProcesses.get(pi.pid);
+                if (proc == null) {
+                    changed = true;
+                    proc = new ProcessItem(context, pi.uid, pi.processName);
+                    proc.mPid = pi.pid;
+                    mRunningProcesses.put(pi.pid, proc);
+                }
+                proc.mDependentProcesses.clear();
+            }
+            
+            if (isInterestingProcess(pi)) {
+                if (!mInterestingProcesses.contains(proc)) {
+                    changed = true;
+                    mInterestingProcesses.add(proc);
+                }
+                proc.mCurSeq = mSequence;
+                proc.mInteresting = true;
+                proc.ensureLabel(pm);
+            } else {
+                proc.mInteresting = false;
+            }
+            
+            proc.mRunningSeq = mSequence;
+            proc.mRunningProcessInfo = pi;
+        }
+
+        // Build the chains from client processes to the process they are
+        // dependent on; also remove any old running processes.
+        int NRP = mRunningProcesses.size();
+        for (int i = 0; i < NRP;) {
+            ProcessItem proc = mRunningProcesses.valueAt(i);
+            if (proc.mRunningSeq == mSequence) {
+                int clientPid = proc.mRunningProcessInfo.importanceReasonPid;
+                if (clientPid != 0) {
+                    ProcessItem client = mServiceProcessesByPid.get(clientPid);
+                    if (client == null) {
+                        client = mRunningProcesses.get(clientPid);
+                    }
+                    if (client != null) {
+                        client.mDependentProcesses.put(proc.mPid, proc);
+                    }
+                } else {
+                    // In this pass the process doesn't have a client.
+                    // Clear to make sure that, if it later gets the same one,
+                    // we will detect the change.
+                    proc.mClient = null;
+                }
+                i++;
+            } else {
+                changed = true;
+                mRunningProcesses.remove(mRunningProcesses.keyAt(i));
+                NRP--;
+            }
+        }
+        
+        // Remove any old interesting processes.
+        int NHP = mInterestingProcesses.size();
+        for (int i=0; i<NHP; i++) {
+            ProcessItem proc = mInterestingProcesses.get(i);
+            if (!proc.mInteresting || mRunningProcesses.get(proc.mPid) == null) {
+                changed = true;
+                mInterestingProcesses.remove(i);
+                i--;
+                NHP--;
+            }
+        }
+        
+        // Follow the tree from all primary service processes to all
+        // processes they are dependent on, marking these processes as
+        // still being active and determining if anything has changed.
+        final int NAP = mServiceProcessesByPid.size();
+        for (int i=0; i<NAP; i++) {
+            ProcessItem proc = mServiceProcessesByPid.valueAt(i);
+            if (proc.mCurSeq == mSequence) {
+                changed |= proc.buildDependencyChain(context, pm, mSequence);
+            }
+        }
+        
+        // Look for services and their primary processes that no longer exist...
+        ArrayList<Integer> uidToDelete = null;
+        for (int i=0; i<mServiceProcessesByName.size(); i++) {
+            HashMap<String, ProcessItem> procs = mServiceProcessesByName.valueAt(i);
+            Iterator<ProcessItem> pit = procs.values().iterator();
+            while (pit.hasNext()) {
+                ProcessItem pi = pit.next();
+                if (pi.mCurSeq == mSequence) {
+                    pi.ensureLabel(pm);
+                    if (pi.mPid == 0) {
+                        // Sanity: a non-process can't be dependent on
+                        // anything.
+                        pi.mDependentProcesses.clear();
+                    }
+                } else {
+                    changed = true;
+                    pit.remove();
+                    if (procs.size() == 0) {
+                        if (uidToDelete == null) {
+                            uidToDelete = new ArrayList<Integer>();
+                        }
+                        uidToDelete.add(mServiceProcessesByName.keyAt(i));
+                    }
+                    if (pi.mPid != 0) {
+                        mServiceProcessesByPid.remove(pi.mPid);
+                    }
+                    continue;
+                }
+                Iterator<ServiceItem> sit = pi.mServices.values().iterator();
+                while (sit.hasNext()) {
+                    ServiceItem si = sit.next();
+                    if (si.mCurSeq != mSequence) {
+                        changed = true;
+                        sit.remove();
+                    }
+                }
+            }
+        }
+        
+        if (uidToDelete != null) {
+            for (int i = 0; i < uidToDelete.size(); i++) {
+                int uid = uidToDelete.get(i);
+                mServiceProcessesByName.remove(uid);
+            }
+        }
+
+        if (changed) {
+            // First determine an order for the services.
+            ArrayList<ProcessItem> sortedProcesses = new ArrayList<ProcessItem>();
+            for (int i=0; i<mServiceProcessesByName.size(); i++) {
+                for (ProcessItem pi : mServiceProcessesByName.valueAt(i).values()) {
+                    pi.mIsSystem = false;
+                    pi.mIsStarted = true;
+                    pi.mActiveSince = Long.MAX_VALUE;
+                    for (ServiceItem si : pi.mServices.values()) {
+                        if (si.mServiceInfo != null
+                                && (si.mServiceInfo.applicationInfo.flags
+                                        & ApplicationInfo.FLAG_SYSTEM) != 0) {
+                            pi.mIsSystem = true;
+                        }
+                        if (si.mRunningService != null
+                                && si.mRunningService.clientLabel != 0) {
+                            pi.mIsStarted = false;
+                            if (pi.mActiveSince > si.mRunningService.activeSince) {
+                                pi.mActiveSince = si.mRunningService.activeSince;
+                            }
+                        }
+                    }
+                    sortedProcesses.add(pi);
+                }
+            }
+            
+            Collections.sort(sortedProcesses, mServiceProcessComparator);
+            
+            ArrayList<BaseItem> newItems = new ArrayList<BaseItem>();
+            ArrayList<MergedItem> newMergedItems = new ArrayList<MergedItem>();
+            SparseArray<MergedItem> otherUsers = null;
+            mProcessItems.clear();
+            for (int i=0; i<sortedProcesses.size(); i++) {
+                ProcessItem pi = sortedProcesses.get(i);
+                pi.mNeedDivider = false;
+                
+                int firstProc = mProcessItems.size();
+                // First add processes we are dependent on.
+                pi.addDependentProcesses(newItems, mProcessItems);
+                // And add the process itself.
+                newItems.add(pi);
+                if (pi.mPid > 0) {
+                    mProcessItems.add(pi);
+                }
+                
+                // Now add the services running in it.
+                MergedItem mergedItem = null;
+                boolean haveAllMerged = false;
+                boolean needDivider = false;
+                for (ServiceItem si : pi.mServices.values()) {
+                    si.mNeedDivider = needDivider;
+                    needDivider = true;
+                    newItems.add(si);
+                    if (si.mMergedItem != null) {
+                        if (mergedItem != null && mergedItem != si.mMergedItem) {
+                            haveAllMerged = false;
+                        }
+                        mergedItem = si.mMergedItem;
+                    } else {
+                        haveAllMerged = false;
+                    }
+                }
+                
+                if (!haveAllMerged || mergedItem == null
+                        || mergedItem.mServices.size() != pi.mServices.size()) {
+                    // Whoops, we need to build a new MergedItem!
+                    mergedItem = new MergedItem(pi.mUserId);
+                    for (ServiceItem si : pi.mServices.values()) {
+                        mergedItem.mServices.add(si);
+                        si.mMergedItem = mergedItem;
+                    }
+                    mergedItem.mProcess = pi;
+                    mergedItem.mOtherProcesses.clear();
+                    for (int mpi=firstProc; mpi<(mProcessItems.size()-1); mpi++) {
+                        mergedItem.mOtherProcesses.add(mProcessItems.get(mpi));
+                    }
+                }
+                
+                mergedItem.update(context, false);
+                if (mergedItem.mUserId != mMyUserId) {
+                    addOtherUserItem(context, newMergedItems, mOtherUserMergedItems, mergedItem);
+                } else {
+                    newMergedItems.add(mergedItem);
+                }
+            }
+
+            // Finally, interesting processes need to be shown and will
+            // go at the top.
+            NHP = mInterestingProcesses.size();
+            for (int i=0; i<NHP; i++) {
+                ProcessItem proc = mInterestingProcesses.get(i);
+                if (proc.mClient == null && proc.mServices.size() <= 0) {
+                    if (proc.mMergedItem == null) {
+                        proc.mMergedItem = new MergedItem(proc.mUserId);
+                        proc.mMergedItem.mProcess = proc;
+                    }
+                    proc.mMergedItem.update(context, false);
+                    if (proc.mMergedItem.mUserId != mMyUserId) {
+                        addOtherUserItem(context, newMergedItems, mOtherUserMergedItems,
+                                proc.mMergedItem);
+                    } else {
+                        newMergedItems.add(0, proc.mMergedItem);
+                    }
+                    mProcessItems.add(proc);
+                }
+            }
+
+            // Finally finally, user aggregated merged items need to be
+            // updated now that they have all of their children.
+            final int NU = mOtherUserMergedItems.size();
+            for (int i=0; i<NU; i++) {
+                MergedItem user = mOtherUserMergedItems.valueAt(i);
+                if (user.mCurSeq == mSequence) {
+                    user.update(context, false);
+                }
+            }
+
+            synchronized (mLock) {
+                mItems = newItems;
+                mMergedItems = newMergedItems;
+            }
+        }
+        
+        // Count number of interesting other (non-active) processes, and
+        // build a list of all processes we will retrieve memory for.
+        mAllProcessItems.clear();
+        mAllProcessItems.addAll(mProcessItems);
+        int numBackgroundProcesses = 0;
+        int numForegroundProcesses = 0;
+        int numServiceProcesses = 0;
+        NRP = mRunningProcesses.size();
+        for (int i=0; i<NRP; i++) {
+            ProcessItem proc = mRunningProcesses.valueAt(i);
+            if (proc.mCurSeq != mSequence) {
+                // We didn't hit this process as a dependency on one
+                // of our active ones, so add it up if needed.
+                if (proc.mRunningProcessInfo.importance >=
+                        ActivityManager.RunningAppProcessInfo.IMPORTANCE_BACKGROUND) {
+                    numBackgroundProcesses++;
+                    mAllProcessItems.add(proc);
+                } else if (proc.mRunningProcessInfo.importance <=
+                        ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) {
+                    numForegroundProcesses++;
+                    mAllProcessItems.add(proc);
+                } else {
+                    Log.i("RunningState", "Unknown non-service process: "
+                            + proc.mProcessName + " #" + proc.mPid);
+                }
+            } else {
+                numServiceProcesses++;
+            }
+        }
+        
+        long backgroundProcessMemory = 0;
+        long foregroundProcessMemory = 0;
+        long serviceProcessMemory = 0;
+        ArrayList<MergedItem> newBackgroundItems = null;
+        ArrayList<MergedItem> newUserBackgroundItems = null;
+        boolean diffUsers = false;
+        try {
+            final int numProc = mAllProcessItems.size();
+            int[] pids = new int[numProc];
+            for (int i=0; i<numProc; i++) {
+                pids[i] = mAllProcessItems.get(i).mPid;
+            }
+            long[] pss = ActivityManagerNative.getDefault()
+                    .getProcessPss(pids);
+            int bgIndex = 0;
+            for (int i=0; i<pids.length; i++) {
+                ProcessItem proc = mAllProcessItems.get(i);
+                changed |= proc.updateSize(context, pss[i], mSequence);
+                if (proc.mCurSeq == mSequence) {
+                    serviceProcessMemory += proc.mSize;
+                } else if (proc.mRunningProcessInfo.importance >=
+                        ActivityManager.RunningAppProcessInfo.IMPORTANCE_BACKGROUND) {
+                    backgroundProcessMemory += proc.mSize;
+                    MergedItem mergedItem;
+                    if (newBackgroundItems != null) {
+                        mergedItem = proc.mMergedItem = new MergedItem(proc.mUserId);
+                        proc.mMergedItem.mProcess = proc;
+                        diffUsers |= mergedItem.mUserId != mMyUserId;
+                        newBackgroundItems.add(mergedItem);
+                    } else {
+                        if (bgIndex >= mBackgroundItems.size()
+                                || mBackgroundItems.get(bgIndex).mProcess != proc) {
+                            newBackgroundItems = new ArrayList<MergedItem>(numBackgroundProcesses);
+                            for (int bgi=0; bgi<bgIndex; bgi++) {
+                                mergedItem = mBackgroundItems.get(bgi);
+                                diffUsers |= mergedItem.mUserId != mMyUserId;
+                                newBackgroundItems.add(mergedItem);
+                            }
+                            mergedItem = proc.mMergedItem = new MergedItem(proc.mUserId);
+                            proc.mMergedItem.mProcess = proc;
+                            diffUsers |= mergedItem.mUserId != mMyUserId;
+                            newBackgroundItems.add(mergedItem);
+                        } else {
+                            mergedItem = mBackgroundItems.get(bgIndex);
+                        }
+                    }
+                    mergedItem.update(context, true);
+                    mergedItem.updateSize(context);
+                    bgIndex++;
+                } else if (proc.mRunningProcessInfo.importance <=
+                        ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) {
+                    foregroundProcessMemory += proc.mSize;
+                }
+            }
+        } catch (RemoteException e) {
+        }
+        
+        if (newBackgroundItems == null) {
+            // One or more at the bottom may no longer exist.
+            if (mBackgroundItems.size() > numBackgroundProcesses) {
+                newBackgroundItems = new ArrayList<MergedItem>(numBackgroundProcesses);
+                for (int bgi=0; bgi<numBackgroundProcesses; bgi++) {
+                    MergedItem mergedItem = mBackgroundItems.get(bgi);
+                    diffUsers |= mergedItem.mUserId != mMyUserId;
+                    newBackgroundItems.add(mergedItem);
+                }
+            }
+        }
+
+        if (newBackgroundItems != null) {
+            // The background items have changed; we need to re-build the
+            // per-user items.
+            if (!diffUsers) {
+                // Easy: there are no other users, we can just use the same array.
+                newUserBackgroundItems = newBackgroundItems;
+            } else {
+                // We now need to re-build the per-user list so that background
+                // items for users are collapsed together.
+                newUserBackgroundItems = new ArrayList<MergedItem>();
+                final int NB = newBackgroundItems.size();
+                for (int i=0; i<NB; i++) {
+                    MergedItem mergedItem = newBackgroundItems.get(i);
+                    if (mergedItem.mUserId != mMyUserId) {
+                        addOtherUserItem(context, newUserBackgroundItems,
+                                mOtherUserBackgroundItems, mergedItem);
+                    } else {
+                        newUserBackgroundItems.add(mergedItem);
+                    }
+                }
+                // And user aggregated merged items need to be
+                // updated now that they have all of their children.
+                final int NU = mOtherUserBackgroundItems.size();
+                for (int i=0; i<NU; i++) {
+                    MergedItem user = mOtherUserBackgroundItems.valueAt(i);
+                    if (user.mCurSeq == mSequence) {
+                        user.update(context, true);
+                        user.updateSize(context);
+                    }
+                }
+            }
+        }
+
+        for (int i=0; i<mMergedItems.size(); i++) {
+            mMergedItems.get(i).updateSize(context);
+        }
+        
+        synchronized (mLock) {
+            mNumBackgroundProcesses = numBackgroundProcesses;
+            mNumForegroundProcesses = numForegroundProcesses;
+            mNumServiceProcesses = numServiceProcesses;
+            mBackgroundProcessMemory = backgroundProcessMemory;
+            mForegroundProcessMemory = foregroundProcessMemory;
+            mServiceProcessMemory = serviceProcessMemory;
+            if (newBackgroundItems != null) {
+                mBackgroundItems = newBackgroundItems;
+                mUserBackgroundItems = newUserBackgroundItems;
+                if (mWatchingBackgroundItems) {
+                    changed = true;
+                }
+            }
+            if (!mHaveData) {
+                mHaveData = true;
+                mLock.notifyAll();
+            }
+        }
+        
+        return changed;
+!!!13943820.java!!!	getCurrentItems() : BaseItem
+        synchronized (mLock) {
+            return mItems;
+        }
+!!!13943948.java!!!	setWatchingBackgroundItems(inout watching : boolean) : void
+        synchronized (mLock) {
+            mWatchingBackgroundItems = watching;
+        }
+!!!13944076.java!!!	getCurrentMergedItems() : MergedItem
+        synchronized (mLock) {
+            return mMergedItems;
+        }
+!!!13944204.java!!!	getCurrentBackgroundItems() : MergedItem
+        synchronized (mLock) {
+            return mUserBackgroundItems;
+        }

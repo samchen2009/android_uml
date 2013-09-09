@@ -1,0 +1,266 @@
+class VibratorService
+!!!8284812.java!!!	VibratorService(inout context : Context)
+        // Reset the hardware to a default state, in case this is a runtime
+        // restart instead of a fresh boot.
+        vibratorOff();
+
+        mContext = context;
+        PowerManager pm = (PowerManager)context.getSystemService(
+                Context.POWER_SERVICE);
+        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "*vibrator*");
+        mWakeLock.setReferenceCounted(true);
+
+        mVibrations = new LinkedList<Vibration>();
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        context.registerReceiver(mIntentReceiver, filter);
+!!!8284940.java!!!	systemReady() : void
+        mIm = (InputManager)mContext.getSystemService(Context.INPUT_SERVICE);
+
+        mContext.getContentResolver().registerContentObserver(
+                Settings.System.getUriFor(Settings.System.VIBRATE_INPUT_DEVICES), true,
+                new ContentObserver(mH) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        updateInputDeviceVibrators();
+                    }
+                }, UserHandle.USER_ALL);
+
+        mContext.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                updateInputDeviceVibrators();
+            }
+        }, new IntentFilter(Intent.ACTION_USER_SWITCHED), null, mH);
+
+        updateInputDeviceVibrators();
+!!!8285068.java!!!	hasVibrator() : boolean
+        return doVibratorExists();
+!!!8285196.java!!!	vibrate(in milliseconds : long, inout token : IBinder) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.VIBRATE)
+                != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("Requires VIBRATE permission");
+        }
+        int uid = Binder.getCallingUid();
+        // We're running in the system server so we cannot crash. Check for a
+        // timeout of 0 or negative. This will ensure that a vibration has
+        // either a timeout of > 0 or a non-null pattern.
+        if (milliseconds <= 0 || (mCurrentVibration != null
+                && mCurrentVibration.hasLongerTimeout(milliseconds))) {
+            // Ignore this vibration since the current vibration will play for
+            // longer than milliseconds.
+            return;
+        }
+
+        Vibration vib = new Vibration(token, milliseconds, uid);
+        synchronized (mVibrations) {
+            removeVibrationLocked(token);
+            doCancelVibrateLocked();
+            mCurrentVibration = vib;
+            startVibrationLocked(vib);
+        }
+!!!8285324.java!!!	isAll0(inout pattern : long) : boolean
+        int N = pattern.length;
+        for (int i = 0; i < N; i++) {
+            if (pattern[i] != 0) {
+                return false;
+            }
+        }
+        return true;
+!!!8285452.java!!!	vibratePattern(inout pattern : long, in repeat : int, inout token : IBinder) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.VIBRATE)
+                != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("Requires VIBRATE permission");
+        }
+        int uid = Binder.getCallingUid();
+        // so wakelock calls will succeed
+        long identity = Binder.clearCallingIdentity();
+        try {
+            if (false) {
+                String s = "";
+                int N = pattern.length;
+                for (int i=0; i<N; i++) {
+                    s += " " + pattern[i];
+                }
+                Slog.i(TAG, "vibrating with pattern: " + s);
+            }
+
+            // we're running in the server so we can't fail
+            if (pattern == null || pattern.length == 0
+                    || isAll0(pattern)
+                    || repeat >= pattern.length || token == null) {
+                return;
+            }
+
+            Vibration vib = new Vibration(token, pattern, repeat, uid);
+            try {
+                token.linkToDeath(vib, 0);
+            } catch (RemoteException e) {
+                return;
+            }
+
+            synchronized (mVibrations) {
+                removeVibrationLocked(token);
+                doCancelVibrateLocked();
+                if (repeat >= 0) {
+                    mVibrations.addFirst(vib);
+                    startNextVibrationLocked();
+                } else {
+                    // A negative repeat means that this pattern is not meant
+                    // to repeat. Treat it like a simple vibration.
+                    mCurrentVibration = vib;
+                    startVibrationLocked(vib);
+                }
+            }
+        }
+        finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!8285580.java!!!	cancelVibrate(inout token : IBinder) : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.VIBRATE,
+                "cancelVibrate");
+
+        // so wakelock calls will succeed
+        long identity = Binder.clearCallingIdentity();
+        try {
+            synchronized (mVibrations) {
+                final Vibration vib = removeVibrationLocked(token);
+                if (vib == mCurrentVibration) {
+                    doCancelVibrateLocked();
+                    startNextVibrationLocked();
+                }
+            }
+        }
+        finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!8285708.java!!!	doCancelVibrateLocked() : void
+        if (mThread != null) {
+            synchronized (mThread) {
+                mThread.mDone = true;
+                mThread.notify();
+            }
+            mThread = null;
+        }
+        doVibratorOff();
+        mH.removeCallbacks(mVibrationRunnable);
+!!!8285836.java!!!	startNextVibrationLocked() : void
+        if (mVibrations.size() <= 0) {
+            mCurrentVibration = null;
+            return;
+        }
+        mCurrentVibration = mVibrations.getFirst();
+        startVibrationLocked(mCurrentVibration);
+!!!8285964.java!!!	startVibrationLocked(in vib : Vibration) : void
+        if (vib.mTimeout != 0) {
+            doVibratorOn(vib.mTimeout);
+            mH.postDelayed(mVibrationRunnable, vib.mTimeout);
+        } else {
+            // mThread better be null here. doCancelVibrate should always be
+            // called before startNextVibrationLocked or startVibrationLocked.
+            mThread = new VibrateThread(vib);
+            mThread.start();
+        }
+!!!8286092.java!!!	removeVibrationLocked(inout token : IBinder) : Vibration
+        ListIterator<Vibration> iter = mVibrations.listIterator(0);
+        while (iter.hasNext()) {
+            Vibration vib = iter.next();
+            if (vib.mToken == token) {
+                iter.remove();
+                unlinkVibration(vib);
+                return vib;
+            }
+        }
+        // We might be looking for a simple vibration which is only stored in
+        // mCurrentVibration.
+        if (mCurrentVibration != null && mCurrentVibration.mToken == token) {
+            unlinkVibration(mCurrentVibration);
+            return mCurrentVibration;
+        }
+        return null;
+!!!8286220.java!!!	unlinkVibration(inout vib : Vibration) : void
+        if (vib.mPattern != null) {
+            // If Vibration object has a pattern,
+            // the Vibration object has also been linkedToDeath.
+            vib.mToken.unlinkToDeath(vib, 0);
+        }
+!!!8286348.java!!!	updateInputDeviceVibrators() : void
+        synchronized (mVibrations) {
+            doCancelVibrateLocked();
+
+            synchronized (mInputDeviceVibrators) {
+                mVibrateInputDevicesSetting = false;
+                try {
+                    mVibrateInputDevicesSetting = Settings.System.getIntForUser(
+                            mContext.getContentResolver(),
+                            Settings.System.VIBRATE_INPUT_DEVICES, UserHandle.USER_CURRENT) > 0;
+                } catch (SettingNotFoundException snfe) {
+                }
+
+                if (mVibrateInputDevicesSetting) {
+                    if (!mInputDeviceListenerRegistered) {
+                        mInputDeviceListenerRegistered = true;
+                        mIm.registerInputDeviceListener(this, mH);
+                    }
+                } else {
+                    if (mInputDeviceListenerRegistered) {
+                        mInputDeviceListenerRegistered = false;
+                        mIm.unregisterInputDeviceListener(this);
+                    }
+                }
+
+                mInputDeviceVibrators.clear();
+                if (mVibrateInputDevicesSetting) {
+                    int[] ids = mIm.getInputDeviceIds();
+                    for (int i = 0; i < ids.length; i++) {
+                        InputDevice device = mIm.getInputDevice(ids[i]);
+                        Vibrator vibrator = device.getVibrator();
+                        if (vibrator.hasVibrator()) {
+                            mInputDeviceVibrators.add(vibrator);
+                        }
+                    }
+                }
+            }
+
+            startNextVibrationLocked();
+        }
+!!!8286476.java!!!	onInputDeviceAdded(in deviceId : int) : void
+        updateInputDeviceVibrators();
+!!!8286604.java!!!	onInputDeviceChanged(in deviceId : int) : void
+        updateInputDeviceVibrators();
+!!!8286732.java!!!	onInputDeviceRemoved(in deviceId : int) : void
+        updateInputDeviceVibrators();
+!!!8286860.java!!!	doVibratorExists() : boolean
+        // For now, we choose to ignore the presence of input devices that have vibrators
+        // when reporting whether the device has a vibrator.  Applications often use this
+        // information to decide whether to enable certain features so they expect the
+        // result of hasVibrator() to be constant.  For now, just report whether
+        // the device has a built-in vibrator.
+        //synchronized (mInputDeviceVibrators) {
+        //    return !mInputDeviceVibrators.isEmpty() || vibratorExists();
+        //}
+        return vibratorExists();
+!!!8286988.java!!!	doVibratorOn(in millis : long) : void
+        synchronized (mInputDeviceVibrators) {
+            final int vibratorCount = mInputDeviceVibrators.size();
+            if (vibratorCount != 0) {
+                for (int i = 0; i < vibratorCount; i++) {
+                    mInputDeviceVibrators.get(i).vibrate(millis);
+                }
+            } else {
+                vibratorOn(millis);
+            }
+        }
+!!!8287116.java!!!	doVibratorOff() : void
+        synchronized (mInputDeviceVibrators) {
+            final int vibratorCount = mInputDeviceVibrators.size();
+            if (vibratorCount != 0) {
+                for (int i = 0; i < vibratorCount; i++) {
+                    mInputDeviceVibrators.get(i).cancel();
+                }
+            } else {
+                vibratorOff();
+            }
+        }

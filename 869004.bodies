@@ -1,0 +1,241 @@
+class AndroidBlockGuardPolicy
+!!!3931148.java!!!	AndroidBlockGuardPolicy(in policyMask : int)
+            mPolicyMask = policyMask;
+!!!3931276.java!!!	toString() : String
+            return "AndroidBlockGuardPolicy; mPolicyMask=" + mPolicyMask;
+!!!3931404.java!!!	getPolicyMask() : int
+            return mPolicyMask;
+!!!3931532.java!!!	onWriteToDisk() : void
+            if ((mPolicyMask & DETECT_DISK_WRITE) == 0) {
+                return;
+            }
+            if (tooManyViolationsThisLoop()) {
+                return;
+            }
+            BlockGuard.BlockGuardPolicyException e = new StrictModeDiskWriteViolation(mPolicyMask);
+            e.fillInStackTrace();
+            startHandlingViolationException(e);
+!!!3931660.java!!!	onCustomSlowCall(in name : String) : void
+            if ((mPolicyMask & DETECT_CUSTOM) == 0) {
+                return;
+            }
+            if (tooManyViolationsThisLoop()) {
+                return;
+            }
+            BlockGuard.BlockGuardPolicyException e = new StrictModeCustomViolation(mPolicyMask, name);
+            e.fillInStackTrace();
+            startHandlingViolationException(e);
+!!!3931788.java!!!	onReadFromDisk() : void
+            if ((mPolicyMask & DETECT_DISK_READ) == 0) {
+                return;
+            }
+            if (tooManyViolationsThisLoop()) {
+                return;
+            }
+            BlockGuard.BlockGuardPolicyException e = new StrictModeDiskReadViolation(mPolicyMask);
+            e.fillInStackTrace();
+            startHandlingViolationException(e);
+!!!3931916.java!!!	onNetwork() : void
+            if ((mPolicyMask & DETECT_NETWORK) == 0) {
+                return;
+            }
+            if ((mPolicyMask & PENALTY_DEATH_ON_NETWORK) != 0) {
+                throw new NetworkOnMainThreadException();
+            }
+            if (tooManyViolationsThisLoop()) {
+                return;
+            }
+            BlockGuard.BlockGuardPolicyException e = new StrictModeNetworkViolation(mPolicyMask);
+            e.fillInStackTrace();
+            startHandlingViolationException(e);
+!!!3932044.java!!!	setPolicyMask(in policyMask : int) : void
+            mPolicyMask = policyMask;
+!!!3932172.java!!!	startHandlingViolationException(inout e : BlockGuard.BlockGuardPolicyException) : void
+            final ViolationInfo info = new ViolationInfo(e, e.getPolicy());
+            info.violationUptimeMillis = SystemClock.uptimeMillis();
+            handleViolationWithTimingAttempt(info);
+!!!3932300.java!!!	handleViolationWithTimingAttempt(in info : ViolationInfo) : void
+            Looper looper = Looper.myLooper();
+
+            // Without a Looper, we're unable to time how long the
+            // violation takes place.  This case should be rare, as
+            // most users will care about timing violations that
+            // happen on their main UI thread.  Note that this case is
+            // also hit when a violation takes place in a Binder
+            // thread, in "gather" mode.  In this case, the duration
+            // of the violation is computed by the ultimate caller and
+            // its Looper, if any.
+            //
+            // Also, as a special short-cut case when the only penalty
+            // bit is death, we die immediately, rather than timing
+            // the violation's duration.  This makes it convenient to
+            // use in unit tests too, rather than waiting on a Looper.
+            //
+            // TODO: if in gather mode, ignore Looper.myLooper() and always
+            //       go into this immediate mode?
+            if (looper == null ||
+                (info.policy & THREAD_PENALTY_MASK) == PENALTY_DEATH) {
+                info.durationMillis = -1;  // unknown (redundant, already set)
+                handleViolation(info);
+                return;
+            }
+
+            final ArrayList<ViolationInfo> records = violationsBeingTimed.get();
+            if (records.size() >= MAX_OFFENSES_PER_LOOP) {
+                // Not worth measuring.  Too many offenses in one loop.
+                return;
+            }
+            records.add(info);
+            if (records.size() > 1) {
+                // There's already been a violation this loop, so we've already
+                // registered an idle handler to process the list of violations
+                // at the end of this Looper's loop.
+                return;
+            }
+
+            final IWindowManager windowManager = (info.policy & PENALTY_FLASH) != 0 ?
+                    sWindowManager.get() : null;
+            if (windowManager != null) {
+                try {
+                    windowManager.showStrictModeViolation(true);
+                } catch (RemoteException unused) {
+                }
+            }
+
+            // We post a runnable to a Handler (== delay 0 ms) for
+            // measuring the end time of a violation instead of using
+            // an IdleHandler (as was previously used) because an
+            // IdleHandler may not run for quite a long period of time
+            // if an ongoing animation is happening and continually
+            // posting ASAP (0 ms) animation steps.  Animations are
+            // throttled back to 60fps via SurfaceFlinger/View
+            // invalidates, _not_ by posting frame updates every 16
+            // milliseconds.
+            threadHandler.get().postAtFrontOfQueue(new Runnable() {
+                    public void run() {
+                        long loopFinishTime = SystemClock.uptimeMillis();
+
+                        // Note: we do this early, before handling the
+                        // violation below, as handling the violation
+                        // may include PENALTY_DEATH and we don't want
+                        // to keep the red border on.
+                        if (windowManager != null) {
+                            try {
+                                windowManager.showStrictModeViolation(false);
+                            } catch (RemoteException unused) {
+                            }
+                        }
+
+                        for (int n = 0; n < records.size(); ++n) {
+                            ViolationInfo v = records.get(n);
+                            v.violationNumThisLoop = n + 1;
+                            v.durationMillis =
+                                    (int) (loopFinishTime - v.violationUptimeMillis);
+                            handleViolation(v);
+                        }
+                        records.clear();
+                    }
+                });
+!!!3932428.java!!!	handleViolation(in info : ViolationInfo) : void
+            if (info == null || info.crashInfo == null || info.crashInfo.stackTrace == null) {
+                Log.wtf(TAG, "unexpected null stacktrace");
+                return;
+            }
+
+            if (LOG_V) Log.d(TAG, "handleViolation; policy=" + info.policy);
+
+            if ((info.policy & PENALTY_GATHER) != 0) {
+                ArrayList<ViolationInfo> violations = gatheredViolations.get();
+                if (violations == null) {
+                    violations = new ArrayList<ViolationInfo>(1);
+                    gatheredViolations.set(violations);
+                } else if (violations.size() >= 5) {
+                    // Too many.  In a loop or something?  Don't gather them all.
+                    return;
+                }
+                for (ViolationInfo previous : violations) {
+                    if (info.crashInfo.stackTrace.equals(previous.crashInfo.stackTrace)) {
+                        // Duplicate. Don't log.
+                        return;
+                    }
+                }
+                violations.add(info);
+                return;
+            }
+
+            // Not perfect, but fast and good enough for dup suppression.
+            Integer crashFingerprint = info.hashCode();
+            long lastViolationTime = 0;
+            if (mLastViolationTime.containsKey(crashFingerprint)) {
+                lastViolationTime = mLastViolationTime.get(crashFingerprint);
+            }
+            long now = SystemClock.uptimeMillis();
+            mLastViolationTime.put(crashFingerprint, now);
+            long timeSinceLastViolationMillis = lastViolationTime == 0 ?
+                    Long.MAX_VALUE : (now - lastViolationTime);
+
+            if ((info.policy & PENALTY_LOG) != 0 &&
+                timeSinceLastViolationMillis > MIN_LOG_INTERVAL_MS) {
+                if (info.durationMillis != -1) {
+                    Log.d(TAG, "StrictMode policy violation; ~duration=" +
+                          info.durationMillis + " ms: " + info.crashInfo.stackTrace);
+                } else {
+                    Log.d(TAG, "StrictMode policy violation: " + info.crashInfo.stackTrace);
+                }
+            }
+
+            // The violationMaskSubset, passed to ActivityManager, is a
+            // subset of the original StrictMode policy bitmask, with
+            // only the bit violated and penalty bits to be executed
+            // by the ActivityManagerService remaining set.
+            int violationMaskSubset = 0;
+
+            if ((info.policy & PENALTY_DIALOG) != 0 &&
+                timeSinceLastViolationMillis > MIN_DIALOG_INTERVAL_MS) {
+                violationMaskSubset |= PENALTY_DIALOG;
+            }
+
+            if ((info.policy & PENALTY_DROPBOX) != 0 && lastViolationTime == 0) {
+                violationMaskSubset |= PENALTY_DROPBOX;
+            }
+
+            if (violationMaskSubset != 0) {
+                int violationBit = parseViolationFromMessage(info.crashInfo.exceptionMessage);
+                violationMaskSubset |= violationBit;
+                final int savedPolicyMask = getThreadPolicyMask();
+
+                final boolean justDropBox = (info.policy & THREAD_PENALTY_MASK) == PENALTY_DROPBOX;
+                if (justDropBox) {
+                    // If all we're going to ask the activity manager
+                    // to do is dropbox it (the common case during
+                    // platform development), we can avoid doing this
+                    // call synchronously which Binder data suggests
+                    // isn't always super fast, despite the implementation
+                    // in the ActivityManager trying to be mostly async.
+                    dropboxViolationAsync(violationMaskSubset, info);
+                    return;
+                }
+
+                // Normal synchronous call to the ActivityManager.
+                try {
+                    // First, remove any policy before we call into the Activity Manager,
+                    // otherwise we'll infinite recurse as we try to log policy violations
+                    // to disk, thus violating policy, thus requiring logging, etc...
+                    // We restore the current policy below, in the finally block.
+                    setThreadPolicyMask(0);
+
+                    ActivityManagerNative.getDefault().handleApplicationStrictModeViolation(
+                        RuntimeInit.getApplicationObject(),
+                        violationMaskSubset,
+                        info);
+                } catch (RemoteException e) {
+                    Log.e(TAG, "RemoteException trying to handle StrictMode violation", e);
+                } finally {
+                    // Restore the policy.
+                    setThreadPolicyMask(savedPolicyMask);
+                }
+            }
+
+            if ((info.policy & PENALTY_DEATH) != 0) {
+                executeDeathPenalty(info);
+            }

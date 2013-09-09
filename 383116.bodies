@@ -1,0 +1,239 @@
+class DirectOutputThread
+!!!828684.cpp!!!	checkForNewParameters_l() : bool
+    bool reconfig = false;
+
+    while (!mNewParameters.isEmpty()) {
+        status_t status = NO_ERROR;
+        String8 keyValuePair = mNewParameters[0];
+        AudioParameter param = AudioParameter(keyValuePair);
+        int value;
+
+        if (param.getInt(String8(AudioParameter::keyFrameCount), value) == NO_ERROR) {
+            // do not accept frame count changes if tracks are open as the track buffer
+            // size depends on frame count and correct behavior would not be garantied
+            // if frame count is changed after track creation
+            if (!mTracks.isEmpty()) {
+                status = INVALID_OPERATION;
+            } else {
+                reconfig = true;
+            }
+        }
+        if (status == NO_ERROR) {
+            status = mOutput->stream->common.set_parameters(&mOutput->stream->common,
+                                                    keyValuePair.string());
+            if (!mStandby && status == INVALID_OPERATION) {
+                mOutput->stream->common.standby(&mOutput->stream->common);
+                mStandby = true;
+                mBytesWritten = 0;
+                status = mOutput->stream->common.set_parameters(&mOutput->stream->common,
+                                                       keyValuePair.string());
+            }
+            if (status == NO_ERROR && reconfig) {
+                readOutputParameters();
+                sendIoConfigEvent_l(AudioSystem::OUTPUT_CONFIG_CHANGED);
+            }
+        }
+
+        mNewParameters.removeAt(0);
+
+        mParamStatus = status;
+        mParamCond.signal();
+        // wait for condition with time out in case the thread calling ThreadBase::setParameters()
+        // already timed out waiting for the status and will never signal the condition.
+        mWaitWorkCV.waitRelative(mLock, kSetParametersTimeoutNs);
+    }
+    return reconfig;
+!!!828812.cpp!!!	getTrackName_l(in channelMask : audio_channel_mask_t, in sessionId : int) : int
+    return 0;
+!!!829068.cpp!!!	activeSleepTimeUs() : uint32_t
+    uint32_t time;
+    if (audio_is_linear_pcm(mFormat)) {
+        time = PlaybackThread::activeSleepTimeUs();
+    } else {
+        time = 10000;
+    }
+    return time;
+!!!829196.cpp!!!	idleSleepTimeUs() : uint32_t
+    uint32_t time;
+    if (audio_is_linear_pcm(mFormat)) {
+        time = (uint32_t)(((mFrameCount * 1000) / mSampleRate) * 1000) / 2;
+    } else {
+        time = 10000;
+    }
+    return time;
+!!!829324.cpp!!!	suspendSleepTimeUs() : uint32_t
+    uint32_t time;
+    if (audio_is_linear_pcm(mFormat)) {
+        time = (uint32_t)(((mFrameCount * 1000) / mSampleRate) * 1000);
+    } else {
+        time = 10000;
+    }
+    return time;
+!!!829452.cpp!!!	cacheParameters_l() : void
+    PlaybackThread::cacheParameters_l();
+
+    // use shorter standby delay as on normal output to release
+    // hardware resources as soon as possible
+    standbyDelay = microseconds(activeSleepTime*2);
+!!!829580.cpp!!!	prepareTracks_l(inout tracksToRemove : Vector< sp<Track> >) : mixer_state
+    sp<Track> trackToRemove;
+
+    mixer_state mixerStatus = MIXER_IDLE;
+
+    // find out which tracks need to be processed
+    if (mActiveTracks.size() != 0) {
+        sp<Track> t = mActiveTracks[0].promote();
+        // The track died recently
+        if (t == 0) return MIXER_IDLE;
+
+        Track* const track = t.get();
+        audio_track_cblk_t* cblk = track->cblk();
+
+        // The first time a track is added we wait
+        // for all its buffers to be filled before processing it
+        uint32_t minFrames;
+        if ((track->sharedBuffer() == 0) && !track->isStopped() && !track->isPausing()) {
+            minFrames = mNormalFrameCount;
+        } else {
+            minFrames = 1;
+        }
+        if ((track->framesReady() >= minFrames) && track->isReady() &&
+                !track->isPaused() && !track->isTerminated())
+        {
+            //ALOGV("track %d u=%08x, s=%08x [OK]", track->name(), cblk->user, cblk->server);
+
+            if (track->mFillingUpStatus == Track::FS_FILLED) {
+                track->mFillingUpStatus = Track::FS_ACTIVE;
+                mLeftVolFloat = mRightVolFloat = 0;
+                if (track->mState == TrackBase::RESUMING) {
+                    track->mState = TrackBase::ACTIVE;
+                }
+            }
+
+            // compute volume for this track
+            float left, right;
+            if (track->isMuted() || mMasterMute || track->isPausing() ||
+                mStreamTypes[track->streamType()].mute) {
+                left = right = 0;
+                if (track->isPausing()) {
+                    track->setPaused();
+                }
+            } else {
+                float typeVolume = mStreamTypes[track->streamType()].volume;
+                float v = mMasterVolume * typeVolume;
+                uint32_t vlr = cblk->getVolumeLR();
+                float v_clamped = v * (vlr & 0xFFFF);
+                if (v_clamped > MAX_GAIN) v_clamped = MAX_GAIN;
+                left = v_clamped/MAX_GAIN;
+                v_clamped = v * (vlr >> 16);
+                if (v_clamped > MAX_GAIN) v_clamped = MAX_GAIN;
+                right = v_clamped/MAX_GAIN;
+            }
+
+            if (left != mLeftVolFloat || right != mRightVolFloat) {
+                mLeftVolFloat = left;
+                mRightVolFloat = right;
+
+                // Convert volumes from float to 8.24
+                uint32_t vl = (uint32_t)(left * (1 << 24));
+                uint32_t vr = (uint32_t)(right * (1 << 24));
+
+                // Delegate volume control to effect in track effect chain if needed
+                // only one effect chain can be present on DirectOutputThread, so if
+                // there is one, the track is connected to it
+                if (!mEffectChains.isEmpty()) {
+                    // Do not ramp volume if volume is controlled by effect
+                    mEffectChains[0]->setVolume_l(&vl, &vr);
+                    left = (float)vl / (1 << 24);
+                    right = (float)vr / (1 << 24);
+                }
+                mOutput->stream->set_volume(mOutput->stream, left, right);
+            }
+
+            // reset retry count
+            track->mRetryCount = kMaxTrackRetriesDirect;
+            mActiveTrack = t;
+            mixerStatus = MIXER_TRACKS_READY;
+        } else {
+            // clear effect chain input buffer if an active track underruns to avoid sending
+            // previous audio buffer again to effects
+            if (!mEffectChains.isEmpty()) {
+                mEffectChains[0]->clearInputBuffer();
+            }
+
+            //ALOGV("track %d u=%08x, s=%08x [NOT READY]", track->name(), cblk->user, cblk->server);
+            if ((track->sharedBuffer() != 0) || track->isTerminated() ||
+                    track->isStopped() || track->isPaused()) {
+                // We have consumed all the buffers of this track.
+                // Remove it from the list of active tracks.
+                // TODO: implement behavior for compressed audio
+                size_t audioHALFrames = (latency_l() * mSampleRate) / 1000;
+                size_t framesWritten =
+                        mBytesWritten / audio_stream_frame_size(&mOutput->stream->common);
+                if (mStandby || track->presentationComplete(framesWritten, audioHALFrames)) {
+                    if (track->isStopped()) {
+                        track->reset();
+                    }
+                    trackToRemove = track;
+                }
+            } else {
+                // No buffers for this track. Give it a few chances to
+                // fill a buffer, then remove it from active list.
+                if (--(track->mRetryCount) <= 0) {
+                    ALOGV("BUFFER TIMEOUT: remove(%d) from active list", track->name());
+                    trackToRemove = track;
+                } else {
+                    mixerStatus = MIXER_TRACKS_ENABLED;
+                }
+            }
+        }
+    }
+
+    // FIXME merge this with similar code for removing multiple tracks
+    // remove all the tracks that need to be...
+    if (CC_UNLIKELY(trackToRemove != 0)) {
+        tracksToRemove->add(trackToRemove);
+        mActiveTracks.remove(trackToRemove);
+        if (!mEffectChains.isEmpty()) {
+            ALOGV("stopping track on chain %p for session Id: %d", mEffectChains[0].get(),
+                    trackToRemove->sessionId());
+            mEffectChains[0]->decActiveTrackCnt();
+        }
+        if (trackToRemove->isTerminated()) {
+            removeTrack_l(trackToRemove);
+        }
+    }
+
+    return mixerStatus;
+!!!829708.cpp!!!	threadLoop_mix() : void
+    AudioBufferProvider::Buffer buffer;
+    size_t frameCount = mFrameCount;
+    int8_t *curBuf = (int8_t *)mMixBuffer;
+    // output audio to hardware
+    while (frameCount) {
+        buffer.frameCount = frameCount;
+        mActiveTrack->getNextBuffer(&buffer);
+        if (CC_UNLIKELY(buffer.raw == NULL)) {
+            memset(curBuf, 0, frameCount * mFrameSize);
+            break;
+        }
+        memcpy(curBuf, buffer.raw, buffer.frameCount * mFrameSize);
+        frameCount -= buffer.frameCount;
+        curBuf += buffer.frameCount * mFrameSize;
+        mActiveTrack->releaseBuffer(&buffer);
+    }
+    sleepTime = 0;
+    standbyTime = systemTime() + standbyDelay;
+    mActiveTrack.clear();
+
+!!!829836.cpp!!!	threadLoop_sleepTime() : void
+    if (sleepTime == 0) {
+        if (mMixerStatus == MIXER_TRACKS_ENABLED) {
+            sleepTime = activeSleepTime;
+        } else {
+            sleepTime = idleSleepTime;
+        }
+    } else if (mBytesWritten != 0 && audio_is_linear_pcm(mFormat)) {
+        memset(mMixBuffer, 0, mFrameCount * mFrameSize);
+        sleepTime = 0;
+    }

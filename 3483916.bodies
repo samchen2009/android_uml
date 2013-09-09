@@ -1,0 +1,117 @@
+class LiteralOpUpgrader
+!!!15190412.java!!!	process(inout ssaMethod : SsaMethod) : void
+        LiteralOpUpgrader dc;
+
+        dc = new LiteralOpUpgrader(ssaMethod);
+
+        dc.run();
+!!!15190540.java!!!	LiteralOpUpgrader(inout ssaMethod : SsaMethod)
+        this.ssaMeth = ssaMethod;
+!!!15190668.java!!!	isConstIntZeroOrKnownNull(inout spec : RegisterSpec) : boolean
+        TypeBearer tb = spec.getTypeBearer();
+        if (tb instanceof CstLiteralBits) {
+            CstLiteralBits clb = (CstLiteralBits) tb;
+            return (clb.getLongBits() == 0);
+        }
+        return false;
+!!!15190796.java!!!	run() : void
+        final TranslationAdvice advice = Optimizer.getAdvice();
+
+        ssaMeth.forEachInsn(new SsaInsn.Visitor() {
+            public void visitMoveInsn(NormalSsaInsn insn) {
+                // do nothing
+            }
+
+            public void visitPhiInsn(PhiInsn insn) {
+                // do nothing
+            }
+
+            public void visitNonMoveInsn(NormalSsaInsn insn) {
+
+                Insn originalRopInsn = insn.getOriginalRopInsn();
+                Rop opcode = originalRopInsn.getOpcode();
+                RegisterSpecList sources = insn.getSources();
+
+                // Replace insns with constant results with const insns
+                if (tryReplacingWithConstant(insn)) return;
+
+                if (sources.size() != 2 ) {
+                    // We're only dealing with two-source insns here.
+                    return;
+                }
+
+                if (opcode.getBranchingness() == Rop.BRANCH_IF) {
+                    /*
+                     * An if instruction can become an if-*z instruction.
+                     */
+                    if (isConstIntZeroOrKnownNull(sources.get(0))) {
+                        replacePlainInsn(insn, sources.withoutFirst(),
+                              RegOps.flippedIfOpcode(opcode.getOpcode()), null);
+                    } else if (isConstIntZeroOrKnownNull(sources.get(1))) {
+                        replacePlainInsn(insn, sources.withoutLast(),
+                              opcode.getOpcode(), null);
+                    }
+                } else if (advice.hasConstantOperation(
+                        opcode, sources.get(0), sources.get(1))) {
+                    insn.upgradeToLiteral();
+                } else  if (opcode.isCommutative()
+                        && advice.hasConstantOperation(
+                        opcode, sources.get(1), sources.get(0))) {
+                    /*
+                     * An instruction can be commuted to a literal operation
+                     */
+
+                    insn.setNewSources(
+                            RegisterSpecList.make(
+                                    sources.get(1), sources.get(0)));
+
+                    insn.upgradeToLiteral();
+                }
+            }
+        });
+!!!15190924.java!!!	tryReplacingWithConstant(inout insn : NormalSsaInsn) : boolean
+        Insn originalRopInsn = insn.getOriginalRopInsn();
+        Rop opcode = originalRopInsn.getOpcode();
+        RegisterSpec result = insn.getResult();
+
+        if (result != null && !ssaMeth.isRegALocal(result) &&
+                opcode.getOpcode() != RegOps.CONST) {
+            TypeBearer type = insn.getResult().getTypeBearer();
+            if (type.isConstant() && type.getBasicType() == Type.BT_INT) {
+                // Replace the instruction with a constant
+                replacePlainInsn(insn, RegisterSpecList.EMPTY,
+                        RegOps.CONST, (Constant) type);
+
+                // Remove the source as well if this is a move-result-pseudo
+                if (opcode.getOpcode() == RegOps.MOVE_RESULT_PSEUDO) {
+                    int pred = insn.getBlock().getPredecessors().nextSetBit(0);
+                    ArrayList<SsaInsn> predInsns =
+                            ssaMeth.getBlocks().get(pred).getInsns();
+                    NormalSsaInsn sourceInsn =
+                            (NormalSsaInsn) predInsns.get(predInsns.size()-1);
+                    replacePlainInsn(sourceInsn, RegisterSpecList.EMPTY,
+                            RegOps.GOTO, null);
+                }
+                return true;
+            }
+        }
+        return false;
+!!!15191052.java!!!	replacePlainInsn(inout insn : NormalSsaInsn, inout newSources : RegisterSpecList, in newOpcode : int, inout cst : Constant) : void
+
+        Insn originalRopInsn = insn.getOriginalRopInsn();
+        Rop newRop = Rops.ropFor(newOpcode, insn.getResult(), newSources, cst);
+        Insn newRopInsn;
+        if (cst == null) {
+            newRopInsn = new PlainInsn(newRop, originalRopInsn.getPosition(),
+                    insn.getResult(), newSources);
+        } else {
+            newRopInsn = new PlainCstInsn(newRop, originalRopInsn.getPosition(),
+                    insn.getResult(), newSources, cst);
+        }
+        NormalSsaInsn newInsn = new NormalSsaInsn(newRopInsn, insn.getBlock());
+
+        List<SsaInsn> insns = insn.getBlock().getInsns();
+
+        ssaMeth.onInsnRemoved(insn);
+        insns.set(insns.lastIndexOf(insn), newInsn);
+        ssaMeth.onInsnAdded(newInsn);

@@ -1,0 +1,128 @@
+class FileSource
+!!!366604.cpp!!!	FileSource(in filename : char)
+
+    mFd = open(filename, O_LARGEFILE | O_RDONLY);
+
+    if (mFd >= 0) {
+        mLength = lseek64(mFd, 0, SEEK_END);
+    } else {
+        ALOGE("Failed to open file '%s'. (%s)", filename, strerror(errno));
+    }
+!!!366732.cpp!!!	FileSource(in fd : int, in offset : int64_t, in length : int64_t)
+    CHECK(offset >= 0);
+    CHECK(length >= 0);
+!!!366860.cpp!!!	initCheck() : status_t
+    return mFd >= 0 ? OK : NO_INIT;
+!!!366988.cpp!!!	readAt(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    if (mFd < 0) {
+        return NO_INIT;
+    }
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (mLength >= 0) {
+        if (offset >= mLength) {
+            return 0;  // read beyond EOF.
+        }
+        int64_t numAvailable = mLength - offset;
+        if ((int64_t)size > numAvailable) {
+            size = numAvailable;
+        }
+    }
+
+    if (mDecryptHandle != NULL && DecryptApiType::CONTAINER_BASED
+            == mDecryptHandle->decryptApiType) {
+        return readAtDRM(offset, data, size);
+   } else {
+        off64_t result = lseek64(mFd, offset + mOffset, SEEK_SET);
+        if (result == -1) {
+            ALOGE("seek to %lld failed", offset + mOffset);
+            return UNKNOWN_ERROR;
+        }
+
+        return ::read(mFd, data, size);
+    }
+!!!367116.cpp!!!	getSize(inout size : off64_t) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    if (mFd < 0) {
+        return NO_INIT;
+    }
+
+    *size = mLength;
+
+    return OK;
+!!!367244.cpp!!!	DrmInitialization(in mime : char) : sp<DecryptHandle>
+    if (mDrmManagerClient == NULL) {
+        mDrmManagerClient = new DrmManagerClient();
+    }
+
+    if (mDrmManagerClient == NULL) {
+        return NULL;
+    }
+
+    if (mDecryptHandle == NULL) {
+        mDecryptHandle = mDrmManagerClient->openDecryptSession(
+                mFd, mOffset, mLength, mime);
+    }
+
+    if (mDecryptHandle == NULL) {
+        delete mDrmManagerClient;
+        mDrmManagerClient = NULL;
+    }
+
+    return mDecryptHandle;
+!!!367372.cpp!!!	getDrmInfo(inout handle : sp<DecryptHandle>, inout client : DrmManagerClient) : void
+    handle = mDecryptHandle;
+
+    *client = mDrmManagerClient;
+!!!367500.cpp!!!	~FileSource()
+    if (mFd >= 0) {
+        close(mFd);
+        mFd = -1;
+    }
+
+    if (mDrmBuf != NULL) {
+        delete[] mDrmBuf;
+        mDrmBuf = NULL;
+    }
+
+    if (mDecryptHandle != NULL) {
+        // To release mDecryptHandle
+        CHECK(mDrmManagerClient);
+        mDrmManagerClient->closeDecryptSession(mDecryptHandle);
+        mDecryptHandle = NULL;
+    }
+
+    if (mDrmManagerClient != NULL) {
+        delete mDrmManagerClient;
+        mDrmManagerClient = NULL;
+    }
+!!!367628.cpp!!!	readAtDRM(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    size_t DRM_CACHE_SIZE = 1024;
+    if (mDrmBuf == NULL) {
+        mDrmBuf = new unsigned char[DRM_CACHE_SIZE];
+    }
+
+    if (mDrmBuf != NULL && mDrmBufSize > 0 && (offset + mOffset) >= mDrmBufOffset
+            && (offset + mOffset + size) <= (mDrmBufOffset + mDrmBufSize)) {
+        /* Use buffered data */
+        memcpy(data, (void*)(mDrmBuf+(offset+mOffset-mDrmBufOffset)), size);
+        return size;
+    } else if (size <= DRM_CACHE_SIZE) {
+        /* Buffer new data */
+        mDrmBufOffset =  offset + mOffset;
+        mDrmBufSize = mDrmManagerClient->pread(mDecryptHandle, mDrmBuf,
+                DRM_CACHE_SIZE, offset + mOffset);
+        if (mDrmBufSize > 0) {
+            int64_t dataRead = 0;
+            dataRead = size > mDrmBufSize ? mDrmBufSize : size;
+            memcpy(data, (void*)mDrmBuf, dataRead);
+            return dataRead;
+        } else {
+            return mDrmBufSize;
+        }
+    } else {
+        /* Too big chunk to cache. Call DRM directly */
+        return mDrmManagerClient->pread(mDecryptHandle, data, size, offset + mOffset);
+    }

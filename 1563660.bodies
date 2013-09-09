@@ -1,0 +1,255 @@
+class AutoRegistrationProcess
+!!!9689612.java!!!	getAction() : String
+            return toString();
+!!!9689740.java!!!	start(inout group : SipSessionGroup) : void
+            if (!mRunning) {
+                mRunning = true;
+                mBackoff = 1;
+                mSession = (SipSessionGroup.SipSessionImpl)
+                        group.createSession(this);
+                // return right away if no active network connection.
+                if (mSession == null) return;
+
+                // start unregistration to clear up old registration at server
+                // TODO: when rfc5626 is deployed, use reg-id and sip.instance
+                // in registration to avoid adding duplicate entries to server
+                mMyWakeLock.acquire(mSession);
+                mSession.unregister();
+                TAG = "SipAutoReg:" + mSession.getLocalProfile().getUriString();
+            }
+!!!9689868.java!!!	startKeepAliveProcess(in interval : int) : void
+            if (DEBUG) Log.d(TAG, "start keepalive w interval=" + interval);
+            if (mKeepAliveSession == null) {
+                mKeepAliveSession = mSession.duplicate();
+            } else {
+                mKeepAliveSession.stopKeepAliveProcess();
+            }
+            try {
+                mKeepAliveSession.startKeepAliveProcess(interval, this);
+            } catch (SipException e) {
+                Log.e(TAG, "failed to start keepalive w interval=" + interval,
+                        e);
+            }
+!!!9689996.java!!!	stopKeepAliveProcess() : void
+            if (mKeepAliveSession != null) {
+                mKeepAliveSession.stopKeepAliveProcess();
+                mKeepAliveSession = null;
+            }
+            mKeepAliveSuccessCount = 0;
+!!!9690124.java!!!	onResponse(inout portChanged : boolean) : void
+            synchronized (SipService.this) {
+                if (portChanged) {
+                    int interval = getKeepAliveInterval();
+                    if (mKeepAliveSuccessCount < MIN_KEEPALIVE_SUCCESS_COUNT) {
+                        Log.i(TAG, "keepalive doesn't work with interval "
+                                + interval + ", past success count="
+                                + mKeepAliveSuccessCount);
+                        if (interval > DEFAULT_KEEPALIVE_INTERVAL) {
+                            restartPortMappingLifetimeMeasurement(
+                                    mSession.getLocalProfile(), interval);
+                            mKeepAliveSuccessCount = 0;
+                        }
+                    } else {
+                        if (DEBUG) {
+                            Log.i(TAG, "keep keepalive going with interval "
+                                    + interval + ", past success count="
+                                    + mKeepAliveSuccessCount);
+                        }
+                        mKeepAliveSuccessCount /= 2;
+                    }
+                } else {
+                    // Start keep-alive interval measurement on the first
+                    // successfully kept-alive SipSessionGroup
+                    startPortMappingLifetimeMeasurement(
+                            mSession.getLocalProfile());
+                    mKeepAliveSuccessCount++;
+                }
+
+                if (!mRunning || !portChanged) return;
+
+                // The keep alive process is stopped when port is changed;
+                // Nullify the session so that the process can be restarted
+                // again when the re-registration is done
+                mKeepAliveSession = null;
+
+                // Acquire wake lock for the registration process. The
+                // lock will be released when registration is complete.
+                mMyWakeLock.acquire(mSession);
+                mSession.register(EXPIRY_TIME);
+            }
+!!!9690252.java!!!	onError(in errorCode : int, in description : String) : void
+            if (DEBUG) {
+                Log.e(TAG, "keepalive error: " + description);
+            }
+            onResponse(true); // re-register immediately
+!!!9690380.java!!!	stop() : void
+            if (!mRunning) return;
+            mRunning = false;
+            mMyWakeLock.release(mSession);
+            if (mSession != null) {
+                mSession.setListener(null);
+                if (mNetworkType != -1 && mRegistered) mSession.unregister();
+            }
+
+            mTimer.cancel(this);
+            stopKeepAliveProcess();
+
+            mRegistered = false;
+            setListener(mProxy.getListener());
+!!!9690508.java!!!	onKeepAliveIntervalChanged() : void
+            if (mKeepAliveSession != null) {
+                int newInterval = getKeepAliveInterval();
+                if (DEBUG) {
+                    Log.v(TAG, "restart keepalive w interval=" + newInterval);
+                }
+                mKeepAliveSuccessCount = 0;
+                startKeepAliveProcess(newInterval);
+            }
+!!!9690636.java!!!	setListener(inout listener : ISipSessionListener) : void
+            synchronized (SipService.this) {
+                mProxy.setListener(listener);
+
+                try {
+                    int state = (mSession == null)
+                            ? SipSession.State.READY_TO_CALL
+                            : mSession.getState();
+                    if ((state == SipSession.State.REGISTERING)
+                            || (state == SipSession.State.DEREGISTERING)) {
+                        mProxy.onRegistering(mSession);
+                    } else if (mRegistered) {
+                        int duration = (int)
+                                (mExpiryTime - SystemClock.elapsedRealtime());
+                        mProxy.onRegistrationDone(mSession, duration);
+                    } else if (mErrorCode != SipErrorCode.NO_ERROR) {
+                        if (mErrorCode == SipErrorCode.TIME_OUT) {
+                            mProxy.onRegistrationTimeout(mSession);
+                        } else {
+                            mProxy.onRegistrationFailed(mSession, mErrorCode,
+                                    mErrorMessage);
+                        }
+                    } else if (mNetworkType == -1) {
+                        mProxy.onRegistrationFailed(mSession,
+                                SipErrorCode.DATA_CONNECTION_LOST,
+                                "no data connection");
+                    } else if (!mRunning) {
+                        mProxy.onRegistrationFailed(mSession,
+                                SipErrorCode.CLIENT_ERROR,
+                                "registration not running");
+                    } else {
+                        mProxy.onRegistrationFailed(mSession,
+                                SipErrorCode.IN_PROGRESS,
+                                String.valueOf(state));
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "setListener(): " + t);
+                }
+            }
+!!!9690764.java!!!	isRegistered() : boolean
+            return mRegistered;
+!!!9690892.java!!!	run() : void
+            synchronized (SipService.this) {
+                if (!mRunning) return;
+
+                mErrorCode = SipErrorCode.NO_ERROR;
+                mErrorMessage = null;
+                if (DEBUG) Log.d(TAG, "registering");
+                if (mNetworkType != -1) {
+                    mMyWakeLock.acquire(mSession);
+                    mSession.register(EXPIRY_TIME);
+                }
+            }
+!!!9691020.java!!!	restart(in duration : int) : void
+            Log.d(TAG, "Refresh registration " + duration + "s later.");
+            mTimer.cancel(this);
+            mTimer.set(duration * 1000, this);
+!!!9691148.java!!!	backoffDuration() : int
+            int duration = SHORT_EXPIRY_TIME * mBackoff;
+            if (duration > 3600) {
+                duration = 3600;
+            } else {
+                mBackoff *= 2;
+            }
+            return duration;
+!!!9691276.java!!!	onRegistering(inout session : ISipSession) : void
+            if (DEBUG) Log.d(TAG, "onRegistering(): " + session);
+            synchronized (SipService.this) {
+                if (notCurrentSession(session)) return;
+
+                mRegistered = false;
+                mProxy.onRegistering(session);
+            }
+!!!9691404.java!!!	notCurrentSession(inout session : ISipSession) : boolean
+            if (session != mSession) {
+                ((SipSessionGroup.SipSessionImpl) session).setListener(null);
+                mMyWakeLock.release(session);
+                return true;
+            }
+            return !mRunning;
+!!!9691532.java!!!	onRegistrationDone(inout session : ISipSession, in duration : int) : void
+            if (DEBUG) Log.d(TAG, "onRegistrationDone(): " + session);
+            synchronized (SipService.this) {
+                if (notCurrentSession(session)) return;
+
+                mProxy.onRegistrationDone(session, duration);
+
+                if (duration > 0) {
+                    mExpiryTime = SystemClock.elapsedRealtime()
+                            + (duration * 1000);
+
+                    if (!mRegistered) {
+                        mRegistered = true;
+                        // allow some overlap to avoid call drop during renew
+                        duration -= MIN_EXPIRY_TIME;
+                        if (duration < MIN_EXPIRY_TIME) {
+                            duration = MIN_EXPIRY_TIME;
+                        }
+                        restart(duration);
+
+                        SipProfile localProfile = mSession.getLocalProfile();
+                        if ((mKeepAliveSession == null) && (isBehindNAT(mLocalIp)
+                                || localProfile.getSendKeepAlive())) {
+                            startKeepAliveProcess(getKeepAliveInterval());
+                        }
+                    }
+                    mMyWakeLock.release(session);
+                } else {
+                    mRegistered = false;
+                    mExpiryTime = -1L;
+                    if (DEBUG) Log.d(TAG, "Refresh registration immediately");
+                    run();
+                }
+            }
+!!!9691660.java!!!	onRegistrationFailed(inout session : ISipSession, in errorCode : int, in message : String) : void
+            if (DEBUG) Log.d(TAG, "onRegistrationFailed(): " + session + ": "
+                    + SipErrorCode.toString(errorCode) + ": " + message);
+            synchronized (SipService.this) {
+                if (notCurrentSession(session)) return;
+
+                switch (errorCode) {
+                    case SipErrorCode.INVALID_CREDENTIALS:
+                    case SipErrorCode.SERVER_UNREACHABLE:
+                        if (DEBUG) Log.d(TAG, "   pause auto-registration");
+                        stop();
+                        break;
+                    default:
+                        restartLater();
+                }
+
+                mErrorCode = errorCode;
+                mErrorMessage = message;
+                mProxy.onRegistrationFailed(session, errorCode, message);
+                mMyWakeLock.release(session);
+            }
+!!!9691788.java!!!	onRegistrationTimeout(inout session : ISipSession) : void
+            if (DEBUG) Log.d(TAG, "onRegistrationTimeout(): " + session);
+            synchronized (SipService.this) {
+                if (notCurrentSession(session)) return;
+
+                mErrorCode = SipErrorCode.TIME_OUT;
+                mProxy.onRegistrationTimeout(session);
+                restartLater();
+                mMyWakeLock.release(session);
+            }
+!!!9691916.java!!!	restartLater() : void
+            mRegistered = false;
+            restart(backoffDuration());

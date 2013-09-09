@@ -1,0 +1,628 @@
+class AndroidRuntime
+!!!960396.cpp!!!	AndroidRuntime()
+    SkGraphics::Init();
+    // this sets our preference for 16bit images during decode
+    // in case the src is opaque and 24bit
+    SkImageDecoder::SetDeviceConfig(SkBitmap::kRGB_565_Config);
+    // This cache is shared between browser native images, and java "purgeable"
+    // bitmaps. This globalpool is for images that do not either use the java
+    // heap, or are not backed by ashmem. See BitmapFactory.cpp for the key
+    // java call site.
+    SkImageRef_GlobalPool::SetRAMBudget(512 * 1024);
+    // There is also a global font cache, but its budget is specified in code
+    // see SkFontHost_android.cpp
+
+    // Pre-allocate enough space to hold a fair number of options.
+    mOptions.setCapacity(20);
+
+    assert(gCurRuntime == NULL);        // one per process
+    gCurRuntime = this;
+!!!960524.cpp!!!	~AndroidRuntime()
+    SkGraphics::Term();
+!!!960652.cpp!!!	registerNativeMethods(inout env : JNIEnv, in className : char, in gMethods : JNINativeMethod, in numMethods : int) : int
+    return jniRegisterNativeMethods(env, className, gMethods, numMethods);
+!!!960780.cpp!!!	callMain(in className : char, in clazz : jclass, in argc : int, in argv : char) : status_t
+    JNIEnv* env;
+    jmethodID methodId;
+
+    ALOGD("Calling main entry %s", className);
+
+    env = getJNIEnv();
+    if (clazz == NULL || env == NULL) {
+        return UNKNOWN_ERROR;
+    }
+
+    methodId = env->GetStaticMethodID(clazz, "main", "([Ljava/lang/String;)V");
+    if (methodId == NULL) {
+        ALOGE("ERROR: could not find method %s.main(String[])\n", className);
+        return UNKNOWN_ERROR;
+    }
+
+    /*
+     * We want to call main() with a String array with our arguments in it.
+     * Create an array and populate it.
+     */
+    jclass stringClass;
+    jobjectArray strArray;
+
+    stringClass = env->FindClass("java/lang/String");
+    strArray = env->NewObjectArray(argc, stringClass, NULL);
+
+    for (int i = 0; i < argc; i++) {
+        jstring argStr = env->NewStringUTF(argv[i]);
+        env->SetObjectArrayElement(strArray, i, argStr);
+    }
+
+    env->CallStaticVoidMethod(clazz, methodId, strArray);
+    return NO_ERROR;
+!!!961036.cpp!!!	addVmArguments(in argc : int, in argv : char) : int
+    int i;
+
+    for (i = 0; i<argc; i++) {
+        if (argv[i][0] != '-') {
+            return i;
+        }
+        if (argv[i][1] == '-' && argv[i][2] == 0) {
+            return i+1;
+        }
+
+        JavaVMOption opt;
+        memset(&opt, 0, sizeof(opt));
+        opt.optionString = (char*)argv[i];
+        mOptions.add(opt);
+    }
+    return i;
+!!!961164.cpp!!!	start(in className : char, in options : char) : void
+    ALOGD("\n>>>>>> AndroidRuntime START %s <<<<<<\n",
+            className != NULL ? className : "(unknown)");
+
+    blockSigpipe();
+
+    /*
+     * 'startSystemServer == true' means runtime is obsolete and not run from
+     * init.rc anymore, so we print out the boot start event here.
+     */
+    if (strcmp(options, "start-system-server") == 0) {
+        /* track our progress through the boot sequence */
+        const int LOG_BOOT_PROGRESS_START = 3000;
+        LOG_EVENT_LONG(LOG_BOOT_PROGRESS_START,
+                       ns2ms(systemTime(SYSTEM_TIME_MONOTONIC)));
+    }
+
+    const char* rootDir = getenv("ANDROID_ROOT");
+    if (rootDir == NULL) {
+        rootDir = "/system";
+        if (!hasDir("/system")) {
+            LOG_FATAL("No root directory specified, and /android does not exist.");
+            return;
+        }
+        setenv("ANDROID_ROOT", rootDir, 1);
+    }
+
+    //const char* kernelHack = getenv("LD_ASSUME_KERNEL");
+    //ALOGD("Found LD_ASSUME_KERNEL='%s'\n", kernelHack);
+
+    /* start the virtual machine */
+    JNIEnv* env;
+    if (startVm(&mJavaVM, &env) != 0) {
+        return;
+    }
+    onVmCreated(env);
+
+    /*
+     * Register android functions.
+     */
+    if (startReg(env) < 0) {
+        ALOGE("Unable to register all android natives\n");
+        return;
+    }
+
+    /*
+     * We want to call main() with a String array with arguments in it.
+     * At present we have two arguments, the class name and an option string.
+     * Create an array to hold them.
+     */
+    jclass stringClass;
+    jobjectArray strArray;
+    jstring classNameStr;
+    jstring optionsStr;
+
+    stringClass = env->FindClass("java/lang/String");
+    assert(stringClass != NULL);
+    strArray = env->NewObjectArray(2, stringClass, NULL);
+    assert(strArray != NULL);
+    classNameStr = env->NewStringUTF(className);
+    assert(classNameStr != NULL);
+    env->SetObjectArrayElement(strArray, 0, classNameStr);
+    optionsStr = env->NewStringUTF(options);
+    env->SetObjectArrayElement(strArray, 1, optionsStr);
+
+    /*
+     * Start VM.  This thread becomes the main thread of the VM, and will
+     * not return until the VM exits.
+     */
+    char* slashClassName = toSlashClassName(className);
+    jclass startClass = env->FindClass(slashClassName);
+    if (startClass == NULL) {
+        ALOGE("JavaVM unable to locate class '%s'\n", slashClassName);
+        /* keep going */
+    } else {
+        jmethodID startMeth = env->GetStaticMethodID(startClass, "main",
+            "([Ljava/lang/String;)V");
+        if (startMeth == NULL) {
+            ALOGE("JavaVM unable to find main() in '%s'\n", className);
+            /* keep going */
+        } else {
+            env->CallStaticVoidMethod(startClass, startMeth, strArray);
+
+#if 0
+            if (env->ExceptionCheck())
+                threadExitUncaughtException(env);
+#endif
+        }
+    }
+    free(slashClassName);
+
+    ALOGD("Shutting down VM\n");
+    if (mJavaVM->DetachCurrentThread() != JNI_OK)
+        ALOGW("Warning: unable to detach main thread\n");
+    if (mJavaVM->DestroyJavaVM() != 0)
+        ALOGW("Warning: VM did not shut down cleanly\n");
+!!!961292.cpp!!!	exit(in code : int) : void
+    if (mExitWithoutCleanup) {
+        ALOGI("VM exiting with result code %d, cleanup skipped.", code);
+        ::_exit(code);
+    } else {
+        ALOGI("VM exiting with result code %d.", code);
+        onExit(code);
+        ::exit(code);
+    }
+!!!961548.cpp!!!	getRuntime() : AndroidRuntime
+    return gCurRuntime;
+!!!961676.cpp!!!	onVmCreated(inout env : JNIEnv) : void
+    // If AndroidRuntime had anything to do here, we'd have done it in 'start'.
+!!!962188.cpp!!!	createJavaThread(in name : char, in start : void (*)(void *), inout arg : void) : android_thread_id_t
+    android_thread_id_t threadId = 0;
+    javaCreateThreadEtc((android_thread_func_t) start, arg, name,
+        ANDROID_PRIORITY_DEFAULT, 0, &threadId);
+    return threadId;
+!!!962444.cpp!!!	getJNIEnv() : JNIEnv
+    JNIEnv* env;
+    JavaVM* vm = AndroidRuntime::getJavaVM();
+    assert(vm != NULL);
+
+    if (vm->GetEnv((void**) &env, JNI_VERSION_1_4) != JNI_OK)
+        return NULL;
+    return env;
+!!!962572.cpp!!!	toSlashClassName(in className : char) : char
+    char* result = strdup(className);
+    for (char* cp = result; *cp != '\0'; cp++) {
+        if (*cp == '.') {
+            *cp = '/';
+        }
+    }
+    return result;
+!!!962700.cpp!!!	startReg(inout env : JNIEnv) : int
+    /*
+     * This hook causes all future threads created in this process to be
+     * attached to the JavaVM.  (This needs to go away in favor of JNI
+     * Attach calls.)
+     */
+    androidSetCreateThreadFunc((android_create_thread_fn) javaCreateThreadEtc);
+
+    ALOGV("--- registering native functions ---\n");
+
+    /*
+     * Every "register" function calls one or more things that return
+     * a local reference (e.g. FindClass).  Because we haven't really
+     * started the VM yet, they're all getting stored in the base frame
+     * and never released.  Use Push/Pop to manage the storage.
+     */
+    env->PushLocalFrame(200);
+
+    if (register_jni_procs(gRegJNI, NELEM(gRegJNI), env) < 0) {
+        env->PopLocalFrame(NULL);
+        return -1;
+    }
+    env->PopLocalFrame(NULL);
+
+    //createJavaThread("fubar", quickTest, (void*) "hello");
+
+    return 0;
+!!!962828.cpp!!!	parseExtraOpts(inout extraOptsBuf : char) : void
+    JavaVMOption opt;
+    char* start;
+    char* end;
+
+    memset(&opt, 0, sizeof(opt));
+    start = extraOptsBuf;
+    while (*start != '\0') {
+        while (*start == ' ')                   /* skip leading whitespace */
+            start++;
+        if (*start == '\0')                     /* was trailing ws, bail */
+            break;
+
+        end = start+1;
+        while (*end != ' ' && *end != '\0')     /* find end of token */
+            end++;
+        if (*end == ' ')
+            *end++ = '\0';          /* mark end, advance to indicate more */
+
+        opt.optionString = start;
+        mOptions.add(opt);
+        start = end;
+    }
+!!!962956.cpp!!!	startVm(inout pJavaVM : JavaVM, inout pEnv : JNIEnv) : int
+    int result = -1;
+    JavaVMInitArgs initArgs;
+    JavaVMOption opt;
+    char propBuf[PROPERTY_VALUE_MAX];
+    char stackTraceFileBuf[PROPERTY_VALUE_MAX];
+    char dexoptFlagsBuf[PROPERTY_VALUE_MAX];
+    char enableAssertBuf[sizeof("-ea:")-1 + PROPERTY_VALUE_MAX];
+    char jniOptsBuf[sizeof("-Xjniopts:")-1 + PROPERTY_VALUE_MAX];
+    char heapstartsizeOptsBuf[sizeof("-Xms")-1 + PROPERTY_VALUE_MAX];
+    char heapsizeOptsBuf[sizeof("-Xmx")-1 + PROPERTY_VALUE_MAX];
+    char heapgrowthlimitOptsBuf[sizeof("-XX:HeapGrowthLimit=")-1 + PROPERTY_VALUE_MAX];
+    char heapminfreeOptsBuf[sizeof("-XX:HeapMinFree=")-1 + PROPERTY_VALUE_MAX];
+    char heapmaxfreeOptsBuf[sizeof("-XX:HeapMaxFree=")-1 + PROPERTY_VALUE_MAX];
+    char heaptargetutilizationOptsBuf[sizeof("-XX:HeapTargetUtilization=")-1 + PROPERTY_VALUE_MAX];
+    char extraOptsBuf[PROPERTY_VALUE_MAX];
+    char* stackTraceFile = NULL;
+    bool checkJni = false;
+    bool checkDexSum = false;
+    bool logStdio = false;
+    enum {
+      kEMDefault,
+      kEMIntPortable,
+      kEMIntFast,
+#if defined(WITH_JIT)
+      kEMJitCompiler,
+#endif
+    } executionMode = kEMDefault;
+
+
+    property_get("dalvik.vm.checkjni", propBuf, "");
+    if (strcmp(propBuf, "true") == 0) {
+        checkJni = true;
+    } else if (strcmp(propBuf, "false") != 0) {
+        /* property is neither true nor false; fall back on kernel parameter */
+        property_get("ro.kernel.android.checkjni", propBuf, "");
+        if (propBuf[0] == '1') {
+            checkJni = true;
+        }
+    }
+
+    property_get("dalvik.vm.execution-mode", propBuf, "");
+    if (strcmp(propBuf, "int:portable") == 0) {
+        executionMode = kEMIntPortable;
+    } else if (strcmp(propBuf, "int:fast") == 0) {
+        executionMode = kEMIntFast;
+#if defined(WITH_JIT)
+    } else if (strcmp(propBuf, "int:jit") == 0) {
+        executionMode = kEMJitCompiler;
+#endif
+    }
+
+    property_get("dalvik.vm.stack-trace-file", stackTraceFileBuf, "");
+
+    property_get("dalvik.vm.check-dex-sum", propBuf, "");
+    if (strcmp(propBuf, "true") == 0) {
+        checkDexSum = true;
+    }
+
+    property_get("log.redirect-stdio", propBuf, "");
+    if (strcmp(propBuf, "true") == 0) {
+        logStdio = true;
+    }
+
+    strcpy(enableAssertBuf, "-ea:");
+    property_get("dalvik.vm.enableassertions", enableAssertBuf+4, "");
+
+    strcpy(jniOptsBuf, "-Xjniopts:");
+    property_get("dalvik.vm.jniopts", jniOptsBuf+10, "");
+
+    /* route exit() to our handler */
+    opt.extraInfo = (void*) runtime_exit;
+    opt.optionString = "exit";
+    mOptions.add(opt);
+
+    /* route fprintf() to our handler */
+    opt.extraInfo = (void*) runtime_vfprintf;
+    opt.optionString = "vfprintf";
+    mOptions.add(opt);
+
+    /* register the framework-specific "is sensitive thread" hook */
+    opt.extraInfo = (void*) runtime_isSensitiveThread;
+    opt.optionString = "sensitiveThread";
+    mOptions.add(opt);
+
+    opt.extraInfo = NULL;
+
+    /* enable verbose; standard options are { jni, gc, class } */
+    //options[curOpt++].optionString = "-verbose:jni";
+    opt.optionString = "-verbose:gc";
+    mOptions.add(opt);
+    //options[curOpt++].optionString = "-verbose:class";
+
+    /*
+     * The default starting and maximum size of the heap.  Larger
+     * values should be specified in a product property override.
+     */
+    strcpy(heapstartsizeOptsBuf, "-Xms");
+    property_get("dalvik.vm.heapstartsize", heapstartsizeOptsBuf+4, "4m");
+    opt.optionString = heapstartsizeOptsBuf;
+    mOptions.add(opt);
+    strcpy(heapsizeOptsBuf, "-Xmx");
+    property_get("dalvik.vm.heapsize", heapsizeOptsBuf+4, "16m");
+    opt.optionString = heapsizeOptsBuf;
+    mOptions.add(opt);
+
+    // Increase the main thread's interpreter stack size for bug 6315322.
+    opt.optionString = "-XX:mainThreadStackSize=24K";
+    mOptions.add(opt);
+
+    strcpy(heapgrowthlimitOptsBuf, "-XX:HeapGrowthLimit=");
+    property_get("dalvik.vm.heapgrowthlimit", heapgrowthlimitOptsBuf+20, "");
+    if (heapgrowthlimitOptsBuf[20] != '\0') {
+        opt.optionString = heapgrowthlimitOptsBuf;
+        mOptions.add(opt);
+    }
+
+    strcpy(heapminfreeOptsBuf, "-XX:HeapMinFree=");
+    property_get("dalvik.vm.heapminfree", heapminfreeOptsBuf+16, "");
+    if (heapminfreeOptsBuf[16] != '\0') {
+        opt.optionString = heapminfreeOptsBuf;
+        mOptions.add(opt);
+    }
+
+    strcpy(heapmaxfreeOptsBuf, "-XX:HeapMaxFree=");
+    property_get("dalvik.vm.heapmaxfree", heapmaxfreeOptsBuf+16, "");
+    if (heapmaxfreeOptsBuf[16] != '\0') {
+        opt.optionString = heapmaxfreeOptsBuf;
+        mOptions.add(opt);
+    }
+
+    strcpy(heaptargetutilizationOptsBuf, "-XX:HeapTargetUtilization=");
+    property_get("dalvik.vm.heaptargetutilization", heaptargetutilizationOptsBuf+26, "");
+    if (heaptargetutilizationOptsBuf[26] != '\0') {
+        opt.optionString = heaptargetutilizationOptsBuf;
+        mOptions.add(opt);
+    }
+
+    /*
+     * Enable or disable dexopt features, such as bytecode verification and
+     * calculation of register maps for precise GC.
+     */
+    property_get("dalvik.vm.dexopt-flags", dexoptFlagsBuf, "");
+    if (dexoptFlagsBuf[0] != '\0') {
+        const char* opc;
+        const char* val;
+
+        opc = strstr(dexoptFlagsBuf, "v=");     /* verification */
+        if (opc != NULL) {
+            switch (*(opc+2)) {
+            case 'n':   val = "-Xverify:none";      break;
+            case 'r':   val = "-Xverify:remote";    break;
+            case 'a':   val = "-Xverify:all";       break;
+            default:    val = NULL;                 break;
+            }
+
+            if (val != NULL) {
+                opt.optionString = val;
+                mOptions.add(opt);
+            }
+        }
+
+        opc = strstr(dexoptFlagsBuf, "o=");     /* optimization */
+        if (opc != NULL) {
+            switch (*(opc+2)) {
+            case 'n':   val = "-Xdexopt:none";      break;
+            case 'v':   val = "-Xdexopt:verified";  break;
+            case 'a':   val = "-Xdexopt:all";       break;
+            case 'f':   val = "-Xdexopt:full";      break;
+            default:    val = NULL;                 break;
+            }
+
+            if (val != NULL) {
+                opt.optionString = val;
+                mOptions.add(opt);
+            }
+        }
+
+        opc = strstr(dexoptFlagsBuf, "m=y");    /* register map */
+        if (opc != NULL) {
+            opt.optionString = "-Xgenregmap";
+            mOptions.add(opt);
+
+            /* turn on precise GC while we're at it */
+            opt.optionString = "-Xgc:precise";
+            mOptions.add(opt);
+        }
+    }
+
+    /* enable debugging; set suspend=y to pause during VM init */
+    /* use android ADB transport */
+    opt.optionString =
+        "-agentlib:jdwp=transport=dt_android_adb,suspend=n,server=y";
+    mOptions.add(opt);
+
+    ALOGD("CheckJNI is %s\n", checkJni ? "ON" : "OFF");
+    if (checkJni) {
+        /* extended JNI checking */
+        opt.optionString = "-Xcheck:jni";
+        mOptions.add(opt);
+
+        /* set a cap on JNI global references */
+        opt.optionString = "-Xjnigreflimit:2000";
+        mOptions.add(opt);
+
+        /* with -Xcheck:jni, this provides a JNI function call trace */
+        //opt.optionString = "-verbose:jni";
+        //mOptions.add(opt);
+    }
+
+    char lockProfThresholdBuf[sizeof("-Xlockprofthreshold:") + sizeof(propBuf)];
+    property_get("dalvik.vm.lockprof.threshold", propBuf, "");
+    if (strlen(propBuf) > 0) {
+      strcpy(lockProfThresholdBuf, "-Xlockprofthreshold:");
+      strcat(lockProfThresholdBuf, propBuf);
+      opt.optionString = lockProfThresholdBuf;
+      mOptions.add(opt);
+    }
+
+#if defined(WITH_JIT)
+    /* Force interpreter-only mode for selected opcodes. Eg "1-0a,3c,f1-ff" */
+    char jitOpBuf[sizeof("-Xjitop:") + PROPERTY_VALUE_MAX];
+    property_get("dalvik.vm.jit.op", propBuf, "");
+    if (strlen(propBuf) > 0) {
+        strcpy(jitOpBuf, "-Xjitop:");
+        strcat(jitOpBuf, propBuf);
+        opt.optionString = jitOpBuf;
+        mOptions.add(opt);
+    }
+
+    /* Force interpreter-only mode for selected methods */
+    char jitMethodBuf[sizeof("-Xjitmethod:") + PROPERTY_VALUE_MAX];
+    property_get("dalvik.vm.jit.method", propBuf, "");
+    if (strlen(propBuf) > 0) {
+        strcpy(jitMethodBuf, "-Xjitmethod:");
+        strcat(jitMethodBuf, propBuf);
+        opt.optionString = jitMethodBuf;
+        mOptions.add(opt);
+    }
+#endif
+
+    if (executionMode == kEMIntPortable) {
+        opt.optionString = "-Xint:portable";
+        mOptions.add(opt);
+    } else if (executionMode == kEMIntFast) {
+        opt.optionString = "-Xint:fast";
+        mOptions.add(opt);
+#if defined(WITH_JIT)
+    } else if (executionMode == kEMJitCompiler) {
+        opt.optionString = "-Xint:jit";
+        mOptions.add(opt);
+#endif
+    }
+
+    if (checkDexSum) {
+        /* perform additional DEX checksum tests */
+        opt.optionString = "-Xcheckdexsum";
+        mOptions.add(opt);
+    }
+
+    if (logStdio) {
+        /* convert stdout/stderr to log messages */
+        opt.optionString = "-Xlog-stdio";
+        mOptions.add(opt);
+    }
+
+    if (enableAssertBuf[4] != '\0') {
+        /* accept "all" to mean "all classes and packages" */
+        if (strcmp(enableAssertBuf+4, "all") == 0)
+            enableAssertBuf[3] = '\0';
+        ALOGI("Assertions enabled: '%s'\n", enableAssertBuf);
+        opt.optionString = enableAssertBuf;
+        mOptions.add(opt);
+    } else {
+        ALOGV("Assertions disabled\n");
+    }
+
+    if (jniOptsBuf[10] != '\0') {
+        ALOGI("JNI options: '%s'\n", jniOptsBuf);
+        opt.optionString = jniOptsBuf;
+        mOptions.add(opt);
+    }
+
+    if (stackTraceFileBuf[0] != '\0') {
+        static const char* stfOptName = "-Xstacktracefile:";
+
+        stackTraceFile = (char*) malloc(strlen(stfOptName) +
+            strlen(stackTraceFileBuf) +1);
+        strcpy(stackTraceFile, stfOptName);
+        strcat(stackTraceFile, stackTraceFileBuf);
+        opt.optionString = stackTraceFile;
+        mOptions.add(opt);
+    }
+
+    /* extra options; parse this late so it overrides others */
+    property_get("dalvik.vm.extra-opts", extraOptsBuf, "");
+    parseExtraOpts(extraOptsBuf);
+
+    /* Set the properties for locale */
+    {
+        char langOption[sizeof("-Duser.language=") + 3];
+        char regionOption[sizeof("-Duser.region=") + 3];
+        strcpy(langOption, "-Duser.language=");
+        strcpy(regionOption, "-Duser.region=");
+        readLocale(langOption, regionOption);
+        opt.extraInfo = NULL;
+        opt.optionString = langOption;
+        mOptions.add(opt);
+        opt.optionString = regionOption;
+        mOptions.add(opt);
+    }
+
+    /*
+     * We don't have /tmp on the device, but we often have an SD card.  Apps
+     * shouldn't use this, but some test suites might want to exercise it.
+     */
+    opt.optionString = "-Djava.io.tmpdir=/sdcard";
+    mOptions.add(opt);
+
+    initArgs.version = JNI_VERSION_1_4;
+    initArgs.options = mOptions.editArray();
+    initArgs.nOptions = mOptions.size();
+    initArgs.ignoreUnrecognized = JNI_FALSE;
+
+    /*
+     * Initialize the VM.
+     *
+     * The JavaVM* is essentially per-process, and the JNIEnv* is per-thread.
+     * If this call succeeds, the VM is ready, and we can start issuing
+     * JNI calls.
+     */
+    if (JNI_CreateJavaVM(pJavaVM, pEnv, &initArgs) < 0) {
+        ALOGE("JNI_CreateJavaVM failed\n");
+        goto bail;
+    }
+
+    result = 0;
+
+bail:
+    free(stackTraceFile);
+    return result;
+!!!963084.cpp!!!	javaCreateThreadEtc(in entryFunction : android_thread_func_t, inout userData : void, in threadName : char, in threadPriority : int32_t, in threadStackSize : size_t, inout threadId : android_thread_id_t) : int
+    void** args = (void**) malloc(3 * sizeof(void*));   // javaThreadShell must free
+    int result;
+
+    assert(threadName != NULL);
+
+    args[0] = (void*) entryFunction;
+    args[1] = userData;
+    args[2] = (void*) strdup(threadName);   // javaThreadShell must free
+
+    result = androidCreateRawThreadEtc(AndroidRuntime::javaThreadShell, args,
+        threadName, threadPriority, threadStackSize, threadId);
+    return result;
+!!!963212.cpp!!!	javaThreadShell(inout args : void) : int
+    void* start = ((void**)args)[0];
+    void* userData = ((void **)args)[1];
+    char* name = (char*) ((void **)args)[2];        // we own this storage
+    free(args);
+    JNIEnv* env;
+    int result;
+
+    /* hook us into the VM */
+    if (javaAttachThread(name, &env) != JNI_OK)
+        return -1;
+
+    /* start the thread running */
+    result = (*(android_thread_func_t)start)(userData);
+
+    /* unhook us */
+    javaDetachThread();
+    free(name);
+
+    return result;

@@ -1,0 +1,318 @@
+class SipSessionGroup
+!!!9671820.java!!!	SipSessionGroup(inout profile : SipProfile, in password : String, inout timer : SipWakeupTimer, inout wakeLock : SipWakeLock)
+        mLocalProfile = profile;
+        mPassword = password;
+        mWakeupTimer = timer;
+        mWakeLock = wakeLock;
+        reset();
+!!!9671948.java!!!	setWakeupTimer(inout timer : SipWakeupTimer) : void
+        mWakeupTimer = timer;
+!!!9672076.java!!!	reset() : void
+        Properties properties = new Properties();
+
+        String protocol = mLocalProfile.getProtocol();
+        int port = mLocalProfile.getPort();
+        String server = mLocalProfile.getProxyAddress();
+
+        if (!TextUtils.isEmpty(server)) {
+            properties.setProperty("javax.sip.OUTBOUND_PROXY",
+                    server + ':' + port + '/' + protocol);
+        } else {
+            server = mLocalProfile.getSipDomain();
+        }
+        if (server.startsWith("[") && server.endsWith("]")) {
+            server = server.substring(1, server.length() - 1);
+        }
+
+        String local = null;
+        try {
+            for (InetAddress remote : InetAddress.getAllByName(server)) {
+                DatagramSocket socket = new DatagramSocket();
+                socket.connect(remote, port);
+                if (socket.isConnected()) {
+                    local = socket.getLocalAddress().getHostAddress();
+                    port = socket.getLocalPort();
+                    socket.close();
+                    break;
+                }
+                socket.close();
+            }
+        } catch (Exception e) {
+            // ignore.
+        }
+        if (local == null) {
+            // We are unable to reach the server. Just bail out.
+            return;
+        }
+
+        close();
+        mLocalIp = local;
+
+        properties.setProperty("javax.sip.STACK_NAME", getStackName());
+        properties.setProperty(
+                "gov.nist.javax.sip.THREAD_POOL_SIZE", THREAD_POOL_SIZE);
+        mSipStack = SipFactory.getInstance().createSipStack(properties);
+        try {
+            SipProvider provider = mSipStack.createSipProvider(
+                    mSipStack.createListeningPoint(local, port, protocol));
+            provider.addSipListener(this);
+            mSipHelper = new SipHelper(mSipStack, provider);
+        } catch (SipException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new SipException("failed to initialize SIP stack", e);
+        }
+
+        Log.d(TAG, " start stack for " + mLocalProfile.getUriString());
+        mSipStack.start();
+!!!9672204.java!!!	onConnectivityChanged() : void
+        SipSessionImpl[] ss = mSessionMap.values().toArray(
+                    new SipSessionImpl[mSessionMap.size()]);
+        // Iterate on the copied array instead of directly on mSessionMap to
+        // avoid ConcurrentModificationException being thrown when
+        // SipSessionImpl removes itself from mSessionMap in onError() in the
+        // following loop.
+        for (SipSessionImpl s : ss) {
+            s.onError(SipErrorCode.DATA_CONNECTION_LOST,
+                    "data connection lost");
+        }
+!!!9672332.java!!!	resetExternalAddress() : void
+        if (DEBUG) {
+            Log.d(TAG, " reset external addr on " + mSipStack);
+        }
+        mExternalIp = null;
+        mExternalPort = 0;
+!!!9672460.java!!!	getLocalProfile() : SipProfile
+        return mLocalProfile;
+!!!9672588.java!!!	getLocalProfileUri() : String
+        return mLocalProfile.getUriString();
+!!!9672716.java!!!	getStackName() : String
+        return "stack" + System.currentTimeMillis();
+!!!9672844.java!!!	close() : void
+        Log.d(TAG, " close stack for " + mLocalProfile.getUriString());
+        onConnectivityChanged();
+        mSessionMap.clear();
+        closeToNotReceiveCalls();
+        if (mSipStack != null) {
+            mSipStack.stop();
+            mSipStack = null;
+            mSipHelper = null;
+        }
+        resetExternalAddress();
+!!!9672972.java!!!	isClosed() : boolean
+        return (mSipStack == null);
+!!!9673100.java!!!	openToReceiveCalls(inout listener : ISipSessionListener) : void
+        if (mCallReceiverSession == null) {
+            mCallReceiverSession = new SipSessionCallReceiverImpl(listener);
+        } else {
+            mCallReceiverSession.setListener(listener);
+        }
+!!!9673228.java!!!	closeToNotReceiveCalls() : void
+        mCallReceiverSession = null;
+!!!9673356.java!!!	createSession(inout listener : ISipSessionListener) : ISipSession
+        return (isClosed() ? null : new SipSessionImpl(listener));
+!!!9673484.java!!!	containsSession(in callId : String) : boolean
+        return mSessionMap.containsKey(callId);
+!!!9673612.java!!!	getSipSession(inout event : EventObject) : SipSessionImpl
+        String key = SipHelper.getCallId(event);
+        SipSessionImpl session = mSessionMap.get(key);
+        if ((session != null) && isLoggable(session)) {
+            Log.d(TAG, "session key from event: " + key);
+            Log.d(TAG, "active sessions:");
+            for (String k : mSessionMap.keySet()) {
+                Log.d(TAG, " ..." + k + ": " + mSessionMap.get(k));
+            }
+        }
+        return ((session != null) ? session : mCallReceiverSession);
+!!!9673740.java!!!	addSipSession(inout newSession : SipSessionImpl) : void
+        removeSipSession(newSession);
+        String key = newSession.getCallId();
+        mSessionMap.put(key, newSession);
+        if (isLoggable(newSession)) {
+            Log.d(TAG, "+++  add a session with key:  '" + key + "'");
+            for (String k : mSessionMap.keySet()) {
+                Log.d(TAG, "  " + k + ": " + mSessionMap.get(k));
+            }
+        }
+!!!9673868.java!!!	removeSipSession(inout session : SipSessionImpl) : void
+        if (session == mCallReceiverSession) return;
+        String key = session.getCallId();
+        SipSessionImpl s = mSessionMap.remove(key);
+        // sanity check
+        if ((s != null) && (s != session)) {
+            Log.w(TAG, "session " + session + " is not associated with key '"
+                    + key + "'");
+            mSessionMap.put(key, s);
+            for (Map.Entry<String, SipSessionImpl> entry
+                    : mSessionMap.entrySet()) {
+                if (entry.getValue() == s) {
+                    key = entry.getKey();
+                    mSessionMap.remove(key);
+                }
+            }
+        }
+
+        if ((s != null) && isLoggable(s)) {
+            Log.d(TAG, "remove session " + session + " @key '" + key + "'");
+            for (String k : mSessionMap.keySet()) {
+                Log.d(TAG, "  " + k + ": " + mSessionMap.get(k));
+            }
+        }
+!!!9673996.java!!!	processRequest(in event : RequestEvent) : void
+        if (isRequestEvent(Request.INVITE, event)) {
+            if (DEBUG) Log.d(TAG, "<<<<< got INVITE, thread:"
+                    + Thread.currentThread());
+            // Acquire a wake lock and keep it for WAKE_LOCK_HOLDING_TIME;
+            // should be large enough to bring up the app.
+            mWakeLock.acquire(WAKE_LOCK_HOLDING_TIME);
+        }
+        process(event);
+!!!9674124.java!!!	processResponse(inout event : ResponseEvent) : void
+        process(event);
+!!!9674252.java!!!	processIOException(inout event : IOExceptionEvent) : void
+        process(event);
+!!!9674380.java!!!	processTimeout(inout event : TimeoutEvent) : void
+        process(event);
+!!!9674508.java!!!	processTransactionTerminated(inout event : TransactionTerminatedEvent) : void
+        process(event);
+!!!9674636.java!!!	processDialogTerminated(inout event : DialogTerminatedEvent) : void
+        process(event);
+!!!9674764.java!!!	process(inout event : EventObject) : void
+        SipSessionImpl session = getSipSession(event);
+        try {
+            boolean isLoggable = isLoggable(session, event);
+            boolean processed = (session != null) && session.process(event);
+            if (isLoggable && processed) {
+                Log.d(TAG, "new state after: "
+                        + SipSession.State.toString(session.mState));
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "event process error: " + event, getRootCause(e));
+            session.onError(e);
+        }
+!!!9674892.java!!!	extractContent(inout message : Message) : String
+        // Currently we do not support secure MIME bodies.
+        byte[] bytes = message.getRawContent();
+        if (bytes != null) {
+            try {
+                if (message instanceof SIPMessage) {
+                    return ((SIPMessage) message).getMessageContent();
+                } else {
+                    return new String(bytes, "UTF-8");
+                }
+            } catch (UnsupportedEncodingException e) {
+            }
+        }
+        return null;
+!!!9675020.java!!!	extractExternalAddress(inout evt : ResponseEvent) : void
+        Response response = evt.getResponse();
+        ViaHeader viaHeader = (ViaHeader)(response.getHeader(
+                SIPHeaderNames.VIA));
+        if (viaHeader == null) return;
+        int rport = viaHeader.getRPort();
+        String externalIp = viaHeader.getReceived();
+        if ((rport > 0) && (externalIp != null)) {
+            mExternalIp = externalIp;
+            mExternalPort = rport;
+            if (DEBUG) {
+                Log.d(TAG, " got external addr " + externalIp + ":" + rport
+                        + " on " + mSipStack);
+            }
+        }
+!!!9675148.java!!!	getRootCause(inout exception : Throwable) : Throwable
+        Throwable cause = exception.getCause();
+        while (cause != null) {
+            exception = cause;
+            cause = exception.getCause();
+        }
+        return exception;
+!!!9675276.java!!!	createNewSession(inout event : RequestEvent, inout listener : ISipSessionListener, inout transaction : ServerTransaction, in newState : int) : SipSessionImpl
+        SipSessionImpl newSession = new SipSessionImpl(listener);
+        newSession.mServerTransaction = transaction;
+        newSession.mState = newState;
+        newSession.mDialog = newSession.mServerTransaction.getDialog();
+        newSession.mInviteReceived = event;
+        newSession.mPeerProfile = createPeerProfile((HeaderAddress)
+                event.getRequest().getHeader(FromHeader.NAME));
+        newSession.mPeerSessionDescription =
+                extractContent(event.getRequest());
+        return newSession;
+!!!9685900.java!!!	isRequestEvent(in method : String, inout event : EventObject) : boolean
+        try {
+            if (event instanceof RequestEvent) {
+                RequestEvent requestEvent = (RequestEvent) event;
+                return method.equals(requestEvent.getRequest().getMethod());
+            }
+        } catch (Throwable e) {
+        }
+        return false;
+!!!9686028.java!!!	getCseqMethod(inout message : Message) : String
+        return ((CSeqHeader) message.getHeader(CSeqHeader.NAME)).getMethod();
+!!!9686156.java!!!	expectResponse(in expectedMethod : String, inout evt : EventObject) : boolean
+        if (evt instanceof ResponseEvent) {
+            ResponseEvent event = (ResponseEvent) evt;
+            Response response = event.getResponse();
+            return expectedMethod.equalsIgnoreCase(getCseqMethod(response));
+        }
+        return false;
+!!!9686284.java!!!	expectResponse(in responseCode : int, in expectedMethod : String, inout evt : EventObject) : boolean
+        if (evt instanceof ResponseEvent) {
+            ResponseEvent event = (ResponseEvent) evt;
+            Response response = event.getResponse();
+            if (response.getStatusCode() == responseCode) {
+                return expectedMethod.equalsIgnoreCase(getCseqMethod(response));
+            }
+        }
+        return false;
+!!!9686412.java!!!	createPeerProfile(inout header : HeaderAddress) : SipProfile
+        try {
+            Address address = header.getAddress();
+            SipURI uri = (SipURI) address.getURI();
+            String username = uri.getUser();
+            if (username == null) username = ANONYMOUS;
+            int port = uri.getPort();
+            SipProfile.Builder builder =
+                    new SipProfile.Builder(username, uri.getHost())
+                    .setDisplayName(address.getDisplayName());
+            if (port > 0) builder.setPort(port);
+            return builder.build();
+        } catch (IllegalArgumentException e) {
+            throw new SipException("createPeerProfile()", e);
+        } catch (ParseException e) {
+            throw new SipException("createPeerProfile()", e);
+        }
+!!!9686540.java!!!	isLoggable(inout s : SipSessionImpl) : boolean
+        if (s != null) {
+            switch (s.mState) {
+                case SipSession.State.PINGING:
+                    return DEBUG_PING;
+            }
+        }
+        return DEBUG;
+!!!9686668.java!!!	isLoggable(inout evt : EventObject) : boolean
+        return isLoggable(null, evt);
+!!!9686796.java!!!	isLoggable(inout s : SipSessionImpl, inout evt : EventObject) : boolean
+        if (!isLoggable(s)) return false;
+        if (evt == null) return false;
+
+        if (evt instanceof ResponseEvent) {
+            Response response = ((ResponseEvent) evt).getResponse();
+            if (Request.OPTIONS.equals(response.getHeader(CSeqHeader.NAME))) {
+                return DEBUG_PING;
+            }
+            return DEBUG;
+        } else if (evt instanceof RequestEvent) {
+            if (isRequestEvent(Request.OPTIONS, evt)) {
+                return DEBUG_PING;
+            }
+            return DEBUG;
+        }
+        return false;
+!!!9686924.java!!!	log(inout evt : EventObject) : String
+        if (evt instanceof RequestEvent) {
+            return ((RequestEvent) evt).getRequest().toString();
+        } else if (evt instanceof ResponseEvent) {
+            return ((ResponseEvent) evt).getResponse().toString();
+        } else {
+            return evt.toString();
+        }

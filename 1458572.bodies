@@ -1,0 +1,307 @@
+class LayoutTestsExecutor
+!!!9071372.java!!!	onCreate(inout savedInstanceState : Bundle) : void
+        super.onCreate(savedInstanceState);
+
+        /**
+         * It detects the crash by catching all the uncaught exceptions. However, we
+         * still have to kill the process, because after catching the exception the
+         * activity remains in a strange state, where intents don't revive it.
+         * However, we send the message to the service to speed up the rebooting
+         * (we don't have to wait for time-out to kick in).
+         */
+        Thread.setDefaultUncaughtExceptionHandler(new UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable e) {
+                Log.w(LOG_TAG,
+                        "onTestCrashed(): " + mCurrentTestRelativePath + " thread=" + thread, e);
+
+                try {
+                    Message serviceMsg =
+                            Message.obtain(null, ManagerService.MSG_CURRENT_TEST_CRASHED);
+
+                    mManagerServiceMessenger.send(serviceMsg);
+                } catch (RemoteException e2) {
+                    Log.e(LOG_TAG, "mCurrentTestRelativePath=" + mCurrentTestRelativePath, e2);
+                }
+
+                Process.killProcess(Process.myPid());
+            }
+        });
+
+        requestWindowFeature(Window.FEATURE_PROGRESS);
+
+        Intent intent = getIntent();
+        mTestsList = FsUtils.loadTestListFromStorage(intent.getStringExtra(EXTRA_TESTS_FILE));
+        mCurrentTestIndex = intent.getIntExtra(EXTRA_TEST_INDEX, -1);
+        mTotalTestCount = mCurrentTestIndex + mTestsList.size();
+
+        PowerManager pm = (PowerManager)getSystemService(Context.POWER_SERVICE);
+        mScreenDimLock = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK
+                | PowerManager.ON_AFTER_RELEASE, "WakeLock in LayoutTester");
+        mScreenDimLock.acquire();
+
+        bindService(new Intent(this, ManagerService.class), mServiceConnection,
+                Context.BIND_AUTO_CREATE);
+!!!9071500.java!!!	reset() : void
+        WebView previousWebView = mCurrentWebView;
+
+        resetLayoutTestController();
+
+        mCurrentTestTimedOut = false;
+        mCurrentResult = null;
+        mCurrentAdditionalTextOutput = null;
+
+        mCurrentWebView = createWebViewWithJavascriptInterfaces();
+        // When we create the first WebView, we need to pause to wait for the WebView thread to spin
+        // and up and for it to register its message handlers.
+        if (previousWebView == null) {
+            try {
+                Thread.currentThread().sleep(1000);
+            } catch (Exception e) {}
+        }
+        setupWebView(mCurrentWebView);
+
+        mEventSender.reset(mCurrentWebView);
+
+        setContentView(mCurrentWebView);
+        if (previousWebView != null) {
+            Log.d(LOG_TAG + "::reset", "previousWebView != null");
+            previousWebView.destroy();
+        }
+!!!9071756.java!!!	createWebViewWithJavascriptInterfaces() : WebView
+        Map<String, Object> javascriptInterfaces = new HashMap<String, Object>();
+        javascriptInterfaces.put("layoutTestController", mLayoutTestController);
+        javascriptInterfaces.put("eventSender", mEventSender);
+        return new WebViewWithJavascriptInterfaces(this, javascriptInterfaces);
+!!!9071884.java!!!	setupWebView(inout webView : WebView) : void
+        webView.setWebViewClient(mWebViewClient);
+        webView.setWebChromeClient(mWebChromeClient);
+
+        /**
+         * Setting a touch interval of -1 effectively disables the optimisation in WebView
+         * that stops repeated touch events flooding WebCore. The Event Sender only sends a
+         * single event rather than a stream of events (like what would generally happen in
+         * a real use of touch events in a WebView)  and so if the WebView drops the event,
+         * the test will fail as the test expects one callback for every touch it synthesizes.
+         */
+        WebViewClassic webViewClassic = WebViewClassic.fromWebView(webView);
+        webViewClassic.setTouchInterval(-1);
+
+        webViewClassic.clearCache(true);
+
+        WebSettingsClassic webViewSettings = webViewClassic.getSettings();
+        webViewSettings.setAppCacheEnabled(true);
+        webViewSettings.setAppCachePath(getApplicationContext().getCacheDir().getPath());
+        // Use of larger values causes unexplained AppCache database corruption.
+        // TODO: Investigate what's really going on here.
+        webViewSettings.setAppCacheMaxSize(100 * 1024 * 1024);
+        webViewSettings.setJavaScriptEnabled(true);
+        webViewSettings.setJavaScriptCanOpenWindowsAutomatically(true);
+        webViewSettings.setSupportMultipleWindows(true);
+        webViewSettings.setLayoutAlgorithm(WebSettings.LayoutAlgorithm.NORMAL);
+        webViewSettings.setDatabaseEnabled(true);
+        webViewSettings.setDatabasePath(getDir("databases", 0).getAbsolutePath());
+        webViewSettings.setDomStorageEnabled(true);
+        webViewSettings.setWorkersEnabled(false);
+        webViewSettings.setXSSAuditorEnabled(false);
+        webViewSettings.setPageCacheCapacity(0);
+
+        // This is asynchronous, but it gets processed by WebCore before it starts loading pages.
+        WebViewClassic.fromWebView(mCurrentWebView).setUseMockGeolocation();
+        WebViewClassic.fromWebView(mCurrentWebView).setUseMockDeviceOrientation();
+
+        // Must do this after setting the AppCache path.
+        WebStorage.getInstance().deleteAllData();
+!!!9072012.java!!!	startTests() : void
+        // This is called when the tests are started and after each crash.
+        // We only send the reset message in the former case.
+        if (mCurrentTestIndex <= 0) {
+            sendResetMessage();
+        }
+        if (mCurrentTestIndex == 0) {
+            sendFirstTestMessage();
+        }
+
+        runNextTest();
+!!!9072140.java!!!	sendResetMessage() : void
+        try {
+            Message serviceMsg = Message.obtain(null, ManagerService.MSG_RESET);
+            mManagerServiceMessenger.send(serviceMsg);
+        } catch (RemoteException e) {
+            Log.e(LOG_TAG, "Error sending message to manager service:", e);
+        }
+!!!9072268.java!!!	sendFirstTestMessage() : void
+        try {
+            Message serviceMsg = Message.obtain(null, ManagerService.MSG_FIRST_TEST);
+
+            Bundle bundle = new Bundle();
+            bundle.putString("firstTest", mTestsList.get(0));
+            bundle.putInt("index", mCurrentTestIndex);
+
+            serviceMsg.setData(bundle);
+            mManagerServiceMessenger.send(serviceMsg);
+        } catch (RemoteException e) {
+            Log.e(LOG_TAG, "Error sending message to manager service:", e);
+        }
+!!!9072396.java!!!	runNextTest() : void
+        assert mCurrentState == CurrentState.IDLE : "mCurrentState = " + mCurrentState.name();
+
+        if (mTestsList.isEmpty()) {
+            onAllTestsFinished();
+            return;
+        }
+
+        mCurrentTestRelativePath = mTestsList.remove(0);
+
+        Log.i(LOG_TAG, "runNextTest(): Start: " + mCurrentTestRelativePath +
+                " (" + mCurrentTestIndex + ")");
+
+        mCurrentTestUri = FileFilter.getUrl(mCurrentTestRelativePath, true).toString();
+
+        reset();
+
+        /** Start time-out countdown and the test */
+        mCurrentState = CurrentState.RENDERING_PAGE;
+        mResultHandler.sendEmptyMessageDelayed(MSG_TEST_TIMED_OUT, DEFAULT_TIME_OUT_MS);
+        mCurrentWebView.loadUrl(mCurrentTestUri);
+!!!9072524.java!!!	onTestTimedOut() : void
+        assert mCurrentState.isRunningState() : "mCurrentState = " + mCurrentState.name();
+
+        Log.w(LOG_TAG, "onTestTimedOut(): " + mCurrentTestRelativePath);
+        mCurrentTestTimedOut = true;
+
+        /**
+         * While it is theoretically possible that the test times out because
+         * of webview becoming unresponsive, it is very unlikely. Therefore it's
+         * assumed that obtaining results (that calls various webview methods)
+         * will not itself hang.
+         */
+        obtainActualResultsFromWebView();
+!!!9072652.java!!!	onTestFinished() : void
+        assert mCurrentState.isRunningState() : "mCurrentState = " + mCurrentState.name();
+
+        Log.i(LOG_TAG, "onTestFinished(): " + mCurrentTestRelativePath);
+        mResultHandler.removeMessages(MSG_TEST_TIMED_OUT);
+        obtainActualResultsFromWebView();
+!!!9072780.java!!!	obtainActualResultsFromWebView() : void
+        /**
+         * If the result has not been set by the time the test finishes we create
+         * a default type of result.
+         */
+        if (mCurrentResult == null) {
+            /** TODO: Default type should be RenderTreeResult. We don't support it now. */
+            mCurrentResult = new TextResult(mCurrentTestRelativePath);
+        }
+
+        mCurrentState = CurrentState.OBTAINING_RESULT;
+
+        if (mCurrentTestTimedOut) {
+            mCurrentResult.setDidTimeOut();
+        }
+        mCurrentResult.obtainActualResults(mCurrentWebView,
+                mResultHandler.obtainMessage(MSG_ACTUAL_RESULT_OBTAINED));
+!!!9072908.java!!!	onActualResultsObtained() : void
+        assert mCurrentState == CurrentState.OBTAINING_RESULT
+                : "mCurrentState = " + mCurrentState.name();
+
+        Log.i(LOG_TAG, "onActualResultsObtained(): " + mCurrentTestRelativePath);
+        mCurrentState = CurrentState.IDLE;
+
+        reportResultToService();
+        mCurrentTestIndex++;
+        updateProgressBar();
+        runNextTest();
+!!!9073036.java!!!	reportResultToService() : void
+        if (mCurrentAdditionalTextOutput != null) {
+            mCurrentResult.setAdditionalTextOutputString(mCurrentAdditionalTextOutput.toString());
+        }
+
+        try {
+            Message serviceMsg =
+                    Message.obtain(null, ManagerService.MSG_PROCESS_ACTUAL_RESULTS);
+
+            Bundle bundle = mCurrentResult.getBundle();
+            bundle.putInt("testIndex", mCurrentTestIndex);
+            if (!mTestsList.isEmpty()) {
+                bundle.putString("nextTest", mTestsList.get(0));
+            }
+
+            serviceMsg.setData(bundle);
+            mManagerServiceMessenger.send(serviceMsg);
+        } catch (RemoteException e) {
+            Log.e(LOG_TAG, "mCurrentTestRelativePath=" + mCurrentTestRelativePath, e);
+        }
+!!!9073164.java!!!	updateProgressBar() : void
+        getWindow().setFeatureInt(Window.FEATURE_PROGRESS,
+                mCurrentTestIndex * Window.PROGRESS_END / mTotalTestCount);
+        setTitle(mCurrentTestIndex * 100 / mTotalTestCount + "% " +
+                "(" + mCurrentTestIndex + "/" + mTotalTestCount + ")");
+!!!9073292.java!!!	onAllTestsFinished() : void
+        mScreenDimLock.release();
+
+        try {
+            Message serviceMsg =
+                    Message.obtain(null, ManagerService.MSG_ALL_TESTS_FINISHED);
+            mManagerServiceMessenger.send(serviceMsg);
+        } catch (RemoteException e) {
+            Log.e(LOG_TAG, "mCurrentTestRelativePath=" + mCurrentTestRelativePath, e);
+        }
+
+        unbindService(mServiceConnection);
+!!!9073420.java!!!	getCurrentAdditionalTextOutput() : AdditionalTextOutput
+        if (mCurrentAdditionalTextOutput == null) {
+            mCurrentAdditionalTextOutput = new AdditionalTextOutput();
+        }
+        return mCurrentAdditionalTextOutput;
+!!!9073548.java!!!	resetLayoutTestController() : void
+        mCanOpenWindows = false;
+        mDumpDatabaseCallbacks = false;
+!!!9073676.java!!!	dumpAsText(inout enablePixelTest : boolean) : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": dumpAsText(" + enablePixelTest + ") called");
+        /** TODO: Implement */
+        if (enablePixelTest) {
+            Log.w(LOG_TAG, "enablePixelTest not implemented, switching to false");
+        }
+        mLayoutTestControllerHandler.sendEmptyMessage(MSG_DUMP_AS_TEXT);
+!!!9073804.java!!!	dumpChildFramesAsText() : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": dumpChildFramesAsText() called");
+        mLayoutTestControllerHandler.sendEmptyMessage(MSG_DUMP_CHILD_FRAMES_AS_TEXT);
+!!!9073932.java!!!	dumpDatabaseCallbacks() : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": dumpDatabaseCallbacks() called");
+        mLayoutTestControllerHandler.sendEmptyMessage(MSG_DUMP_DATABASE_CALLBACKS);
+!!!9074060.java!!!	notifyDone() : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": notifyDone() called");
+        mLayoutTestControllerHandler.sendEmptyMessage(MSG_NOTIFY_DONE);
+!!!9074188.java!!!	overridePreference(in key : String, inout value : boolean) : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": overridePreference(" + key + ", " + value +
+        ") called");
+        Message msg = mLayoutTestControllerHandler.obtainMessage(MSG_OVERRIDE_PREFERENCE);
+        msg.getData().putString("key", key);
+        msg.getData().putBoolean("value", value);
+        msg.sendToTarget();
+!!!9074316.java!!!	setCanOpenWindows() : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": setCanOpenWindows() called");
+        mLayoutTestControllerHandler.sendEmptyMessage(MSG_SET_CAN_OPEN_WINDOWS);
+!!!9074444.java!!!	setMockGeolocationPosition(in latitude : double, in longitude : double, in accuracy : double) : void
+        WebViewClassic.fromWebView(mCurrentWebView).setMockGeolocationPosition(latitude, longitude,
+                accuracy);
+!!!9074572.java!!!	setMockGeolocationError(in code : int, in message : String) : void
+        WebViewClassic.fromWebView(mCurrentWebView).setMockGeolocationError(code, message);
+!!!9074700.java!!!	setGeolocationPermission(inout allow : boolean) : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": setGeolocationPermission(" + allow +
+                ") called");
+        WebViewClassic.fromWebView(mCurrentWebView).setMockGeolocationPermission(allow);
+!!!9074828.java!!!	setMockDeviceOrientation(inout canProvideAlpha : boolean, in alpha : double, inout canProvideBeta : boolean, in beta : double, inout canProvideGamma : boolean, in gamma : double) : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": setMockDeviceOrientation(" + canProvideAlpha +
+                ", " + alpha + ", " + canProvideBeta + ", " + beta + ", " + canProvideGamma +
+                ", " + gamma + ")");
+        WebViewClassic.fromWebView(mCurrentWebView).setMockDeviceOrientation(canProvideAlpha,
+                alpha, canProvideBeta, beta, canProvideGamma, gamma);
+!!!9074956.java!!!	setXSSAuditorEnabled(inout flag : boolean) : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": setXSSAuditorEnabled(" + flag + ") called");
+        Message msg = mLayoutTestControllerHandler.obtainMessage(MSG_SET_XSS_AUDITOR_ENABLED);
+        msg.arg1 = flag ? 1 : 0;
+        msg.sendToTarget();
+!!!9075084.java!!!	waitUntilDone() : void
+        Log.i(LOG_TAG, mCurrentTestRelativePath + ": waitUntilDone() called");
+        mLayoutTestControllerHandler.sendEmptyMessage(MSG_WAIT_UNTIL_DONE);

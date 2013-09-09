@@ -1,0 +1,863 @@
+class MPEG4Writer
+!!!393612.cpp!!!	MPEG4Writer(in filename : char)
+
+    mFd = open(filename, O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
+    if (mFd >= 0) {
+        mInitCheck = OK;
+    }
+!!!393868.cpp!!!	addSource(in source : sp<MediaSource>) : status_t
+    Mutex::Autolock l(mLock);
+    if (mStarted) {
+        ALOGE("Attempt to add source AFTER recording is started");
+        return UNKNOWN_ERROR;
+    }
+    Track *track = new Track(this, source, 1 + mTracks.size());
+    mTracks.push_back(track);
+
+    return OK;
+!!!393996.cpp!!!	start(inout param : MetaData = NULL) : status_t
+    if (mInitCheck != OK) {
+        return UNKNOWN_ERROR;
+    }
+
+    /*
+     * Check mMaxFileSizeLimitBytes at the beginning
+     * since mMaxFileSizeLimitBytes may be implicitly
+     * changed later for 32-bit file offset even if
+     * user does not ask to set it explicitly.
+     */
+    if (mMaxFileSizeLimitBytes != 0) {
+        mIsFileSizeLimitExplicitlyRequested = true;
+    }
+
+    int32_t use64BitOffset;
+    if (param &&
+        param->findInt32(kKey64BitFileOffset, &use64BitOffset) &&
+        use64BitOffset) {
+        mUse32BitOffset = false;
+    }
+
+    if (mUse32BitOffset) {
+        // Implicit 32 bit file size limit
+        if (mMaxFileSizeLimitBytes == 0) {
+            mMaxFileSizeLimitBytes = kMax32BitFileSize;
+        }
+
+        // If file size is set to be larger than the 32 bit file
+        // size limit, treat it as an error.
+        if (mMaxFileSizeLimitBytes > kMax32BitFileSize) {
+            ALOGW("32-bit file size limit (%lld bytes) too big. "
+                 "It is changed to %lld bytes",
+                mMaxFileSizeLimitBytes, kMax32BitFileSize);
+            mMaxFileSizeLimitBytes = kMax32BitFileSize;
+        }
+    }
+
+    int32_t use2ByteNalLength;
+    if (param &&
+        param->findInt32(kKey2ByteNalLength, &use2ByteNalLength) &&
+        use2ByteNalLength) {
+        mUse4ByteNalLength = false;
+    }
+
+    mStartTimestampUs = -1;
+
+    if (mStarted) {
+        if (mPaused) {
+            mPaused = false;
+            return startTracks(param);
+        }
+        return OK;
+    }
+
+    if (!param ||
+        !param->findInt32(kKeyTimeScale, &mTimeScale)) {
+        mTimeScale = 1000;
+    }
+    CHECK_GT(mTimeScale, 0);
+    ALOGV("movie time scale: %d", mTimeScale);
+
+    /*
+     * When the requested file size limit is small, the priority
+     * is to meet the file size limit requirement, rather than
+     * to make the file streamable.
+     */
+    mStreamableFile =
+        (mMaxFileSizeLimitBytes != 0 &&
+         mMaxFileSizeLimitBytes >= kMinStreamableFileSizeInBytes);
+
+    mWriteMoovBoxToMemory = mStreamableFile;
+    mMoovBoxBuffer = NULL;
+    mMoovBoxBufferOffset = 0;
+
+    writeFtypBox(param);
+
+    mFreeBoxOffset = mOffset;
+
+    if (mEstimatedMoovBoxSize == 0) {
+        int32_t bitRate = -1;
+        if (param) {
+            param->findInt32(kKeyBitRate, &bitRate);
+        }
+        mEstimatedMoovBoxSize = estimateMoovBoxSize(bitRate);
+    }
+    CHECK_GE(mEstimatedMoovBoxSize, 8);
+    if (mStreamableFile) {
+        // Reserve a 'free' box only for streamable file
+        lseek64(mFd, mFreeBoxOffset, SEEK_SET);
+        writeInt32(mEstimatedMoovBoxSize);
+        write("free", 4);
+        mMdatOffset = mFreeBoxOffset + mEstimatedMoovBoxSize;
+    } else {
+        mMdatOffset = mOffset;
+    }
+
+    mOffset = mMdatOffset;
+    lseek64(mFd, mMdatOffset, SEEK_SET);
+    if (mUse32BitOffset) {
+        write("????mdat", 8);
+    } else {
+        write("\x00\x00\x00\x01mdat????????", 16);
+    }
+
+    status_t err = startWriterThread();
+    if (err != OK) {
+        return err;
+    }
+
+    err = startTracks(param);
+    if (err != OK) {
+        return err;
+    }
+
+    mStarted = true;
+    return OK;
+!!!394252.cpp!!!	pause() : status_t
+    if (mInitCheck != OK) {
+        return OK;
+    }
+    mPaused = true;
+    status_t err = OK;
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        status_t status = (*it)->pause();
+        if (status != OK) {
+            err = status;
+        }
+    }
+    return err;
+!!!394380.cpp!!!	reachedEOS() : bool
+    bool allDone = true;
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        if (!(*it)->reachedEOS()) {
+            allDone = false;
+            break;
+        }
+    }
+
+    return allDone;
+!!!394508.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+    snprintf(buffer, SIZE, "   MPEG4Writer %p\n", this);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "     mStarted: %s\n", mStarted? "true": "false");
+    result.append(buffer);
+    ::write(fd, result.string(), result.size());
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        (*it)->dump(fd, args);
+    }
+    return OK;
+!!!394636.cpp!!!	beginBox(in fourcc : char) : void
+    CHECK_EQ(strlen(fourcc), 4);
+
+    mBoxes.push_back(mWriteMoovBoxToMemory?
+            mMoovBoxBufferOffset: mOffset);
+
+    writeInt32(0);
+    writeFourcc(fourcc);
+!!!394764.cpp!!!	writeInt8(in x : int8_t) : void
+    write(&x, 1, 1);
+!!!394892.cpp!!!	writeInt16(in x : int16_t) : void
+    x = htons(x);
+    write(&x, 1, 2);
+!!!395020.cpp!!!	writeInt32(in x : int32_t) : void
+    x = htonl(x);
+    write(&x, 1, 4);
+!!!395148.cpp!!!	writeInt64(in x : int64_t) : void
+    x = hton64(x);
+    write(&x, 1, 8);
+!!!395276.cpp!!!	writeCString(in s : char) : void
+    size_t n = strlen(s);
+    write(s, 1, n + 1);
+!!!395404.cpp!!!	writeFourcc(in s : char) : void
+    CHECK_EQ(strlen(s), 4);
+    write(s, 1, 4);
+!!!395532.cpp!!!	write(in data : void, in size : size_t) : void
+    write(data, 1, size);
+!!!395660.cpp!!!	write(in ptr : void, in size : size_t, in nmemb : size_t) : size_t
+
+    const size_t bytes = size * nmemb;
+    if (mWriteMoovBoxToMemory) {
+        // This happens only when we write the moov box at the end of
+        // recording, not for each output video/audio frame we receive.
+        off64_t moovBoxSize = 8 + mMoovBoxBufferOffset + bytes;
+        if (moovBoxSize > mEstimatedMoovBoxSize) {
+            for (List<off64_t>::iterator it = mBoxes.begin();
+                 it != mBoxes.end(); ++it) {
+                (*it) += mOffset;
+            }
+            lseek64(mFd, mOffset, SEEK_SET);
+            ::write(mFd, mMoovBoxBuffer, mMoovBoxBufferOffset);
+            ::write(mFd, ptr, size * nmemb);
+            mOffset += (bytes + mMoovBoxBufferOffset);
+            free(mMoovBoxBuffer);
+            mMoovBoxBuffer = NULL;
+            mMoovBoxBufferOffset = 0;
+            mWriteMoovBoxToMemory = false;
+            mStreamableFile = false;
+        } else {
+            memcpy(mMoovBoxBuffer + mMoovBoxBufferOffset, ptr, bytes);
+            mMoovBoxBufferOffset += bytes;
+        }
+    } else {
+        ::write(mFd, ptr, size * nmemb);
+        mOffset += bytes;
+    }
+    return bytes;
+!!!395788.cpp!!!	endBox() : void
+    CHECK(!mBoxes.empty());
+
+    off64_t offset = *--mBoxes.end();
+    mBoxes.erase(--mBoxes.end());
+
+    if (mWriteMoovBoxToMemory) {
+       int32_t x = htonl(mMoovBoxBufferOffset - offset);
+       memcpy(mMoovBoxBuffer + offset, &x, 4);
+    } else {
+        lseek64(mFd, offset, SEEK_SET);
+        writeInt32(mOffset - offset);
+        mOffset -= 4;
+        lseek64(mFd, mOffset, SEEK_SET);
+    }
+!!!396044.cpp!!!	setInterleaveDuration(in durationUs : uint32_t) : status_t
+    mInterleaveDurationUs = durationUs;
+    return OK;
+!!!396300.cpp!!!	setGeoData(in latitudex10000 : int, in longitudex10000 : int) : status_t
+    // Is latitude or longitude out of range?
+    if (latitudex10000 < -900000 || latitudex10000 > 900000 ||
+        longitudex10000 < -1800000 || longitudex10000 > 1800000) {
+        return BAD_VALUE;
+    }
+
+    mLatitudex10000 = latitudex10000;
+    mLongitudex10000 = longitudex10000;
+    mAreGeoTagsAvailable = true;
+    return OK;
+!!!396684.cpp!!!	~MPEG4Writer()
+    reset();
+
+    while (!mTracks.empty()) {
+        List<Track *>::iterator it = mTracks.begin();
+        delete *it;
+        (*it) = NULL;
+        mTracks.erase(it);
+    }
+    mTracks.clear();
+!!!396812.cpp!!!	setStartTimestampUs(in timeUs : int64_t) : void
+    ALOGI("setStartTimestampUs: %lld", timeUs);
+    CHECK_GE(timeUs, 0ll);
+    Mutex::Autolock autoLock(mLock);
+    if (mStartTimestampUs < 0 || mStartTimestampUs > timeUs) {
+        mStartTimestampUs = timeUs;
+        ALOGI("Earliest track starting time: %lld", mStartTimestampUs);
+    }
+!!!396940.cpp!!!	getStartTimestampUs() : int64_t
+    Mutex::Autolock autoLock(mLock);
+    return mStartTimestampUs;
+!!!397068.cpp!!!	startTracks(inout params : MetaData) : status_t
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        status_t err = (*it)->start(params);
+
+        if (err != OK) {
+            for (List<Track *>::iterator it2 = mTracks.begin();
+                 it2 != it; ++it2) {
+                (*it2)->stop();
+            }
+
+            return err;
+        }
+    }
+    return OK;
+!!!397196.cpp!!!	numTracks() : size_t
+    Mutex::Autolock autolock(mLock);
+    return mTracks.size();
+!!!397324.cpp!!!	estimateMoovBoxSize(in bitRate : int32_t) : int64_t
+    // This implementation is highly experimental/heurisitic.
+    //
+    // Statistical analysis shows that metadata usually accounts
+    // for a small portion of the total file size, usually < 0.6%.
+
+    // The default MIN_MOOV_BOX_SIZE is set to 0.6% x 1MB / 2,
+    // where 1MB is the common file size limit for MMS application.
+    // The default MAX _MOOV_BOX_SIZE value is based on about 3
+    // minute video recording with a bit rate about 3 Mbps, because
+    // statistics also show that most of the video captured are going
+    // to be less than 3 minutes.
+
+    // If the estimation is wrong, we will pay the price of wasting
+    // some reserved space. This should not happen so often statistically.
+    static const int32_t factor = mUse32BitOffset? 1: 2;
+    static const int64_t MIN_MOOV_BOX_SIZE = 3 * 1024;  // 3 KB
+    static const int64_t MAX_MOOV_BOX_SIZE = (180 * 3000000 * 6LL / 8000);
+    int64_t size = MIN_MOOV_BOX_SIZE;
+
+    // Max file size limit is set
+    if (mMaxFileSizeLimitBytes != 0 && mIsFileSizeLimitExplicitlyRequested) {
+        size = mMaxFileSizeLimitBytes * 6 / 1000;
+    }
+
+    // Max file duration limit is set
+    if (mMaxFileDurationLimitUs != 0) {
+        if (bitRate > 0) {
+            int64_t size2 =
+                ((mMaxFileDurationLimitUs * bitRate * 6) / 1000 / 8000000);
+            if (mMaxFileSizeLimitBytes != 0 && mIsFileSizeLimitExplicitlyRequested) {
+                // When both file size and duration limits are set,
+                // we use the smaller limit of the two.
+                if (size > size2) {
+                    size = size2;
+                }
+            } else {
+                // Only max file duration limit is set
+                size = size2;
+            }
+        }
+    }
+
+    if (size < MIN_MOOV_BOX_SIZE) {
+        size = MIN_MOOV_BOX_SIZE;
+    }
+
+    // Any long duration recording will be probably end up with
+    // non-streamable mp4 file.
+    if (size > MAX_MOOV_BOX_SIZE) {
+        size = MAX_MOOV_BOX_SIZE;
+    }
+
+    ALOGI("limits: %lld/%lld bytes/us, bit rate: %d bps and the estimated"
+         " moov size %lld bytes",
+         mMaxFileSizeLimitBytes, mMaxFileDurationLimitUs, bitRate, size);
+    return factor * size;
+!!!397708.cpp!!!	startWriterThread() : status_t
+    ALOGV("startWriterThread");
+
+    mDone = false;
+    mIsFirstChunk = true;
+    mDriftTimeUs = 0;
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        ChunkInfo info;
+        info.mTrack = *it;
+        info.mPrevChunkTimestampUs = 0;
+        info.mMaxInterChunkDurUs = 0;
+        mChunkInfos.push_back(info);
+    }
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    pthread_create(&mThread, &attr, ThreadWrapper, this);
+    pthread_attr_destroy(&attr);
+    mWriterThreadStarted = true;
+    return OK;
+!!!397836.cpp!!!	stopWriterThread() : void
+    ALOGD("Stopping writer thread");
+    if (!mWriterThreadStarted) {
+        return;
+    }
+
+    {
+        Mutex::Autolock autolock(mLock);
+
+        mDone = true;
+        mChunkReadyCondition.signal();
+    }
+
+    void *dummy;
+    pthread_join(mThread, &dummy);
+    mWriterThreadStarted = false;
+    ALOGD("Writer thread stopped");
+!!!397964.cpp!!!	ThreadWrapper(inout me : void) : void
+    ALOGV("ThreadWrapper: %p", me);
+    MPEG4Writer *writer = static_cast<MPEG4Writer *>(me);
+    writer->threadFunc();
+    return NULL;
+!!!398092.cpp!!!	threadFunc() : void
+    ALOGV("threadFunc");
+
+    prctl(PR_SET_NAME, (unsigned long)"MPEG4Writer", 0, 0, 0);
+
+    Mutex::Autolock autoLock(mLock);
+    while (!mDone) {
+        Chunk chunk;
+        bool chunkFound = false;
+
+        while (!mDone && !(chunkFound = findChunkToWrite(&chunk))) {
+            mChunkReadyCondition.wait(mLock);
+        }
+
+        // Actual write without holding the lock in order to
+        // reduce the blocking time for media track threads.
+        if (chunkFound) {
+            mLock.unlock();
+            writeChunkToFile(&chunk);
+            mLock.lock();
+        }
+    }
+
+    writeAllChunks();
+!!!398220.cpp!!!	bufferChunk(in chunk : Chunk) : void
+    ALOGV("bufferChunk: %p", chunk.mTrack);
+    Mutex::Autolock autolock(mLock);
+    CHECK_EQ(mDone, false);
+
+    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+         it != mChunkInfos.end(); ++it) {
+
+        if (chunk.mTrack == it->mTrack) {  // Found owner
+            it->mChunks.push_back(chunk);
+            mChunkReadyCondition.signal();
+            return;
+        }
+    }
+
+    CHECK(!"Received a chunk for a unknown track");
+!!!398348.cpp!!!	writeAllChunks() : void
+    ALOGV("writeAllChunks");
+    size_t outstandingChunks = 0;
+    Chunk chunk;
+    while (findChunkToWrite(&chunk)) {
+        writeChunkToFile(&chunk);
+        ++outstandingChunks;
+    }
+
+    sendSessionSummary();
+
+    mChunkInfos.clear();
+    ALOGD("%d chunks are written in the last batch", outstandingChunks);
+!!!398476.cpp!!!	findChunkToWrite(inout chunk : Chunk) : bool
+    ALOGV("findChunkToWrite");
+
+    int64_t minTimestampUs = 0x7FFFFFFFFFFFFFFFLL;
+    Track *track = NULL;
+    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+         it != mChunkInfos.end(); ++it) {
+        if (!it->mChunks.empty()) {
+            List<Chunk>::iterator chunkIt = it->mChunks.begin();
+            if (chunkIt->mTimeStampUs < minTimestampUs) {
+                minTimestampUs = chunkIt->mTimeStampUs;
+                track = it->mTrack;
+            }
+        }
+    }
+
+    if (track == NULL) {
+        ALOGV("Nothing to be written after all");
+        return false;
+    }
+
+    if (mIsFirstChunk) {
+        mIsFirstChunk = false;
+    }
+
+    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+         it != mChunkInfos.end(); ++it) {
+        if (it->mTrack == track) {
+            *chunk = *(it->mChunks.begin());
+            it->mChunks.erase(it->mChunks.begin());
+            CHECK_EQ(chunk->mTrack, track);
+
+            int64_t interChunkTimeUs =
+                chunk->mTimeStampUs - it->mPrevChunkTimestampUs;
+            if (interChunkTimeUs > it->mPrevChunkTimestampUs) {
+                it->mMaxInterChunkDurUs = interChunkTimeUs;
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+!!!398604.cpp!!!	writeChunkToFile(inout chunk : Chunk) : void
+    ALOGV("writeChunkToFile: %lld from %s track",
+        chunk->mTimeStampUs, chunk->mTrack->isAudio()? "audio": "video");
+
+    int32_t isFirstSample = true;
+    while (!chunk->mSamples.empty()) {
+        List<MediaBuffer *>::iterator it = chunk->mSamples.begin();
+
+        off64_t offset = chunk->mTrack->isAvc()
+                                ? addLengthPrefixedSample_l(*it)
+                                : addSample_l(*it);
+
+        if (isFirstSample) {
+            chunk->mTrack->addChunkOffset(offset);
+            isFirstSample = false;
+        }
+
+        (*it)->release();
+        (*it) = NULL;
+        chunk->mSamples.erase(it);
+    }
+    chunk->mSamples.clear();
+!!!398732.cpp!!!	setDriftTimeUs(in driftTimeUs : int64_t) : void
+    ALOGV("setDriftTimeUs: %lld us", driftTimeUs);
+    Mutex::Autolock autolock(mLock);
+    mDriftTimeUs = driftTimeUs;
+!!!398860.cpp!!!	getDriftTimeUs() : int64_t
+    ALOGV("getDriftTimeUs: %lld us", mDriftTimeUs);
+    Mutex::Autolock autolock(mLock);
+    return mDriftTimeUs;
+!!!398988.cpp!!!	useNalLengthFour() : bool
+    return mUse4ByteNalLength;
+!!!399116.cpp!!!	lock() : void
+    mLock.lock();
+!!!399244.cpp!!!	unlock() : void
+    mLock.unlock();
+!!!399372.cpp!!!	addSample_l(inout buffer : MediaBuffer) : off64_t
+    off64_t old_offset = mOffset;
+
+    ::write(mFd,
+          (const uint8_t *)buffer->data() + buffer->range_offset(),
+          buffer->range_length());
+
+    mOffset += buffer->range_length();
+
+    return old_offset;
+!!!399500.cpp!!!	addLengthPrefixedSample_l(inout buffer : MediaBuffer) : off64_t
+    off64_t old_offset = mOffset;
+
+    size_t length = buffer->range_length();
+
+    if (mUse4ByteNalLength) {
+        uint8_t x = length >> 24;
+        ::write(mFd, &x, 1);
+        x = (length >> 16) & 0xff;
+        ::write(mFd, &x, 1);
+        x = (length >> 8) & 0xff;
+        ::write(mFd, &x, 1);
+        x = length & 0xff;
+        ::write(mFd, &x, 1);
+
+        ::write(mFd,
+              (const uint8_t *)buffer->data() + buffer->range_offset(),
+              length);
+
+        mOffset += length + 4;
+    } else {
+        CHECK_LT(length, 65536);
+
+        uint8_t x = length >> 8;
+        ::write(mFd, &x, 1);
+        x = length & 0xff;
+        ::write(mFd, &x, 1);
+        ::write(mFd, (const uint8_t *)buffer->data() + buffer->range_offset(), length);
+        mOffset += length + 2;
+    }
+
+    return old_offset;
+!!!399628.cpp!!!	exceedsFileSizeLimit() : bool
+    // No limit
+    if (mMaxFileSizeLimitBytes == 0) {
+        return false;
+    }
+
+    int64_t nTotalBytesEstimate = static_cast<int64_t>(mEstimatedMoovBoxSize);
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        nTotalBytesEstimate += (*it)->getEstimatedTrackSizeBytes();
+    }
+
+    if (!mStreamableFile) {
+        // Add 1024 bytes as error tolerance
+        return nTotalBytesEstimate + 1024 >= mMaxFileSizeLimitBytes;
+    }
+    // Be conservative in the estimate: do not exceed 95% of
+    // the target file limit. For small target file size limit, though,
+    // this will not help.
+    return (nTotalBytesEstimate >= (95 * mMaxFileSizeLimitBytes) / 100);
+!!!399756.cpp!!!	use32BitFileOffset() : bool
+    return mUse32BitOffset;
+!!!399884.cpp!!!	exceedsFileDurationLimit() : bool
+    // No limit
+    if (mMaxFileDurationLimitUs == 0) {
+        return false;
+    }
+
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        if ((*it)->getDurationUs() >= mMaxFileDurationLimitUs) {
+            return true;
+        }
+    }
+    return false;
+!!!400012.cpp!!!	isFileStreamable() : bool
+    return mStreamableFile;
+!!!400140.cpp!!!	trackProgressStatus(in trackId : size_t, in timeUs : int64_t, in err : status_t = OK) : void
+    Mutex::Autolock lock(mLock);
+    int32_t trackNum = (trackId << 28);
+
+    // Error notification
+    // Do not consider ERROR_END_OF_STREAM an error
+    if (err != OK && err != ERROR_END_OF_STREAM) {
+        notify(MEDIA_RECORDER_TRACK_EVENT_ERROR,
+               trackNum | MEDIA_RECORDER_TRACK_ERROR_GENERAL,
+               err);
+        return;
+    }
+
+    if (timeUs == -1) {
+        // Send completion notification
+        notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+               trackNum | MEDIA_RECORDER_TRACK_INFO_COMPLETION_STATUS,
+               err);
+    } else {
+        // Send progress status
+        notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+               trackNum | MEDIA_RECORDER_TRACK_INFO_PROGRESS_IN_TIME,
+               timeUs / 1000);
+    }
+!!!400396.cpp!!!	writeMvhdBox(in durationUs : int64_t) : void
+    uint32_t now = getMpeg4Time();
+    beginBox("mvhd");
+    writeInt32(0);             // version=0, flags=0
+    writeInt32(now);           // creation time
+    writeInt32(now);           // modification time
+    writeInt32(mTimeScale);    // mvhd timescale
+    int32_t duration = (durationUs * mTimeScale + 5E5) / 1E6;
+    writeInt32(duration);
+    writeInt32(0x10000);       // rate: 1.0
+    writeInt16(0x100);         // volume
+    writeInt16(0);             // reserved
+    writeInt32(0);             // reserved
+    writeInt32(0);             // reserved
+    writeCompositionMatrix(0); // matrix
+    writeInt32(0);             // predefined
+    writeInt32(0);             // predefined
+    writeInt32(0);             // predefined
+    writeInt32(0);             // predefined
+    writeInt32(0);             // predefined
+    writeInt32(0);             // predefined
+    writeInt32(mTracks.size() + 1);  // nextTrackID
+    endBox();  // mvhd
+!!!400524.cpp!!!	writeMoovBox(in durationUs : int64_t) : void
+    beginBox("moov");
+    writeMvhdBox(durationUs);
+    if (mAreGeoTagsAvailable) {
+        writeUdtaBox();
+    }
+    int32_t id = 1;
+    for (List<Track *>::iterator it = mTracks.begin();
+        it != mTracks.end(); ++it, ++id) {
+        (*it)->writeTrackHeader(mUse32BitOffset);
+    }
+    endBox();  // moov
+!!!400652.cpp!!!	writeFtypBox(inout param : MetaData) : void
+    beginBox("ftyp");
+
+    int32_t fileType;
+    if (param && param->findInt32(kKeyFileType, &fileType) &&
+        fileType != OUTPUT_FORMAT_MPEG_4) {
+        writeFourcc("3gp4");
+    } else {
+        writeFourcc("isom");
+    }
+
+    writeInt32(0);
+    writeFourcc("isom");
+    writeFourcc("3gp4");
+    endBox();
+!!!400780.cpp!!!	writeUdtaBox() : void
+    beginBox("udta");
+    writeGeoDataBox();
+    endBox();
+!!!400908.cpp!!!	writeGeoDataBox() : void
+    beginBox("\xA9xyz");
+    /*
+     * For historical reasons, any user data start
+     * with "\0xA9", must be followed by its assoicated
+     * language code.
+     * 0x0012: text string length
+     * 0x15c7: lang (locale) code: en
+     */
+    writeInt32(0x001215c7);
+    writeLatitude(mLatitudex10000);
+    writeLongitude(mLongitudex10000);
+    writeInt8(0x2F);
+    endBox();
+!!!401036.cpp!!!	writeLatitude(in degreex10000 : int) : void
+    bool isNegative = (degreex10000 < 0);
+    char sign = isNegative? '-': '+';
+
+    // Handle the whole part
+    char str[9];
+    int wholePart = degreex10000 / 10000;
+    if (wholePart == 0) {
+        snprintf(str, 5, "%c%.2d.", sign, wholePart);
+    } else {
+        snprintf(str, 5, "%+.2d.", wholePart);
+    }
+
+    // Handle the fractional part
+    int fractionalPart = degreex10000 - (wholePart * 10000);
+    if (fractionalPart < 0) {
+        fractionalPart = -fractionalPart;
+    }
+    snprintf(&str[4], 5, "%.4d", fractionalPart);
+
+    // Do not write the null terminator
+    write(str, 1, 8);
+!!!401164.cpp!!!	writeLongitude(in degreex10000 : int) : void
+    bool isNegative = (degreex10000 < 0);
+    char sign = isNegative? '-': '+';
+
+    // Handle the whole part
+    char str[10];
+    int wholePart = degreex10000 / 10000;
+    if (wholePart == 0) {
+        snprintf(str, 6, "%c%.3d.", sign, wholePart);
+    } else {
+        snprintf(str, 6, "%+.3d.", wholePart);
+    }
+
+    // Handle the fractional part
+    int fractionalPart = degreex10000 - (wholePart * 10000);
+    if (fractionalPart < 0) {
+        fractionalPart = -fractionalPart;
+    }
+    snprintf(&str[5], 5, "%.4d", fractionalPart);
+
+    // Do not write the null terminator
+    write(str, 1, 9);
+!!!401292.cpp!!!	sendSessionSummary() : void
+    // Send session summary only if test mode is enabled
+    if (!isTestModeEnabled()) {
+        return;
+    }
+
+    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+         it != mChunkInfos.end(); ++it) {
+        int trackNum = it->mTrack->getTrackId() << 28;
+        notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                trackNum | MEDIA_RECORDER_TRACK_INTER_CHUNK_TIME_MS,
+                it->mMaxInterChunkDurUs);
+    }
+!!!401420.cpp!!!	release() : void
+    close(mFd);
+    mFd = -1;
+    mInitCheck = NO_INIT;
+    mStarted = false;
+!!!401548.cpp!!!	reset() : status_t
+    if (mInitCheck != OK) {
+        return OK;
+    } else {
+        if (!mWriterThreadStarted ||
+            !mStarted) {
+            if (mWriterThreadStarted) {
+                stopWriterThread();
+            }
+            release();
+            return OK;
+        }
+    }
+
+    status_t err = OK;
+    int64_t maxDurationUs = 0;
+    int64_t minDurationUs = 0x7fffffffffffffffLL;
+    for (List<Track *>::iterator it = mTracks.begin();
+         it != mTracks.end(); ++it) {
+        status_t status = (*it)->stop();
+        if (err == OK && status != OK) {
+            err = status;
+        }
+
+        int64_t durationUs = (*it)->getDurationUs();
+        if (durationUs > maxDurationUs) {
+            maxDurationUs = durationUs;
+        }
+        if (durationUs < minDurationUs) {
+            minDurationUs = durationUs;
+        }
+    }
+
+    if (mTracks.size() > 1) {
+        ALOGD("Duration from tracks range is [%lld, %lld] us",
+            minDurationUs, maxDurationUs);
+    }
+
+    stopWriterThread();
+
+    // Do not write out movie header on error.
+    if (err != OK) {
+        release();
+        return err;
+    }
+
+    // Fix up the size of the 'mdat' chunk.
+    if (mUse32BitOffset) {
+        lseek64(mFd, mMdatOffset, SEEK_SET);
+        int32_t size = htonl(static_cast<int32_t>(mOffset - mMdatOffset));
+        ::write(mFd, &size, 4);
+    } else {
+        lseek64(mFd, mMdatOffset + 8, SEEK_SET);
+        int64_t size = mOffset - mMdatOffset;
+        size = hton64(size);
+        ::write(mFd, &size, 8);
+    }
+    lseek64(mFd, mOffset, SEEK_SET);
+
+    const off64_t moovOffset = mOffset;
+    mWriteMoovBoxToMemory = mStreamableFile;
+    mMoovBoxBuffer = (uint8_t *) malloc(mEstimatedMoovBoxSize);
+    mMoovBoxBufferOffset = 0;
+    CHECK(mMoovBoxBuffer != NULL);
+    writeMoovBox(maxDurationUs);
+
+    mWriteMoovBoxToMemory = false;
+    if (mStreamableFile) {
+        CHECK_LE(mMoovBoxBufferOffset + 8, mEstimatedMoovBoxSize);
+
+        // Moov box
+        lseek64(mFd, mFreeBoxOffset, SEEK_SET);
+        mOffset = mFreeBoxOffset;
+        write(mMoovBoxBuffer, 1, mMoovBoxBufferOffset);
+
+        // Free box
+        lseek64(mFd, mOffset, SEEK_SET);
+        writeInt32(mEstimatedMoovBoxSize - mMoovBoxBufferOffset);
+        write("free", 4);
+
+        // Free temp memory
+        free(mMoovBoxBuffer);
+        mMoovBoxBuffer = NULL;
+        mMoovBoxBufferOffset = 0;
+    } else {
+        ALOGI("The mp4 file will not be streamable.");
+    }
+
+    CHECK(mBoxes.empty());
+
+    release();
+    return err;
+!!!401676.cpp!!!	getMpeg4Time() : uint32_t
+    time_t now = time(NULL);
+    // MP4 file uses time counting seconds since midnight, Jan. 1, 1904
+    // while time function returns Unix epoch values which starts
+    // at 1970-01-01. Lets add the number of seconds between them
+    uint32_t mpeg4Time = now + (66 * 365 + 17) * (24 * 60 * 60);
+    return mpeg4Time;

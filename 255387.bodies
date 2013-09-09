@@ -1,0 +1,340 @@
+class ConcurrentHashMap
+!!!1436059.java!!!	entryAt(inout tab : HashEntry, in i : int) : HashEntry
+        return (tab == null) ? null :
+            (HashEntry<K,V>) UNSAFE.getObjectVolatile
+            (tab, ((long)i << TSHIFT) + TBASE);
+!!!1436187.java!!!	setEntryAt(inout tab : HashEntry, in i : int, inout e : HashEntry) : void
+        UNSAFE.putOrderedObject(tab, ((long)i << TSHIFT) + TBASE, e);
+!!!1436315.java!!!	hash(in h : int) : int
+        // Spread bits to regularize both segment and index locations,
+        // using variant of single-word Wang/Jenkins hash.
+        h += (h <<  15) ^ 0xffffcd7d;
+        h ^= (h >>> 10);
+        h += (h <<   3);
+        h ^= (h >>>  6);
+        h += (h <<   2) + (h << 14);
+        return h ^ (h >>> 16);
+!!!1454363.java!!!	segmentAt(inout ss : Segment, in j : int) : Segment
+        long u = (j << SSHIFT) + SBASE;
+        return ss == null ? null :
+            (Segment<K,V>) UNSAFE.getObjectVolatile(ss, u);
+!!!1454491.java!!!	ensureSegment(in k : int) : Segment
+        final Segment<K,V>[] ss = this.segments;
+        long u = (k << SSHIFT) + SBASE; // raw offset
+        Segment<K,V> seg;
+        if ((seg = (Segment<K,V>)UNSAFE.getObjectVolatile(ss, u)) == null) {
+            Segment<K,V> proto = ss[0]; // use segment 0 as prototype
+            int cap = proto.table.length;
+            float lf = proto.loadFactor;
+            int threshold = (int)(cap * lf);
+            HashEntry<K,V>[] tab = (HashEntry<K,V>[])new HashEntry<?,?>[cap];
+            if ((seg = (Segment<K,V>)UNSAFE.getObjectVolatile(ss, u))
+                == null) { // recheck
+                Segment<K,V> s = new Segment<K,V>(lf, threshold, tab);
+                while ((seg = (Segment<K,V>)UNSAFE.getObjectVolatile(ss, u))
+                       == null) {
+                    if (UNSAFE.compareAndSwapObject(ss, u, null, seg = s))
+                        break;
+                }
+            }
+        }
+        return seg;
+!!!1454619.java!!!	segmentForHash(in h : int) : Segment
+        long u = (((h >>> segmentShift) & segmentMask) << SSHIFT) + SBASE;
+        return (Segment<K,V>) UNSAFE.getObjectVolatile(segments, u);
+!!!1454747.java!!!	entryForHash(inout seg : Segment, in h : int) : HashEntry
+        HashEntry<K,V>[] tab;
+        return (seg == null || (tab = seg.table) == null) ? null :
+            (HashEntry<K,V>) UNSAFE.getObjectVolatile
+            (tab, ((long)(((tab.length - 1) & h)) << TSHIFT) + TBASE);
+!!!1454875.java!!!	ConcurrentHashMap(in initialCapacity : int, in loadFactor : float, in concurrencyLevel : int)
+        if (!(loadFactor > 0) || initialCapacity < 0 || concurrencyLevel <= 0)
+            throw new IllegalArgumentException();
+        if (concurrencyLevel > MAX_SEGMENTS)
+            concurrencyLevel = MAX_SEGMENTS;
+        // Find power-of-two sizes best matching arguments
+        int sshift = 0;
+        int ssize = 1;
+        while (ssize < concurrencyLevel) {
+            ++sshift;
+            ssize <<= 1;
+        }
+        this.segmentShift = 32 - sshift;
+        this.segmentMask = ssize - 1;
+        if (initialCapacity > MAXIMUM_CAPACITY)
+            initialCapacity = MAXIMUM_CAPACITY;
+        int c = initialCapacity / ssize;
+        if (c * ssize < initialCapacity)
+            ++c;
+        int cap = MIN_SEGMENT_TABLE_CAPACITY;
+        while (cap < c)
+            cap <<= 1;
+        // create segments and segments[0]
+        Segment<K,V> s0 =
+            new Segment<K,V>(loadFactor, (int)(cap * loadFactor),
+                             (HashEntry<K,V>[])new HashEntry<?,?>[cap]);
+        Segment<K,V>[] ss = (Segment<K,V>[])new Segment<?,?>[ssize];
+        UNSAFE.putOrderedObject(ss, SBASE, s0); // ordered write of segments[0]
+        this.segments = ss;
+!!!1455003.java!!!	ConcurrentHashMap(in initialCapacity : int, in loadFactor : float)
+        this(initialCapacity, loadFactor, DEFAULT_CONCURRENCY_LEVEL);
+!!!1455131.java!!!	ConcurrentHashMap(in initialCapacity : int)
+        this(initialCapacity, DEFAULT_LOAD_FACTOR, DEFAULT_CONCURRENCY_LEVEL);
+!!!1455259.java!!!	ConcurrentHashMap()
+        this(DEFAULT_INITIAL_CAPACITY, DEFAULT_LOAD_FACTOR, DEFAULT_CONCURRENCY_LEVEL);
+!!!1455387.java!!!	ConcurrentHashMap(inout m : Map)
+        this(Math.max((int) (m.size() / DEFAULT_LOAD_FACTOR) + 1,
+                      DEFAULT_INITIAL_CAPACITY),
+             DEFAULT_LOAD_FACTOR, DEFAULT_CONCURRENCY_LEVEL);
+        putAll(m);
+!!!1455515.java!!!	isEmpty() : boolean
+        /*
+         * Sum per-segment modCounts to avoid mis-reporting when
+         * elements are concurrently added and removed in one segment
+         * while checking another, in which case the table was never
+         * actually empty at any point. (The sum ensures accuracy up
+         * through at least 1<<31 per-segment modifications before
+         * recheck.)  Methods size() and containsValue() use similar
+         * constructions for stability checks.
+         */
+        long sum = 0L;
+        final Segment<K,V>[] segments = this.segments;
+        for (int j = 0; j < segments.length; ++j) {
+            Segment<K,V> seg = segmentAt(segments, j);
+            if (seg != null) {
+                if (seg.count != 0)
+                    return false;
+                sum += seg.modCount;
+            }
+        }
+        if (sum != 0L) { // recheck unless no modifications
+            for (int j = 0; j < segments.length; ++j) {
+                Segment<K,V> seg = segmentAt(segments, j);
+                if (seg != null) {
+                    if (seg.count != 0)
+                        return false;
+                    sum -= seg.modCount;
+                }
+            }
+            if (sum != 0L)
+                return false;
+        }
+        return true;
+!!!1455643.java!!!	size() : int
+        // Try a few times to get accurate count. On failure due to
+        // continuous async changes in table, resort to locking.
+        final Segment<K,V>[] segments = this.segments;
+        final int segmentCount = segments.length;
+
+        long previousSum = 0L;
+        for (int retries = -1; retries < RETRIES_BEFORE_LOCK; retries++) {
+            long sum = 0L;    // sum of modCounts
+            long size = 0L;
+            for (int i = 0; i < segmentCount; i++) {
+                Segment<K,V> segment = segmentAt(segments, i);
+                if (segment != null) {
+                    sum += segment.modCount;
+                    size += segment.count;
+                }
+            }
+            if (sum == previousSum)
+                return ((size >>> 31) == 0) ? (int) size : Integer.MAX_VALUE;
+            previousSum = sum;
+        }
+
+        long size = 0L;
+        for (int i = 0; i < segmentCount; i++) {
+            Segment<K,V> segment = ensureSegment(i);
+            segment.lock();
+            size += segment.count;
+        }
+        for (int i = 0; i < segmentCount; i++)
+            segments[i].unlock();
+        return ((size >>> 31) == 0) ? (int) size : Integer.MAX_VALUE;
+!!!1455771.java!!!	get(inout key : Object) : V
+        Segment<K,V> s; // manually integrate access methods to reduce overhead
+        HashEntry<K,V>[] tab;
+        int h = hash(key.hashCode());
+        long u = (((h >>> segmentShift) & segmentMask) << SSHIFT) + SBASE;
+        if ((s = (Segment<K,V>)UNSAFE.getObjectVolatile(segments, u)) != null &&
+            (tab = s.table) != null) {
+            for (HashEntry<K,V> e = (HashEntry<K,V>) UNSAFE.getObjectVolatile
+                     (tab, ((long)(((tab.length - 1) & h)) << TSHIFT) + TBASE);
+                 e != null; e = e.next) {
+                K k;
+                if ((k = e.key) == key || (e.hash == h && key.equals(k)))
+                    return e.value;
+            }
+        }
+        return null;
+!!!1455899.java!!!	containsKey(inout key : Object) : boolean
+        Segment<K,V> s; // same as get() except no need for volatile value read
+        HashEntry<K,V>[] tab;
+        int h = hash(key.hashCode());
+        long u = (((h >>> segmentShift) & segmentMask) << SSHIFT) + SBASE;
+        if ((s = (Segment<K,V>)UNSAFE.getObjectVolatile(segments, u)) != null &&
+            (tab = s.table) != null) {
+            for (HashEntry<K,V> e = (HashEntry<K,V>) UNSAFE.getObjectVolatile
+                     (tab, ((long)(((tab.length - 1) & h)) << TSHIFT) + TBASE);
+                 e != null; e = e.next) {
+                K k;
+                if ((k = e.key) == key || (e.hash == h && key.equals(k)))
+                    return true;
+            }
+        }
+        return false;
+!!!1456027.java!!!	containsValue(inout value : Object) : boolean
+        // Same idea as size()
+        if (value == null)
+            throw new NullPointerException();
+        final Segment<K,V>[] segments = this.segments;
+        long previousSum = 0L;
+        int lockCount = 0;
+        try {
+            for (int retries = -1; ; retries++) {
+                long sum = 0L;    // sum of modCounts
+                for (int j = 0; j < segments.length; j++) {
+                    Segment<K,V> segment;
+                    if (retries == RETRIES_BEFORE_LOCK) {
+                        segment = ensureSegment(j);
+                        segment.lock();
+                        lockCount++;
+                    } else {
+                        segment = segmentAt(segments, j);
+                        if (segment == null)
+                            continue;
+                    }
+                    HashEntry<K,V>[] tab = segment.table;
+                    if (tab != null) {
+                        for (int i = 0 ; i < tab.length; i++) {
+                            HashEntry<K,V> e;
+                            for (e = entryAt(tab, i); e != null; e = e.next) {
+                                V v = e.value;
+                                if (v != null && value.equals(v))
+                                    return true;
+                            }
+                        }
+                        sum += segment.modCount;
+                    }
+                }
+                if ((retries >= 0 && sum == previousSum) || lockCount > 0)
+                    return false;
+                previousSum = sum;
+            }
+        } finally {
+            for (int j = 0; j < lockCount; j++)
+                segments[j].unlock();
+        }
+!!!1456155.java!!!	contains(inout value : Object) : boolean
+        return containsValue(value);
+!!!1456283.java!!!	put(inout key : K, inout value : V) : V
+        Segment<K,V> s;
+        if (value == null)
+            throw new NullPointerException();
+        int hash = hash(key.hashCode());
+        int j = (hash >>> segmentShift) & segmentMask;
+        if ((s = (Segment<K,V>)UNSAFE.getObject          // nonvolatile; recheck
+             (segments, (j << SSHIFT) + SBASE)) == null) //  in ensureSegment
+            s = ensureSegment(j);
+        return s.put(key, hash, value, false);
+!!!1456411.java!!!	putIfAbsent(inout key : K, inout value : V) : V
+        Segment<K,V> s;
+        if (value == null)
+            throw new NullPointerException();
+        int hash = hash(key.hashCode());
+        int j = (hash >>> segmentShift) & segmentMask;
+        if ((s = (Segment<K,V>)UNSAFE.getObject
+             (segments, (j << SSHIFT) + SBASE)) == null)
+            s = ensureSegment(j);
+        return s.put(key, hash, value, true);
+!!!1456539.java!!!	putAll(inout m : Map) : void
+        for (Map.Entry<? extends K, ? extends V> e : m.entrySet())
+            put(e.getKey(), e.getValue());
+!!!1456667.java!!!	remove(inout key : Object) : V
+        int hash = hash(key.hashCode());
+        Segment<K,V> s = segmentForHash(hash);
+        return s == null ? null : s.remove(key, hash, null);
+!!!1456795.java!!!	remove(inout key : Object, inout value : Object) : boolean
+        int hash = hash(key.hashCode());
+        Segment<K,V> s;
+        return value != null && (s = segmentForHash(hash)) != null &&
+            s.remove(key, hash, value) != null;
+!!!1456923.java!!!	replace(inout key : K, inout oldValue : V, inout newValue : V) : boolean
+        int hash = hash(key.hashCode());
+        if (oldValue == null || newValue == null)
+            throw new NullPointerException();
+        Segment<K,V> s = segmentForHash(hash);
+        return s != null && s.replace(key, hash, oldValue, newValue);
+!!!1457051.java!!!	replace(inout key : K, inout value : V) : V
+        int hash = hash(key.hashCode());
+        if (value == null)
+            throw new NullPointerException();
+        Segment<K,V> s = segmentForHash(hash);
+        return s == null ? null : s.replace(key, hash, value);
+!!!1457179.java!!!	clear() : void
+        final Segment<K,V>[] segments = this.segments;
+        for (int j = 0; j < segments.length; ++j) {
+            Segment<K,V> s = segmentAt(segments, j);
+            if (s != null)
+                s.clear();
+        }
+!!!1457307.java!!!	keySet() : Set
+        Set<K> ks = keySet;
+        return (ks != null) ? ks : (keySet = new KeySet());
+!!!1457435.java!!!	values() : Collection
+        Collection<V> vs = values;
+        return (vs != null) ? vs : (values = new Values());
+!!!1457563.java!!!	entrySet() : Set
+        Set<Map.Entry<K,V>> es = entrySet;
+        return (es != null) ? es : (entrySet = new EntrySet());
+!!!1457691.java!!!	keys() : Enumeration
+        return new KeyIterator();
+!!!1457819.java!!!	elements() : Enumeration
+        return new ValueIterator();
+!!!1461787.java!!!	writeObject(inout s : ObjectOutputStream) : void
+        // force all segments for serialization compatibility
+        for (int k = 0; k < segments.length; ++k)
+            ensureSegment(k);
+        s.defaultWriteObject();
+
+        final Segment<K,V>[] segments = this.segments;
+        for (int k = 0; k < segments.length; ++k) {
+            Segment<K,V> seg = segmentAt(segments, k);
+            seg.lock();
+            try {
+                HashEntry<K,V>[] tab = seg.table;
+                for (int i = 0; i < tab.length; ++i) {
+                    HashEntry<K,V> e;
+                    for (e = entryAt(tab, i); e != null; e = e.next) {
+                        s.writeObject(e.key);
+                        s.writeObject(e.value);
+                    }
+                }
+            } finally {
+                seg.unlock();
+            }
+        }
+        s.writeObject(null);
+        s.writeObject(null);
+!!!1461915.java!!!	readObject(inout s : ObjectInputStream) : void
+        s.defaultReadObject();
+
+        // Re-initialize segments to be minimally sized, and let grow.
+        int cap = MIN_SEGMENT_TABLE_CAPACITY;
+        final Segment<K,V>[] segments = this.segments;
+        for (int k = 0; k < segments.length; ++k) {
+            Segment<K,V> seg = segments[k];
+            if (seg != null) {
+                seg.threshold = (int)(cap * seg.loadFactor);
+                seg.table = (HashEntry<K,V>[]) new HashEntry<?,?>[cap];
+            }
+        }
+
+        // Read the keys and values, and put the mappings in the table
+        for (;;) {
+            K key = (K) s.readObject();
+            V value = (V) s.readObject();
+            if (key == null)
+                break;
+            put(key, value);
+        }

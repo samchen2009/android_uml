@@ -1,0 +1,137 @@
+class AH263Assembler
+!!!693388.cpp!!!	assembleMore(in source : sp<ARTPSource>) : AssemblyStatus
+    AssemblyStatus status = addPacket(source);
+    if (status == MALFORMED_PACKET) {
+        mAccessUnitDamaged = true;
+    }
+    return status;
+!!!693516.cpp!!!	onByeReceived() : void
+    sp<AMessage> msg = mNotifyMsg->dup();
+    msg->setInt32("eos", true);
+    msg->post();
+!!!693644.cpp!!!	packetLost() : void
+    CHECK(mNextExpectedSeqNoValid);
+    ++mNextExpectedSeqNo;
+
+    mAccessUnitDamaged = true;
+!!!693772.cpp!!!	addPacket(in source : sp<ARTPSource>) : AssemblyStatus
+    List<sp<ABuffer> > *queue = source->queue();
+
+    if (queue->empty()) {
+        return NOT_ENOUGH_DATA;
+    }
+
+    if (mNextExpectedSeqNoValid) {
+        List<sp<ABuffer> >::iterator it = queue->begin();
+        while (it != queue->end()) {
+            if ((uint32_t)(*it)->int32Data() >= mNextExpectedSeqNo) {
+                break;
+            }
+
+            it = queue->erase(it);
+        }
+
+        if (queue->empty()) {
+            return NOT_ENOUGH_DATA;
+        }
+    }
+
+    sp<ABuffer> buffer = *queue->begin();
+
+    if (!mNextExpectedSeqNoValid) {
+        mNextExpectedSeqNoValid = true;
+        mNextExpectedSeqNo = (uint32_t)buffer->int32Data();
+    } else if ((uint32_t)buffer->int32Data() != mNextExpectedSeqNo) {
+#if VERBOSE
+        LOG(VERBOSE) << "Not the sequence number I expected";
+#endif
+
+        return WRONG_SEQUENCE_NUMBER;
+    }
+
+    uint32_t rtpTime;
+    CHECK(buffer->meta()->findInt32("rtp-time", (int32_t *)&rtpTime));
+
+    if (mPackets.size() > 0 && rtpTime != mAccessUnitRTPTime) {
+        submitAccessUnit();
+    }
+    mAccessUnitRTPTime = rtpTime;
+
+    // hexdump(buffer->data(), buffer->size());
+
+    if (buffer->size() < 2) {
+        queue->erase(queue->begin());
+        ++mNextExpectedSeqNo;
+
+        return MALFORMED_PACKET;
+    }
+
+    unsigned payloadHeader = U16_AT(buffer->data());
+    CHECK_EQ(payloadHeader >> 11, 0u);  // RR=0
+    unsigned P = (payloadHeader >> 10) & 1;
+    unsigned V = (payloadHeader >> 9) & 1;
+    unsigned PLEN = (payloadHeader >> 3) & 0x3f;
+    // unsigned PEBIT = payloadHeader & 7;
+
+    size_t skip = V + PLEN + (P ? 0 : 2);
+
+    buffer->setRange(buffer->offset() + skip, buffer->size() - skip);
+
+    if (P) {
+        buffer->data()[0] = 0x00;
+        buffer->data()[1] = 0x00;
+    }
+
+    mPackets.push_back(buffer);
+
+    queue->erase(queue->begin());
+    ++mNextExpectedSeqNo;
+
+    return OK;
+!!!693900.cpp!!!	submitAccessUnit() : void
+    CHECK(!mPackets.empty());
+
+#if VERBOSE
+    LOG(VERBOSE) << "Access unit complete (" << mPackets.size() << " packets)";
+#endif
+
+    size_t totalSize = 0;
+    List<sp<ABuffer> >::iterator it = mPackets.begin();
+    while (it != mPackets.end()) {
+        const sp<ABuffer> &unit = *it;
+
+        totalSize += unit->size();
+        ++it;
+    }
+
+    sp<ABuffer> accessUnit = new ABuffer(totalSize);
+    size_t offset = 0;
+    it = mPackets.begin();
+    while (it != mPackets.end()) {
+        const sp<ABuffer> &unit = *it;
+
+        memcpy((uint8_t *)accessUnit->data() + offset,
+               unit->data(), unit->size());
+
+        offset += unit->size();
+
+        ++it;
+    }
+
+    CopyTimes(accessUnit, *mPackets.begin());
+
+#if 0
+    printf(mAccessUnitDamaged ? "X" : ".");
+    fflush(stdout);
+#endif
+
+    if (mAccessUnitDamaged) {
+        accessUnit->meta()->setInt32("damaged", true);
+    }
+
+    mPackets.clear();
+    mAccessUnitDamaged = false;
+
+    sp<AMessage> msg = mNotifyMsg->dup();
+    msg->setBuffer("access-unit", accessUnit);
+    msg->post();

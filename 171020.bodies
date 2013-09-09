@@ -1,0 +1,100 @@
+class AudioBufferProviderSource
+!!!329484.cpp!!!	AudioBufferProviderSource(inout provider : AudioBufferProvider, in format : NBAIO_Format)
+    ALOG_ASSERT(provider != NULL);
+    ALOG_ASSERT(format != Format_Invalid);
+!!!329612.cpp!!!	~AudioBufferProviderSource()
+    if (mBuffer.raw != NULL) {
+        mProvider->releaseBuffer(&mBuffer);
+    }
+!!!329740.cpp!!!	availableToRead() : ssize_t
+    if (CC_UNLIKELY(!mNegotiated)) {
+        return NEGOTIATE;
+    }
+    return mBuffer.raw != NULL ? mBuffer.frameCount - mConsumed : 0;
+!!!329868.cpp!!!	read(inout buffer : void, in count : size_t, in readPTS : int64_t) : ssize_t
+    if (CC_UNLIKELY(!mNegotiated)) {
+        return NEGOTIATE;
+    }
+    if (CC_UNLIKELY(mBuffer.raw == NULL)) {
+        mBuffer.frameCount = count;
+        status_t status = mProvider->getNextBuffer(&mBuffer, readPTS);
+        if (status != OK) {
+            return status == NOT_ENOUGH_DATA ? (ssize_t) WOULD_BLOCK : (ssize_t) status;
+        }
+        ALOG_ASSERT(mBuffer.raw != NULL);
+        // mConsumed is 0 either from constructor or after releaseBuffer()
+    }
+    size_t available = mBuffer.frameCount - mConsumed;
+    if (CC_UNLIKELY(count > available)) {
+        count = available;
+    }
+    // count could be zero, either because count was zero on entry or
+    // available is zero, but both are unlikely so don't check for that
+    memcpy(buffer, (char *) mBuffer.raw + (mConsumed << mBitShift), count << mBitShift);
+    if (CC_UNLIKELY((mConsumed += count) >= mBuffer.frameCount)) {
+        mProvider->releaseBuffer(&mBuffer);
+        mBuffer.raw = NULL;
+        mConsumed = 0;
+    }
+    mFramesRead += count;
+    // For better responsiveness with large values of count,
+    // return a short count rather than continuing with next buffer.
+    // This gives the caller a chance to interpolate other actions.
+    return count;
+!!!329996.cpp!!!	readVia(in via : readVia_t, in total : size_t, inout user : void, in readPTS : int64_t, in block : size_t) : ssize_t
+    if (CC_UNLIKELY(!mNegotiated)) {
+        return NEGOTIATE;
+    }
+    if (CC_UNLIKELY(block == 0)) {
+        block = ~0;
+    }
+    for (size_t accumulator = 0; ; ) {
+        ALOG_ASSERT(accumulator <= total);
+        size_t count = total - accumulator;
+        if (CC_UNLIKELY(count == 0)) {
+            return accumulator;
+        }
+        if (CC_LIKELY(count > block)) {
+            count = block;
+        }
+        // 1 <= count <= block
+        if (CC_UNLIKELY(mBuffer.raw == NULL)) {
+            mBuffer.frameCount = count;
+            status_t status = mProvider->getNextBuffer(&mBuffer, readPTS);
+            if (CC_LIKELY(status == OK)) {
+                ALOG_ASSERT(mBuffer.raw != NULL && mBuffer.frameCount <= count);
+                // mConsumed is 0 either from constructor or after releaseBuffer()
+                continue;
+            }
+            // FIXME simplify logic - does the initial count and block checks again for no reason;
+            //       don't you just want to fall through to the size_t available line?
+            if (CC_LIKELY(status == NOT_ENOUGH_DATA)) {
+                status = WOULD_BLOCK;
+            }
+            return accumulator > 0 ? accumulator : (ssize_t) status;
+        }
+        size_t available = mBuffer.frameCount - mConsumed;
+        if (CC_UNLIKELY(count > available)) {
+            count = available;
+        }
+        if (CC_LIKELY(count > 0)) {
+            char* readTgt = (char *) mBuffer.raw + (mConsumed << mBitShift);
+            ssize_t ret = via(user, readTgt, count, readPTS);
+            if (CC_UNLIKELY(ret <= 0)) {
+                if (CC_LIKELY(accumulator > 0)) {
+                    return accumulator;
+                }
+                return ret;
+            }
+            ALOG_ASSERT((size_t) ret <= count);
+            mFramesRead += ret;
+            accumulator += ret;
+            if (CC_LIKELY((mConsumed += ret) < mBuffer.frameCount)) {
+                continue;
+            }
+        }
+        mProvider->releaseBuffer(&mBuffer);
+        mBuffer.raw = NULL;
+        mConsumed = 0;
+        // don't get next buffer until we really need it
+    }

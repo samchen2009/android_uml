@@ -1,0 +1,94 @@
+class AlarmThread
+!!!8019212.java!!!	AlarmThread()
+            super("AlarmManager");
+!!!8019340.java!!!	run() : void
+            while (true)
+            {
+                int result = waitForAlarm(mDescriptor);
+                
+                ArrayList<Alarm> triggerList = new ArrayList<Alarm>();
+                
+                if ((result & TIME_CHANGED_MASK) != 0) {
+                    remove(mTimeTickSender);
+                    mClockReceiver.scheduleTimeTickEvent();
+                    Intent intent = new Intent(Intent.ACTION_TIME_CHANGED);
+                    intent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING
+                            | Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                    mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+                }
+                
+                synchronized (mLock) {
+                    final long nowRTC = System.currentTimeMillis();
+                    final long nowELAPSED = SystemClock.elapsedRealtime();
+                    if (localLOGV) Slog.v(
+                        TAG, "Checking for alarms... rtc=" + nowRTC
+                        + ", elapsed=" + nowELAPSED);
+
+                    if ((result & RTC_WAKEUP_MASK) != 0)
+                        triggerAlarmsLocked(mRtcWakeupAlarms, triggerList, nowRTC);
+                    
+                    if ((result & RTC_MASK) != 0)
+                        triggerAlarmsLocked(mRtcAlarms, triggerList, nowRTC);
+                    
+                    if ((result & ELAPSED_REALTIME_WAKEUP_MASK) != 0)
+                        triggerAlarmsLocked(mElapsedRealtimeWakeupAlarms, triggerList, nowELAPSED);
+                    
+                    if ((result & ELAPSED_REALTIME_MASK) != 0)
+                        triggerAlarmsLocked(mElapsedRealtimeAlarms, triggerList, nowELAPSED);
+                    
+                    // now trigger the alarms
+                    Iterator<Alarm> it = triggerList.iterator();
+                    while (it.hasNext()) {
+                        Alarm alarm = it.next();
+                        try {
+                            if (localLOGV) Slog.v(TAG, "sending alarm " + alarm);
+                            alarm.operation.send(mContext, 0,
+                                    mBackgroundIntent.putExtra(
+                                            Intent.EXTRA_ALARM_COUNT, alarm.count),
+                                    mResultReceiver, mHandler);
+                            
+                            // we have an active broadcast so stay awake.
+                            if (mBroadcastRefCount == 0) {
+                                setWakelockWorkSource(alarm.operation);
+                                mWakeLock.acquire();
+                            }
+                            final InFlight inflight = new InFlight(AlarmManagerService.this,
+                                    alarm.operation);
+                            mInFlight.add(inflight);
+                            mBroadcastRefCount++;
+
+                            final BroadcastStats bs = inflight.mBroadcastStats;
+                            bs.count++;
+                            if (bs.nesting == 0) {
+                                bs.nesting = 1;
+                                bs.startTime = nowELAPSED;
+                            } else {
+                                bs.nesting++;
+                            }
+                            final FilterStats fs = inflight.mFilterStats;
+                            fs.count++;
+                            if (fs.nesting == 0) {
+                                fs.nesting = 1;
+                                fs.startTime = nowELAPSED;
+                            } else {
+                                fs.nesting++;
+                            }
+                            if (alarm.type == AlarmManager.ELAPSED_REALTIME_WAKEUP
+                                    || alarm.type == AlarmManager.RTC_WAKEUP) {
+                                bs.numWakeup++;
+                                fs.numWakeup++;
+                                ActivityManagerNative.noteWakeupAlarm(
+                                        alarm.operation);
+                            }
+                        } catch (PendingIntent.CanceledException e) {
+                            if (alarm.repeatInterval > 0) {
+                                // This IntentSender is no longer valid, but this
+                                // is a repeating alarm, so toss the hoser.
+                                remove(alarm.operation);
+                            }
+                        } catch (RuntimeException e) {
+                            Slog.w(TAG, "Failure sending alarm.", e);
+                        }
+                    }
+                }
+            }

@@ -1,0 +1,206 @@
+class SsaToRop
+!!!15221260.java!!!	convertToRopMethod(inout ssaMeth : SsaMethod, inout minimizeRegisters : boolean) : RopMethod
+        return new SsaToRop(ssaMeth, minimizeRegisters).convert();
+!!!15221388.java!!!	SsaToRop(inout ssaMethod : SsaMethod, inout minimizeRegisters : boolean)
+        this.minimizeRegisters = minimizeRegisters;
+        this.ssaMeth = ssaMethod;
+        this.interference =
+            LivenessAnalyzer.constructInterferenceGraph(ssaMethod);
+!!!15221516.java!!!	convert() : RopMethod
+        if (DEBUG) {
+            interference.dumpToStdout();
+        }
+
+        // These are other allocators for debugging or historical comparison:
+        // allocator = new NullRegisterAllocator(ssaMeth, interference);
+        // allocator = new FirstFitAllocator(ssaMeth, interference);
+
+        RegisterAllocator allocator =
+            new FirstFitLocalCombiningAllocator(ssaMeth, interference,
+                    minimizeRegisters);
+
+        RegisterMapper mapper = allocator.allocateRegisters();
+
+        if (DEBUG) {
+            System.out.println("Printing reg map");
+            System.out.println(((BasicRegisterMapper)mapper).toHuman());
+        }
+
+        ssaMeth.setBackMode();
+
+        ssaMeth.mapRegisters(mapper);
+
+        removePhiFunctions();
+
+        if (allocator.wantsParamsMovedHigh()) {
+            moveParametersToHighRegisters();
+        }
+
+        removeEmptyGotos();
+
+        RopMethod ropMethod = new RopMethod(convertBasicBlocks(),
+                ssaMeth.blockIndexToRopLabel(ssaMeth.getEntryBlockIndex()));
+        ropMethod = new IdenticalBlockCombiner(ropMethod).process();
+
+        return ropMethod;
+!!!15221644.java!!!	removeEmptyGotos() : void
+        final ArrayList<SsaBasicBlock> blocks = ssaMeth.getBlocks();
+
+        ssaMeth.forEachBlockDepthFirst(false, new SsaBasicBlock.Visitor() {
+            public void visitBlock(SsaBasicBlock b, SsaBasicBlock parent) {
+                ArrayList<SsaInsn> insns = b.getInsns();
+
+                if ((insns.size() == 1)
+                        && (insns.get(0).getOpcode() == Rops.GOTO)) {
+                    BitSet preds = (BitSet) b.getPredecessors().clone();
+
+                    for (int i = preds.nextSetBit(0); i >= 0;
+                            i = preds.nextSetBit(i + 1)) {
+                        SsaBasicBlock pb = blocks.get(i);
+                        pb.replaceSuccessor(b.getIndex(),
+                                b.getPrimarySuccessorIndex());
+                    }
+                }
+            }
+        });
+!!!15221772.java!!!	removePhiFunctions() : void
+        ArrayList<SsaBasicBlock> blocks = ssaMeth.getBlocks();
+
+        for (SsaBasicBlock block : blocks) {
+            // Add moves in all the pred blocks for each phi insn.
+            block.forEachPhiInsn(new PhiVisitor(blocks));
+
+            // Delete the phi insns.
+            block.removeAllPhiInsns();
+        }
+
+        /*
+         * After all move insns have been added, sort them so they don't
+         * destructively interfere.
+         */
+        for (SsaBasicBlock block : blocks) {
+            block.scheduleMovesFromPhis();
+        }
+!!!15222156.java!!!	moveParametersToHighRegisters() : void
+        int paramWidth = ssaMeth.getParamWidth();
+        BasicRegisterMapper mapper
+                = new BasicRegisterMapper(ssaMeth.getRegCount());
+        int regCount = ssaMeth.getRegCount();
+
+        for (int i = 0; i < regCount; i++) {
+            if (i < paramWidth) {
+                mapper.addMapping(i, regCount - paramWidth + i, 1);
+            } else {
+                mapper.addMapping(i, i - paramWidth, 1);
+            }
+        }
+
+        if (DEBUG) {
+            System.out.printf("Moving %d registers from 0 to %d\n",
+                    paramWidth, regCount - paramWidth);
+        }
+
+        ssaMeth.mapRegisters(mapper);
+!!!15222284.java!!!	convertBasicBlocks() : BasicBlockList
+        ArrayList<SsaBasicBlock> blocks = ssaMeth.getBlocks();
+
+        // Exit block may be null.
+        SsaBasicBlock exitBlock = ssaMeth.getExitBlock();
+
+        ssaMeth.computeReachability();
+        int ropBlockCount = ssaMeth.getCountReachableBlocks();
+
+        // Don't count the exit block, if it exists and is reachable.
+        ropBlockCount -= (exitBlock != null && exitBlock.isReachable()) ? 1 : 0;
+
+        BasicBlockList result = new BasicBlockList(ropBlockCount);
+
+        // Convert all the reachable blocks except the exit block.
+        int ropBlockIndex = 0;
+        for (SsaBasicBlock b : blocks) {
+            if (b.isReachable() && b != exitBlock) {
+                result.set(ropBlockIndex++, convertBasicBlock(b));
+            }
+        }
+
+        // The exit block, which is discarded, must do nothing.
+        if (exitBlock != null && exitBlock.getInsns().size() != 0) {
+            throw new RuntimeException(
+                    "Exit block must have no insns when leaving SSA form");
+        }
+
+        return result;
+!!!15222412.java!!!	verifyValidExitPredecessor(inout b : SsaBasicBlock) : void
+        ArrayList<SsaInsn> insns = b.getInsns();
+        SsaInsn lastInsn = insns.get(insns.size() - 1);
+        Rop opcode = lastInsn.getOpcode();
+
+        if (opcode.getBranchingness() != Rop.BRANCH_RETURN
+                && opcode != Rops.THROW) {
+            throw new RuntimeException("Exit predecessor must end"
+                    + " in valid exit statement.");
+        }
+!!!15222540.java!!!	convertBasicBlock(inout block : SsaBasicBlock) : BasicBlock
+        IntList successorList = block.getRopLabelSuccessorList();
+        int primarySuccessorLabel = block.getPrimarySuccessorRopLabel();
+
+        // Filter out any reference to the SSA form's exit block.
+
+        // Exit block may be null.
+        SsaBasicBlock exitBlock = ssaMeth.getExitBlock();
+        int exitRopLabel = (exitBlock == null) ? -1 : exitBlock.getRopLabel();
+
+        if (successorList.contains(exitRopLabel)) {
+            if (successorList.size() > 1) {
+                throw new RuntimeException(
+                        "Exit predecessor must have no other successors"
+                                + Hex.u2(block.getRopLabel()));
+            } else {
+                successorList = IntList.EMPTY;
+                primarySuccessorLabel = -1;
+
+                verifyValidExitPredecessor(block);
+            }
+        }
+
+        successorList.setImmutable();
+
+        BasicBlock result = new BasicBlock(
+                block.getRopLabel(), convertInsns(block.getInsns()),
+                successorList,
+                primarySuccessorLabel);
+
+        return result;
+!!!15222668.java!!!	convertInsns(inout ssaInsns : ArrayList<SsaInsn>) : InsnList
+        int insnCount = ssaInsns.size();
+        InsnList result = new InsnList(insnCount);
+
+        for (int i = 0; i < insnCount; i++) {
+            result.set(i, ssaInsns.get(i).toRopInsn());
+        }
+
+        result.setImmutable();
+
+        return result;
+!!!15222796.java!!!	getRegistersByFrequency() : int
+        int regCount = ssaMeth.getRegCount();
+        Integer[] ret = new Integer[regCount];
+
+        for (int i = 0; i < regCount; i++) {
+            ret[i] = i;
+        }
+
+        Arrays.sort(ret, new Comparator<Integer>() {
+            public int compare(Integer o1, Integer o2) {
+                return ssaMeth.getUseListForRegister(o2).size()
+                        - ssaMeth.getUseListForRegister(o1).size();
+            }
+        });
+
+        int result[] = new int[regCount];
+
+        for (int i = 0; i < regCount; i++) {
+            result[i] = ret[i];
+        }
+
+        return result;

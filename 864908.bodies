@@ -1,0 +1,230 @@
+class Process
+!!!3904652.java!!!	start(in processClass : String, in niceName : String, in uid : int, in gid : int, inout gids : int, in debugFlags : int, in mountExternal : int, in targetSdkVersion : int, in seInfo : String, inout zygoteArgs : String) : ProcessStartResult
+        try {
+            return startViaZygote(processClass, niceName, uid, gid, gids,
+                    debugFlags, mountExternal, targetSdkVersion, seInfo, zygoteArgs);
+        } catch (ZygoteStartFailedEx ex) {
+            Log.e(LOG_TAG,
+                    "Starting VM process through Zygote failed");
+            throw new RuntimeException(
+                    "Starting VM process through Zygote failed", ex);
+        }
+!!!3904780.java!!!	openZygoteSocketIfNeeded() : void
+
+        int retryCount;
+
+        if (sPreviousZygoteOpenFailed) {
+            /*
+             * If we've failed before, expect that we'll fail again and
+             * don't pause for retries.
+             */
+            retryCount = 0;
+        } else {
+            retryCount = 10;            
+        }
+
+        /*
+         * See bug #811181: Sometimes runtime can make it up before zygote.
+         * Really, we'd like to do something better to avoid this condition,
+         * but for now just wait a bit...
+         */
+        for (int retry = 0
+                ; (sZygoteSocket == null) && (retry < (retryCount + 1))
+                ; retry++ ) {
+
+            if (retry > 0) {
+                try {
+                    Log.i("Zygote", "Zygote not up yet, sleeping...");
+                    Thread.sleep(ZYGOTE_RETRY_MILLIS);
+                } catch (InterruptedException ex) {
+                    // should never happen
+                }
+            }
+
+            try {
+                sZygoteSocket = new LocalSocket();
+
+                sZygoteSocket.connect(new LocalSocketAddress(ZYGOTE_SOCKET, 
+                        LocalSocketAddress.Namespace.RESERVED));
+
+                sZygoteInputStream
+                        = new DataInputStream(sZygoteSocket.getInputStream());
+
+                sZygoteWriter =
+                    new BufferedWriter(
+                            new OutputStreamWriter(
+                                    sZygoteSocket.getOutputStream()),
+                            256);
+
+                Log.i("Zygote", "Process: zygote socket opened");
+
+                sPreviousZygoteOpenFailed = false;
+                break;
+            } catch (IOException ex) {
+                if (sZygoteSocket != null) {
+                    try {
+                        sZygoteSocket.close();
+                    } catch (IOException ex2) {
+                        Log.e(LOG_TAG,"I/O exception on close after exception",
+                                ex2);
+                    }
+                }
+
+                sZygoteSocket = null;
+            }
+        }
+
+        if (sZygoteSocket == null) {
+            sPreviousZygoteOpenFailed = true;
+            throw new ZygoteStartFailedEx("connect failed");                 
+        }
+!!!3904908.java!!!	zygoteSendArgsAndGetResult(inout args : ArrayList<String>) : ProcessStartResult
+        openZygoteSocketIfNeeded();
+
+        try {
+            /**
+             * See com.android.internal.os.ZygoteInit.readArgumentList()
+             * Presently the wire format to the zygote process is:
+             * a) a count of arguments (argc, in essence)
+             * b) a number of newline-separated argument strings equal to count
+             *
+             * After the zygote process reads these it will write the pid of
+             * the child or -1 on failure, followed by boolean to
+             * indicate whether a wrapper process was used.
+             */
+
+            sZygoteWriter.write(Integer.toString(args.size()));
+            sZygoteWriter.newLine();
+
+            int sz = args.size();
+            for (int i = 0; i < sz; i++) {
+                String arg = args.get(i);
+                if (arg.indexOf('\n') >= 0) {
+                    throw new ZygoteStartFailedEx(
+                            "embedded newlines not allowed");
+                }
+                sZygoteWriter.write(arg);
+                sZygoteWriter.newLine();
+            }
+
+            sZygoteWriter.flush();
+
+            // Should there be a timeout on this?
+            ProcessStartResult result = new ProcessStartResult();
+            result.pid = sZygoteInputStream.readInt();
+            if (result.pid < 0) {
+                throw new ZygoteStartFailedEx("fork() failed");
+            }
+            result.usingWrapper = sZygoteInputStream.readBoolean();
+            return result;
+        } catch (IOException ex) {
+            try {
+                if (sZygoteSocket != null) {
+                    sZygoteSocket.close();
+                }
+            } catch (IOException ex2) {
+                // we're going to fail anyway
+                Log.e(LOG_TAG,"I/O exception on routine close", ex2);
+            }
+
+            sZygoteSocket = null;
+
+            throw new ZygoteStartFailedEx(ex);
+        }
+!!!3905036.java!!!	startViaZygote(in processClass : String, in niceName : String, in uid : int, in gid : int, in gids : int, in debugFlags : int, in mountExternal : int, in targetSdkVersion : int, in seInfo : String, inout extraArgs : String) : ProcessStartResult
+        synchronized(Process.class) {
+            ArrayList<String> argsForZygote = new ArrayList<String>();
+
+            // --runtime-init, --setuid=, --setgid=,
+            // and --setgroups= must go first
+            argsForZygote.add("--runtime-init");
+            argsForZygote.add("--setuid=" + uid);
+            argsForZygote.add("--setgid=" + gid);
+            if ((debugFlags & Zygote.DEBUG_ENABLE_JNI_LOGGING) != 0) {
+                argsForZygote.add("--enable-jni-logging");
+            }
+            if ((debugFlags & Zygote.DEBUG_ENABLE_SAFEMODE) != 0) {
+                argsForZygote.add("--enable-safemode");
+            }
+            if ((debugFlags & Zygote.DEBUG_ENABLE_DEBUGGER) != 0) {
+                argsForZygote.add("--enable-debugger");
+            }
+            if ((debugFlags & Zygote.DEBUG_ENABLE_CHECKJNI) != 0) {
+                argsForZygote.add("--enable-checkjni");
+            }
+            if ((debugFlags & Zygote.DEBUG_ENABLE_ASSERT) != 0) {
+                argsForZygote.add("--enable-assert");
+            }
+            if (mountExternal == Zygote.MOUNT_EXTERNAL_MULTIUSER) {
+                argsForZygote.add("--mount-external-multiuser");
+            } else if (mountExternal == Zygote.MOUNT_EXTERNAL_MULTIUSER_ALL) {
+                argsForZygote.add("--mount-external-multiuser-all");
+            }
+            argsForZygote.add("--target-sdk-version=" + targetSdkVersion);
+
+            //TODO optionally enable debuger
+            //argsForZygote.add("--enable-debugger");
+
+            // --setgroups is a comma-separated list
+            if (gids != null && gids.length > 0) {
+                StringBuilder sb = new StringBuilder();
+                sb.append("--setgroups=");
+
+                int sz = gids.length;
+                for (int i = 0; i < sz; i++) {
+                    if (i != 0) {
+                        sb.append(',');
+                    }
+                    sb.append(gids[i]);
+                }
+
+                argsForZygote.add(sb.toString());
+            }
+
+            if (niceName != null) {
+                argsForZygote.add("--nice-name=" + niceName);
+            }
+
+            if (seInfo != null) {
+                argsForZygote.add("--seinfo=" + seInfo);
+            }
+
+            argsForZygote.add(processClass);
+
+            if (extraArgs != null) {
+                for (String arg : extraArgs) {
+                    argsForZygote.add(arg);
+                }
+            }
+
+            return zygoteSendArgsAndGetResult(argsForZygote);
+        }
+!!!3905676.java!!!	myUserHandle() : UserHandle
+        return new UserHandle(UserHandle.getUserId(myUid()));
+!!!3905804.java!!!	isIsolated() : boolean
+        int uid = UserHandle.getAppId(myUid());
+        return uid >= FIRST_ISOLATED_UID && uid <= LAST_ISOLATED_UID;
+!!!3906188.java!!!	getUidForPid(in pid : int) : int
+        String[] procStatusLabels = { "Uid:" };
+        long[] procStatusValues = new long[1];
+        procStatusValues[0] = -1;
+        Process.readProcLines("/proc/" + pid + "/status", procStatusLabels, procStatusValues);
+        return (int) procStatusValues[0];
+!!!3906316.java!!!	getParentPid(in pid : int) : int
+        String[] procStatusLabels = { "PPid:" };
+        long[] procStatusValues = new long[1];
+        procStatusValues[0] = -1;
+        Process.readProcLines("/proc/" + pid + "/status", procStatusLabels, procStatusValues);
+        return (int) procStatusValues[0];
+!!!3906444.java!!!	getThreadGroupLeader(in tid : int) : int
+        String[] procStatusLabels = { "Tgid:" };
+        long[] procStatusValues = new long[1];
+        procStatusValues[0] = -1;
+        Process.readProcLines("/proc/" + tid + "/status", procStatusLabels, procStatusValues);
+        return (int) procStatusValues[0];
+!!!3907468.java!!!	supportsProcesses() : boolean
+        return true;
+!!!3907852.java!!!	killProcess(in pid : int) : void
+        sendSignal(pid, SIGNAL_KILL);
+!!!3908364.java!!!	killProcessQuiet(in pid : int) : void
+        sendSignalQuiet(pid, SIGNAL_KILL);

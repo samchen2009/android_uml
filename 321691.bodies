@@ -1,0 +1,156 @@
+class HttpResponseCache
+!!!2085019.java!!!	HttpResponseCache(inout directory : File, in maxSize : long)
+        cache = DiskLruCache.open(directory, VERSION, ENTRY_COUNT, maxSize);
+!!!2085147.java!!!	uriToKey(inout uri : URI) : String
+        try {
+            MessageDigest messageDigest = MessageDigest.getInstance("MD5");
+            byte[] md5bytes = messageDigest.digest(uri.toString().getBytes(Charsets.UTF_8));
+            return IntegralToString.bytesToHexString(md5bytes, false);
+        } catch (NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
+!!!2085275.java!!!	get(inout uri : URI, inout requestMethod : String, inout requestHeaders : Map) : CacheResponse
+        String key = uriToKey(uri);
+        DiskLruCache.Snapshot snapshot;
+        Entry entry;
+        try {
+            snapshot = cache.get(key);
+            if (snapshot == null) {
+                return null;
+            }
+            entry = new Entry(snapshot.getInputStream(ENTRY_METADATA));
+        } catch (IOException e) {
+            // Give up because the cache cannot be read.
+            return null;
+        }
+
+        if (!entry.matches(uri, requestMethod, requestHeaders)) {
+            snapshot.close();
+            return null;
+        }
+
+        return entry.isHttps()
+                ? new EntrySecureCacheResponse(entry, snapshot)
+                : new EntryCacheResponse(entry, snapshot);
+!!!2085403.java!!!	put(inout uri : URI, inout urlConnection : URLConnection) : CacheRequest
+        if (!(urlConnection instanceof HttpURLConnection)) {
+            return null;
+        }
+
+        HttpURLConnection httpConnection = (HttpURLConnection) urlConnection;
+        String requestMethod = httpConnection.getRequestMethod();
+        String key = uriToKey(uri);
+
+        if (requestMethod.equals(HttpEngine.POST)
+                || requestMethod.equals(HttpEngine.PUT)
+                || requestMethod.equals(HttpEngine.DELETE)) {
+            try {
+                cache.remove(key);
+            } catch (IOException ignored) {
+                // The cache cannot be written.
+            }
+            return null;
+        } else if (!requestMethod.equals(HttpEngine.GET)) {
+            /*
+             * Don't cache non-GET responses. We're technically allowed to cache
+             * HEAD requests and some POST requests, but the complexity of doing
+             * so is high and the benefit is low.
+             */
+            return null;
+        }
+
+        HttpEngine httpEngine = getHttpEngine(httpConnection);
+        if (httpEngine == null) {
+            // Don't cache unless the HTTP implementation is ours.
+            return null;
+        }
+
+        ResponseHeaders response = httpEngine.getResponseHeaders();
+        if (response.hasVaryAll()) {
+            return null;
+        }
+
+        RawHeaders varyHeaders = httpEngine.getRequestHeaders().getHeaders().getAll(
+                response.getVaryFields());
+        Entry entry = new Entry(uri, varyHeaders, httpConnection);
+        DiskLruCache.Editor editor = null;
+        try {
+            editor = cache.edit(key);
+            if (editor == null) {
+                return null;
+            }
+            entry.writeTo(editor);
+            return new CacheRequestImpl(editor);
+        } catch (IOException e) {
+            abortQuietly(editor);
+            return null;
+        }
+!!!2085531.java!!!	update(inout conditionalCacheHit : CacheResponse, inout httpConnection : HttpURLConnection) : void
+        HttpEngine httpEngine = getHttpEngine(httpConnection);
+        URI uri = httpEngine.getUri();
+        ResponseHeaders response = httpEngine.getResponseHeaders();
+        RawHeaders varyHeaders = httpEngine.getRequestHeaders().getHeaders()
+                .getAll(response.getVaryFields());
+        Entry entry = new Entry(uri, varyHeaders, httpConnection);
+        DiskLruCache.Snapshot snapshot = (conditionalCacheHit instanceof EntryCacheResponse)
+                ? ((EntryCacheResponse) conditionalCacheHit).snapshot
+                : ((EntrySecureCacheResponse) conditionalCacheHit).snapshot;
+        DiskLruCache.Editor editor = null;
+        try {
+            editor = snapshot.edit(); // returns null if snapshot is not current
+            if (editor != null) {
+                entry.writeTo(editor);
+                editor.commit();
+            }
+        } catch (IOException e) {
+            abortQuietly(editor);
+        }
+!!!2085659.java!!!	abortQuietly(inout editor : Editor) : void
+        // Give up because the cache cannot be written.
+        try {
+            if (editor != null) {
+                editor.abort();
+            }
+        } catch (IOException ignored) {
+        }
+!!!2085787.java!!!	getHttpEngine(inout httpConnection : HttpURLConnection) : HttpEngine
+        if (httpConnection instanceof HttpURLConnectionImpl) {
+            return ((HttpURLConnectionImpl) httpConnection).getHttpEngine();
+        } else if (httpConnection instanceof HttpsURLConnectionImpl) {
+            return ((HttpsURLConnectionImpl) httpConnection).getHttpEngine();
+        } else {
+            return null;
+        }
+!!!2085915.java!!!	getCache() : DiskLruCache
+        return cache;
+!!!2086043.java!!!	getWriteAbortCount() : int
+        return writeAbortCount;
+!!!2086171.java!!!	getWriteSuccessCount() : int
+        return writeSuccessCount;
+!!!2086299.java!!!	trackResponse(inout source : ResponseSource) : void
+        requestCount++;
+
+        switch (source) {
+        case CACHE:
+            hitCount++;
+            break;
+        case CONDITIONAL_CACHE:
+        case NETWORK:
+            networkCount++;
+            break;
+        }
+!!!2086427.java!!!	trackConditionalCacheHit() : void
+        hitCount++;
+!!!2086555.java!!!	getNetworkCount() : int
+        return networkCount;
+!!!2086683.java!!!	getHitCount() : int
+        return hitCount;
+!!!2086811.java!!!	getRequestCount() : int
+        return requestCount;
+!!!2088219.java!!!	newBodyInputStream(in snapshot : Snapshot) : InputStream
+        return new FilterInputStream(snapshot.getInputStream(ENTRY_BODY)) {
+            @Override public void close() throws IOException {
+                snapshot.close();
+                super.close();
+            }
+        };

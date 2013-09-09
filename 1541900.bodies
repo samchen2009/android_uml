@@ -1,0 +1,311 @@
+class Bridge
+!!!9486732.java!!!	getApiLevel() : int
+        return com.android.ide.common.rendering.api.Bridge.API_CURRENT;
+!!!9486860.java!!!	getCapabilities() : EnumSet<Capability>
+        return mCapabilities;
+!!!9486988.java!!!	init(inout platformProperties : Map<String,String>, inout fontLocation : File, inout enumValueMap : Map<String, Map<String, Integer>>, inout log : LayoutLog) : boolean
+        sPlatformProperties = platformProperties;
+        sEnumValueMap = enumValueMap;
+
+        // don't use EnumSet.allOf(), because the bridge doesn't come with its specific version
+        // of layoutlib_api. It is provided by the client which could have a more recent version
+        // with newer, unsupported capabilities.
+        mCapabilities = EnumSet.of(
+                Capability.UNBOUND_RENDERING,
+                Capability.CUSTOM_BACKGROUND_COLOR,
+                Capability.RENDER,
+                Capability.LAYOUT_ONLY,
+                Capability.EMBEDDED_LAYOUT,
+                Capability.VIEW_MANIPULATION,
+                Capability.PLAY_ANIMATION,
+                Capability.ANIMATED_VIEW_MANIPULATION,
+                Capability.ADAPTER_BINDING,
+                Capability.EXTENDED_VIEWINFO,
+                Capability.FIXED_SCALABLE_NINE_PATCH);
+
+
+        BridgeAssetManager.initSystem();
+
+        // When DEBUG_LAYOUT is set and is not 0 or false, setup a default listener
+        // on static (native) methods which prints the signature on the console and
+        // throws an exception.
+        // This is useful when testing the rendering in ADT to identify static native
+        // methods that are ignored -- layoutlib_create makes them returns 0/false/null
+        // which is generally OK yet might be a problem, so this is how you'd find out.
+        //
+        // Currently layoutlib_create only overrides static native method.
+        // Static non-natives are not overridden and thus do not get here.
+        final String debug = System.getenv("DEBUG_LAYOUT");
+        if (debug != null && !debug.equals("0") && !debug.equals("false")) {
+
+            OverrideMethod.setDefaultListener(new MethodAdapter() {
+                @Override
+                public void onInvokeV(String signature, boolean isNative, Object caller) {
+                    sDefaultLog.error(null, "Missing Stub: " + signature +
+                            (isNative ? " (native)" : ""), null /*data*/);
+
+                    if (debug.equalsIgnoreCase("throw")) {
+                        // Throwing this exception doesn't seem that useful. It breaks
+                        // the layout editor yet doesn't display anything meaningful to the
+                        // user. Having the error in the console is just as useful. We'll
+                        // throw it only if the environment variable is "throw" or "THROW".
+                        throw new StaticMethodNotImplementedException(signature);
+                    }
+                }
+            });
+        }
+
+        // load the fonts.
+        FontLoader fontLoader = FontLoader.create(fontLocation.getAbsolutePath());
+        if (fontLoader != null) {
+            Typeface_Delegate.init(fontLoader);
+        } else {
+            log.error(LayoutLog.TAG_BROKEN,
+                    "Failed create FontLoader in layout lib.", null);
+            return false;
+        }
+
+        // now parse com.android.internal.R (and only this one as android.R is a subset of
+        // the internal version), and put the content in the maps.
+        try {
+            Class<?> r = com.android.internal.R.class;
+
+            for (Class<?> inner : r.getDeclaredClasses()) {
+                String resTypeName = inner.getSimpleName();
+                ResourceType resType = ResourceType.getEnum(resTypeName);
+                if (resType != null) {
+                    Map<String, Integer> fullMap = new HashMap<String, Integer>();
+                    sRevRMap.put(resType, fullMap);
+
+                    for (Field f : inner.getDeclaredFields()) {
+                        // only process static final fields. Since the final attribute may have
+                        // been altered by layoutlib_create, we only check static
+                        int modifiers = f.getModifiers();
+                        if (Modifier.isStatic(modifiers)) {
+                            Class<?> type = f.getType();
+                            if (type.isArray() && type.getComponentType() == int.class) {
+                                // if the object is an int[] we put it in sRArrayMap using an IntArray
+                                // wrapper that properly implements equals and hashcode for the array
+                                // objects, as required by the map contract.
+                                sRArrayMap.put(new IntArray((int[]) f.get(null)), f.getName());
+                            } else if (type == int.class) {
+                                Integer value = (Integer) f.get(null);
+                                sRMap.put(value, Pair.of(resType, f.getName()));
+                                fullMap.put(f.getName(), value);
+                            } else {
+                                assert false;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable throwable) {
+            if (log != null) {
+                log.error(LayoutLog.TAG_BROKEN,
+                        "Failed to load com.android.internal.R from the layout library jar",
+                        throwable);
+            }
+            return false;
+        }
+
+        return true;
+!!!9487116.java!!!	dispose() : boolean
+        BridgeAssetManager.clearSystem();
+
+        // dispose of the default typeface.
+        Typeface_Accessor.resetDefaults();
+
+        return true;
+!!!9487244.java!!!	createSession(inout params : SessionParams) : RenderSession
+        try {
+            Result lastResult = SUCCESS.createResult();
+            RenderSessionImpl scene = new RenderSessionImpl(params);
+            try {
+                prepareThread();
+                lastResult = scene.init(params.getTimeout());
+                if (lastResult.isSuccess()) {
+                    lastResult = scene.inflate();
+                    if (lastResult.isSuccess()) {
+                        lastResult = scene.render(true /*freshRender*/);
+                    }
+                }
+            } finally {
+                scene.release();
+                cleanupThread();
+            }
+
+            return new BridgeRenderSession(scene, lastResult);
+        } catch (Throwable t) {
+            // get the real cause of the exception.
+            Throwable t2 = t;
+            while (t2.getCause() != null) {
+                t2 = t.getCause();
+            }
+            return new BridgeRenderSession(null,
+                    ERROR_UNKNOWN.createResult(t2.getMessage(), t));
+        }
+!!!9487372.java!!!	renderDrawable(inout params : DrawableParams) : Result
+        try {
+            Result lastResult = SUCCESS.createResult();
+            RenderDrawable action = new RenderDrawable(params);
+            try {
+                prepareThread();
+                lastResult = action.init(params.getTimeout());
+                if (lastResult.isSuccess()) {
+                    lastResult = action.render();
+                }
+            } finally {
+                action.release();
+                cleanupThread();
+            }
+
+            return lastResult;
+        } catch (Throwable t) {
+            // get the real cause of the exception.
+            Throwable t2 = t;
+            while (t2.getCause() != null) {
+                t2 = t.getCause();
+            }
+            return ERROR_UNKNOWN.createResult(t2.getMessage(), t);
+        }
+!!!9487500.java!!!	clearCaches(inout projectKey : Object) : void
+        if (projectKey != null) {
+            sProjectBitmapCache.remove(projectKey);
+            sProject9PatchCache.remove(projectKey);
+        }
+!!!9487628.java!!!	getViewParent(inout viewObject : Object) : Result
+        if (viewObject instanceof View) {
+            return Status.SUCCESS.createResult(((View)viewObject).getParent());
+        }
+
+        throw new IllegalArgumentException("viewObject is not a View");
+!!!9487756.java!!!	getViewIndex(inout viewObject : Object) : Result
+        if (viewObject instanceof View) {
+            View view = (View) viewObject;
+            ViewParent parentView = view.getParent();
+
+            if (parentView instanceof ViewGroup) {
+                Status.SUCCESS.createResult(((ViewGroup) parentView).indexOfChild(view));
+            }
+
+            return Status.SUCCESS.createResult();
+        }
+
+        throw new IllegalArgumentException("viewObject is not a View");
+!!!9487884.java!!!	getLock() : ReentrantLock
+        return sLock;
+!!!9488012.java!!!	prepareThread() : void
+        // we need to make sure the Looper has been initialized for this thread.
+        // this is required for View that creates Handler objects.
+        if (Looper.myLooper() == null) {
+            Looper.prepare();
+        }
+!!!9488140.java!!!	cleanupThread() : void
+        // clean up the looper
+        Looper_Accessor.cleanupThread();
+!!!9488268.java!!!	getLog() : LayoutLog
+        return sCurrentLog;
+!!!9488396.java!!!	setLog(inout log : LayoutLog) : void
+        // check only the thread currently owning the lock can do this.
+        if (sLock.isHeldByCurrentThread() == false) {
+            throw new IllegalStateException("scene must be acquired first. see #acquire(long)");
+        }
+
+        if (log != null) {
+            sCurrentLog = log;
+        } else {
+            sCurrentLog = sDefaultLog;
+        }
+!!!9488524.java!!!	resolveResourceId(in value : int) : Pair<ResourceType, String>
+        Pair<ResourceType, String> pair = sRMap.get(value);
+        if (pair == null) {
+            pair = sDynamicIds.resolveId(value);
+            if (pair == null) {
+                //System.out.println(String.format("Missing id: %1$08X (%1$d)", value));
+            }
+        }
+        return pair;
+!!!9488652.java!!!	resolveResourceId(inout array : int) : String
+        sIntArrayWrapper.set(array);
+        return sRArrayMap.get(sIntArrayWrapper);
+!!!9488780.java!!!	getResourceId(inout type : ResourceType, in name : String) : Integer
+        Map<String, Integer> map = sRevRMap.get(type);
+        Integer value = null;
+        if (map != null) {
+            value = map.get(name);
+        }
+
+        if (value == null) {
+            value = sDynamicIds.getId(type, name);
+        }
+
+        return value;
+!!!9488908.java!!!	getEnumValues(in attributeName : String) : Map<String, Integer>
+        if (sEnumValueMap != null) {
+            return sEnumValueMap.get(attributeName);
+        }
+
+        return null;
+!!!9489036.java!!!	getPlatformProperties() : Map<String, String>
+        return sPlatformProperties;
+!!!9489164.java!!!	getCachedBitmap(in value : String, inout projectKey : Object) : Bitmap
+        if (projectKey != null) {
+            Map<String, SoftReference<Bitmap>> map = sProjectBitmapCache.get(projectKey);
+            if (map != null) {
+                SoftReference<Bitmap> ref = map.get(value);
+                if (ref != null) {
+                    return ref.get();
+                }
+            }
+        } else {
+            SoftReference<Bitmap> ref = sFrameworkBitmapCache.get(value);
+            if (ref != null) {
+                return ref.get();
+            }
+        }
+
+        return null;
+!!!9489292.java!!!	setCachedBitmap(in value : String, inout bmp : Bitmap, inout projectKey : Object) : void
+        if (projectKey != null) {
+            Map<String, SoftReference<Bitmap>> map = sProjectBitmapCache.get(projectKey);
+
+            if (map == null) {
+                map = new HashMap<String, SoftReference<Bitmap>>();
+                sProjectBitmapCache.put(projectKey, map);
+            }
+
+            map.put(value, new SoftReference<Bitmap>(bmp));
+        } else {
+            sFrameworkBitmapCache.put(value, new SoftReference<Bitmap>(bmp));
+        }
+!!!9489420.java!!!	getCached9Patch(in value : String, inout projectKey : Object) : NinePatchChunk
+        if (projectKey != null) {
+            Map<String, SoftReference<NinePatchChunk>> map = sProject9PatchCache.get(projectKey);
+
+            if (map != null) {
+                SoftReference<NinePatchChunk> ref = map.get(value);
+                if (ref != null) {
+                    return ref.get();
+                }
+            }
+        } else {
+            SoftReference<NinePatchChunk> ref = sFramework9PatchCache.get(value);
+            if (ref != null) {
+                return ref.get();
+            }
+        }
+
+        return null;
+!!!9489548.java!!!	setCached9Patch(in value : String, inout ninePatch : NinePatchChunk, inout projectKey : Object) : void
+        if (projectKey != null) {
+            Map<String, SoftReference<NinePatchChunk>> map = sProject9PatchCache.get(projectKey);
+
+            if (map == null) {
+                map = new HashMap<String, SoftReference<NinePatchChunk>>();
+                sProject9PatchCache.put(projectKey, map);
+            }
+
+            map.put(value, new SoftReference<NinePatchChunk>(ninePatch));
+        } else {
+            sFramework9PatchCache.put(value, new SoftReference<NinePatchChunk>(ninePatch));
+        }

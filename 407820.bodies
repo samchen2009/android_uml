@@ -1,0 +1,217 @@
+class Asset
+!!!963340.cpp!!!	~Asset(in  : void)
+    AutoMutex _l(gAssetLock);
+	gCount--;
+    if (gHead == this) {
+        gHead = mNext;
+    }
+    if (gTail == this) {
+        gTail = mPrev;
+    }
+    if (mNext != NULL) {
+        mNext->mPrev = mPrev;
+    }
+    if (mPrev != NULL) {
+        mPrev->mNext = mNext;
+    }
+    mNext = mPrev = NULL;
+    //ALOGI("Destroying Asset in %p #%d\n", this, gCount);
+!!!963468.cpp!!!	getGlobalCount() : int32_t
+    AutoMutex _l(gAssetLock);
+    return gCount;
+!!!963596.cpp!!!	getAssetAllocations() : String8
+    AutoMutex _l(gAssetLock);
+    String8 res;
+    Asset* cur = gHead;
+    while (cur != NULL) {
+        if (cur->isAllocated()) {
+            res.append("    ");
+            res.append(cur->getAssetSource());
+            off64_t size = (cur->getLength()+512)/1024;
+            char buf[64];
+            sprintf(buf, ": %dK\n", (int)size);
+            res.append(buf);
+        }
+        cur = cur->mNext;
+    }
+    
+    return res;
+!!!964876.cpp!!!	Asset(in  : void)
+    AutoMutex _l(gAssetLock);
+    gCount++;
+    mNext = mPrev = NULL;
+    if (gTail == NULL) {
+        gHead = gTail = this;
+  	} else {
+  	    mPrev = gTail;
+  	    gTail->mNext = this;
+  	    gTail = this;
+  	}
+    //ALOGI("Creating Asset %p #%d\n", this, gCount);
+!!!965004.cpp!!!	handleSeek(in offset : off64_t, in whence : int, in curPosn : off64_t, in maxPosn : off64_t) : off64_t
+    off64_t newOffset;
+
+    switch (whence) {
+    case SEEK_SET:
+        newOffset = offset;
+        break;
+    case SEEK_CUR:
+        newOffset = curPosn + offset;
+        break;
+    case SEEK_END:
+        newOffset = maxPosn + offset;
+        break;
+    default:
+        ALOGW("unexpected whence %d\n", whence);
+        // this was happening due to an off64_t size mismatch
+        assert(false);
+        return (off64_t) -1;
+    }
+
+    if (newOffset < 0 || newOffset > maxPosn) {
+        ALOGW("seek out of range: want %ld, end=%ld\n",
+            (long) newOffset, (long) maxPosn);
+        return (off64_t) -1;
+    }
+
+    return newOffset;
+!!!965644.cpp!!!	createFromFile(in fileName : char, in mode : AccessMode) : Asset
+    _FileAsset* pAsset;
+    status_t result;
+    off64_t length;
+    int fd;
+
+    fd = open(fileName, O_RDONLY | O_BINARY);
+    if (fd < 0)
+        return NULL;
+
+    /*
+     * Under Linux, the lseek fails if we actually opened a directory.  To
+     * be correct we should test the file type explicitly, but since we
+     * always open things read-only it doesn't really matter, so there's
+     * no value in incurring the extra overhead of an fstat() call.
+     */
+    // TODO(kroot): replace this with fstat despite the plea above.
+#if 1
+    length = lseek64(fd, 0, SEEK_END);
+    if (length < 0) {
+        ::close(fd);
+        return NULL;
+    }
+    (void) lseek64(fd, 0, SEEK_SET);
+#else
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        ::close(fd);
+        return NULL;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return NULL;
+    }
+#endif
+
+    pAsset = new _FileAsset;
+    result = pAsset->openChunk(fileName, fd, 0, length);
+    if (result != NO_ERROR) {
+        delete pAsset;
+        return NULL;
+    }
+
+    pAsset->mAccessMode = mode;
+    return pAsset;
+!!!965772.cpp!!!	createFromCompressedFile(in fileName : char, in mode : AccessMode) : Asset
+    _CompressedAsset* pAsset;
+    status_t result;
+    off64_t fileLen;
+    bool scanResult;
+    long offset;
+    int method;
+    long uncompressedLen, compressedLen;
+    int fd;
+
+    fd = open(fileName, O_RDONLY | O_BINARY);
+    if (fd < 0)
+        return NULL;
+
+    fileLen = lseek(fd, 0, SEEK_END);
+    if (fileLen < 0) {
+        ::close(fd);
+        return NULL;
+    }
+    (void) lseek(fd, 0, SEEK_SET);
+
+    /* want buffered I/O for the file scan; must dup so fclose() is safe */
+    FILE* fp = fdopen(dup(fd), "rb");
+    if (fp == NULL) {
+        ::close(fd);
+        return NULL;
+    }
+
+    unsigned long crc32;
+    scanResult = ZipUtils::examineGzip(fp, &method, &uncompressedLen,
+                    &compressedLen, &crc32);
+    offset = ftell(fp);
+    fclose(fp);
+    if (!scanResult) {
+        ALOGD("File '%s' is not in gzip format\n", fileName);
+        ::close(fd);
+        return NULL;
+    }
+
+    pAsset = new _CompressedAsset;
+    result = pAsset->openChunk(fd, offset, method, uncompressedLen,
+                compressedLen);
+    if (result != NO_ERROR) {
+        delete pAsset;
+        return NULL;
+    }
+
+    pAsset->mAccessMode = mode;
+    return pAsset;
+!!!965900.cpp!!!	createFromFileSegment(in fd : int, in offset : off64_t, in length : size_t, in mode : AccessMode) : Asset
+    _FileAsset* pAsset;
+    status_t result;
+
+    pAsset = new _FileAsset;
+    result = pAsset->openChunk(NULL, fd, offset, length);
+    if (result != NO_ERROR)
+        return NULL;
+
+    pAsset->mAccessMode = mode;
+    return pAsset;
+!!!966028.cpp!!!	createFromCompressedData(in fd : int, in offset : off64_t, in compressionMethod : int, in uncompressedLen : size_t, in compressedLen : size_t, in mode : AccessMode) : Asset
+    _CompressedAsset* pAsset;
+    status_t result;
+
+    pAsset = new _CompressedAsset;
+    result = pAsset->openChunk(fd, offset, compressionMethod,
+                uncompressedLen, compressedLen);
+    if (result != NO_ERROR)
+        return NULL;
+
+    pAsset->mAccessMode = mode;
+    return pAsset;
+!!!966156.cpp!!!	createFromUncompressedMap(inout dataMap : FileMap, in mode : AccessMode) : Asset
+    _FileAsset* pAsset;
+    status_t result;
+
+    pAsset = new _FileAsset;
+    result = pAsset->openChunk(dataMap);
+    if (result != NO_ERROR)
+        return NULL;
+
+    pAsset->mAccessMode = mode;
+    return pAsset;
+!!!966284.cpp!!!	createFromCompressedMap(inout dataMap : FileMap, in method : int, in uncompressedLen : size_t, in mode : AccessMode) : Asset
+    _CompressedAsset* pAsset;
+    status_t result;
+
+    pAsset = new _CompressedAsset;
+    result = pAsset->openChunk(dataMap, method, uncompressedLen);
+    if (result != NO_ERROR)
+        return NULL;
+
+    pAsset->mAccessMode = mode;
+    return pAsset;

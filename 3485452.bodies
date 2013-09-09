@@ -1,0 +1,238 @@
+class BlockRenamer
+!!!15211276.java!!!	BlockRenamer(in block : SsaBasicBlock)
+            this.block = block;
+            currentMapping = startsForBlocks[block.getIndex()];
+            movesToKeep = new HashSet<SsaInsn>();
+            insnsToReplace = new HashMap<SsaInsn, SsaInsn>();
+            mapper =  new RenamingMapper();
+
+            // We don't need our own start state anymore
+            startsForBlocks[block.getIndex()] = null;
+!!!15211788.java!!!	process() : void
+            /*
+             * From Appel:
+             *
+             * Rename(n) =
+             *   for each statement S in block n   // 'statement' in 'block'
+             */
+
+            block.forEachInsn(this);
+
+            updateSuccessorPhis();
+
+            // Delete all move insns in this block.
+            ArrayList<SsaInsn> insns = block.getInsns();
+            int szInsns = insns.size();
+
+            for (int i = szInsns - 1; i >= 0 ; i--) {
+                SsaInsn insn = insns.get(i);
+                SsaInsn replaceInsn;
+
+                replaceInsn = insnsToReplace.get(insn);
+
+                if (replaceInsn != null) {
+                    insns.set(i, replaceInsn);
+                } else if (insn.isNormalMoveInsn()
+                        && !movesToKeep.contains(insn)) {
+                    insns.remove(i);
+                }
+            }
+
+            // Store the start states for our dom children.
+            boolean first = true;
+            for (SsaBasicBlock child : block.getDomChildren()) {
+                if (child != block) {
+                    // Don't bother duplicating the array for the first child.
+                    RegisterSpec[] childStart = first ? currentMapping
+                        : dupArray(currentMapping);
+
+                    startsForBlocks[child.getIndex()] = childStart;
+                    first = false;
+                }
+            }
+
+            // currentMapping is owned by a child now.
+!!!15211916.java!!!	addMapping(in ropReg : int, inout ssaReg : RegisterSpec) : void
+            int ssaRegNum = ssaReg.getReg();
+            LocalItem ssaRegLocal = ssaReg.getLocalItem();
+
+            currentMapping[ropReg] = ssaReg;
+
+            /*
+             * Ensure all SSA register specs with the same reg are identical.
+             */
+            for (int i = currentMapping.length - 1; i >= 0; i--) {
+                RegisterSpec cur = currentMapping[i];
+
+                if (ssaRegNum == cur.getReg()) {
+                    currentMapping[i] = ssaReg;
+                }
+            }
+
+            // All further steps are for registers with local information.
+            if (ssaRegLocal == null) {
+                return;
+            }
+
+            // Record that this SSA reg has been associated with a local.
+            setNameForSsaReg(ssaReg);
+
+            // Ensure that no other SSA regs are associated with this local.
+            for (int i = currentMapping.length - 1; i >= 0; i--) {
+                RegisterSpec cur = currentMapping[i];
+
+                if (ssaRegNum != cur.getReg()
+                        && ssaRegLocal.equals(cur.getLocalItem())) {
+                    currentMapping[i] = cur.withLocalItem(null);
+                }
+            }
+!!!15212044.java!!!	visitPhiInsn(inout phi : PhiInsn) : void
+            /* don't process sources for phi's */
+            processResultReg(phi);
+!!!15212172.java!!!	visitMoveInsn(inout insn : NormalSsaInsn) : void
+            /*
+             * For moves: copy propogate the move if we can, but don't
+             * if we need to preserve local variable info and the
+             * result has a different name than the source.
+             */
+
+            RegisterSpec ropResult = insn.getResult();
+            int ropResultReg = ropResult.getReg();
+            int ropSourceReg = insn.getSources().get(0).getReg();
+
+            insn.mapSourceRegisters(mapper);
+            int ssaSourceReg = insn.getSources().get(0).getReg();
+
+            LocalItem sourceLocal
+                = currentMapping[ropSourceReg].getLocalItem();
+            LocalItem resultLocal = ropResult.getLocalItem();
+
+            /*
+             * A move from a register that's currently associated with a local
+             * to one that will not be associated with a local does not need
+             * to be preserved, but the local association should remain.
+             * Hence, we inherit the sourceLocal where the resultLocal is null.
+             */
+
+            LocalItem newLocal
+                = (resultLocal == null) ? sourceLocal : resultLocal;
+            LocalItem associatedLocal = getLocalForNewReg(ssaSourceReg);
+
+            /*
+             * If we take the new local, will only one local have ever
+             * been associated with this SSA reg?
+             */
+            boolean onlyOneAssociatedLocal
+                    = associatedLocal == null || newLocal == null
+                    || newLocal.equals(associatedLocal);
+
+            /*
+             * If we're going to copy-propogate, then the ssa register
+             * spec that's going to go into the mapping is made up of
+             * the source register number mapped from above, the type
+             * of the result, and the name either from the result (if
+             * specified) or inherited from the existing mapping.
+             *
+             * The move source has incomplete type information in null
+             * object cases, so the result type is used.
+             */
+            RegisterSpec ssaReg
+                    = RegisterSpec.makeLocalOptional(
+                        ssaSourceReg, ropResult.getType(), newLocal);
+
+            if (!Optimizer.getPreserveLocals() || (onlyOneAssociatedLocal
+                    && equalsHandlesNulls(newLocal, sourceLocal)) &&
+                    threshold == 0) {
+                /*
+                 * We don't have to keep this move to preserve local
+                 * information. Either the name is the same, or the result
+                 * register spec is unnamed.
+                 */
+
+                addMapping(ropResultReg, ssaReg);
+            } else if (onlyOneAssociatedLocal && sourceLocal == null &&
+                    threshold == 0) {
+                /*
+                 * The register was previously unnamed. This means that a
+                 * local starts after it's first assignment in SSA form
+                 */
+
+                RegisterSpecList ssaSources = RegisterSpecList.make(
+                        RegisterSpec.make(ssaReg.getReg(),
+                                ssaReg.getType(), newLocal));
+
+                SsaInsn newInsn
+                        = SsaInsn.makeFromRop(
+                            new PlainInsn(Rops.opMarkLocal(ssaReg),
+                            SourcePosition.NO_INFO, null, ssaSources),block);
+
+                insnsToReplace.put(insn, newInsn);
+
+                // Just map as above.
+                addMapping(ropResultReg, ssaReg);
+            } else {
+                /*
+                 * Do not copy-propogate, since the two registers have
+                 * two different local-variable names.
+                 */
+                processResultReg(insn);
+
+                movesToKeep.add(insn);
+            }
+!!!15212300.java!!!	visitNonMoveInsn(inout insn : NormalSsaInsn) : void
+            /* for each use of some variable X in S */
+            insn.mapSourceRegisters(mapper);
+
+            processResultReg(insn);
+!!!15212428.java!!!	processResultReg(inout insn : SsaInsn) : void
+            RegisterSpec ropResult = insn.getResult();
+
+            if (ropResult == null) {
+                return;
+            }
+
+            int ropReg = ropResult.getReg();
+            if (isBelowThresholdRegister(ropReg)) {
+                return;
+            }
+
+            insn.changeResultReg(nextSsaReg);
+            addMapping(ropReg, insn.getResult());
+
+            if (DEBUG) {
+                ssaRegToRopReg.add(ropReg);
+            }
+
+            nextSsaReg++;
+!!!15212556.java!!!	updateSuccessorPhis() : void
+            PhiInsn.Visitor visitor = new PhiInsn.Visitor() {
+                public void visitPhiInsn (PhiInsn insn) {
+                    int ropReg;
+
+                    ropReg = insn.getRopResultReg();
+                    if (isBelowThresholdRegister(ropReg)) {
+                        return;
+                    }
+
+                    /*
+                     * Never add a version 0 register as a phi
+                     * operand. Version 0 registers represent the
+                     * initial register state, and thus are never
+                     * significant. Furthermore, the register liveness
+                     * algorithm doesn't properly count them as "live
+                     * in" at the beginning of the method.
+                     */
+
+                    RegisterSpec stackTop = currentMapping[ropReg];
+                    if (!isVersionZeroRegister(stackTop.getReg())) {
+                        insn.addPhiOperand(stackTop, block);
+                    }
+                }
+            };
+
+            BitSet successors = block.getSuccessors();
+            for (int i = successors.nextSetBit(0); i >= 0;
+                    i = successors.nextSetBit(i + 1)) {
+                SsaBasicBlock successor = ssaMeth.getBlocks().get(i);
+                successor.forEachPhiInsn(visitor);
+            }

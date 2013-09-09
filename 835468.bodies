@@ -1,0 +1,93 @@
+class DhcpStateMachine
+!!!3589900.java!!!	DhcpStateMachine(inout context : Context, inout controller : StateMachine, in intf : String)
+        super(TAG);
+
+        mContext = context;
+        mController = controller;
+        mInterfaceName = intf;
+
+        mAlarmManager = (AlarmManager)mContext.getSystemService(Context.ALARM_SERVICE);
+        Intent dhcpRenewalIntent = new Intent(ACTION_DHCP_RENEW, null);
+        mDhcpRenewalIntent = PendingIntent.getBroadcast(mContext, DHCP_RENEW, dhcpRenewalIntent, 0);
+
+        PowerManager powerManager = (PowerManager)mContext.getSystemService(Context.POWER_SERVICE);
+        mDhcpRenewWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG);
+        mDhcpRenewWakeLock.setReferenceCounted(false);
+
+        mBroadcastReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                //DHCP renew
+                if (DBG) Log.d(TAG, "Sending a DHCP renewal " + this);
+                //Lock released after 40s in worst case scenario
+                mDhcpRenewWakeLock.acquire(40000);
+                sendMessage(CMD_RENEW_DHCP);
+            }
+        };
+        mContext.registerReceiver(mBroadcastReceiver, new IntentFilter(ACTION_DHCP_RENEW));
+
+        addState(mDefaultState);
+            addState(mStoppedState, mDefaultState);
+            addState(mWaitBeforeStartState, mDefaultState);
+            addState(mRunningState, mDefaultState);
+            addState(mWaitBeforeRenewalState, mDefaultState);
+
+        setInitialState(mStoppedState);
+!!!3590028.java!!!	makeDhcpStateMachine(inout context : Context, inout controller : StateMachine, in intf : String) : DhcpStateMachine
+        DhcpStateMachine dsm = new DhcpStateMachine(context, controller, intf);
+        dsm.start();
+        return dsm;
+!!!3590156.java!!!	registerForPreDhcpNotification() : void
+        mRegisteredForPreDhcpNotification = true;
+!!!3590284.java!!!	doQuit() : void
+        quit();
+!!!3590412.java!!!	onQuitting() : void
+        mController.sendMessage(CMD_ON_QUIT);
+!!!3591948.java!!!	runDhcp(inout dhcpAction : DhcpAction) : boolean
+        boolean success = false;
+        DhcpInfoInternal dhcpInfoInternal = new DhcpInfoInternal();
+
+        if (dhcpAction == DhcpAction.START) {
+            /* Stop any existing DHCP daemon before starting new */
+            NetworkUtils.stopDhcp(mInterfaceName);
+            if (DBG) Log.d(TAG, "DHCP request on " + mInterfaceName);
+            success = NetworkUtils.runDhcp(mInterfaceName, dhcpInfoInternal);
+            mDhcpInfo = dhcpInfoInternal;
+        } else if (dhcpAction == DhcpAction.RENEW) {
+            if (DBG) Log.d(TAG, "DHCP renewal on " + mInterfaceName);
+            success = NetworkUtils.runDhcpRenew(mInterfaceName, dhcpInfoInternal);
+            dhcpInfoInternal.updateFromDhcpRequest(mDhcpInfo);
+        }
+
+        if (success) {
+            if (DBG) Log.d(TAG, "DHCP succeeded on " + mInterfaceName);
+            long leaseDuration = dhcpInfoInternal.leaseDuration; //int to long conversion
+
+            //Sanity check for renewal
+            if (leaseDuration >= 0) {
+                //TODO: would be good to notify the user that his network configuration is
+                //bad and that the device cannot renew below MIN_RENEWAL_TIME_SECS
+                if (leaseDuration < MIN_RENEWAL_TIME_SECS) {
+                    leaseDuration = MIN_RENEWAL_TIME_SECS;
+                }
+                //Do it a bit earlier than half the lease duration time
+                //to beat the native DHCP client and avoid extra packets
+                //48% for one hour lease time = 29 minutes
+                mAlarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        SystemClock.elapsedRealtime() +
+                        leaseDuration * 480, //in milliseconds
+                        mDhcpRenewalIntent);
+            } else {
+                //infinite lease time, no renewal needed
+            }
+
+            mController.obtainMessage(CMD_POST_DHCP_ACTION, DHCP_SUCCESS, 0, dhcpInfoInternal)
+                .sendToTarget();
+        } else {
+            Log.e(TAG, "DHCP failed on " + mInterfaceName + ": " +
+                    NetworkUtils.getDhcpError());
+            NetworkUtils.stopDhcp(mInterfaceName);
+            mController.obtainMessage(CMD_POST_DHCP_ACTION, DHCP_FAILURE, 0)
+                .sendToTarget();
+        }
+        return success;

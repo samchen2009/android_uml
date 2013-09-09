@@ -1,0 +1,213 @@
+class BerlinHPDHandler
+!!!10938764.cpp!!!	Init(in display : AMP_DISP, in avin : AMP_AVIN) : void
+    AVS_FUNC_ENTER
+    disp_handle_ = display;
+    CHECK(disp_handle_ != NULL);
+    avin_handle_ = avin;
+    CHECK(avin_handle_ != NULL);
+    AVS_FUNC_LEAVE
+!!!10938892.cpp!!!	Destroy() : void
+    AVS_FUNC_ENTER
+    disp_handle_ = NULL;
+    avin_handle_ = NULL;
+    AVS_FUNC_LEAVE
+!!!10939020.cpp!!!	UpdateEDIDBySinkHPD(in sink_connected : bool) : status_t
+    AVS_FUNC_ENTER
+    CHECK(disp_handle_ != NULL && avin_handle_ != NULL);
+    HRESULT ret = SUCCESS;
+    AMP_DISP_HDMI_SINK_CAPS sink_caps;
+    AMP_DISP_HDMI_RAW_EDID raw_edid;
+    AMP_AVIN_EDID_INFO edid_info;
+    int nBlock = 0;
+    UINT8 TXEDID[256];
+    UINT8 RXEDID[256];
+
+    memset(RXEDID, 0, sizeof(RXEDID));
+    memset(TXEDID, 0, sizeof(TXEDID));
+
+    if (sink_connected) {
+        ALOGD("Sink connected");
+
+        // Check sink edid
+        memset(&sink_caps, 0, sizeof(sink_caps));
+        AMP_RPC(ret, AMP_DISP_OUT_HDMI_GetSinkCaps,
+                disp_handle_, &sink_caps);
+        AVS_CHECK(ret, "AMP_DISP_OUT_HDMI_GetSinkCaps");
+        if (!sink_caps.bValidEdid) {
+            ALOGW("sink_caps invalid edid, is TV connected?");
+            goto bailout;
+        }
+
+        // Check raw edid
+        memset(&raw_edid, 0, sizeof(raw_edid));
+        AMP_RPC(ret, AMP_DISP_OUT_HDMI_GetRawEdid,
+                disp_handle_, &raw_edid);
+        AVS_CHECK(ret, "AMP_DISP_OUT_HDMI_GetRawEdid");
+        if (!raw_edid.uiIsValid) {
+            ALOGW("raw_edid invalid");
+            goto bailout;
+        }
+
+        memcpy(&TXEDID[0], &raw_edid.uiDataBuf[0], 128);
+        nBlock = 1;
+        if (TXEDID[0x7E]) {
+            memcpy(&TXEDID[128], &raw_edid.uiDataBufExt[0], 128);
+            nBlock = 2;
+        }
+
+        // Read rx edid
+        memset(&edid_info, 0, sizeof(edid_info));
+        AMP_RPC(ret, AMP_AVIN_ReadEdid, avin_handle_, &edid_info);
+        AVS_CHECK(ret, "AMP_AVIN_ReadEdid");
+        // Use rx edid instead of hardcode sample edid
+        memcpy(RXEDID, edid_info.data, 256);
+
+        unsigned short txPhyAddr = sink_caps.uiCecPhyAddr;
+        unsigned short rxPhyAddr = txPhyAddr;
+
+        if ((txPhyAddr & 0x0f00) == 0) {
+            rxPhyAddr = txPhyAddr | 0x0100;
+        } else if ((txPhyAddr & 0x00f0) == 0) {
+            rxPhyAddr = txPhyAddr | 0x0010;
+        } else if ((txPhyAddr * 0x000f) == 0) {
+            rxPhyAddr = txPhyAddr |0x0001;
+        } else {
+            rxPhyAddr = 0xffff;
+        }
+
+        RXEDID[0xA9] = (rxPhyAddr >> 8);
+        RXEDID[0xAA] = (rxPhyAddr & 0x00ff);
+        ALOGD("After calculate phyAddr: 0x%x 0x%x", RXEDID[0xA9], RXEDID[0xAA]);
+
+        ResetChecksum(RXEDID);
+
+        // EDID filter capability
+        ALOGD("Filter capability, TXEDID:%p nBlock:%d txPhyAddr:%x, rxPhyAddr:%x, RXEDID:%p",
+              TXEDID, nBlock, txPhyAddr, rxPhyAddr, RXEDID);
+        ALOGD("EDID_Filter_Capability PCMOnly false");
+        ret = EDID_Filter_Capability(TXEDID, nBlock, false, txPhyAddr, RXEDID);
+        if (SUCCESS != ret) {
+            ALOGW("EDID_Filter_Capability() fail");
+            goto bailout;
+        }
+
+#ifdef DUMP_PARSED_EDID
+        ALOGD("Parse TX EDID raw data enter");
+        ret = Sample_Parse_EDID(TXEDID, 2);
+        ALOGD("Parse TX EDID raw data leave, ret %d", ret);
+#endif
+
+        ALOGD("Before update HDMI-RX Edid\n");
+        DumpRxEDIDRawData();
+
+        // Toggle hpd and update edid
+        AMP_RPC(ret, AMP_AVIN_ToggleHpd, avin_handle_, 0);
+        AVS_CHECK(ret, "AMP_AVIN_ToggleHpd");
+
+        MV_OSAL_Task_Sleep(200);
+
+        memset(&edid_info, 0, sizeof(edid_info));
+        edid_info.size = nBlock * 128;
+        memcpy(edid_info.data, RXEDID, edid_info.size);
+        AMP_RPC(ret, AMP_AVIN_UpdateEdid, avin_handle_, &edid_info);
+        if (SUCCESS != ret) {
+            ALOGW("Update edid fail, Still toggle HPD");
+            AMP_RPC(ret, AMP_AVIN_ToggleHpd, avin_handle_, 1);
+            AVS_CHECK(ret, "AMP_AVIN_ToggleHpd");
+            goto bailout;
+        }
+        ALOGD("After update HDMI-RX edid\n");
+        DumpRxEDIDRawData();
+        AMP_RPC(ret, AMP_AVIN_ToggleHpd, avin_handle_, 1);
+        AVS_CHECK(ret, "AMP_AVIN_ToggleHpd");
+
+        if (!VerifyRxEDIDUpdateResult(reinterpret_cast<char*>(RXEDID), 256)) {
+            goto bailout;
+        } else {
+            ALOGD("Update edid successfully");
+        }
+    } else {
+        ALOGD("Sink disconnected, disable HPD");
+        AMP_RPC(ret, AMP_AVIN_ToggleHpd, avin_handle_, 0);
+        AVS_CHECK(ret, "AMP_AVIN_ToggleHpd");
+    }
+
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10939148.cpp!!!	VerifyRxEDIDUpdateResult(in ref : char, in len : uint32_t) : bool
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    bool result = false;
+    AMP_AVIN_EDID_INFO edid_info;
+
+    if (NULL == ref) {
+        ALOGW("ref data null");
+        return false;
+    }
+
+    memset(&edid_info, 0, sizeof(edid_info));
+    AMP_RPC(ret, AMP_AVIN_ReadEdid, avin_handle_, &edid_info);
+    AVS_CHECK(ret, "AMP_AVIN_ReadEdid");
+    result = (memcmp(edid_info.data, ref, len) == 0);
+    ALOGD("Verify update result: %d", result);
+    AVS_FUNC_LEAVE
+    return result;
+
+bailout:
+    ALOGW("Fail to verify update result.");
+    return false;
+!!!10939276.cpp!!!	DumpRxEDIDRawData() : void
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    AMP_AVIN_EDID_INFO edid_info;
+    uint8_t data_byte;
+    memset(&edid_info, 0, sizeof(edid_info));
+    AMP_RPC(ret, AMP_AVIN_ReadEdid, avin_handle_, &edid_info);
+    AVS_CHECK(ret, "AMP_AVIN_ReadEdid");
+#ifdef DUMP_PARSED_EDID
+    // Dump raw data
+    //Display_Block_RawData(edid_info.data, 2);
+    ALOGD("Parse RX EDID raw data enter");
+    ret = Sample_Parse_EDID(edid_info.data, 2);
+    ALOGD("Parse RX EDID raw data leave, ret %d", ret);
+#else
+    ALOGD("*************************RAW EDID START*************************");
+    for(int i = 0; i < 16; i++)
+    {
+        for(int j = 0; j < 16; j++)
+        {
+                data_byte = edid_info.data[i * 16 + j];
+                if (data_byte <= 0x0f) {
+                    ALOGD("0x0%x ", data_byte);
+                } else {
+                    ALOGD("0x%x ", data_byte);
+                }
+        }
+        ALOGD("\n");
+    }
+    ALOGD("*************************RAW EDID END*************************");
+#endif
+    AVS_FUNC_LEAVE
+    return;
+
+bailout:
+    ALOGW("Fail to dump EDID data.");
+!!!10939404.cpp!!!	ResetChecksum(inout pEDID : byte) : void
+    AVS_FUNC_ENTER
+    int i = 0;
+    unsigned short value = 0;
+    unsigned char check_sum = 0;
+    for (i = 0; i < 127; i++) {
+        value += pEDID[i];
+    }
+
+    pEDID[127] = 256 - (value&0x00ff);
+    value = 0;
+
+    for (i = 128; i < 255; i++) {
+        value += pEDID[i];
+    }
+    pEDID[255] = 256 - (value&0x00ff);
+    AVS_FUNC_LEAVE

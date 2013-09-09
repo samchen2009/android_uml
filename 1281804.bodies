@@ -1,0 +1,378 @@
+class DefaultContainerService
+!!!7548556.java!!!	DefaultContainerService()
+        super("DefaultContainerService");
+        setIntentRedelivery(true);
+!!!7548684.java!!!	onHandleIntent(inout intent : Intent) : void
+        if (PackageManager.ACTION_CLEAN_EXTERNAL_STORAGE.equals(intent.getAction())) {
+            final IPackageManager pm = IPackageManager.Stub.asInterface(
+                    ServiceManager.getService("package"));
+            PackageCleanItem item = null;
+            try {
+                while ((item = pm.nextPackageToClean(item)) != null) {
+                    final UserEnvironment userEnv = new UserEnvironment(item.userId);
+                    eraseFiles(userEnv.getExternalStorageAppDataDirectory(item.packageName));
+                    eraseFiles(userEnv.getExternalStorageAppMediaDirectory(item.packageName));
+                    if (item.andCode) {
+                        eraseFiles(userEnv.getExternalStorageAppObbDirectory(item.packageName));
+                    }
+                }
+            } catch (RemoteException e) {
+            }
+        }
+!!!7548812.java!!!	eraseFiles(inout path : File) : void
+        if (path.isDirectory()) {
+            String[] files = path.list();
+            if (files != null) {
+                for (String file : files) {
+                    eraseFiles(new File(path, file));
+                }
+            }
+        }
+        path.delete();
+!!!7548940.java!!!	onBind(inout intent : Intent) : IBinder
+        return mBinder;
+!!!7549068.java!!!	copyResourceInner(inout packageURI : Uri, in newCid : String, in key : String, in resFileName : String, in publicResFileName : String, inout isExternal : boolean, inout isForwardLocked : boolean) : String
+
+        if (isExternal) {
+            // Make sure the sdcard is mounted.
+            String status = Environment.getExternalStorageState();
+            if (!status.equals(Environment.MEDIA_MOUNTED)) {
+                Slog.w(TAG, "Make sure sdcard is mounted.");
+                return null;
+            }
+        }
+
+        // The .apk file
+        String codePath = packageURI.getPath();
+        File codeFile = new File(codePath);
+
+        // Calculate size of container needed to hold base APK.
+        final int sizeMb;
+        try {
+            sizeMb = calculateContainerSize(codeFile, isForwardLocked);
+        } catch (IOException e) {
+            Slog.w(TAG, "Problem when trying to copy " + codeFile.getPath());
+            return null;
+        }
+
+        // Create new container
+        final String newCachePath = PackageHelper.createSdDir(sizeMb, newCid, key, Process.myUid(),
+                isExternal);
+        if (newCachePath == null) {
+            Slog.e(TAG, "Failed to create container " + newCid);
+            return null;
+        }
+
+        if (localLOGV) {
+            Slog.i(TAG, "Created container for " + newCid + " at path : " + newCachePath);
+        }
+
+        final File resFile = new File(newCachePath, resFileName);
+        if (FileUtils.copyFile(new File(codePath), resFile)) {
+            if (localLOGV) {
+                Slog.i(TAG, "Copied " + codePath + " to " + resFile);
+            }
+        } else {
+            Slog.e(TAG, "Failed to copy " + codePath + " to " + resFile);
+            // Clean up container
+            PackageHelper.destroySdDir(newCid);
+            return null;
+        }
+
+        try {
+            Libcore.os.chmod(resFile.getAbsolutePath(), 0640);
+        } catch (ErrnoException e) {
+            Slog.e(TAG, "Could not chown APK: " + e.getMessage());
+            PackageHelper.destroySdDir(newCid);
+            return null;
+        }
+
+        if (isForwardLocked) {
+            File publicZipFile = new File(newCachePath, publicResFileName);
+            try {
+                PackageHelper.extractPublicFiles(resFile.getAbsolutePath(), publicZipFile);
+                if (localLOGV) {
+                    Slog.i(TAG, "Copied resources to " + publicZipFile);
+                }
+            } catch (IOException e) {
+                Slog.e(TAG, "Could not chown public APK " + publicZipFile.getAbsolutePath() + ": "
+                        + e.getMessage());
+                PackageHelper.destroySdDir(newCid);
+                return null;
+            }
+
+            try {
+                Libcore.os.chmod(publicZipFile.getAbsolutePath(), 0644);
+            } catch (ErrnoException e) {
+                Slog.e(TAG, "Could not chown public resource file: " + e.getMessage());
+                PackageHelper.destroySdDir(newCid);
+                return null;
+            }
+        }
+
+        final File sharedLibraryDir = new File(newCachePath, LIB_DIR_NAME);
+        if (sharedLibraryDir.mkdir()) {
+            int ret = NativeLibraryHelper.copyNativeBinariesIfNeededLI(codeFile, sharedLibraryDir);
+            if (ret != PackageManager.INSTALL_SUCCEEDED) {
+                Slog.e(TAG, "Could not copy native libraries to " + sharedLibraryDir.getPath());
+                PackageHelper.destroySdDir(newCid);
+                return null;
+            }
+        } else {
+            Slog.e(TAG, "Could not create native lib directory: " + sharedLibraryDir.getPath());
+            PackageHelper.destroySdDir(newCid);
+            return null;
+        }
+
+        if (!PackageHelper.finalizeSdDir(newCid)) {
+            Slog.e(TAG, "Failed to finalize " + newCid + " at path " + newCachePath);
+            // Clean up container
+            PackageHelper.destroySdDir(newCid);
+            return null;
+        }
+
+        if (localLOGV) {
+            Slog.i(TAG, "Finalized container " + newCid);
+        }
+
+        if (PackageHelper.isContainerMounted(newCid)) {
+            if (localLOGV) {
+                Slog.i(TAG, "Unmounting " + newCid + " at path " + newCachePath);
+            }
+
+            // Force a gc to avoid being killed.
+            Runtime.getRuntime().gc();
+            PackageHelper.unMountSdDir(newCid);
+        } else {
+            if (localLOGV) {
+                Slog.i(TAG, "Container " + newCid + " not mounted");
+            }
+        }
+
+        return newCachePath;
+!!!7549196.java!!!	copyToFile(inout inputStream : InputStream, inout out : OutputStream) : void
+        byte[] buffer = new byte[16384];
+        int bytesRead;
+        while ((bytesRead = inputStream.read(buffer)) >= 0) {
+            out.write(buffer, 0, bytesRead);
+        }
+!!!7549324.java!!!	copyFile(inout pPackageURI : Uri, inout outStream : OutputStream, inout encryptionParams : ContainerEncryptionParams) : void
+        String scheme = pPackageURI.getScheme();
+        InputStream inStream = null;
+        try {
+            if (scheme == null || scheme.equals("file")) {
+                final InputStream is = new FileInputStream(new File(pPackageURI.getPath()));
+                inStream = new BufferedInputStream(is);
+            } else if (scheme.equals("content")) {
+                final ParcelFileDescriptor fd;
+                try {
+                    fd = getContentResolver().openFileDescriptor(pPackageURI, "r");
+                } catch (FileNotFoundException e) {
+                    Slog.e(TAG, "Couldn't open file descriptor from download service. "
+                            + "Failed with exception " + e);
+                    throw e;
+                }
+
+                if (fd == null) {
+                    Slog.e(TAG, "Provider returned no file descriptor for " +
+                            pPackageURI.toString());
+                    throw new FileNotFoundException("provider returned no file descriptor");
+                } else {
+                    if (localLOGV) {
+                        Slog.i(TAG, "Opened file descriptor from download service.");
+                    }
+                    inStream = new ParcelFileDescriptor.AutoCloseInputStream(fd);
+                }
+            } else {
+                Slog.e(TAG, "Package URI is not 'file:' or 'content:' - " + pPackageURI);
+                throw new FileNotFoundException("Package URI is not 'file:' or 'content:'");
+            }
+
+            /*
+             * If this resource is encrypted, get the decrypted stream version
+             * of it.
+             */
+            ApkContainer container = new ApkContainer(inStream, encryptionParams);
+
+            try {
+                /*
+                 * We copy the source package file to a temp file and then
+                 * rename it to the destination file in order to eliminate a
+                 * window where the package directory scanner notices the new
+                 * package file but it's not completely copied yet.
+                 */
+                copyToFile(container.getInputStream(), outStream);
+
+                if (!container.isAuthenticated()) {
+                    throw new DigestException();
+                }
+            } catch (GeneralSecurityException e) {
+                throw new DigestException("A problem occured copying the file.");
+            }
+        } finally {
+            IoUtils.closeQuietly(inStream);
+        }
+!!!7550092.java!!!	recommendAppInstallLocation(in installLocation : int, in archiveFilePath : String, in flags : int, in threshold : long) : int
+        int prefer;
+        boolean checkBoth = false;
+
+        final boolean isForwardLocked = (flags & PackageManager.INSTALL_FORWARD_LOCK) != 0;
+
+        check_inner : {
+            /*
+             * Explicit install flags should override the manifest settings.
+             */
+            if ((flags & PackageManager.INSTALL_INTERNAL) != 0) {
+                prefer = PREFER_INTERNAL;
+                break check_inner;
+            } else if ((flags & PackageManager.INSTALL_EXTERNAL) != 0) {
+                prefer = PREFER_EXTERNAL;
+                break check_inner;
+            }
+
+            /* No install flags. Check for manifest option. */
+            if (installLocation == PackageInfo.INSTALL_LOCATION_INTERNAL_ONLY) {
+                prefer = PREFER_INTERNAL;
+                break check_inner;
+            } else if (installLocation == PackageInfo.INSTALL_LOCATION_PREFER_EXTERNAL) {
+                prefer = PREFER_EXTERNAL;
+                checkBoth = true;
+                break check_inner;
+            } else if (installLocation == PackageInfo.INSTALL_LOCATION_AUTO) {
+                // We default to preferring internal storage.
+                prefer = PREFER_INTERNAL;
+                checkBoth = true;
+                break check_inner;
+            }
+
+            // Pick user preference
+            int installPreference = Settings.Global.getInt(getApplicationContext()
+                    .getContentResolver(),
+                    Settings.Global.DEFAULT_INSTALL_LOCATION,
+                    PackageHelper.APP_INSTALL_AUTO);
+            if (installPreference == PackageHelper.APP_INSTALL_INTERNAL) {
+                prefer = PREFER_INTERNAL;
+                break check_inner;
+            } else if (installPreference == PackageHelper.APP_INSTALL_EXTERNAL) {
+                prefer = PREFER_EXTERNAL;
+                break check_inner;
+            }
+
+            /*
+             * Fall back to default policy of internal-only if nothing else is
+             * specified.
+             */
+            prefer = PREFER_INTERNAL;
+        }
+
+        final boolean emulated = Environment.isExternalStorageEmulated();
+
+        final File apkFile = new File(archiveFilePath);
+
+        boolean fitsOnInternal = false;
+        if (checkBoth || prefer == PREFER_INTERNAL) {
+            try {
+                fitsOnInternal = isUnderInternalThreshold(apkFile, isForwardLocked, threshold);
+            } catch (IOException e) {
+                return PackageHelper.RECOMMEND_FAILED_INVALID_URI;
+            }
+        }
+
+        boolean fitsOnSd = false;
+        if (!emulated && (checkBoth || prefer == PREFER_EXTERNAL)) {
+            try {
+                fitsOnSd = isUnderExternalThreshold(apkFile, isForwardLocked);
+            } catch (IOException e) {
+                return PackageHelper.RECOMMEND_FAILED_INVALID_URI;
+            }
+        }
+
+        if (prefer == PREFER_INTERNAL) {
+            if (fitsOnInternal) {
+                return PackageHelper.RECOMMEND_INSTALL_INTERNAL;
+            }
+        } else if (!emulated && prefer == PREFER_EXTERNAL) {
+            if (fitsOnSd) {
+                return PackageHelper.RECOMMEND_INSTALL_EXTERNAL;
+            }
+        }
+
+        if (checkBoth) {
+            if (fitsOnInternal) {
+                return PackageHelper.RECOMMEND_INSTALL_INTERNAL;
+            } else if (!emulated && fitsOnSd) {
+                return PackageHelper.RECOMMEND_INSTALL_EXTERNAL;
+            }
+        }
+
+        /*
+         * If they requested to be on the external media by default, return that
+         * the media was unavailable. Otherwise, indicate there was insufficient
+         * storage space available.
+         */
+        if (!emulated && (checkBoth || prefer == PREFER_EXTERNAL)
+                && !Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState())) {
+            return PackageHelper.RECOMMEND_MEDIA_UNAVAILABLE;
+        } else {
+            return PackageHelper.RECOMMEND_FAILED_INSUFFICIENT_STORAGE;
+        }
+!!!7550220.java!!!	isUnderInternalThreshold(inout apkFile : File, inout isForwardLocked : boolean, in threshold : long) : boolean
+        long size = apkFile.length();
+        if (size == 0 && !apkFile.exists()) {
+            throw new FileNotFoundException();
+        }
+
+        if (isForwardLocked) {
+            size += PackageHelper.extractPublicFiles(apkFile.getAbsolutePath(), null);
+        }
+
+        final StatFs internalStats = new StatFs(Environment.getDataDirectory().getPath());
+        final long availInternalSize = (long) internalStats.getAvailableBlocks()
+                * (long) internalStats.getBlockSize();
+
+        return (availInternalSize - size) > threshold;
+!!!7550348.java!!!	isUnderExternalThreshold(inout apkFile : File, inout isForwardLocked : boolean) : boolean
+        if (Environment.isExternalStorageEmulated()) {
+            return false;
+        }
+
+        final int sizeMb = calculateContainerSize(apkFile, isForwardLocked);
+
+        final int availSdMb;
+        if (Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState())) {
+            final StatFs sdStats = new StatFs(Environment.getExternalStorageDirectory().getPath());
+            final int blocksToMb = (1 << 20) / sdStats.getBlockSize();
+            availSdMb = sdStats.getAvailableBlocks() * blocksToMb;
+        } else {
+            availSdMb = -1;
+        }
+
+        return availSdMb > sizeMb;
+!!!7550476.java!!!	calculateContainerSize(inout apkFile : File, inout forwardLocked : boolean) : int
+        // Calculate size of container needed to hold base APK.
+        long sizeBytes = apkFile.length();
+        if (sizeBytes == 0 && !apkFile.exists()) {
+            throw new FileNotFoundException();
+        }
+
+        // Check all the native files that need to be copied and add that to the
+        // container size.
+        sizeBytes += NativeLibraryHelper.sumNativeBinariesLI(apkFile);
+
+        if (forwardLocked) {
+            sizeBytes += PackageHelper.extractPublicFiles(apkFile.getPath(), null);
+        }
+
+        int sizeMb = (int) (sizeBytes >> 20);
+        if ((sizeBytes - (sizeMb * 1024 * 1024)) > 0) {
+            sizeMb++;
+        }
+
+        /*
+         * Add buffer size because we don't have a good way to determine the
+         * real FAT size. Your FAT size varies with how many directory entries
+         * you need, how big the whole filesystem is, and other such headaches.
+         */
+        sizeMb++;
+
+        return sizeMb;

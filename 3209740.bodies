@@ -1,0 +1,872 @@
+class DataUsageSummary
+!!!13797388.java!!!	onCreate(inout savedInstanceState : Bundle) : void
+        super.onCreate(savedInstanceState);
+        final Context context = getActivity();
+
+        mNetworkService = INetworkManagementService.Stub.asInterface(
+                ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE));
+        mStatsService = INetworkStatsService.Stub.asInterface(
+                ServiceManager.getService(Context.NETWORK_STATS_SERVICE));
+        mPolicyManager = NetworkPolicyManager.from(context);
+        mConnService = ConnectivityManager.from(context);
+
+        mPrefs = getActivity().getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE);
+
+        mPolicyEditor = new NetworkPolicyEditor(mPolicyManager);
+        mPolicyEditor.read();
+
+        try {
+            mStatsSession = mStatsService.openSession();
+        } catch (RemoteException e) {
+            throw new RuntimeException(e);
+        }
+
+        mShowWifi = mPrefs.getBoolean(PREF_SHOW_WIFI, false);
+        mShowEthernet = mPrefs.getBoolean(PREF_SHOW_ETHERNET, false);
+
+        // override preferences when no mobile radio
+        if (!hasReadyMobileRadio(context)) {
+            mShowWifi = true;
+            mShowEthernet = true;
+        }
+
+        setHasOptionsMenu(true);
+!!!13797516.java!!!	onCreateView(inout inflater : LayoutInflater, inout container : ViewGroup, inout savedInstanceState : Bundle) : View
+
+        final Context context = inflater.getContext();
+        final View view = inflater.inflate(R.layout.data_usage_summary, container, false);
+
+        mUidDetailProvider = new UidDetailProvider(context);
+
+        mTabHost = (TabHost) view.findViewById(android.R.id.tabhost);
+        mTabsContainer = (ViewGroup) view.findViewById(R.id.tabs_container);
+        mTabWidget = (TabWidget) view.findViewById(android.R.id.tabs);
+        mListView = (ListView) view.findViewById(android.R.id.list);
+
+        // decide if we need to manually inset our content, or if we should rely
+        // on parent container for inset.
+        final boolean shouldInset = mListView.getScrollBarStyle()
+                == View.SCROLLBARS_OUTSIDE_OVERLAY;
+        if (shouldInset) {
+            mInsetSide = view.getResources().getDimensionPixelOffset(
+                    com.android.internal.R.dimen.preference_fragment_padding_side);
+        } else {
+            mInsetSide = 0;
+        }
+
+        // adjust padding around tabwidget as needed
+        prepareCustomPreferencesList(container, view, mListView, true);
+
+        mTabHost.setup();
+        mTabHost.setOnTabChangedListener(mTabListener);
+
+        mHeader = (ViewGroup) inflater.inflate(R.layout.data_usage_header, mListView, false);
+        mHeader.setClickable(true);
+
+        mListView.addHeaderView(mHeader, null, true);
+        mListView.setItemsCanFocus(true);
+
+        if (mInsetSide > 0) {
+            // inset selector and divider drawables
+            insetListViewDrawables(mListView, mInsetSide);
+            mHeader.setPadding(mInsetSide, 0, mInsetSide, 0);
+        }
+
+        {
+            // bind network switches
+            mNetworkSwitchesContainer = (ViewGroup) mHeader.findViewById(
+                    R.id.network_switches_container);
+            mNetworkSwitches = (LinearLayout) mHeader.findViewById(R.id.network_switches);
+
+            mDataEnabled = new Switch(inflater.getContext());
+            mDataEnabledView = inflatePreference(inflater, mNetworkSwitches, mDataEnabled);
+            mDataEnabled.setOnCheckedChangeListener(mDataEnabledListener);
+            mNetworkSwitches.addView(mDataEnabledView);
+
+            mDisableAtLimit = new CheckBox(inflater.getContext());
+            mDisableAtLimit.setClickable(false);
+            mDisableAtLimit.setFocusable(false);
+            mDisableAtLimitView = inflatePreference(inflater, mNetworkSwitches, mDisableAtLimit);
+            mDisableAtLimitView.setClickable(true);
+            mDisableAtLimitView.setFocusable(true);
+            mDisableAtLimitView.setOnClickListener(mDisableAtLimitListener);
+            mNetworkSwitches.addView(mDisableAtLimitView);
+        }
+
+        // bind cycle dropdown
+        mCycleView = mHeader.findViewById(R.id.cycles);
+        mCycleSpinner = (Spinner) mCycleView.findViewById(R.id.cycles_spinner);
+        mCycleAdapter = new CycleAdapter(context);
+        mCycleSpinner.setAdapter(mCycleAdapter);
+        mCycleSpinner.setOnItemSelectedListener(mCycleListener);
+
+        mChart = (ChartDataUsageView) mHeader.findViewById(R.id.chart);
+        mChart.setListener(mChartListener);
+        mChart.bindNetworkPolicy(null);
+
+        {
+            // bind app detail controls
+            mAppDetail = mHeader.findViewById(R.id.app_detail);
+            mAppIcon = (ImageView) mAppDetail.findViewById(R.id.app_icon);
+            mAppTitles = (ViewGroup) mAppDetail.findViewById(R.id.app_titles);
+            mAppPieChart = (PieChartView) mAppDetail.findViewById(R.id.app_pie_chart);
+            mAppForeground = (TextView) mAppDetail.findViewById(R.id.app_foreground);
+            mAppBackground = (TextView) mAppDetail.findViewById(R.id.app_background);
+            mAppSwitches = (LinearLayout) mAppDetail.findViewById(R.id.app_switches);
+
+            mAppSettings = (Button) mAppDetail.findViewById(R.id.app_settings);
+            mAppSettings.setOnClickListener(mAppSettingsListener);
+
+            mAppRestrict = new CheckBox(inflater.getContext());
+            mAppRestrict.setClickable(false);
+            mAppRestrict.setFocusable(false);
+            mAppRestrictView = inflatePreference(inflater, mAppSwitches, mAppRestrict);
+            mAppRestrictView.setClickable(true);
+            mAppRestrictView.setFocusable(true);
+            mAppRestrictView.setOnClickListener(mAppRestrictListener);
+            mAppSwitches.addView(mAppRestrictView);
+        }
+
+        mUsageSummary = (TextView) mHeader.findViewById(R.id.usage_summary);
+        mEmpty = (TextView) mHeader.findViewById(android.R.id.empty);
+
+        mAdapter = new DataUsageAdapter(mUidDetailProvider, mInsetSide);
+        mListView.setOnItemClickListener(mListListener);
+        mListView.setAdapter(mAdapter);
+
+        return view;
+!!!13797644.java!!!	onResume() : void
+        super.onResume();
+
+        // pick default tab based on incoming intent
+        final Intent intent = getActivity().getIntent();
+        mIntentTab = computeTabFromIntent(intent);
+
+        // this kicks off chain reaction which creates tabs, binds the body to
+        // selected network, and binds chart, cycles and detail list.
+        updateTabs();
+
+        // kick off background task to update stats
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                try {
+                    // wait a few seconds before kicking off
+                    Thread.sleep(2 * DateUtils.SECOND_IN_MILLIS);
+                    mStatsService.forceUpdate();
+                } catch (InterruptedException e) {
+                } catch (RemoteException e) {
+                }
+                return null;
+            }
+
+            @Override
+            protected void onPostExecute(Void result) {
+                if (isAdded()) {
+                    updateBody();
+                }
+            }
+        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+!!!13797772.java!!!	onCreateOptionsMenu(inout menu : Menu, inout inflater : MenuInflater) : void
+        inflater.inflate(R.menu.data_usage, menu);
+!!!13797900.java!!!	onPrepareOptionsMenu(inout menu : Menu) : void
+        final Context context = getActivity();
+        final boolean appDetailMode = isAppDetailMode();
+        final boolean isOwner = ActivityManager.getCurrentUser() == UserHandle.USER_OWNER;
+
+        mMenuDataRoaming = menu.findItem(R.id.data_usage_menu_roaming);
+        mMenuDataRoaming.setVisible(hasReadyMobileRadio(context) && !appDetailMode);
+        mMenuDataRoaming.setChecked(getDataRoaming());
+
+        mMenuRestrictBackground = menu.findItem(R.id.data_usage_menu_restrict_background);
+        mMenuRestrictBackground.setVisible(hasReadyMobileRadio(context) && !appDetailMode);
+        mMenuRestrictBackground.setChecked(mPolicyManager.getRestrictBackground());
+        mMenuRestrictBackground.setVisible(isOwner);
+
+        mMenuAutoSync = menu.findItem(R.id.data_usage_menu_auto_sync);
+        mMenuAutoSync.setChecked(ContentResolver.getMasterSyncAutomatically());
+        mMenuAutoSync.setVisible(!appDetailMode);
+
+        final MenuItem split4g = menu.findItem(R.id.data_usage_menu_split_4g);
+        split4g.setVisible(hasReadyMobile4gRadio(context) && isOwner && !appDetailMode);
+        split4g.setChecked(isMobilePolicySplit());
+
+        final MenuItem showWifi = menu.findItem(R.id.data_usage_menu_show_wifi);
+        if (hasWifiRadio(context) && hasReadyMobileRadio(context)) {
+            showWifi.setVisible(!appDetailMode);
+            showWifi.setChecked(mShowWifi);
+        } else {
+            showWifi.setVisible(false);
+        }
+
+        final MenuItem showEthernet = menu.findItem(R.id.data_usage_menu_show_ethernet);
+        if (hasEthernet(context) && hasReadyMobileRadio(context)) {
+            showEthernet.setVisible(!appDetailMode);
+            showEthernet.setChecked(mShowEthernet);
+        } else {
+            showEthernet.setVisible(false);
+        }
+
+        final MenuItem metered = menu.findItem(R.id.data_usage_menu_metered);
+        if (hasReadyMobileRadio(context) || hasWifiRadio(context)) {
+            metered.setVisible(!appDetailMode);
+        } else {
+            metered.setVisible(false);
+        }
+
+        final MenuItem help = menu.findItem(R.id.data_usage_menu_help);
+        String helpUrl;
+        if (!TextUtils.isEmpty(helpUrl = getResources().getString(R.string.help_url_data_usage))) {
+            HelpUtils.prepareHelpMenuItem(context, help, helpUrl);
+        } else {
+            help.setVisible(false);
+        }
+!!!13798028.java!!!	onOptionsItemSelected(inout item : MenuItem) : boolean
+        switch (item.getItemId()) {
+            case R.id.data_usage_menu_roaming: {
+                final boolean dataRoaming = !item.isChecked();
+                if (dataRoaming) {
+                    ConfirmDataRoamingFragment.show(this);
+                } else {
+                    // no confirmation to disable roaming
+                    setDataRoaming(false);
+                }
+                return true;
+            }
+            case R.id.data_usage_menu_restrict_background: {
+                final boolean restrictBackground = !item.isChecked();
+                if (restrictBackground) {
+                    ConfirmRestrictFragment.show(this);
+                } else {
+                    // no confirmation to drop restriction
+                    setRestrictBackground(false);
+                }
+                return true;
+            }
+            case R.id.data_usage_menu_split_4g: {
+                final boolean mobileSplit = !item.isChecked();
+                setMobilePolicySplit(mobileSplit);
+                item.setChecked(isMobilePolicySplit());
+                updateTabs();
+                return true;
+            }
+            case R.id.data_usage_menu_show_wifi: {
+                mShowWifi = !item.isChecked();
+                mPrefs.edit().putBoolean(PREF_SHOW_WIFI, mShowWifi).apply();
+                item.setChecked(mShowWifi);
+                updateTabs();
+                return true;
+            }
+            case R.id.data_usage_menu_show_ethernet: {
+                mShowEthernet = !item.isChecked();
+                mPrefs.edit().putBoolean(PREF_SHOW_ETHERNET, mShowEthernet).apply();
+                item.setChecked(mShowEthernet);
+                updateTabs();
+                return true;
+            }
+            case R.id.data_usage_menu_metered: {
+                final PreferenceActivity activity = (PreferenceActivity) getActivity();
+                activity.startPreferencePanel(DataUsageMeteredSettings.class.getCanonicalName(), null,
+                        R.string.data_usage_metered_title, null, this, 0);
+                return true;
+            }
+            case R.id.data_usage_menu_auto_sync: {
+                if (ActivityManager.isUserAMonkey()) {
+                    Log.d("SyncState", "ignoring monkey's attempt to flip global sync state");
+                } else {
+                    ConfirmAutoSyncChangeFragment.show(this, !item.isChecked());
+                }
+                return true;
+            }
+        }
+        return false;
+!!!13798156.java!!!	onDestroy() : void
+        mDataEnabledView = null;
+        mDisableAtLimitView = null;
+
+        mUidDetailProvider.clearCache();
+        mUidDetailProvider = null;
+
+        TrafficStats.closeQuietly(mStatsSession);
+
+        if (this.isRemoving()) {
+            getFragmentManager()
+                    .popBackStack(TAG_APP_DETAILS, FragmentManager.POP_BACK_STACK_INCLUSIVE);
+        }
+
+        super.onDestroy();
+!!!13798284.java!!!	ensureLayoutTransitions() : void
+        // skip when already setup
+        if (mChart.getLayoutTransition() != null) return;
+
+        mTabsContainer.setLayoutTransition(buildLayoutTransition());
+        mHeader.setLayoutTransition(buildLayoutTransition());
+        mNetworkSwitchesContainer.setLayoutTransition(buildLayoutTransition());
+
+        final LayoutTransition chartTransition = buildLayoutTransition();
+        chartTransition.disableTransitionType(LayoutTransition.APPEARING);
+        chartTransition.disableTransitionType(LayoutTransition.DISAPPEARING);
+        mChart.setLayoutTransition(chartTransition);
+!!!13798412.java!!!	buildLayoutTransition() : LayoutTransition
+        final LayoutTransition transition = new LayoutTransition();
+        if (TEST_ANIM) {
+            transition.setDuration(1500);
+        }
+        transition.setAnimateParentHierarchy(false);
+        return transition;
+!!!13798540.java!!!	updateTabs() : void
+        final Context context = getActivity();
+        mTabHost.clearAllTabs();
+
+        final boolean mobileSplit = isMobilePolicySplit();
+        if (mobileSplit && hasReadyMobile4gRadio(context)) {
+            mTabHost.addTab(buildTabSpec(TAB_3G, R.string.data_usage_tab_3g));
+            mTabHost.addTab(buildTabSpec(TAB_4G, R.string.data_usage_tab_4g));
+        } else if (hasReadyMobileRadio(context)) {
+            mTabHost.addTab(buildTabSpec(TAB_MOBILE, R.string.data_usage_tab_mobile));
+        }
+        if (mShowWifi && hasWifiRadio(context)) {
+            mTabHost.addTab(buildTabSpec(TAB_WIFI, R.string.data_usage_tab_wifi));
+        }
+        if (mShowEthernet && hasEthernet(context)) {
+            mTabHost.addTab(buildTabSpec(TAB_ETHERNET, R.string.data_usage_tab_ethernet));
+        }
+
+        final boolean noTabs = mTabWidget.getTabCount() == 0;
+        final boolean multipleTabs = mTabWidget.getTabCount() > 1;
+        mTabWidget.setVisibility(multipleTabs ? View.VISIBLE : View.GONE);
+        if (mIntentTab != null) {
+            if (Objects.equal(mIntentTab, mTabHost.getCurrentTabTag())) {
+                // already hit updateBody() when added; ignore
+                updateBody();
+            } else {
+                mTabHost.setCurrentTabByTag(mIntentTab);
+            }
+            mIntentTab = null;
+        } else if (noTabs) {
+            // no usable tabs, so hide body
+            updateBody();
+        } else {
+            // already hit updateBody() when added; ignore
+        }
+!!!13798668.java!!!	buildTabSpec(in tag : String, in titleRes : int) : TabSpec
+        return mTabHost.newTabSpec(tag).setIndicator(getText(titleRes)).setContent(
+                mEmptyTabContent);
+!!!13798796.java!!!	updateBody() : void
+        mBinding = true;
+        if (!isAdded()) return;
+
+        final Context context = getActivity();
+        final String currentTab = mTabHost.getCurrentTabTag();
+        final boolean isOwner = ActivityManager.getCurrentUser() == UserHandle.USER_OWNER;
+
+        if (currentTab == null) {
+            Log.w(TAG, "no tab selected; hiding body");
+            mListView.setVisibility(View.GONE);
+            return;
+        } else {
+            mListView.setVisibility(View.VISIBLE);
+        }
+
+        final boolean tabChanged = !currentTab.equals(mCurrentTab);
+        mCurrentTab = currentTab;
+
+        if (LOGD) Log.d(TAG, "updateBody() with currentTab=" + currentTab);
+
+        mDataEnabledView.setVisibility(isOwner ? View.VISIBLE : View.GONE);
+
+        // TODO: remove mobile tabs when SIM isn't ready
+        final TelephonyManager tele = TelephonyManager.from(context);
+
+        if (TAB_MOBILE.equals(currentTab)) {
+            setPreferenceTitle(mDataEnabledView, R.string.data_usage_enable_mobile);
+            setPreferenceTitle(mDisableAtLimitView, R.string.data_usage_disable_mobile_limit);
+            mTemplate = buildTemplateMobileAll(getActiveSubscriberId(context));
+
+        } else if (TAB_3G.equals(currentTab)) {
+            setPreferenceTitle(mDataEnabledView, R.string.data_usage_enable_3g);
+            setPreferenceTitle(mDisableAtLimitView, R.string.data_usage_disable_3g_limit);
+            // TODO: bind mDataEnabled to 3G radio state
+            mTemplate = buildTemplateMobile3gLower(getActiveSubscriberId(context));
+
+        } else if (TAB_4G.equals(currentTab)) {
+            setPreferenceTitle(mDataEnabledView, R.string.data_usage_enable_4g);
+            setPreferenceTitle(mDisableAtLimitView, R.string.data_usage_disable_4g_limit);
+            // TODO: bind mDataEnabled to 4G radio state
+            mTemplate = buildTemplateMobile4g(getActiveSubscriberId(context));
+
+        } else if (TAB_WIFI.equals(currentTab)) {
+            // wifi doesn't have any controls
+            mDataEnabledView.setVisibility(View.GONE);
+            mDisableAtLimitView.setVisibility(View.GONE);
+            mTemplate = buildTemplateWifiWildcard();
+
+        } else if (TAB_ETHERNET.equals(currentTab)) {
+            // ethernet doesn't have any controls
+            mDataEnabledView.setVisibility(View.GONE);
+            mDisableAtLimitView.setVisibility(View.GONE);
+            mTemplate = buildTemplateEthernet();
+
+        } else {
+            throw new IllegalStateException("unknown tab: " + currentTab);
+        }
+
+        // kick off loader for network history
+        // TODO: consider chaining two loaders together instead of reloading
+        // network history when showing app detail.
+        getLoaderManager().restartLoader(LOADER_CHART_DATA,
+                ChartDataLoader.buildArgs(mTemplate, mCurrentApp), mChartDataCallbacks);
+
+        // detail mode can change visible menus, invalidate
+        getActivity().invalidateOptionsMenu();
+
+        mBinding = false;
+!!!13798924.java!!!	isAppDetailMode() : boolean
+        return mCurrentApp != null;
+!!!13799052.java!!!	updateAppDetail() : void
+        final Context context = getActivity();
+        final PackageManager pm = context.getPackageManager();
+        final LayoutInflater inflater = getActivity().getLayoutInflater();
+
+        if (isAppDetailMode()) {
+            mAppDetail.setVisibility(View.VISIBLE);
+            mCycleAdapter.setChangeVisible(false);
+        } else {
+            mAppDetail.setVisibility(View.GONE);
+            mCycleAdapter.setChangeVisible(true);
+
+            // hide detail stats when not in detail mode
+            mChart.bindDetailNetworkStats(null);
+            return;
+        }
+
+        // remove warning/limit sweeps while in detail mode
+        mChart.bindNetworkPolicy(null);
+
+        // show icon and all labels appearing under this app
+        final int uid = mCurrentApp.key;
+        final UidDetail detail = mUidDetailProvider.getUidDetail(uid, true);
+        mAppIcon.setImageDrawable(detail.icon);
+
+        mAppTitles.removeAllViews();
+        if (detail.detailLabels != null) {
+            for (CharSequence label : detail.detailLabels) {
+                mAppTitles.addView(inflateAppTitle(inflater, mAppTitles, label));
+            }
+        } else {
+            mAppTitles.addView(inflateAppTitle(inflater, mAppTitles, detail.label));
+        }
+
+        // enable settings button when package provides it
+        final String[] packageNames = pm.getPackagesForUid(uid);
+        if (packageNames != null && packageNames.length > 0) {
+            mAppSettingsIntent = new Intent(Intent.ACTION_MANAGE_NETWORK_USAGE);
+            mAppSettingsIntent.addCategory(Intent.CATEGORY_DEFAULT);
+
+            // Search for match across all packages
+            boolean matchFound = false;
+            for (String packageName : packageNames) {
+                mAppSettingsIntent.setPackage(packageName);
+                if (pm.resolveActivity(mAppSettingsIntent, 0) != null) {
+                    matchFound = true;
+                    break;
+                }
+            }
+
+            mAppSettings.setEnabled(matchFound);
+            mAppSettings.setVisibility(View.VISIBLE);
+
+        } else {
+            mAppSettingsIntent = null;
+            mAppSettings.setVisibility(View.GONE);
+        }
+
+        updateDetailData();
+
+        if (UserHandle.isApp(uid) && !mPolicyManager.getRestrictBackground()
+                && isBandwidthControlEnabled() && hasReadyMobileRadio(context)) {
+            setPreferenceTitle(mAppRestrictView, R.string.data_usage_app_restrict_background);
+            setPreferenceSummary(mAppRestrictView,
+                    getString(R.string.data_usage_app_restrict_background_summary));
+
+            mAppRestrictView.setVisibility(View.VISIBLE);
+            mAppRestrict.setChecked(getAppRestrictBackground());
+
+        } else {
+            mAppRestrictView.setVisibility(View.GONE);
+        }
+!!!13799180.java!!!	setPolicyWarningBytes(in warningBytes : long) : void
+        if (LOGD) Log.d(TAG, "setPolicyWarningBytes()");
+        mPolicyEditor.setPolicyWarningBytes(mTemplate, warningBytes);
+        updatePolicy(false);
+!!!13799308.java!!!	setPolicyLimitBytes(in limitBytes : long) : void
+        if (LOGD) Log.d(TAG, "setPolicyLimitBytes()");
+        mPolicyEditor.setPolicyLimitBytes(mTemplate, limitBytes);
+        updatePolicy(false);
+!!!13799436.java!!!	isMobileDataEnabled() : boolean
+        if (mMobileDataEnabled != null) {
+            // TODO: deprecate and remove this once enabled flag is on policy
+            return mMobileDataEnabled;
+        } else {
+            return mConnService.getMobileDataEnabled();
+        }
+!!!13799564.java!!!	setMobileDataEnabled(inout enabled : boolean) : void
+        if (LOGD) Log.d(TAG, "setMobileDataEnabled()");
+        mConnService.setMobileDataEnabled(enabled);
+        mMobileDataEnabled = enabled;
+        updatePolicy(false);
+!!!13799692.java!!!	isNetworkPolicyModifiable(inout policy : NetworkPolicy) : boolean
+        return policy != null && isBandwidthControlEnabled() && mDataEnabled.isChecked()
+                && ActivityManager.getCurrentUser() == UserHandle.USER_OWNER;
+!!!13799820.java!!!	isBandwidthControlEnabled() : boolean
+        try {
+            return mNetworkService.isBandwidthControlEnabled();
+        } catch (RemoteException e) {
+            Log.w(TAG, "problem talking with INetworkManagementService: " + e);
+            return false;
+        }
+!!!13799948.java!!!	getDataRoaming() : boolean
+        final ContentResolver resolver = getActivity().getContentResolver();
+        return Settings.Global.getInt(resolver, Settings.Global.DATA_ROAMING, 0) != 0;
+!!!13800076.java!!!	setDataRoaming(inout enabled : boolean) : void
+        // TODO: teach telephony DataConnectionTracker to watch and apply
+        // updates when changed.
+        final ContentResolver resolver = getActivity().getContentResolver();
+        Settings.Global.putInt(resolver, Settings.Global.DATA_ROAMING, enabled ? 1 : 0);
+        mMenuDataRoaming.setChecked(enabled);
+!!!13800204.java!!!	setRestrictBackground(inout restrictBackground : boolean) : void
+        mPolicyManager.setRestrictBackground(restrictBackground);
+        mMenuRestrictBackground.setChecked(restrictBackground);
+!!!13800332.java!!!	getAppRestrictBackground() : boolean
+        final int uid = mCurrentApp.key;
+        final int uidPolicy = mPolicyManager.getUidPolicy(uid);
+        return (uidPolicy & POLICY_REJECT_METERED_BACKGROUND) != 0;
+!!!13800460.java!!!	setAppRestrictBackground(inout restrictBackground : boolean) : void
+        if (LOGD) Log.d(TAG, "setAppRestrictBackground()");
+        final int uid = mCurrentApp.key;
+        mPolicyManager.setUidPolicy(
+                uid, restrictBackground ? POLICY_REJECT_METERED_BACKGROUND : POLICY_NONE);
+        mAppRestrict.setChecked(restrictBackground);
+!!!13800588.java!!!	updatePolicy(inout refreshCycle : boolean) : void
+        if (isAppDetailMode()) {
+            mNetworkSwitches.setVisibility(View.GONE);
+        } else {
+            mNetworkSwitches.setVisibility(View.VISIBLE);
+        }
+
+        // TODO: move enabled state directly into policy
+        if (TAB_MOBILE.equals(mCurrentTab)) {
+            mBinding = true;
+            mDataEnabled.setChecked(isMobileDataEnabled());
+            mBinding = false;
+        }
+
+        final NetworkPolicy policy = mPolicyEditor.getPolicy(mTemplate);
+        if (isNetworkPolicyModifiable(policy)) {
+            mDisableAtLimitView.setVisibility(View.VISIBLE);
+            mDisableAtLimit.setChecked(policy != null && policy.limitBytes != LIMIT_DISABLED);
+            if (!isAppDetailMode()) {
+                mChart.bindNetworkPolicy(policy);
+            }
+
+        } else {
+            // controls are disabled; don't bind warning/limit sweeps
+            mDisableAtLimitView.setVisibility(View.GONE);
+            mChart.bindNetworkPolicy(null);
+        }
+
+        if (refreshCycle) {
+            // generate cycle list based on policy and available history
+            updateCycleList(policy);
+        }
+!!!13800716.java!!!	updateCycleList(inout policy : NetworkPolicy) : void
+        // stash away currently selected cycle to try restoring below
+        final CycleItem previousItem = (CycleItem) mCycleSpinner.getSelectedItem();
+        mCycleAdapter.clear();
+
+        final Context context = mCycleSpinner.getContext();
+
+        long historyStart = Long.MAX_VALUE;
+        long historyEnd = Long.MIN_VALUE;
+        if (mChartData != null) {
+            historyStart = mChartData.network.getStart();
+            historyEnd = mChartData.network.getEnd();
+        }
+
+        final long now = System.currentTimeMillis();
+        if (historyStart == Long.MAX_VALUE) historyStart = now;
+        if (historyEnd == Long.MIN_VALUE) historyEnd = now + 1;
+
+        boolean hasCycles = false;
+        if (policy != null) {
+            // find the next cycle boundary
+            long cycleEnd = computeNextCycleBoundary(historyEnd, policy);
+
+            // walk backwards, generating all valid cycle ranges
+            while (cycleEnd > historyStart) {
+                final long cycleStart = computeLastCycleBoundary(cycleEnd, policy);
+                Log.d(TAG, "generating cs=" + cycleStart + " to ce=" + cycleEnd + " waiting for hs="
+                        + historyStart);
+                mCycleAdapter.add(new CycleItem(context, cycleStart, cycleEnd));
+                cycleEnd = cycleStart;
+                hasCycles = true;
+            }
+
+            // one last cycle entry to modify policy cycle day
+            mCycleAdapter.setChangePossible(isNetworkPolicyModifiable(policy));
+        }
+
+        if (!hasCycles) {
+            // no policy defined cycles; show entry for each four-week period
+            long cycleEnd = historyEnd;
+            while (cycleEnd > historyStart) {
+                final long cycleStart = cycleEnd - (DateUtils.WEEK_IN_MILLIS * 4);
+                mCycleAdapter.add(new CycleItem(context, cycleStart, cycleEnd));
+                cycleEnd = cycleStart;
+            }
+
+            mCycleAdapter.setChangePossible(false);
+        }
+
+        // force pick the current cycle (first item)
+        if (mCycleAdapter.getCount() > 0) {
+            final int position = mCycleAdapter.findNearestPosition(previousItem);
+            mCycleSpinner.setSelection(position);
+
+            // only force-update cycle when changed; skipping preserves any
+            // user-defined inspection region.
+            final CycleItem selectedItem = mCycleAdapter.getItem(position);
+            if (!Objects.equal(selectedItem, previousItem)) {
+                mCycleListener.onItemSelected(mCycleSpinner, null, position, 0);
+            } else {
+                // but still kick off loader for detailed list
+                updateDetailData();
+            }
+        } else {
+            updateDetailData();
+        }
+!!!13800844.java!!!	updateDetailData() : void
+        if (LOGD) Log.d(TAG, "updateDetailData()");
+
+        final long start = mChart.getInspectStart();
+        final long end = mChart.getInspectEnd();
+        final long now = System.currentTimeMillis();
+
+        final Context context = getActivity();
+
+        NetworkStatsHistory.Entry entry = null;
+        if (isAppDetailMode() && mChartData != null && mChartData.detail != null) {
+            // bind foreground/background to piechart and labels
+            entry = mChartData.detailDefault.getValues(start, end, now, entry);
+            final long defaultBytes = entry.rxBytes + entry.txBytes;
+            entry = mChartData.detailForeground.getValues(start, end, now, entry);
+            final long foregroundBytes = entry.rxBytes + entry.txBytes;
+
+            mAppPieChart.setOriginAngle(175);
+
+            mAppPieChart.removeAllSlices();
+            mAppPieChart.addSlice(foregroundBytes, Color.parseColor("#d88d3a"));
+            mAppPieChart.addSlice(defaultBytes, Color.parseColor("#666666"));
+
+            mAppPieChart.generatePath();
+
+            mAppBackground.setText(Formatter.formatFileSize(context, defaultBytes));
+            mAppForeground.setText(Formatter.formatFileSize(context, foregroundBytes));
+
+            // and finally leave with summary data for label below
+            entry = mChartData.detail.getValues(start, end, now, null);
+
+            getLoaderManager().destroyLoader(LOADER_SUMMARY);
+
+        } else {
+            if (mChartData != null) {
+                entry = mChartData.network.getValues(start, end, now, null);
+            }
+
+            // kick off loader for detailed stats
+            getLoaderManager().restartLoader(LOADER_SUMMARY,
+                    SummaryForAllUidLoader.buildArgs(mTemplate, start, end), mSummaryCallbacks);
+        }
+
+        final long totalBytes = entry != null ? entry.rxBytes + entry.txBytes : 0;
+        final String totalPhrase = Formatter.formatFileSize(context, totalBytes);
+        final String rangePhrase = formatDateRange(context, start, end);
+
+        final int summaryRes;
+        if (TAB_MOBILE.equals(mCurrentTab) || TAB_3G.equals(mCurrentApp)
+                || TAB_4G.equals(mCurrentApp)) {
+            summaryRes = R.string.data_usage_total_during_range_mobile;
+        } else {
+            summaryRes = R.string.data_usage_total_during_range;
+        }
+
+        mUsageSummary.setText(getString(summaryRes, totalPhrase, rangePhrase));
+
+        // initial layout is finished above, ensure we have transitions
+        ensureLayoutTransitions();
+!!!13800972.java!!!	isMobilePolicySplit() : boolean
+        final Context context = getActivity();
+        if (hasReadyMobileRadio(context)) {
+            final TelephonyManager tele = TelephonyManager.from(context);
+            return mPolicyEditor.isMobilePolicySplit(getActiveSubscriberId(context));
+        } else {
+            return false;
+        }
+!!!13801100.java!!!	setMobilePolicySplit(inout split : boolean) : void
+        final Context context = getActivity();
+        if (hasReadyMobileRadio(context)) {
+            final TelephonyManager tele = TelephonyManager.from(context);
+            mPolicyEditor.setMobilePolicySplit(getActiveSubscriberId(context), split);
+        }
+!!!13801228.java!!!	getActiveSubscriberId(inout context : Context) : String
+        final TelephonyManager tele = TelephonyManager.from(context);
+        final String actualSubscriberId = tele.getSubscriberId();
+        return SystemProperties.get(TEST_SUBSCRIBER_PROP, actualSubscriberId);
+!!!13801996.java!!!	formatDateRange(inout context : Context, in start : long, in end : long) : String
+        final int flags = FORMAT_SHOW_DATE | FORMAT_ABBREV_MONTH;
+
+        synchronized (sBuilder) {
+            sBuilder.setLength(0);
+            return DateUtils.formatDateRange(context, sFormatter, start, end, flags, null)
+                    .toString();
+        }
+!!!13807500.java!!!	computeTabFromIntent(inout intent : Intent) : String
+        final NetworkTemplate template = intent.getParcelableExtra(EXTRA_NETWORK_TEMPLATE);
+        if (template == null) return null;
+
+        switch (template.getMatchRule()) {
+            case MATCH_MOBILE_3G_LOWER:
+                return TAB_3G;
+            case MATCH_MOBILE_4G:
+                return TAB_4G;
+            case MATCH_MOBILE_ALL:
+                return TAB_MOBILE;
+            case MATCH_WIFI:
+                return TAB_WIFI;
+            default:
+                return null;
+        }
+!!!13808396.java!!!	hasReadyMobileRadio(inout context : Context) : boolean
+        if (TEST_RADIOS) {
+            return SystemProperties.get(TEST_RADIOS_PROP).contains("mobile");
+        }
+
+        final ConnectivityManager conn = ConnectivityManager.from(context);
+        final TelephonyManager tele = TelephonyManager.from(context);
+
+        // require both supported network and ready SIM
+        return conn.isNetworkSupported(TYPE_MOBILE) && tele.getSimState() == SIM_STATE_READY;
+!!!13808524.java!!!	hasReadyMobile4gRadio(inout context : Context) : boolean
+        if (!NetworkPolicyEditor.ENABLE_SPLIT_POLICIES) {
+            return false;
+        }
+        if (TEST_RADIOS) {
+            return SystemProperties.get(TEST_RADIOS_PROP).contains("4g");
+        }
+
+        final ConnectivityManager conn = ConnectivityManager.from(context);
+        final TelephonyManager tele = TelephonyManager.from(context);
+
+        final boolean hasWimax = conn.isNetworkSupported(TYPE_WIMAX);
+        final boolean hasLte = (tele.getLteOnCdmaMode() == PhoneConstants.LTE_ON_CDMA_TRUE)
+                && hasReadyMobileRadio(context);
+        return hasWimax || hasLte;
+!!!13808652.java!!!	hasWifiRadio(inout context : Context) : boolean
+        if (TEST_RADIOS) {
+            return SystemProperties.get(TEST_RADIOS_PROP).contains("wifi");
+        }
+
+        final ConnectivityManager conn = ConnectivityManager.from(context);
+        return conn.isNetworkSupported(TYPE_WIFI);
+!!!13808780.java!!!	hasEthernet(inout context : Context) : boolean
+        if (TEST_RADIOS) {
+            return SystemProperties.get(TEST_RADIOS_PROP).contains("ethernet");
+        }
+
+        final ConnectivityManager conn = ConnectivityManager.from(context);
+        final boolean hasEthernet = conn.isNetworkSupported(TYPE_ETHERNET);
+
+        final long ethernetBytes;
+        if (mStatsSession != null) {
+            try {
+                ethernetBytes = mStatsSession.getSummaryForNetwork(
+                        NetworkTemplate.buildTemplateEthernet(), Long.MIN_VALUE, Long.MAX_VALUE)
+                        .getTotalBytes();
+            } catch (RemoteException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            ethernetBytes = 0;
+        }
+
+        // only show ethernet when both hardware present and traffic has occurred
+        return hasEthernet && ethernetBytes > 0;
+!!!13808908.java!!!	inflatePreference(inout inflater : LayoutInflater, inout root : ViewGroup, inout widget : View) : View
+        final View view = inflater.inflate(R.layout.preference, root, false);
+        final LinearLayout widgetFrame = (LinearLayout) view.findViewById(
+                android.R.id.widget_frame);
+        widgetFrame.addView(widget, new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT));
+        return view;
+!!!13809036.java!!!	inflateAppTitle(inout inflater : LayoutInflater, inout root : ViewGroup, inout label : CharSequence) : View
+        final TextView view = (TextView) inflater.inflate(
+                R.layout.data_usage_app_title, root, false);
+        view.setText(label);
+        return view;
+!!!13809164.java!!!	hasLimitedNetworks() : boolean
+        return !buildLimitedNetworksList().isEmpty();
+!!!13809292.java!!!	buildLimitedNetworksString() : CharSequence
+        final List<CharSequence> limited = buildLimitedNetworksList();
+
+        // handle case where no networks limited
+        if (limited.isEmpty()) {
+            limited.add(getText(R.string.data_usage_list_none));
+        }
+
+        return TextUtils.join(limited);
+!!!13809420.java!!!	buildLimitedNetworksList() : List<CharSequence>
+        final Context context = getActivity();
+
+        // build combined list of all limited networks
+        final ArrayList<CharSequence> limited = Lists.newArrayList();
+
+        final TelephonyManager tele = TelephonyManager.from(context);
+        if (tele.getSimState() == SIM_STATE_READY) {
+            final String subscriberId = getActiveSubscriberId(context);
+            if (mPolicyEditor.hasLimitedPolicy(buildTemplateMobileAll(subscriberId))) {
+                limited.add(getText(R.string.data_usage_list_mobile));
+            }
+            if (mPolicyEditor.hasLimitedPolicy(buildTemplateMobile3gLower(subscriberId))) {
+                limited.add(getText(R.string.data_usage_tab_3g));
+            }
+            if (mPolicyEditor.hasLimitedPolicy(buildTemplateMobile4g(subscriberId))) {
+                limited.add(getText(R.string.data_usage_tab_4g));
+            }
+        }
+
+        if (mPolicyEditor.hasLimitedPolicy(buildTemplateWifiWildcard())) {
+            limited.add(getText(R.string.data_usage_tab_wifi));
+        }
+        if (mPolicyEditor.hasLimitedPolicy(buildTemplateEthernet())) {
+            limited.add(getText(R.string.data_usage_tab_ethernet));
+        }
+
+        return limited;
+!!!13809548.java!!!	insetListViewDrawables(inout view : ListView, in insetSide : int) : void
+        final Drawable selector = view.getSelector();
+        final Drawable divider = view.getDivider();
+
+        // fully unregister these drawables so callbacks can be maintained after
+        // wrapping below.
+        final Drawable stub = new ColorDrawable(Color.TRANSPARENT);
+        view.setSelector(stub);
+        view.setDivider(stub);
+
+        view.setSelector(new InsetBoundsDrawable(selector, insetSide));
+        view.setDivider(new InsetBoundsDrawable(divider, insetSide));
+!!!13809676.java!!!	setPreferenceTitle(inout parent : View, in resId : int) : void
+        final TextView title = (TextView) parent.findViewById(android.R.id.title);
+        title.setText(resId);
+!!!13809804.java!!!	setPreferenceSummary(inout parent : View, inout string : CharSequence) : void
+        final TextView summary = (TextView) parent.findViewById(android.R.id.summary);
+        summary.setVisibility(View.VISIBLE);
+        summary.setText(string);

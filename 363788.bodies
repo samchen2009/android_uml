@@ -1,0 +1,186 @@
+class ARTPSession
+!!!701836.cpp!!!	setup(in desc : sp<ASessionDescription>) : status_t
+    CHECK_EQ(mInitCheck, (status_t)NO_INIT);
+
+    mDesc = desc;
+
+    mRTPConn = new ARTPConnection(ARTPConnection::kRegularlyRequestFIR);
+
+    looper()->registerHandler(mRTPConn);
+
+    for (size_t i = 1; i < mDesc->countTracks(); ++i) {
+        AString connection;
+        if (!mDesc->findAttribute(i, "c=", &connection)) {
+            // No per-stream connection information, try global fallback.
+            if (!mDesc->findAttribute(0, "c=", &connection)) {
+                ALOGE("Unable to find connection attribute.");
+                return mInitCheck;
+            }
+        }
+        if (!(connection == "IN IP4 127.0.0.1")) {
+            ALOGE("We only support localhost connections for now.");
+            return mInitCheck;
+        }
+
+        unsigned port;
+        if (!validateMediaFormat(i, &port) || (port & 1) != 0) {
+            ALOGE("Invalid media format.");
+            return mInitCheck;
+        }
+
+        sp<APacketSource> source = new APacketSource(mDesc, i);
+        if (source->initCheck() != OK) {
+            ALOGE("Unsupported format.");
+            return mInitCheck;
+        }
+
+        int rtpSocket = MakeUDPSocket(port);
+        int rtcpSocket = MakeUDPSocket(port + 1);
+
+        mTracks.push(TrackInfo());
+        TrackInfo *info = &mTracks.editItemAt(mTracks.size() - 1);
+        info->mRTPSocket = rtpSocket;
+        info->mRTCPSocket = rtcpSocket;
+
+        sp<AMessage> notify = new AMessage(kWhatAccessUnitComplete, id());
+        notify->setSize("track-index", mTracks.size() - 1);
+
+        mRTPConn->addStream(
+                rtpSocket, rtcpSocket, mDesc, i, notify, false /* injected */);
+
+        info->mPacketSource = source;
+    }
+
+    mInitCheck = OK;
+
+    return OK;
+!!!701964.cpp!!!	countTracks() : size_t
+    return mTracks.size();
+!!!702092.cpp!!!	trackAt(in index : size_t) : sp<MediaSource>
+    CHECK_LT(index, mTracks.size());
+    return mTracks.editItemAt(index).mPacketSource;
+!!!702220.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatAccessUnitComplete:
+        {
+            int32_t firstRTCP;
+            if (msg->findInt32("first-rtcp", &firstRTCP)) {
+                // There won't be an access unit here, it's just a notification
+                // that the data communication worked since we got the first
+                // rtcp packet.
+                break;
+            }
+
+            size_t trackIndex;
+            CHECK(msg->findSize("track-index", &trackIndex));
+
+            int32_t eos;
+            if (msg->findInt32("eos", &eos) && eos) {
+                TrackInfo *info = &mTracks.editItemAt(trackIndex);
+                info->mPacketSource->signalEOS(ERROR_END_OF_STREAM);
+                break;
+            }
+
+            sp<ABuffer> accessUnit;
+            CHECK(msg->findBuffer("access-unit", &accessUnit));
+
+            uint64_t ntpTime;
+            CHECK(accessUnit->meta()->findInt64(
+                        "ntp-time", (int64_t *)&ntpTime));
+
+#if 0
+#if 0
+            printf("access unit complete size=%d\tntp-time=0x%016llx\n",
+                   accessUnit->size(), ntpTime);
+#else
+            ALOGI("access unit complete, size=%d, ntp-time=%llu",
+                 accessUnit->size(), ntpTime);
+            hexdump(accessUnit->data(), accessUnit->size());
+#endif
+#endif
+
+#if 0
+            CHECK_GE(accessUnit->size(), 5u);
+            CHECK(!memcmp("\x00\x00\x00\x01", accessUnit->data(), 4));
+            unsigned x = accessUnit->data()[4];
+
+            ALOGI("access unit complete: nalType=0x%02x, nalRefIdc=0x%02x",
+                 x & 0x1f, (x & 0x60) >> 5);
+#endif
+
+            accessUnit->meta()->setInt64("ntp-time", ntpTime);
+            accessUnit->meta()->setInt64("timeUs", 0);
+
+#if 0
+            int32_t damaged;
+            if (accessUnit->meta()->findInt32("damaged", &damaged)
+                    && damaged != 0) {
+                ALOGI("ignoring damaged AU");
+            } else
+#endif
+            {
+                TrackInfo *info = &mTracks.editItemAt(trackIndex);
+                info->mPacketSource->queueAccessUnit(accessUnit);
+            }
+            break;
+        }
+
+        default:
+            TRESPASS();
+            break;
+    }
+!!!702348.cpp!!!	~ARTPSession()
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        TrackInfo *info = &mTracks.editItemAt(i);
+
+        info->mPacketSource->signalEOS(UNKNOWN_ERROR);
+
+        close(info->mRTPSocket);
+        close(info->mRTCPSocket);
+    }
+!!!702476.cpp!!!	validateMediaFormat(in index : size_t, inout port : uint) : bool
+    AString format;
+    mDesc->getFormat(index, &format);
+
+    ssize_t i = format.find(" ");
+    if (i < 0) {
+        return false;
+    }
+
+    ++i;
+    size_t j = i;
+    while (isdigit(format.c_str()[j])) {
+        ++j;
+    }
+    if (format.c_str()[j] != ' ') {
+        return false;
+    }
+
+    AString portString(format, i, j - i);
+
+    char *end;
+    unsigned long x = strtoul(portString.c_str(), &end, 10);
+    if (end == portString.c_str() || *end != '\0') {
+        return false;
+    }
+
+    if (x == 0 || x > 65535) {
+        return false;
+    }
+
+    *port = x;
+
+    return true;
+!!!702604.cpp!!!	MakeUDPSocket(in port : uint) : int
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK_GE(s, 0);
+
+    struct sockaddr_in addr;
+    memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    CHECK_EQ(0, bind(s, (const struct sockaddr *)&addr, sizeof(addr)));
+
+    return s;

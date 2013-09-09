@@ -1,0 +1,96 @@
+class Condition
+!!!1576460.cpp!!!	Condition()
+    WinCondition* condState = new WinCondition;
+
+    condState->waitersCount = 0;
+    condState->wasBroadcast = false;
+    // semaphore: no security, initial value of 0
+    condState->sema = CreateSemaphore(NULL, 0, 0x7fffffff, NULL);
+    InitializeCriticalSection(&condState->waitersCountLock);
+    // auto-reset event, not signaled initially
+    condState->waitersDone = CreateEvent(NULL, FALSE, FALSE, NULL);
+    // used so we don't have to lock external mutex on signal/broadcast
+    condState->internalMutex = CreateMutex(NULL, FALSE, NULL);
+
+    mState = condState;
+!!!1576588.cpp!!!	Condition(in type : int)
+    if (type == SHARED) {
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        pthread_condattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+        pthread_cond_init(&mCond, &attr);
+        pthread_condattr_destroy(&attr);
+    } else {
+        pthread_cond_init(&mCond, NULL);
+    }
+!!!1576716.cpp!!!	~Condition()
+    WinCondition* condState = (WinCondition*) mState;
+    if (condState != NULL) {
+        CloseHandle(condState->sema);
+        CloseHandle(condState->waitersDone);
+        delete condState;
+    }
+!!!1576844.cpp!!!	wait(inout mutex : Mutex) : status_t
+    WinCondition* condState = (WinCondition*) mState;
+    HANDLE hMutex = (HANDLE) mutex.mState;
+    
+    return ((WinCondition*)mState)->wait(condState, hMutex, NULL);
+!!!1576972.cpp!!!	waitRelative(inout mutex : Mutex, in reltime : nsecs_t) : status_t
+    WinCondition* condState = (WinCondition*) mState;
+    HANDLE hMutex = (HANDLE) mutex.mState;
+    nsecs_t absTime = systemTime()+reltime;
+
+    return ((WinCondition*)mState)->wait(condState, hMutex, &absTime);
+!!!1577100.cpp!!!	signal() : void
+    WinCondition* condState = (WinCondition*) mState;
+
+    // Lock the internal mutex.  This ensures that we don't clash with
+    // broadcast().
+    WaitForSingleObject(condState->internalMutex, INFINITE);
+
+    EnterCriticalSection(&condState->waitersCountLock);
+    bool haveWaiters = (condState->waitersCount > 0);
+    LeaveCriticalSection(&condState->waitersCountLock);
+
+    // If no waiters, then this is a no-op.  Otherwise, knock the semaphore
+    // down a notch.
+    if (haveWaiters)
+        ReleaseSemaphore(condState->sema, 1, 0);
+
+    // Release internal mutex.
+    ReleaseMutex(condState->internalMutex);
+!!!1577228.cpp!!!	broadcast() : void
+    WinCondition* condState = (WinCondition*) mState;
+
+    // Lock the internal mutex.  This keeps the guys we're waking up
+    // from getting too far.
+    WaitForSingleObject(condState->internalMutex, INFINITE);
+
+    EnterCriticalSection(&condState->waitersCountLock);
+    bool haveWaiters = false;
+
+    if (condState->waitersCount > 0) {
+        haveWaiters = true;
+        condState->wasBroadcast = true;
+    }
+
+    if (haveWaiters) {
+        // Wake up all the waiters.
+        ReleaseSemaphore(condState->sema, condState->waitersCount, 0);
+
+        LeaveCriticalSection(&condState->waitersCountLock);
+
+        // Wait for all awakened threads to acquire the counting semaphore.
+        // The last guy who was waiting sets this.
+        WaitForSingleObject(condState->waitersDone, INFINITE);
+
+        // Reset wasBroadcast.  (No crit section needed because nobody
+        // else can wake up to poke at it.)
+        condState->wasBroadcast = 0;
+    } else {
+        // nothing to do
+        LeaveCriticalSection(&condState->waitersCountLock);
+    }
+
+    // Release internal mutex.
+    ReleaseMutex(condState->internalMutex);

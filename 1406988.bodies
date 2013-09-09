@@ -1,0 +1,481 @@
+class ElectronBeam
+!!!8658956.java!!!	ElectronBeam(inout displayManager : DisplayManagerService)
+        mDisplayManager = displayManager;
+!!!8659084.java!!!	prepare(in mode : int) : boolean
+        if (DEBUG) {
+            Slog.d(TAG, "prepare: mode=" + mode);
+        }
+
+        mMode = mode;
+
+        // Get the display size and layer stack.
+        // This is not expected to change while the electron beam surface is showing.
+        DisplayInfo displayInfo = mDisplayManager.getDisplayInfo(Display.DEFAULT_DISPLAY);
+        mDisplayLayerStack = displayInfo.layerStack;
+        mDisplayWidth = displayInfo.getNaturalWidth();
+        mDisplayHeight = displayInfo.getNaturalHeight();
+
+        // Prepare the surface for drawing.
+        if (!tryPrepare()) {
+            dismiss();
+            return false;
+        }
+
+        // Done.
+        mPrepared = true;
+
+        // Dejanking optimization.
+        // Some GL drivers can introduce a lot of lag in the first few frames as they
+        // initialize their state and allocate graphics buffers for rendering.
+        // Work around this problem by rendering the first frame of the animation a few
+        // times.  The rest of the animation should run smoothly thereafter.
+        // The frames we draw here aren't visible because we are essentially just
+        // painting the screenshot as-is.
+        if (mode == MODE_COOL_DOWN) {
+            for (int i = 0; i < DEJANK_FRAMES; i++) {
+                draw(1.0f);
+            }
+        }
+        return true;
+!!!8659212.java!!!	tryPrepare() : boolean
+        if (createSurface()) {
+            if (mMode == MODE_FADE) {
+                return true;
+            }
+            return createEglContext()
+                    && createEglSurface()
+                    && captureScreenshotTextureAndSetViewport();
+        }
+        return false;
+!!!8659340.java!!!	dismiss() : void
+        if (DEBUG) {
+            Slog.d(TAG, "dismiss");
+        }
+
+        destroyScreenshotTexture();
+        destroyEglSurface();
+        destroySurface();
+        mPrepared = false;
+!!!8659468.java!!!	draw(in level : float) : boolean
+        if (DEBUG) {
+            Slog.d(TAG, "drawFrame: level=" + level);
+        }
+
+        if (!mPrepared) {
+            return false;
+        }
+
+        if (mMode == MODE_FADE) {
+            return showSurface(1.0f - level);
+        }
+
+        if (!attachEglContext()) {
+            return false;
+        }
+        try {
+            // Clear frame to solid black.
+            GLES10.glClearColor(0f, 0f, 0f, 1f);
+            GLES10.glClear(GLES10.GL_COLOR_BUFFER_BIT);
+
+            // Draw the frame.
+            if (level < HSTRETCH_DURATION) {
+                drawHStretch(1.0f - (level / HSTRETCH_DURATION));
+            } else {
+                drawVStretch(1.0f - ((level - HSTRETCH_DURATION) / VSTRETCH_DURATION));
+            }
+            if (checkGlErrors("drawFrame")) {
+                return false;
+            }
+
+            EGL14.eglSwapBuffers(mEglDisplay, mEglSurface);
+        } finally {
+            detachEglContext();
+        }
+        return showSurface(1.0f);
+!!!8659596.java!!!	drawVStretch(in stretch : float) : void
+        // compute interpolation scale factors for each color channel
+        final float ar = scurve(stretch, 7.5f);
+        final float ag = scurve(stretch, 8.0f);
+        final float ab = scurve(stretch, 8.5f);
+        if (DEBUG) {
+            Slog.d(TAG, "drawVStretch: stretch=" + stretch
+                    + ", ar=" + ar + ", ag=" + ag + ", ab=" + ab);
+        }
+
+        // set blending
+        GLES10.glBlendFunc(GLES10.GL_ONE, GLES10.GL_ONE);
+        GLES10.glEnable(GLES10.GL_BLEND);
+
+        // bind vertex buffer
+        GLES10.glVertexPointer(2, GLES10.GL_FLOAT, 0, mVertexBuffer);
+        GLES10.glEnableClientState(GLES10.GL_VERTEX_ARRAY);
+
+        // bind texture and set blending for drawing planes
+        GLES10.glBindTexture(GLES10.GL_TEXTURE_2D, mTexNames[0]);
+        GLES10.glTexEnvx(GLES10.GL_TEXTURE_ENV, GLES10.GL_TEXTURE_ENV_MODE,
+                mMode == MODE_WARM_UP ? GLES10.GL_MODULATE : GLES10.GL_REPLACE);
+        GLES10.glTexParameterx(GLES10.GL_TEXTURE_2D,
+                GLES10.GL_TEXTURE_MAG_FILTER, GLES10.GL_LINEAR);
+        GLES10.glTexParameterx(GLES10.GL_TEXTURE_2D,
+                GLES10.GL_TEXTURE_MIN_FILTER, GLES10.GL_LINEAR);
+        GLES10.glTexParameterx(GLES10.GL_TEXTURE_2D,
+                GLES10.GL_TEXTURE_WRAP_S, GLES10.GL_CLAMP_TO_EDGE);
+        GLES10.glTexParameterx(GLES10.GL_TEXTURE_2D,
+                GLES10.GL_TEXTURE_WRAP_T, GLES10.GL_CLAMP_TO_EDGE);
+        GLES10.glEnable(GLES10.GL_TEXTURE_2D);
+        GLES10.glTexCoordPointer(2, GLES10.GL_FLOAT, 0, mTexCoordBuffer);
+        GLES10.glEnableClientState(GLES10.GL_TEXTURE_COORD_ARRAY);
+
+        // draw the red plane
+        setVStretchQuad(mVertexBuffer, mDisplayWidth, mDisplayHeight, ar);
+        GLES10.glColorMask(true, false, false, true);
+        GLES10.glDrawArrays(GLES10.GL_TRIANGLE_FAN, 0, 4);
+
+        // draw the green plane
+        setVStretchQuad(mVertexBuffer, mDisplayWidth, mDisplayHeight, ag);
+        GLES10.glColorMask(false, true, false, true);
+        GLES10.glDrawArrays(GLES10.GL_TRIANGLE_FAN, 0, 4);
+
+        // draw the blue plane
+        setVStretchQuad(mVertexBuffer, mDisplayWidth, mDisplayHeight, ab);
+        GLES10.glColorMask(false, false, true, true);
+        GLES10.glDrawArrays(GLES10.GL_TRIANGLE_FAN, 0, 4);
+
+        // clean up after drawing planes
+        GLES10.glDisable(GLES10.GL_TEXTURE_2D);
+        GLES10.glDisableClientState(GLES10.GL_TEXTURE_COORD_ARRAY);
+        GLES10.glColorMask(true, true, true, true);
+
+        // draw the white highlight (we use the last vertices)
+        if (mMode == MODE_COOL_DOWN) {
+            GLES10.glColor4f(ag, ag, ag, 1.0f);
+            GLES10.glDrawArrays(GLES10.GL_TRIANGLE_FAN, 0, 4);
+        }
+
+        // clean up
+        GLES10.glDisableClientState(GLES10.GL_VERTEX_ARRAY);
+        GLES10.glDisable(GLES10.GL_BLEND);
+!!!8659724.java!!!	drawHStretch(in stretch : float) : void
+        // compute interpolation scale factor
+        final float ag = scurve(stretch, 8.0f);
+        if (DEBUG) {
+            Slog.d(TAG, "drawHStretch: stretch=" + stretch + ", ag=" + ag);
+        }
+
+        if (stretch < 1.0f) {
+            // bind vertex buffer
+            GLES10.glVertexPointer(2, GLES10.GL_FLOAT, 0, mVertexBuffer);
+            GLES10.glEnableClientState(GLES10.GL_VERTEX_ARRAY);
+
+            // draw narrow fading white line
+            setHStretchQuad(mVertexBuffer, mDisplayWidth, mDisplayHeight, ag);
+            GLES10.glColor4f(1.0f - ag, 1.0f - ag, 1.0f - ag, 1.0f);
+            GLES10.glDrawArrays(GLES10.GL_TRIANGLE_FAN, 0, 4);
+
+            // clean up
+            GLES10.glDisableClientState(GLES10.GL_VERTEX_ARRAY);
+        }
+!!!8659852.java!!!	setVStretchQuad(inout vtx : FloatBuffer, in dw : float, in dh : float, in a : float) : void
+        final float w = dw + (dw * a);
+        final float h = dh - (dh * a);
+        final float x = (dw - w) * 0.5f;
+        final float y = (dh - h) * 0.5f;
+        setQuad(vtx, x, y, w, h);
+!!!8659980.java!!!	setHStretchQuad(inout vtx : FloatBuffer, in dw : float, in dh : float, in a : float) : void
+        final float w = dw + (dw * a);
+        final float h = 1.0f;
+        final float x = (dw - w) * 0.5f;
+        final float y = (dh - h) * 0.5f;
+        setQuad(vtx, x, y, w, h);
+!!!8660108.java!!!	setQuad(inout vtx : FloatBuffer, in x : float, in y : float, in w : float, in h : float) : void
+        if (DEBUG) {
+            Slog.d(TAG, "setQuad: x=" + x + ", y=" + y + ", w=" + w + ", h=" + h);
+        }
+        vtx.put(0, x);
+        vtx.put(1, y);
+        vtx.put(2, x);
+        vtx.put(3, y + h);
+        vtx.put(4, x + w);
+        vtx.put(5, y + h);
+        vtx.put(6, x + w);
+        vtx.put(7, y);
+!!!8660236.java!!!	captureScreenshotTextureAndSetViewport() : boolean
+        // TODO: Use a SurfaceTexture to avoid the extra texture upload.
+        Bitmap bitmap = Surface.screenshot(mDisplayWidth, mDisplayHeight,
+                0, ELECTRON_BEAM_LAYER - 1);
+        if (bitmap == null) {
+            Slog.e(TAG, "Could not take a screenshot!");
+            return false;
+        }
+        try {
+            if (!attachEglContext()) {
+                return false;
+            }
+            try {
+                if (!mTexNamesGenerated) {
+                    GLES10.glGenTextures(1, mTexNames, 0);
+                    if (checkGlErrors("glGenTextures")) {
+                        return false;
+                    }
+                    mTexNamesGenerated = true;
+                }
+
+                GLES10.glBindTexture(GLES10.GL_TEXTURE_2D, mTexNames[0]);
+                if (checkGlErrors("glBindTexture")) {
+                    return false;
+                }
+
+                float u = 1.0f;
+                float v = 1.0f;
+                GLUtils.texImage2D(GLES10.GL_TEXTURE_2D, 0, bitmap, 0);
+                if (checkGlErrors("glTexImage2D, first try", false)) {
+                    // Try a power of two size texture instead.
+                    int tw = nextPowerOfTwo(mDisplayWidth);
+                    int th = nextPowerOfTwo(mDisplayHeight);
+                    int format = GLUtils.getInternalFormat(bitmap);
+                    GLES10.glTexImage2D(GLES10.GL_TEXTURE_2D, 0,
+                            format, tw, th, 0,
+                            format, GLES10.GL_UNSIGNED_BYTE, null);
+                    if (checkGlErrors("glTexImage2D, second try")) {
+                        return false;
+                    }
+
+                    GLUtils.texSubImage2D(GLES10.GL_TEXTURE_2D, 0, 0, 0, bitmap);
+                    if (checkGlErrors("glTexSubImage2D")) {
+                        return false;
+                    }
+
+                    u = (float)mDisplayWidth / tw;
+                    v = (float)mDisplayHeight / th;
+                }
+
+                // Set up texture coordinates for a quad.
+                // We might need to change this if the texture ends up being
+                // a different size from the display for some reason.
+                mTexCoordBuffer.put(0, 0f);
+                mTexCoordBuffer.put(1, v);
+                mTexCoordBuffer.put(2, 0f);
+                mTexCoordBuffer.put(3, 0f);
+                mTexCoordBuffer.put(4, u);
+                mTexCoordBuffer.put(5, 0f);
+                mTexCoordBuffer.put(6, u);
+                mTexCoordBuffer.put(7, v);
+
+                // Set up our viewport.
+                GLES10.glViewport(0, 0, mDisplayWidth, mDisplayHeight);
+                GLES10.glMatrixMode(GLES10.GL_PROJECTION);
+                GLES10.glLoadIdentity();
+                GLES10.glOrthof(0, mDisplayWidth, 0, mDisplayHeight, 0, 1);
+                GLES10.glMatrixMode(GLES10.GL_MODELVIEW);
+                GLES10.glLoadIdentity();
+                GLES10.glMatrixMode(GLES10.GL_TEXTURE);
+                GLES10.glLoadIdentity();
+            } finally {
+                detachEglContext();
+            }
+        } finally {
+            bitmap.recycle();
+        }
+        return true;
+!!!8660364.java!!!	destroyScreenshotTexture() : void
+        if (mTexNamesGenerated) {
+            mTexNamesGenerated = false;
+            if (attachEglContext()) {
+                try {
+                    GLES10.glDeleteTextures(1, mTexNames, 0);
+                    checkGlErrors("glDeleteTextures");
+                } finally {
+                    detachEglContext();
+                }
+            }
+        }
+!!!8660492.java!!!	createEglContext() : boolean
+        if (mEglDisplay == null) {
+            mEglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+            if (mEglDisplay == EGL14.EGL_NO_DISPLAY) {
+                logEglError("eglGetDisplay");
+                return false;
+            }
+
+            int[] version = new int[2];
+            if (!EGL14.eglInitialize(mEglDisplay, version, 0, version, 1)) {
+                mEglDisplay = null;
+                logEglError("eglInitialize");
+                return false;
+            }
+        }
+
+        if (mEglConfig == null) {
+            int[] eglConfigAttribList = new int[] {
+                    EGL14.EGL_RED_SIZE, 8,
+                    EGL14.EGL_GREEN_SIZE, 8,
+                    EGL14.EGL_BLUE_SIZE, 8,
+                    EGL14.EGL_ALPHA_SIZE, 8,
+                    EGL14.EGL_NONE
+            };
+            int[] numEglConfigs = new int[1];
+            EGLConfig[] eglConfigs = new EGLConfig[1];
+            if (!EGL14.eglChooseConfig(mEglDisplay, eglConfigAttribList, 0,
+                    eglConfigs, 0, eglConfigs.length, numEglConfigs, 0)) {
+                logEglError("eglChooseConfig");
+                return false;
+            }
+            mEglConfig = eglConfigs[0];
+        }
+
+        if (mEglContext == null) {
+            int[] eglContextAttribList = new int[] {
+                    EGL14.EGL_NONE
+            };
+            mEglContext = EGL14.eglCreateContext(mEglDisplay, mEglConfig,
+                    EGL14.EGL_NO_CONTEXT, eglContextAttribList, 0);
+            if (mEglContext == null) {
+                logEglError("eglCreateContext");
+                return false;
+            }
+        }
+        return true;
+!!!8660620.java!!!	createSurface() : boolean
+        if (mSurfaceSession == null) {
+            mSurfaceSession = new SurfaceSession();
+        }
+
+        Surface.openTransaction();
+        try {
+            if (mSurface == null) {
+                try {
+                    int flags;
+                    if (mMode == MODE_FADE) {
+                        flags = Surface.FX_SURFACE_DIM | Surface.HIDDEN;
+                    } else {
+                        flags = Surface.OPAQUE | Surface.HIDDEN;
+                    }
+                    mSurface = new Surface(mSurfaceSession,
+                            "ElectronBeam", mDisplayWidth, mDisplayHeight,
+                            PixelFormat.OPAQUE, flags);
+                } catch (Surface.OutOfResourcesException ex) {
+                    Slog.e(TAG, "Unable to create surface.", ex);
+                    return false;
+                }
+            }
+
+            mSurface.setLayerStack(mDisplayLayerStack);
+            mSurface.setSize(mDisplayWidth, mDisplayHeight);
+
+            mSurfaceLayout = new NaturalSurfaceLayout(mDisplayManager, mSurface);
+            mSurfaceLayout.onDisplayTransaction();
+        } finally {
+            Surface.closeTransaction();
+        }
+        return true;
+!!!8660748.java!!!	createEglSurface() : boolean
+        if (mEglSurface == null) {
+            int[] eglSurfaceAttribList = new int[] {
+                    EGL14.EGL_NONE
+            };
+            mEglSurface = EGL14.eglCreateWindowSurface(mEglDisplay, mEglConfig, mSurface,
+                    eglSurfaceAttribList, 0);
+            if (mEglSurface == null) {
+                logEglError("eglCreateWindowSurface");
+                return false;
+            }
+        }
+        return true;
+!!!8660876.java!!!	destroyEglSurface() : void
+        if (mEglSurface != null) {
+            if (!EGL14.eglDestroySurface(mEglDisplay, mEglSurface)) {
+                logEglError("eglDestroySurface");
+            }
+            mEglSurface = null;
+        }
+!!!8661004.java!!!	destroySurface() : void
+        if (mSurface != null) {
+            mSurfaceLayout.dispose();
+            mSurfaceLayout = null;
+            Surface.openTransaction();
+            try {
+                mSurface.destroy();
+            } finally {
+                Surface.closeTransaction();
+            }
+            mSurface = null;
+            mSurfaceVisible = false;
+            mSurfaceAlpha = 0f;
+        }
+!!!8661132.java!!!	showSurface(in alpha : float) : boolean
+        if (!mSurfaceVisible || mSurfaceAlpha != alpha) {
+            Surface.openTransaction();
+            try {
+                mSurface.setLayer(ELECTRON_BEAM_LAYER);
+                mSurface.setAlpha(alpha);
+                mSurface.show();
+            } finally {
+                Surface.closeTransaction();
+            }
+            mSurfaceVisible = true;
+            mSurfaceAlpha = alpha;
+        }
+        return true;
+!!!8661260.java!!!	attachEglContext() : boolean
+        if (mEglSurface == null) {
+            return false;
+        }
+        if (!EGL14.eglMakeCurrent(mEglDisplay, mEglSurface, mEglSurface, mEglContext)) {
+            logEglError("eglMakeCurrent");
+            return false;
+        }
+        return true;
+!!!8661388.java!!!	detachEglContext() : void
+        if (mEglDisplay != null) {
+            EGL14.eglMakeCurrent(mEglDisplay,
+                    EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+        }
+!!!8661516.java!!!	scurve(in value : float, in s : float) : float
+        // A basic sigmoid has the form y = 1.0f / FloatMap.exp(-x * s).
+        // Here we take the input datum and shift it by 0.5 so that the
+        // domain spans the range -0.5 .. 0.5 instead of 0 .. 1.
+        final float x = value - 0.5f;
+
+        // Next apply the sigmoid function to the scaled value
+        // which produces a value in the range 0 .. 1 so we subtract
+        // 0.5 to get a value in the range -0.5 .. 0.5 instead.
+        final float y = sigmoid(x, s) - 0.5f;
+
+        // To obtain the desired boundary conditions we need to scale
+        // the result so that it fills a range of -1 .. 1.
+        final float v = sigmoid(0.5f, s) - 0.5f;
+
+        // And finally remap the value back to a range of 0 .. 1.
+        return y / v * 0.5f + 0.5f;
+!!!8661644.java!!!	sigmoid(in x : float, in s : float) : float
+        return 1.0f / (1.0f + FloatMath.exp(-x * s));
+!!!8661772.java!!!	nextPowerOfTwo(in value : int) : int
+        return 1 << (32 - Integer.numberOfLeadingZeros(value));
+!!!8661900.java!!!	createNativeFloatBuffer(in size : int) : FloatBuffer
+        ByteBuffer bb = ByteBuffer.allocateDirect(size * 4);
+        bb.order(ByteOrder.nativeOrder());
+        return bb.asFloatBuffer();
+!!!8662028.java!!!	logEglError(in func : String) : void
+        Slog.e(TAG, func + " failed: error " + EGL14.eglGetError(), new Throwable());
+!!!8662156.java!!!	checkGlErrors(in func : String) : boolean
+        return checkGlErrors(func, true);
+!!!8662284.java!!!	checkGlErrors(in func : String, inout log : boolean) : boolean
+        boolean hadError = false;
+        int error;
+        while ((error = GLES10.glGetError()) != GLES10.GL_NO_ERROR) {
+            if (log) {
+                Slog.e(TAG, func + " failed: error " + error, new Throwable());
+            }
+            hadError = true;
+        }
+        return hadError;
+!!!8662412.java!!!	dump(inout pw : PrintWriter) : void
+        pw.println();
+        pw.println("Electron Beam State:");
+        pw.println("  mPrepared=" + mPrepared);
+        pw.println("  mMode=" + mMode);
+        pw.println("  mDisplayLayerStack=" + mDisplayLayerStack);
+        pw.println("  mDisplayWidth=" + mDisplayWidth);
+        pw.println("  mDisplayHeight=" + mDisplayHeight);
+        pw.println("  mSurfaceVisible=" + mSurfaceVisible);
+        pw.println("  mSurfaceAlpha=" + mSurfaceAlpha);

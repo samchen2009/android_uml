@@ -1,0 +1,1005 @@
+class MixerThread
+!!!826124.cpp!!!	MixerThread(in audioFlinger : sp<AudioFlinger>, inout output : AudioStreamOut, in id : audio_io_handle_t, in device : audio_devices_t, in type : type_t = MIXER)
+    ALOGV("MixerThread() id=%d device=%#x type=%d", id, device, type);
+    ALOGV("mSampleRate=%d, mChannelMask=%#x, mChannelCount=%d, mFormat=%d, mFrameSize=%d, "
+            "mFrameCount=%d, mNormalFrameCount=%d",
+            mSampleRate, mChannelMask, mChannelCount, mFormat, mFrameSize, mFrameCount,
+            mNormalFrameCount);
+    mAudioMixer = new AudioMixer(mNormalFrameCount, mSampleRate);
+
+    // FIXME - Current mixer implementation only supports stereo output
+    if (mChannelCount != FCC_2) {
+        ALOGE("Invalid audio hardware channel count %d", mChannelCount);
+    }
+
+    // create an NBAIO sink for the HAL output stream, and negotiate
+    mOutputSink = new AudioStreamOutSink(output->stream);
+    size_t numCounterOffers = 0;
+    const NBAIO_Format offers[1] = {Format_from_SR_C(mSampleRate, mChannelCount)};
+    ssize_t index = mOutputSink->negotiate(offers, 1, NULL, numCounterOffers);
+    ALOG_ASSERT(index == 0);
+
+    // initialize fast mixer depending on configuration
+    bool initFastMixer;
+    switch (kUseFastMixer) {
+    case FastMixer_Never:
+        initFastMixer = false;
+        break;
+    case FastMixer_Always:
+        initFastMixer = true;
+        break;
+    case FastMixer_Static:
+    case FastMixer_Dynamic:
+        initFastMixer = mFrameCount < mNormalFrameCount;
+        break;
+    }
+    if (initFastMixer) {
+
+        // create a MonoPipe to connect our submix to FastMixer
+        NBAIO_Format format = mOutputSink->format();
+        // This pipe depth compensates for scheduling latency of the normal mixer thread.
+        // When it wakes up after a maximum latency, it runs a few cycles quickly before
+        // finally blocking.  Note the pipe implementation rounds up the request to a power of 2.
+        MonoPipe *monoPipe = new MonoPipe(mNormalFrameCount * 4, format, true /*writeCanBlock*/);
+        const NBAIO_Format offers[1] = {format};
+        size_t numCounterOffers = 0;
+        ssize_t index = monoPipe->negotiate(offers, 1, NULL, numCounterOffers);
+        ALOG_ASSERT(index == 0);
+        monoPipe->setAvgFrames((mScreenState & 1) ?
+                (monoPipe->maxFrames() * 7) / 8 : mNormalFrameCount * 2);
+        mPipeSink = monoPipe;
+
+#ifdef TEE_SINK_FRAMES
+        // create a Pipe to archive a copy of FastMixer's output for dumpsys
+        Pipe *teeSink = new Pipe(TEE_SINK_FRAMES, format);
+        numCounterOffers = 0;
+        index = teeSink->negotiate(offers, 1, NULL, numCounterOffers);
+        ALOG_ASSERT(index == 0);
+        mTeeSink = teeSink;
+        PipeReader *teeSource = new PipeReader(*teeSink);
+        numCounterOffers = 0;
+        index = teeSource->negotiate(offers, 1, NULL, numCounterOffers);
+        ALOG_ASSERT(index == 0);
+        mTeeSource = teeSource;
+#endif
+
+        // create fast mixer and configure it initially with just one fast track for our submix
+        mFastMixer = new FastMixer();
+        FastMixerStateQueue *sq = mFastMixer->sq();
+#ifdef STATE_QUEUE_DUMP
+        sq->setObserverDump(&mStateQueueObserverDump);
+        sq->setMutatorDump(&mStateQueueMutatorDump);
+#endif
+        FastMixerState *state = sq->begin();
+        FastTrack *fastTrack = &state->mFastTracks[0];
+        // wrap the source side of the MonoPipe to make it an AudioBufferProvider
+        fastTrack->mBufferProvider = new SourceAudioBufferProvider(new MonoPipeReader(monoPipe));
+        fastTrack->mVolumeProvider = NULL;
+        fastTrack->mGeneration++;
+        state->mFastTracksGen++;
+        state->mTrackMask = 1;
+        // fast mixer will use the HAL output sink
+        state->mOutputSink = mOutputSink.get();
+        state->mOutputSinkGen++;
+        state->mFrameCount = mFrameCount;
+        state->mCommand = FastMixerState::COLD_IDLE;
+        // already done in constructor initialization list
+        //mFastMixerFutex = 0;
+        state->mColdFutexAddr = &mFastMixerFutex;
+        state->mColdGen++;
+        state->mDumpState = &mFastMixerDumpState;
+        state->mTeeSink = mTeeSink.get();
+        sq->end();
+        sq->push(FastMixerStateQueue::BLOCK_UNTIL_PUSHED);
+
+        // start the fast mixer
+        mFastMixer->run("FastMixer", PRIORITY_URGENT_AUDIO);
+        pid_t tid = mFastMixer->getTid();
+        int err = requestPriority(getpid_cached, tid, kPriorityFastMixer);
+        if (err != 0) {
+            ALOGW("Policy SCHED_FIFO priority %d is unavailable for pid %d tid %d; error %d",
+                    kPriorityFastMixer, getpid_cached, tid, err);
+        }
+
+#ifdef AUDIO_WATCHDOG
+        // create and start the watchdog
+        mAudioWatchdog = new AudioWatchdog();
+        mAudioWatchdog->setDump(&mAudioWatchdogDump);
+        mAudioWatchdog->run("AudioWatchdog", PRIORITY_URGENT_AUDIO);
+        tid = mAudioWatchdog->getTid();
+        err = requestPriority(getpid_cached, tid, kPriorityFastMixer);
+        if (err != 0) {
+            ALOGW("Policy SCHED_FIFO priority %d is unavailable for pid %d tid %d; error %d",
+                    kPriorityFastMixer, getpid_cached, tid, err);
+        }
+#endif
+
+    } else {
+        mFastMixer = NULL;
+    }
+
+    switch (kUseFastMixer) {
+    case FastMixer_Never:
+    case FastMixer_Dynamic:
+        mNormalSink = mOutputSink;
+        break;
+    case FastMixer_Always:
+        mNormalSink = mPipeSink;
+        break;
+    case FastMixer_Static:
+        mNormalSink = initFastMixer ? mPipeSink : mOutputSink;
+        break;
+    }
+!!!826252.cpp!!!	~MixerThread()
+    if (mFastMixer != NULL) {
+        FastMixerStateQueue *sq = mFastMixer->sq();
+        FastMixerState *state = sq->begin();
+        if (state->mCommand == FastMixerState::COLD_IDLE) {
+            int32_t old = android_atomic_inc(&mFastMixerFutex);
+            if (old == -1) {
+                __futex_syscall3(&mFastMixerFutex, FUTEX_WAKE_PRIVATE, 1);
+            }
+        }
+        state->mCommand = FastMixerState::EXIT;
+        sq->end();
+        sq->push(FastMixerStateQueue::BLOCK_UNTIL_PUSHED);
+        mFastMixer->join();
+        // Though the fast mixer thread has exited, it's state queue is still valid.
+        // We'll use that extract the final state which contains one remaining fast track
+        // corresponding to our sub-mix.
+        state = sq->begin();
+        ALOG_ASSERT(state->mTrackMask == 1);
+        FastTrack *fastTrack = &state->mFastTracks[0];
+        ALOG_ASSERT(fastTrack->mBufferProvider != NULL);
+        delete fastTrack->mBufferProvider;
+        sq->end(false /*didModify*/);
+        delete mFastMixer;
+#ifdef AUDIO_WATCHDOG
+        if (mAudioWatchdog != 0) {
+            mAudioWatchdog->requestExit();
+            mAudioWatchdog->requestExitAndWait();
+            mAudioWatchdog.clear();
+        }
+#endif
+    }
+    delete mAudioMixer;
+!!!826380.cpp!!!	checkForNewParameters_l() : bool
+    // if !&IDLE, holds the FastMixer state to restore after new parameters processed
+    FastMixerState::Command previousCommand = FastMixerState::HOT_IDLE;
+    bool reconfig = false;
+
+    while (!mNewParameters.isEmpty()) {
+
+        if (mFastMixer != NULL) {
+            FastMixerStateQueue *sq = mFastMixer->sq();
+            FastMixerState *state = sq->begin();
+            if (!(state->mCommand & FastMixerState::IDLE)) {
+                previousCommand = state->mCommand;
+                state->mCommand = FastMixerState::HOT_IDLE;
+                sq->end();
+                sq->push(FastMixerStateQueue::BLOCK_UNTIL_ACKED);
+            } else {
+                sq->end(false /*didModify*/);
+            }
+        }
+
+        status_t status = NO_ERROR;
+        String8 keyValuePair = mNewParameters[0];
+        AudioParameter param = AudioParameter(keyValuePair);
+        int value;
+
+        if (param.getInt(String8(AudioParameter::keySamplingRate), value) == NO_ERROR) {
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyFormat), value) == NO_ERROR) {
+            if ((audio_format_t) value != AUDIO_FORMAT_PCM_16_BIT) {
+                status = BAD_VALUE;
+            } else {
+                reconfig = true;
+            }
+        }
+        if (param.getInt(String8(AudioParameter::keyChannels), value) == NO_ERROR) {
+            if (value != AUDIO_CHANNEL_OUT_STEREO) {
+                status = BAD_VALUE;
+            } else {
+                reconfig = true;
+            }
+        }
+        if (param.getInt(String8(AudioParameter::keyFrameCount), value) == NO_ERROR) {
+            // do not accept frame count changes if tracks are open as the track buffer
+            // size depends on frame count and correct behavior would not be guaranteed
+            // if frame count is changed after track creation
+            if (!mTracks.isEmpty()) {
+                status = INVALID_OPERATION;
+            } else {
+                reconfig = true;
+            }
+        }
+        if (param.getInt(String8(AudioParameter::keyRouting), value) == NO_ERROR) {
+#ifdef ADD_BATTERY_DATA
+            // when changing the audio output device, call addBatteryData to notify
+            // the change
+            if (mOutDevice != value) {
+                uint32_t params = 0;
+                // check whether speaker is on
+                if (value & AUDIO_DEVICE_OUT_SPEAKER) {
+                    params |= IMediaPlayerService::kBatteryDataSpeakerOn;
+                }
+
+                audio_devices_t deviceWithoutSpeaker
+                    = AUDIO_DEVICE_OUT_ALL & ~AUDIO_DEVICE_OUT_SPEAKER;
+                // check if any other device (except speaker) is on
+                if (value & deviceWithoutSpeaker ) {
+                    params |= IMediaPlayerService::kBatteryDataOtherAudioDeviceOn;
+                }
+
+                if (params != 0) {
+                    addBatteryData(params);
+                }
+            }
+#endif
+
+            // forward device change to effects that have requested to be
+            // aware of attached audio device.
+            mOutDevice = value;
+            for (size_t i = 0; i < mEffectChains.size(); i++) {
+                mEffectChains[i]->setDevice_l(mOutDevice);
+            }
+        }
+
+        if (status == NO_ERROR) {
+            status = mOutput->stream->common.set_parameters(&mOutput->stream->common,
+                                                    keyValuePair.string());
+            if (!mStandby && status == INVALID_OPERATION) {
+                mOutput->stream->common.standby(&mOutput->stream->common);
+                mStandby = true;
+                mBytesWritten = 0;
+                status = mOutput->stream->common.set_parameters(&mOutput->stream->common,
+                                                       keyValuePair.string());
+            }
+            if (status == NO_ERROR && reconfig) {
+                delete mAudioMixer;
+                // for safety in case readOutputParameters() accesses mAudioMixer (it doesn't)
+                mAudioMixer = NULL;
+                readOutputParameters();
+                mAudioMixer = new AudioMixer(mNormalFrameCount, mSampleRate);
+                for (size_t i = 0; i < mTracks.size() ; i++) {
+                    int name = getTrackName_l(mTracks[i]->mChannelMask, mTracks[i]->mSessionId);
+                    if (name < 0) break;
+                    mTracks[i]->mName = name;
+                    // limit track sample rate to 2 x new output sample rate
+                    if (mTracks[i]->mCblk->sampleRate > 2 * sampleRate()) {
+                        mTracks[i]->mCblk->sampleRate = 2 * sampleRate();
+                    }
+                }
+                sendIoConfigEvent_l(AudioSystem::OUTPUT_CONFIG_CHANGED);
+            }
+        }
+
+        mNewParameters.removeAt(0);
+
+        mParamStatus = status;
+        mParamCond.signal();
+        // wait for condition with time out in case the thread calling ThreadBase::setParameters()
+        // already timed out waiting for the status and will never signal the condition.
+        mWaitWorkCV.waitRelative(mLock, kSetParametersTimeoutNs);
+    }
+
+    if (!(previousCommand & FastMixerState::IDLE)) {
+        ALOG_ASSERT(mFastMixer != NULL);
+        FastMixerStateQueue *sq = mFastMixer->sq();
+        FastMixerState *state = sq->begin();
+        ALOG_ASSERT(state->mCommand == FastMixerState::HOT_IDLE);
+        state->mCommand = previousCommand;
+        sq->end();
+        sq->push(FastMixerStateQueue::BLOCK_UNTIL_PUSHED);
+    }
+
+    return reconfig;
+!!!826508.cpp!!!	dumpInternals(in fd : int, in args : Vector<String16>) : void
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    PlaybackThread::dumpInternals(fd, args);
+
+    snprintf(buffer, SIZE, "AudioMixer tracks: %08x\n", mAudioMixer->trackNames());
+    result.append(buffer);
+    write(fd, result.string(), result.size());
+
+    // Make a non-atomic copy of fast mixer dump state so it won't change underneath us
+    FastMixerDumpState copy = mFastMixerDumpState;
+    copy.dump(fd);
+
+#ifdef STATE_QUEUE_DUMP
+    // Similar for state queue
+    StateQueueObserverDump observerCopy = mStateQueueObserverDump;
+    observerCopy.dump(fd);
+    StateQueueMutatorDump mutatorCopy = mStateQueueMutatorDump;
+    mutatorCopy.dump(fd);
+#endif
+
+    // Write the tee output to a .wav file
+    NBAIO_Source *teeSource = mTeeSource.get();
+    if (teeSource != NULL) {
+        char teePath[64];
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tm;
+        localtime_r(&tv.tv_sec, &tm);
+        strftime(teePath, sizeof(teePath), "/data/misc/media/%T.wav", &tm);
+        int teeFd = open(teePath, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+        if (teeFd >= 0) {
+            char wavHeader[44];
+            memcpy(wavHeader,
+                "RIFF\0\0\0\0WAVEfmt \20\0\0\0\1\0\2\0\104\254\0\0\0\0\0\0\4\0\20\0data\0\0\0\0",
+                sizeof(wavHeader));
+            NBAIO_Format format = teeSource->format();
+            unsigned channelCount = Format_channelCount(format);
+            ALOG_ASSERT(channelCount <= FCC_2);
+            unsigned sampleRate = Format_sampleRate(format);
+            wavHeader[22] = channelCount;       // number of channels
+            wavHeader[24] = sampleRate;         // sample rate
+            wavHeader[25] = sampleRate >> 8;
+            wavHeader[32] = channelCount * 2;   // block alignment
+            write(teeFd, wavHeader, sizeof(wavHeader));
+            size_t total = 0;
+            bool firstRead = true;
+            for (;;) {
+#define TEE_SINK_READ 1024
+                short buffer[TEE_SINK_READ * FCC_2];
+                size_t count = TEE_SINK_READ;
+                ssize_t actual = teeSource->read(buffer, count,
+                        AudioBufferProvider::kInvalidPTS);
+                bool wasFirstRead = firstRead;
+                firstRead = false;
+                if (actual <= 0) {
+                    if (actual == (ssize_t) OVERRUN && wasFirstRead) {
+                        continue;
+                    }
+                    break;
+                }
+                ALOG_ASSERT(actual <= (ssize_t)count);
+                write(teeFd, buffer, actual * channelCount * sizeof(short));
+                total += actual;
+            }
+            lseek(teeFd, (off_t) 4, SEEK_SET);
+            uint32_t temp = 44 + total * channelCount * sizeof(short) - 8;
+            write(teeFd, &temp, sizeof(temp));
+            lseek(teeFd, (off_t) 40, SEEK_SET);
+            temp =  total * channelCount * sizeof(short);
+            write(teeFd, &temp, sizeof(temp));
+            close(teeFd);
+            fdprintf(fd, "FastMixer tee copied to %s\n", teePath);
+        } else {
+            fdprintf(fd, "FastMixer unable to create tee %s: \n", strerror(errno));
+        }
+    }
+
+#ifdef AUDIO_WATCHDOG
+    if (mAudioWatchdog != 0) {
+        // Make a non-atomic copy of audio watchdog dump so it won't change underneath us
+        AudioWatchdogDump wdCopy = mAudioWatchdogDump;
+        wdCopy.dump(fd);
+    }
+#endif
+!!!826636.cpp!!!	prepareTracks_l(inout tracksToRemove : Vector< sp<Track> >) : mixer_state
+
+    mixer_state mixerStatus = MIXER_IDLE;
+    // find out which tracks need to be processed
+    size_t count = mActiveTracks.size();
+    size_t mixedTracks = 0;
+    size_t tracksWithEffect = 0;
+    // counts only _active_ fast tracks
+    size_t fastTracks = 0;
+    uint32_t resetMask = 0; // bit mask of fast tracks that need to be reset
+
+    float masterVolume = mMasterVolume;
+    bool masterMute = mMasterMute;
+
+    if (masterMute) {
+        masterVolume = 0;
+    }
+    // Delegate master volume control to effect in output mix effect chain if needed
+    sp<EffectChain> chain = getEffectChain_l(AUDIO_SESSION_OUTPUT_MIX);
+    if (chain != 0) {
+        uint32_t v = (uint32_t)(masterVolume * (1 << 24));
+        chain->setVolume_l(&v, &v);
+        masterVolume = (float)((v + (1 << 23)) >> 24);
+        chain.clear();
+    }
+
+    // prepare a new state to push
+    FastMixerStateQueue *sq = NULL;
+    FastMixerState *state = NULL;
+    bool didModify = false;
+    FastMixerStateQueue::block_t block = FastMixerStateQueue::BLOCK_UNTIL_PUSHED;
+    if (mFastMixer != NULL) {
+        sq = mFastMixer->sq();
+        state = sq->begin();
+    }
+
+    for (size_t i=0 ; i<count ; i++) {
+        sp<Track> t = mActiveTracks[i].promote();
+        if (t == 0) continue;
+
+        // this const just means the local variable doesn't change
+        Track* const track = t.get();
+
+        // process fast tracks
+        if (track->isFastTrack()) {
+
+            // It's theoretically possible (though unlikely) for a fast track to be created
+            // and then removed within the same normal mix cycle.  This is not a problem, as
+            // the track never becomes active so it's fast mixer slot is never touched.
+            // The converse, of removing an (active) track and then creating a new track
+            // at the identical fast mixer slot within the same normal mix cycle,
+            // is impossible because the slot isn't marked available until the end of each cycle.
+            int j = track->mFastIndex;
+            ALOG_ASSERT(0 < j && j < (int)FastMixerState::kMaxFastTracks);
+            ALOG_ASSERT(!(mFastTrackAvailMask & (1 << j)));
+            FastTrack *fastTrack = &state->mFastTracks[j];
+
+            // Determine whether the track is currently in underrun condition,
+            // and whether it had a recent underrun.
+            FastTrackDump *ftDump = &mFastMixerDumpState.mTracks[j];
+            FastTrackUnderruns underruns = ftDump->mUnderruns;
+            uint32_t recentFull = (underruns.mBitFields.mFull -
+                    track->mObservedUnderruns.mBitFields.mFull) & UNDERRUN_MASK;
+            uint32_t recentPartial = (underruns.mBitFields.mPartial -
+                    track->mObservedUnderruns.mBitFields.mPartial) & UNDERRUN_MASK;
+            uint32_t recentEmpty = (underruns.mBitFields.mEmpty -
+                    track->mObservedUnderruns.mBitFields.mEmpty) & UNDERRUN_MASK;
+            uint32_t recentUnderruns = recentPartial + recentEmpty;
+            track->mObservedUnderruns = underruns;
+            // don't count underruns that occur while stopping or pausing
+            // or stopped which can occur when flush() is called while active
+            if (!(track->isStopping() || track->isPausing() || track->isStopped())) {
+                track->mUnderrunCount += recentUnderruns;
+            }
+
+            // This is similar to the state machine for normal tracks,
+            // with a few modifications for fast tracks.
+            bool isActive = true;
+            switch (track->mState) {
+            case TrackBase::STOPPING_1:
+                // track stays active in STOPPING_1 state until first underrun
+                if (recentUnderruns > 0) {
+                    track->mState = TrackBase::STOPPING_2;
+                }
+                break;
+            case TrackBase::PAUSING:
+                // ramp down is not yet implemented
+                track->setPaused();
+                break;
+            case TrackBase::RESUMING:
+                // ramp up is not yet implemented
+                track->mState = TrackBase::ACTIVE;
+                break;
+            case TrackBase::ACTIVE:
+                if (recentFull > 0 || recentPartial > 0) {
+                    // track has provided at least some frames recently: reset retry count
+                    track->mRetryCount = kMaxTrackRetries;
+                }
+                if (recentUnderruns == 0) {
+                    // no recent underruns: stay active
+                    break;
+                }
+                // there has recently been an underrun of some kind
+                if (track->sharedBuffer() == 0) {
+                    // were any of the recent underruns "empty" (no frames available)?
+                    if (recentEmpty == 0) {
+                        // no, then ignore the partial underruns as they are allowed indefinitely
+                        break;
+                    }
+                    // there has recently been an "empty" underrun: decrement the retry counter
+                    if (--(track->mRetryCount) > 0) {
+                        break;
+                    }
+                    // indicate to client process that the track was disabled because of underrun;
+                    // it will then automatically call start() when data is available
+                    android_atomic_or(CBLK_DISABLED_ON, &track->mCblk->flags);
+                    // remove from active list, but state remains ACTIVE [confusing but true]
+                    isActive = false;
+                    break;
+                }
+                // fall through
+            case TrackBase::STOPPING_2:
+            case TrackBase::PAUSED:
+            case TrackBase::TERMINATED:
+            case TrackBase::STOPPED:
+            case TrackBase::FLUSHED:   // flush() while active
+                // Check for presentation complete if track is inactive
+                // We have consumed all the buffers of this track.
+                // This would be incomplete if we auto-paused on underrun
+                {
+                    size_t audioHALFrames =
+                            (mOutput->stream->get_latency(mOutput->stream)*mSampleRate) / 1000;
+                    size_t framesWritten =
+                            mBytesWritten / audio_stream_frame_size(&mOutput->stream->common);
+                    if (!(mStandby || track->presentationComplete(framesWritten, audioHALFrames))) {
+                        // track stays in active list until presentation is complete
+                        break;
+                    }
+                }
+                if (track->isStopping_2()) {
+                    track->mState = TrackBase::STOPPED;
+                }
+                if (track->isStopped()) {
+                    // Can't reset directly, as fast mixer is still polling this track
+                    //   track->reset();
+                    // So instead mark this track as needing to be reset after push with ack
+                    resetMask |= 1 << i;
+                }
+                isActive = false;
+                break;
+            case TrackBase::IDLE:
+            default:
+                LOG_FATAL("unexpected track state %d", track->mState);
+            }
+
+            if (isActive) {
+                // was it previously inactive?
+                if (!(state->mTrackMask & (1 << j))) {
+                    ExtendedAudioBufferProvider *eabp = track;
+                    VolumeProvider *vp = track;
+                    fastTrack->mBufferProvider = eabp;
+                    fastTrack->mVolumeProvider = vp;
+                    fastTrack->mSampleRate = track->mSampleRate;
+                    fastTrack->mChannelMask = track->mChannelMask;
+                    fastTrack->mGeneration++;
+                    state->mTrackMask |= 1 << j;
+                    didModify = true;
+                    // no acknowledgement required for newly active tracks
+                }
+                // cache the combined master volume and stream type volume for fast mixer; this
+                // lacks any synchronization or barrier so VolumeProvider may read a stale value
+                track->mCachedVolume = track->isMuted() ?
+                        0 : masterVolume * mStreamTypes[track->streamType()].volume;
+                ++fastTracks;
+            } else {
+                // was it previously active?
+                if (state->mTrackMask & (1 << j)) {
+                    fastTrack->mBufferProvider = NULL;
+                    fastTrack->mGeneration++;
+                    state->mTrackMask &= ~(1 << j);
+                    didModify = true;
+                    // If any fast tracks were removed, we must wait for acknowledgement
+                    // because we're about to decrement the last sp<> on those tracks.
+                    block = FastMixerStateQueue::BLOCK_UNTIL_ACKED;
+                } else {
+                    LOG_FATAL("fast track %d should have been active", j);
+                }
+                tracksToRemove->add(track);
+                // Avoids a misleading display in dumpsys
+                track->mObservedUnderruns.mBitFields.mMostRecent = UNDERRUN_FULL;
+            }
+            continue;
+        }
+
+        {   // local variable scope to avoid goto warning
+
+        audio_track_cblk_t* cblk = track->cblk();
+
+        // The first time a track is added we wait
+        // for all its buffers to be filled before processing it
+        int name = track->name();
+        // make sure that we have enough frames to mix one full buffer.
+        // enforce this condition only once to enable draining the buffer in case the client
+        // app does not call stop() and relies on underrun to stop:
+        // hence the test on (mMixerStatus == MIXER_TRACKS_READY) meaning the track was mixed
+        // during last round
+        uint32_t minFrames = 1;
+        if ((track->sharedBuffer() == 0) && !track->isStopped() && !track->isPausing() &&
+                (mMixerStatusIgnoringFastTracks == MIXER_TRACKS_READY)) {
+            if (t->sampleRate() == (int)mSampleRate) {
+                minFrames = mNormalFrameCount;
+            } else {
+                // +1 for rounding and +1 for additional sample needed for interpolation
+                minFrames = (mNormalFrameCount * t->sampleRate()) / mSampleRate + 1 + 1;
+                // add frames already consumed but not yet released by the resampler
+                // because cblk->framesReady() will include these frames
+                minFrames += mAudioMixer->getUnreleasedFrames(track->name());
+                // the minimum track buffer size is normally twice the number of frames necessary
+                // to fill one buffer and the resampler should not leave more than one buffer worth
+                // of unreleased frames after each pass, but just in case...
+                ALOG_ASSERT(minFrames <= cblk->frameCount);
+            }
+        }
+        if ((track->framesReady() >= minFrames) && track->isReady() &&
+                !track->isPaused() && !track->isTerminated())
+        {
+            //ALOGV("track %d u=%08x, s=%08x [OK] on thread %p", name, cblk->user, cblk->server, this);
+
+            mixedTracks++;
+
+            // track->mainBuffer() != mMixBuffer means there is an effect chain
+            // connected to the track
+            chain.clear();
+            if (track->mainBuffer() != mMixBuffer) {
+                chain = getEffectChain_l(track->sessionId());
+                // Delegate volume control to effect in track effect chain if needed
+                if (chain != 0) {
+                    tracksWithEffect++;
+                } else {
+                    ALOGW("prepareTracks_l(): track %d attached to effect but no chain found on session %d",
+                            name, track->sessionId());
+                }
+            }
+
+
+            int param = AudioMixer::VOLUME;
+            if (track->mFillingUpStatus == Track::FS_FILLED) {
+                // no ramp for the first volume setting
+                track->mFillingUpStatus = Track::FS_ACTIVE;
+                if (track->mState == TrackBase::RESUMING) {
+                    track->mState = TrackBase::ACTIVE;
+                    param = AudioMixer::RAMP_VOLUME;
+                }
+                mAudioMixer->setParameter(name, AudioMixer::RESAMPLE, AudioMixer::RESET, NULL);
+            } else if (cblk->server != 0) {
+                // If the track is stopped before the first frame was mixed,
+                // do not apply ramp
+                param = AudioMixer::RAMP_VOLUME;
+            }
+
+            // compute volume for this track
+            uint32_t vl, vr, va;
+            if (track->isMuted() || track->isPausing() ||
+                mStreamTypes[track->streamType()].mute) {
+                vl = vr = va = 0;
+                if (track->isPausing()) {
+                    track->setPaused();
+                }
+            } else {
+
+                // read original volumes with volume control
+                float typeVolume = mStreamTypes[track->streamType()].volume;
+                float v = masterVolume * typeVolume;
+                uint32_t vlr = cblk->getVolumeLR();
+                vl = vlr & 0xFFFF;
+                vr = vlr >> 16;
+                // track volumes come from shared memory, so can't be trusted and must be clamped
+                if (vl > MAX_GAIN_INT) {
+                    ALOGV("Track left volume out of range: %04X", vl);
+                    vl = MAX_GAIN_INT;
+                }
+                if (vr > MAX_GAIN_INT) {
+                    ALOGV("Track right volume out of range: %04X", vr);
+                    vr = MAX_GAIN_INT;
+                }
+                // now apply the master volume and stream type volume
+                vl = (uint32_t)(v * vl) << 12;
+                vr = (uint32_t)(v * vr) << 12;
+                // assuming master volume and stream type volume each go up to 1.0,
+                // vl and vr are now in 8.24 format
+
+                uint16_t sendLevel = cblk->getSendLevel_U4_12();
+                // send level comes from shared memory and so may be corrupt
+                if (sendLevel > MAX_GAIN_INT) {
+                    ALOGV("Track send level out of range: %04X", sendLevel);
+                    sendLevel = MAX_GAIN_INT;
+                }
+                va = (uint32_t)(v * sendLevel);
+            }
+            // Delegate volume control to effect in track effect chain if needed
+            if (chain != 0 && chain->setVolume_l(&vl, &vr)) {
+                // Do not ramp volume if volume is controlled by effect
+                param = AudioMixer::VOLUME;
+                track->mHasVolumeController = true;
+            } else {
+                // force no volume ramp when volume controller was just disabled or removed
+                // from effect chain to avoid volume spike
+                if (track->mHasVolumeController) {
+                    param = AudioMixer::VOLUME;
+                }
+                track->mHasVolumeController = false;
+            }
+
+            // Convert volumes from 8.24 to 4.12 format
+            // This additional clamping is needed in case chain->setVolume_l() overshot
+            vl = (vl + (1 << 11)) >> 12;
+            if (vl > MAX_GAIN_INT) vl = MAX_GAIN_INT;
+            vr = (vr + (1 << 11)) >> 12;
+            if (vr > MAX_GAIN_INT) vr = MAX_GAIN_INT;
+
+            if (va > MAX_GAIN_INT) va = MAX_GAIN_INT;   // va is uint32_t, so no need to check for -
+
+            // XXX: these things DON'T need to be done each time
+            mAudioMixer->setBufferProvider(name, track);
+            mAudioMixer->enable(name);
+
+            mAudioMixer->setParameter(name, param, AudioMixer::VOLUME0, (void *)vl);
+            mAudioMixer->setParameter(name, param, AudioMixer::VOLUME1, (void *)vr);
+            mAudioMixer->setParameter(name, param, AudioMixer::AUXLEVEL, (void *)va);
+            mAudioMixer->setParameter(
+                name,
+                AudioMixer::TRACK,
+                AudioMixer::FORMAT, (void *)track->format());
+            mAudioMixer->setParameter(
+                name,
+                AudioMixer::TRACK,
+                AudioMixer::CHANNEL_MASK, (void *)track->channelMask());
+            mAudioMixer->setParameter(
+                name,
+                AudioMixer::RESAMPLE,
+                AudioMixer::SAMPLE_RATE,
+                (void *)(cblk->sampleRate));
+            mAudioMixer->setParameter(
+                name,
+                AudioMixer::TRACK,
+                AudioMixer::MAIN_BUFFER, (void *)track->mainBuffer());
+            mAudioMixer->setParameter(
+                name,
+                AudioMixer::TRACK,
+                AudioMixer::AUX_BUFFER, (void *)track->auxBuffer());
+
+            // reset retry count
+            track->mRetryCount = kMaxTrackRetries;
+
+            // If one track is ready, set the mixer ready if:
+            //  - the mixer was not ready during previous round OR
+            //  - no other track is not ready
+            if (mMixerStatusIgnoringFastTracks != MIXER_TRACKS_READY ||
+                    mixerStatus != MIXER_TRACKS_ENABLED) {
+                mixerStatus = MIXER_TRACKS_READY;
+            }
+        } else {
+            // clear effect chain input buffer if an active track underruns to avoid sending
+            // previous audio buffer again to effects
+            chain = getEffectChain_l(track->sessionId());
+            if (chain != 0) {
+                chain->clearInputBuffer();
+            }
+
+            //ALOGV("track %d u=%08x, s=%08x [NOT READY] on thread %p", name, cblk->user, cblk->server, this);
+            if ((track->sharedBuffer() != 0) || track->isTerminated() ||
+                    track->isStopped() || track->isPaused()) {
+                // We have consumed all the buffers of this track.
+                // Remove it from the list of active tracks.
+                // TODO: use actual buffer filling status instead of latency when available from
+                // audio HAL
+                size_t audioHALFrames = (latency_l() * mSampleRate) / 1000;
+                size_t framesWritten =
+                        mBytesWritten / audio_stream_frame_size(&mOutput->stream->common);
+                if (mStandby || track->presentationComplete(framesWritten, audioHALFrames)) {
+                    if (track->isStopped()) {
+                        track->reset();
+                    }
+                    tracksToRemove->add(track);
+                }
+            } else {
+                track->mUnderrunCount++;
+                // No buffers for this track. Give it a few chances to
+                // fill a buffer, then remove it from active list.
+                if (--(track->mRetryCount) <= 0) {
+                    ALOGV("BUFFER TIMEOUT: remove(%d) from active list on thread %p", name, this);
+                    tracksToRemove->add(track);
+                    // indicate to client process that the track was disabled because of underrun;
+                    // it will then automatically call start() when data is available
+                    android_atomic_or(CBLK_DISABLED_ON, &cblk->flags);
+                // If one track is not ready, mark the mixer also not ready if:
+                //  - the mixer was ready during previous round OR
+                //  - no other track is ready
+                } else if (mMixerStatusIgnoringFastTracks == MIXER_TRACKS_READY ||
+                                mixerStatus != MIXER_TRACKS_READY) {
+                    mixerStatus = MIXER_TRACKS_ENABLED;
+                }
+            }
+            mAudioMixer->disable(name);
+        }
+
+        }   // local variable scope to avoid goto warning
+track_is_ready: ;
+
+    }
+
+    // Push the new FastMixer state if necessary
+    bool pauseAudioWatchdog = false;
+    if (didModify) {
+        state->mFastTracksGen++;
+        // if the fast mixer was active, but now there are no fast tracks, then put it in cold idle
+        if (kUseFastMixer == FastMixer_Dynamic &&
+                state->mCommand == FastMixerState::MIX_WRITE && state->mTrackMask <= 1) {
+            state->mCommand = FastMixerState::COLD_IDLE;
+            state->mColdFutexAddr = &mFastMixerFutex;
+            state->mColdGen++;
+            mFastMixerFutex = 0;
+            if (kUseFastMixer == FastMixer_Dynamic) {
+                mNormalSink = mOutputSink;
+            }
+            // If we go into cold idle, need to wait for acknowledgement
+            // so that fast mixer stops doing I/O.
+            block = FastMixerStateQueue::BLOCK_UNTIL_ACKED;
+            pauseAudioWatchdog = true;
+        }
+        sq->end();
+    }
+    if (sq != NULL) {
+        sq->end(didModify);
+        sq->push(block);
+    }
+#ifdef AUDIO_WATCHDOG
+    if (pauseAudioWatchdog && mAudioWatchdog != 0) {
+        mAudioWatchdog->pause();
+    }
+#endif
+
+    // Now perform the deferred reset on fast tracks that have stopped
+    while (resetMask != 0) {
+        size_t i = __builtin_ctz(resetMask);
+        ALOG_ASSERT(i < count);
+        resetMask &= ~(1 << i);
+        sp<Track> t = mActiveTracks[i].promote();
+        if (t == 0) continue;
+        Track* track = t.get();
+        ALOG_ASSERT(track->isFastTrack() && track->isStopped());
+        track->reset();
+    }
+
+    // remove all the tracks that need to be...
+    count = tracksToRemove->size();
+    if (CC_UNLIKELY(count)) {
+        for (size_t i=0 ; i<count ; i++) {
+            const sp<Track>& track = tracksToRemove->itemAt(i);
+            mActiveTracks.remove(track);
+            if (track->mainBuffer() != mMixBuffer) {
+                chain = getEffectChain_l(track->sessionId());
+                if (chain != 0) {
+                    ALOGV("stopping track on chain %p for session Id: %d", chain.get(), track->sessionId());
+                    chain->decActiveTrackCnt();
+                }
+            }
+            if (track->isTerminated()) {
+                removeTrack_l(track);
+            }
+        }
+    }
+
+    // mix buffer must be cleared if all tracks are connected to an
+    // effect chain as in this case the mixer will not write to
+    // mix buffer and track effects will accumulate into it
+    if ((mixedTracks != 0 && mixedTracks == tracksWithEffect) || (mixedTracks == 0 && fastTracks > 0)) {
+        // FIXME as a performance optimization, should remember previous zero status
+        memset(mMixBuffer, 0, mNormalFrameCount * mChannelCount * sizeof(int16_t));
+    }
+
+    // if any fast tracks, then status is ready
+    mMixerStatusIgnoringFastTracks = mixerStatus;
+    if (fastTracks > 0) {
+        mixerStatus = MIXER_TRACKS_READY;
+    }
+    return mixerStatus;
+!!!826764.cpp!!!	getTrackName_l(in channelMask : audio_channel_mask_t, in sessionId : int) : int
+    return mAudioMixer->getTrackName(channelMask, sessionId);
+!!!826892.cpp!!!	deleteTrackName_l(in name : int) : void
+    ALOGV("remove track (%d) and delete from mixer", name);
+    mAudioMixer->deleteTrackName(name);
+!!!827020.cpp!!!	idleSleepTimeUs() : uint32_t
+    return (uint32_t)(((mNormalFrameCount * 1000) / mSampleRate) * 1000) / 2;
+!!!827148.cpp!!!	suspendSleepTimeUs() : uint32_t
+    return (uint32_t)(((mNormalFrameCount * 1000) / mSampleRate) * 1000);
+!!!827276.cpp!!!	cacheParameters_l() : void
+    PlaybackThread::cacheParameters_l();
+
+    // FIXME: Relaxed timing because of a certain device that can't meet latency
+    // Should be reduced to 2x after the vendor fixes the driver issue
+    // increase threshold again due to low power audio mode. The way this warning
+    // threshold is calculated and its usefulness should be reconsidered anyway.
+    maxPeriod = seconds(mNormalFrameCount) / mSampleRate * 15;
+!!!827404.cpp!!!	threadLoop_write() : void
+    // FIXME we should only do one push per cycle; confirm this is true
+    // Start the fast mixer if it's not already running
+    if (mFastMixer != NULL) {
+        FastMixerStateQueue *sq = mFastMixer->sq();
+        FastMixerState *state = sq->begin();
+        if (state->mCommand != FastMixerState::MIX_WRITE &&
+                (kUseFastMixer != FastMixer_Dynamic || state->mTrackMask > 1)) {
+            if (state->mCommand == FastMixerState::COLD_IDLE) {
+                int32_t old = android_atomic_inc(&mFastMixerFutex);
+                if (old == -1) {
+                    __futex_syscall3(&mFastMixerFutex, FUTEX_WAKE_PRIVATE, 1);
+                }
+#ifdef AUDIO_WATCHDOG
+                if (mAudioWatchdog != 0) {
+                    mAudioWatchdog->resume();
+                }
+#endif
+            }
+            state->mCommand = FastMixerState::MIX_WRITE;
+            sq->end();
+            sq->push(FastMixerStateQueue::BLOCK_UNTIL_PUSHED);
+            if (kUseFastMixer == FastMixer_Dynamic) {
+                mNormalSink = mPipeSink;
+            }
+        } else {
+            sq->end(false /*didModify*/);
+        }
+    }
+    PlaybackThread::threadLoop_write();
+!!!827532.cpp!!!	threadLoop_standby() : void
+    // Idle the fast mixer if it's currently running
+    if (mFastMixer != NULL) {
+        FastMixerStateQueue *sq = mFastMixer->sq();
+        FastMixerState *state = sq->begin();
+        if (!(state->mCommand & FastMixerState::IDLE)) {
+            state->mCommand = FastMixerState::COLD_IDLE;
+            state->mColdFutexAddr = &mFastMixerFutex;
+            state->mColdGen++;
+            mFastMixerFutex = 0;
+            sq->end();
+            // BLOCK_UNTIL_PUSHED would be insufficient, as we need it to stop doing I/O now
+            sq->push(FastMixerStateQueue::BLOCK_UNTIL_ACKED);
+            if (kUseFastMixer == FastMixer_Dynamic) {
+                mNormalSink = mOutputSink;
+            }
+#ifdef AUDIO_WATCHDOG
+            if (mAudioWatchdog != 0) {
+                mAudioWatchdog->pause();
+            }
+#endif
+        } else {
+            sq->end(false /*didModify*/);
+        }
+    }
+    PlaybackThread::threadLoop_standby();
+!!!827660.cpp!!!	threadLoop_mix() : void
+    // obtain the presentation timestamp of the next output buffer
+    int64_t pts;
+    status_t status = INVALID_OPERATION;
+
+    if (mNormalSink != 0) {
+        status = mNormalSink->getNextWriteTimestamp(&pts);
+    } else {
+        status = mOutputSink->getNextWriteTimestamp(&pts);
+    }
+
+    if (status != NO_ERROR) {
+        pts = AudioBufferProvider::kInvalidPTS;
+    }
+
+    // mix buffers...
+    mAudioMixer->process(pts);
+    // increase sleep time progressively when application underrun condition clears.
+    // Only increase sleep time if the mixer is ready for two consecutive times to avoid
+    // that a steady state of alternating ready/not ready conditions keeps the sleep time
+    // such that we would underrun the audio HAL.
+    if ((sleepTime == 0) && (sleepTimeShift > 0)) {
+        sleepTimeShift--;
+    }
+    sleepTime = 0;
+    standbyTime = systemTime() + standbyDelay;
+    //TODO: delay standby when effects have a tail
+!!!827788.cpp!!!	threadLoop_sleepTime() : void
+    // If no tracks are ready, sleep once for the duration of an output
+    // buffer size, then write 0s to the output
+    if (sleepTime == 0) {
+        if (mMixerStatus == MIXER_TRACKS_ENABLED) {
+            sleepTime = activeSleepTime >> sleepTimeShift;
+            if (sleepTime < kMinThreadSleepTimeUs) {
+                sleepTime = kMinThreadSleepTimeUs;
+            }
+            // reduce sleep time in case of consecutive application underruns to avoid
+            // starving the audio HAL. As activeSleepTimeUs() is larger than a buffer
+            // duration we would end up writing less data than needed by the audio HAL if
+            // the condition persists.
+            if (sleepTimeShift < kMaxThreadSleepTimeShift) {
+                sleepTimeShift++;
+            }
+        } else {
+            sleepTime = idleSleepTime;
+        }
+    } else if (mBytesWritten != 0 || (mMixerStatus == MIXER_TRACKS_ENABLED)) {
+        memset (mMixBuffer, 0, mixBufferSize);
+        sleepTime = 0;
+        ALOGV_IF((mBytesWritten == 0 && (mMixerStatus == MIXER_TRACKS_ENABLED)), "anticipated start");
+    }
+    // TODO add standby time extension fct of effect tail
+!!!827916.cpp!!!	threadLoop_removeTracks(in tracksToRemove : Vector< sp<Track> >) : void
+    PlaybackThread::threadLoop_removeTracks(tracksToRemove);
+!!!828044.cpp!!!	correctLatency(in latency : uint32_t) : uint32_t
+    if (mFastMixer != NULL) {
+        MonoPipe *pipe = (MonoPipe *)mPipeSink.get();
+        latency += (pipe->getAvgFrames() * 1000) / mSampleRate;
+    }
+    return latency;

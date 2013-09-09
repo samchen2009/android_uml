@@ -1,0 +1,1305 @@
+class MPEG4Writer::Track
+!!!1871244.cpp!!!	start(inout params : MetaData) : status_t
+    if (!mDone && mPaused) {
+        mPaused = false;
+        mResumed = true;
+        return OK;
+    }
+
+    int64_t startTimeUs;
+    if (params == NULL || !params->findInt64(kKeyTime, &startTimeUs)) {
+        startTimeUs = 0;
+    }
+    mStartTimeRealUs = startTimeUs;
+
+    int32_t rotationDegrees;
+    if (!mIsAudio && params && params->findInt32(kKeyRotation, &rotationDegrees)) {
+        mRotation = rotationDegrees;
+    }
+
+    mIsRealTimeRecording = true;
+    {
+        int32_t isNotRealTime;
+        if (params && params->findInt32(kKeyNotRealTime, &isNotRealTime)) {
+            mIsRealTimeRecording = (isNotRealTime == 0);
+        }
+    }
+
+    initTrackingProgressStatus(params);
+
+    sp<MetaData> meta = new MetaData;
+    if (mIsRealTimeRecording && mOwner->numTracks() > 1) {
+        /*
+         * This extra delay of accepting incoming audio/video signals
+         * helps to align a/v start time at the beginning of a recording
+         * session, and it also helps eliminate the "recording" sound for
+         * camcorder applications.
+         *
+         * If client does not set the start time offset, we fall back to
+         * use the default initial delay value.
+         */
+        int64_t startTimeOffsetUs = mOwner->getStartTimeOffsetMs() * 1000LL;
+        if (startTimeOffsetUs < 0) {  // Start time offset was not set
+            startTimeOffsetUs = kInitialDelayTimeUs;
+        }
+        startTimeUs += startTimeOffsetUs;
+        ALOGI("Start time offset: %lld us", startTimeOffsetUs);
+    }
+
+    meta->setInt64(kKeyTime, startTimeUs);
+
+    status_t err = mSource->start(meta.get());
+    if (err != OK) {
+        mDone = mReachedEOS = true;
+        return err;
+    }
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    mDone = false;
+    mStarted = true;
+    mTrackDurationUs = 0;
+    mReachedEOS = false;
+    mEstimatedTrackSizeBytes = 0;
+    mMdatSizeBytes = 0;
+    mMaxChunkDurationUs = 0;
+
+    pthread_create(&mThread, &attr, ThreadWrapper, this);
+    pthread_attr_destroy(&attr);
+
+    return OK;
+!!!1871372.cpp!!!	stop() : status_t
+    ALOGD("Stopping %s track", mIsAudio? "Audio": "Video");
+    if (!mStarted) {
+        ALOGE("Stop() called but track is not started");
+        return ERROR_END_OF_STREAM;
+    }
+
+    if (mDone) {
+        return OK;
+    }
+    mDone = true;
+
+    void *dummy;
+    pthread_join(mThread, &dummy);
+
+    status_t err = (status_t) dummy;
+
+    ALOGD("Stopping %s track source", mIsAudio? "Audio": "Video");
+    {
+        status_t status = mSource->stop();
+        if (err == OK && status != OK && status != ERROR_END_OF_STREAM) {
+            err = status;
+        }
+    }
+
+    ALOGD("%s track stopped", mIsAudio? "Audio": "Video");
+    return err;
+!!!1871500.cpp!!!	pause() : status_t
+    mPaused = true;
+    return OK;
+!!!1871628.cpp!!!	reachedEOS() : bool
+    return mReachedEOS;
+!!!1871756.cpp!!!	getDurationUs() : int64_t
+    return mTrackDurationUs;
+!!!1871884.cpp!!!	getEstimatedTrackSizeBytes() : int64_t
+    return mEstimatedTrackSizeBytes;
+!!!1872012.cpp!!!	writeTrackHeader(in use32BitOffset : bool = true) : void
+
+    ALOGV("%s track time scale: %d",
+        mIsAudio? "Audio": "Video", mTimeScale);
+
+    uint32_t now = getMpeg4Time();
+    mOwner->beginBox("trak");
+        writeTkhdBox(now);
+        mOwner->beginBox("mdia");
+            writeMdhdBox(now);
+            writeHdlrBox();
+            mOwner->beginBox("minf");
+                if (mIsAudio) {
+                    writeSmhdBox();
+                } else {
+                    writeVmhdBox();
+                }
+                writeDinfBox();
+                writeStblBox(use32BitOffset);
+            mOwner->endBox();  // minf
+        mOwner->endBox();  // mdia
+    mOwner->endBox();  // trak
+!!!1872140.cpp!!!	bufferChunk(in timestampUs : int64_t) : void
+    ALOGV("bufferChunk");
+
+    Chunk chunk(this, timestampUs, mChunkSamples);
+    mOwner->bufferChunk(chunk);
+    mChunkSamples.clear();
+!!!1872652.cpp!!!	addChunkOffset(in offset : off64_t) : void
+    if (mOwner->use32BitFileOffset()) {
+        uint32_t value = offset;
+        mStcoTableEntries->add(htonl(value));
+    } else {
+        mCo64TableEntries->add(hton64(offset));
+    }
+!!!1872908.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+    snprintf(buffer, SIZE, "     %s track\n", mIsAudio? "Audio": "Video");
+    result.append(buffer);
+    snprintf(buffer, SIZE, "       reached EOS: %s\n",
+            mReachedEOS? "true": "false");
+    result.append(buffer);
+    snprintf(buffer, SIZE, "       frames encoded : %d\n", mStszTableEntries->count());
+    result.append(buffer);
+    snprintf(buffer, SIZE, "       duration encoded : %lld us\n", mTrackDurationUs);
+    result.append(buffer);
+    ::write(fd, result.string(), result.size());
+    return OK;
+!!!1874060.cpp!!!	updateDriftTime(in meta : sp<MetaData>) : void
+    int64_t driftTimeUs = 0;
+    if (meta->findInt64(kKeyDriftTime, &driftTimeUs)) {
+        int64_t prevDriftTimeUs = mOwner->getDriftTimeUs();
+        int64_t timeUs = (driftTimeUs + prevDriftTimeUs) >> 1;
+        mOwner->setDriftTimeUs(timeUs);
+    }
+!!!1874188.cpp!!!	getStartTimeOffsetScaledTime() : int32_t
+    int64_t trackStartTimeOffsetUs = 0;
+    int64_t moovStartTimeUs = mOwner->getStartTimestampUs();
+    if (mStartTimestampUs != moovStartTimeUs) {
+        CHECK_GT(mStartTimestampUs, moovStartTimeUs);
+        trackStartTimeOffsetUs = mStartTimestampUs - moovStartTimeUs;
+    }
+    return (trackStartTimeOffsetUs *  mTimeScale + 500000LL) / 1000000LL;
+!!!1874316.cpp!!!	ThreadWrapper(inout me : void) : void
+    Track *track = static_cast<Track *>(me);
+
+    status_t err = track->threadEntry();
+    return (void *) err;
+!!!1874444.cpp!!!	threadEntry() : status_t
+    int32_t count = 0;
+    const int64_t interleaveDurationUs = mOwner->interleaveDuration();
+    const bool hasMultipleTracks = (mOwner->numTracks() > 1);
+    int64_t chunkTimestampUs = 0;
+    int32_t nChunks = 0;
+    int32_t nZeroLengthFrames = 0;
+    int64_t lastTimestampUs = 0;      // Previous sample time stamp
+    int64_t lastDurationUs = 0;       // Between the previous two samples
+    int64_t currDurationTicks = 0;    // Timescale based ticks
+    int64_t lastDurationTicks = 0;    // Timescale based ticks
+    int32_t sampleCount = 1;          // Sample count in the current stts table entry
+    uint32_t previousSampleSize = 0;  // Size of the previous sample
+    int64_t previousPausedDurationUs = 0;
+    int64_t timestampUs = 0;
+    int64_t cttsOffsetTimeUs = 0;
+    int64_t currCttsOffsetTimeTicks = 0;   // Timescale based ticks
+    int64_t lastCttsOffsetTimeTicks = -1;  // Timescale based ticks
+    int32_t cttsSampleCount = 0;           // Sample count in the current ctts table entry
+    uint32_t lastSamplesPerChunk = 0;
+
+    if (mIsAudio) {
+        prctl(PR_SET_NAME, (unsigned long)"AudioTrackEncoding", 0, 0, 0);
+    } else {
+        prctl(PR_SET_NAME, (unsigned long)"VideoTrackEncoding", 0, 0, 0);
+    }
+    androidSetThreadPriority(0, ANDROID_PRIORITY_AUDIO);
+
+    sp<MetaData> meta_data;
+
+    status_t err = OK;
+    MediaBuffer *buffer;
+    while (!mDone && (err = mSource->read(&buffer)) == OK) {
+        if (buffer->range_length() == 0) {
+            buffer->release();
+            buffer = NULL;
+            ++nZeroLengthFrames;
+            continue;
+        }
+
+        // If the codec specific data has not been received yet, delay pause.
+        // After the codec specific data is received, discard what we received
+        // when the track is to be paused.
+        if (mPaused && !mResumed) {
+            buffer->release();
+            buffer = NULL;
+            continue;
+        }
+
+        ++count;
+
+        int32_t isCodecConfig;
+        if (buffer->meta_data()->findInt32(kKeyIsCodecConfig, &isCodecConfig)
+                && isCodecConfig) {
+            CHECK(!mGotAllCodecSpecificData);
+
+            if (mIsAvc) {
+                status_t err = makeAVCCodecSpecificData(
+                        (const uint8_t *)buffer->data()
+                            + buffer->range_offset(),
+                        buffer->range_length());
+                CHECK_EQ((status_t)OK, err);
+            } else if (mIsMPEG4) {
+                mCodecSpecificDataSize = buffer->range_length();
+                mCodecSpecificData = malloc(mCodecSpecificDataSize);
+                memcpy(mCodecSpecificData,
+                        (const uint8_t *)buffer->data()
+                            + buffer->range_offset(),
+                       buffer->range_length());
+            }
+
+            buffer->release();
+            buffer = NULL;
+
+            mGotAllCodecSpecificData = true;
+            continue;
+        }
+
+        // Make a deep copy of the MediaBuffer and Metadata and release
+        // the original as soon as we can
+        MediaBuffer *copy = new MediaBuffer(buffer->range_length());
+        memcpy(copy->data(), (uint8_t *)buffer->data() + buffer->range_offset(),
+                buffer->range_length());
+        copy->set_range(0, buffer->range_length());
+        meta_data = new MetaData(*buffer->meta_data().get());
+        buffer->release();
+        buffer = NULL;
+
+        if (mIsAvc) StripStartcode(copy);
+
+        size_t sampleSize = copy->range_length();
+        if (mIsAvc) {
+            if (mOwner->useNalLengthFour()) {
+                sampleSize += 4;
+            } else {
+                sampleSize += 2;
+            }
+        }
+
+        // Max file size or duration handling
+        mMdatSizeBytes += sampleSize;
+        updateTrackSizeEstimate();
+
+        if (mOwner->exceedsFileSizeLimit()) {
+            mOwner->notify(MEDIA_RECORDER_EVENT_INFO, MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED, 0);
+            break;
+        }
+        if (mOwner->exceedsFileDurationLimit()) {
+            mOwner->notify(MEDIA_RECORDER_EVENT_INFO, MEDIA_RECORDER_INFO_MAX_DURATION_REACHED, 0);
+            break;
+        }
+
+
+        int32_t isSync = false;
+        meta_data->findInt32(kKeyIsSyncFrame, &isSync);
+        CHECK(meta_data->findInt64(kKeyTime, &timestampUs));
+
+////////////////////////////////////////////////////////////////////////////////
+        if (mStszTableEntries->count() == 0) {
+            mFirstSampleTimeRealUs = systemTime() / 1000;
+            mStartTimestampUs = timestampUs;
+            mOwner->setStartTimestampUs(mStartTimestampUs);
+            previousPausedDurationUs = mStartTimestampUs;
+        }
+
+        if (mResumed) {
+            int64_t durExcludingEarlierPausesUs = timestampUs - previousPausedDurationUs;
+            CHECK_GE(durExcludingEarlierPausesUs, 0ll);
+            int64_t pausedDurationUs = durExcludingEarlierPausesUs - mTrackDurationUs;
+            CHECK_GE(pausedDurationUs, lastDurationUs);
+            previousPausedDurationUs += pausedDurationUs - lastDurationUs;
+            mResumed = false;
+        }
+
+        timestampUs -= previousPausedDurationUs;
+        CHECK_GE(timestampUs, 0ll);
+        if (!mIsAudio) {
+            /*
+             * Composition time: timestampUs
+             * Decoding time: decodingTimeUs
+             * Composition time offset = composition time - decoding time
+             */
+            int64_t decodingTimeUs;
+            CHECK(meta_data->findInt64(kKeyDecodingTime, &decodingTimeUs));
+            decodingTimeUs -= previousPausedDurationUs;
+            cttsOffsetTimeUs =
+                    timestampUs + kMaxCttsOffsetTimeUs - decodingTimeUs;
+            CHECK_GE(cttsOffsetTimeUs, 0ll);
+            timestampUs = decodingTimeUs;
+            ALOGV("decoding time: %lld and ctts offset time: %lld",
+                timestampUs, cttsOffsetTimeUs);
+
+            // Update ctts box table if necessary
+            currCttsOffsetTimeTicks =
+                    (cttsOffsetTimeUs * mTimeScale + 500000LL) / 1000000LL;
+            CHECK_LE(currCttsOffsetTimeTicks, 0x0FFFFFFFFLL);
+            if (mStszTableEntries->count() == 0) {
+                // Force the first ctts table entry to have one single entry
+                // so that we can do adjustment for the initial track start
+                // time offset easily in writeCttsBox().
+                lastCttsOffsetTimeTicks = currCttsOffsetTimeTicks;
+                addOneCttsTableEntry(1, currCttsOffsetTimeTicks);
+                cttsSampleCount = 0;      // No sample in ctts box is pending
+            } else {
+                if (currCttsOffsetTimeTicks != lastCttsOffsetTimeTicks) {
+                    addOneCttsTableEntry(cttsSampleCount, lastCttsOffsetTimeTicks);
+                    lastCttsOffsetTimeTicks = currCttsOffsetTimeTicks;
+                    cttsSampleCount = 1;  // One sample in ctts box is pending
+                } else {
+                    ++cttsSampleCount;
+                }
+            }
+
+            // Update ctts time offset range
+            if (mStszTableEntries->count() == 0) {
+                mMinCttsOffsetTimeUs = currCttsOffsetTimeTicks;
+                mMaxCttsOffsetTimeUs = currCttsOffsetTimeTicks;
+            } else {
+                if (currCttsOffsetTimeTicks > mMaxCttsOffsetTimeUs) {
+                    mMaxCttsOffsetTimeUs = currCttsOffsetTimeTicks;
+                } else if (currCttsOffsetTimeTicks < mMinCttsOffsetTimeUs) {
+                    mMinCttsOffsetTimeUs = currCttsOffsetTimeTicks;
+                }
+            }
+
+        }
+
+        if (mIsRealTimeRecording) {
+            if (mIsAudio) {
+                updateDriftTime(meta_data);
+            }
+        }
+
+        CHECK_GE(timestampUs, 0ll);
+        ALOGV("%s media time stamp: %lld and previous paused duration %lld",
+                mIsAudio? "Audio": "Video", timestampUs, previousPausedDurationUs);
+        if (timestampUs > mTrackDurationUs) {
+            mTrackDurationUs = timestampUs;
+        }
+
+        // We need to use the time scale based ticks, rather than the
+        // timestamp itself to determine whether we have to use a new
+        // stts entry, since we may have rounding errors.
+        // The calculation is intended to reduce the accumulated
+        // rounding errors.
+        currDurationTicks =
+            ((timestampUs * mTimeScale + 500000LL) / 1000000LL -
+                (lastTimestampUs * mTimeScale + 500000LL) / 1000000LL);
+        if (currDurationTicks < 0ll) {
+            ALOGE("timestampUs %lld < lastTimestampUs %lld for %s track",
+                timestampUs, lastTimestampUs, mIsAudio? "Audio": "Video");
+            return UNKNOWN_ERROR;
+        }
+
+        mStszTableEntries->add(htonl(sampleSize));
+        if (mStszTableEntries->count() > 2) {
+
+            // Force the first sample to have its own stts entry so that
+            // we can adjust its value later to maintain the A/V sync.
+            if (mStszTableEntries->count() == 3 || currDurationTicks != lastDurationTicks) {
+                addOneSttsTableEntry(sampleCount, lastDurationTicks);
+                sampleCount = 1;
+            } else {
+                ++sampleCount;
+            }
+
+        }
+        if (mSamplesHaveSameSize) {
+            if (mStszTableEntries->count() >= 2 && previousSampleSize != sampleSize) {
+                mSamplesHaveSameSize = false;
+            }
+            previousSampleSize = sampleSize;
+        }
+        ALOGV("%s timestampUs/lastTimestampUs: %lld/%lld",
+                mIsAudio? "Audio": "Video", timestampUs, lastTimestampUs);
+        lastDurationUs = timestampUs - lastTimestampUs;
+        lastDurationTicks = currDurationTicks;
+        lastTimestampUs = timestampUs;
+
+        if (isSync != 0) {
+            addOneStssTableEntry(mStszTableEntries->count());
+        }
+
+        if (mTrackingProgressStatus) {
+            if (mPreviousTrackTimeUs <= 0) {
+                mPreviousTrackTimeUs = mStartTimestampUs;
+            }
+            trackProgressStatus(timestampUs);
+        }
+        if (!hasMultipleTracks) {
+            off64_t offset = mIsAvc? mOwner->addLengthPrefixedSample_l(copy)
+                                 : mOwner->addSample_l(copy);
+
+            uint32_t count = (mOwner->use32BitFileOffset()
+                        ? mStcoTableEntries->count()
+                        : mCo64TableEntries->count());
+
+            if (count == 0) {
+                addChunkOffset(offset);
+            }
+            copy->release();
+            copy = NULL;
+            continue;
+        }
+
+        mChunkSamples.push_back(copy);
+        if (interleaveDurationUs == 0) {
+            addOneStscTableEntry(++nChunks, 1);
+            bufferChunk(timestampUs);
+        } else {
+            if (chunkTimestampUs == 0) {
+                chunkTimestampUs = timestampUs;
+            } else {
+                int64_t chunkDurationUs = timestampUs - chunkTimestampUs;
+                if (chunkDurationUs > interleaveDurationUs) {
+                    if (chunkDurationUs > mMaxChunkDurationUs) {
+                        mMaxChunkDurationUs = chunkDurationUs;
+                    }
+                    ++nChunks;
+                    if (nChunks == 1 ||  // First chunk
+                        lastSamplesPerChunk != mChunkSamples.size()) {
+                        lastSamplesPerChunk = mChunkSamples.size();
+                        addOneStscTableEntry(nChunks, lastSamplesPerChunk);
+                    }
+                    bufferChunk(timestampUs);
+                    chunkTimestampUs = timestampUs;
+                }
+            }
+        }
+
+    }
+
+    if (isTrackMalFormed()) {
+        err = ERROR_MALFORMED;
+    }
+
+    mOwner->trackProgressStatus(mTrackId, -1, err);
+
+    // Last chunk
+    if (!hasMultipleTracks) {
+        addOneStscTableEntry(1, mStszTableEntries->count());
+    } else if (!mChunkSamples.empty()) {
+        addOneStscTableEntry(++nChunks, mChunkSamples.size());
+        bufferChunk(timestampUs);
+    }
+
+    // We don't really know how long the last frame lasts, since
+    // there is no frame time after it, just repeat the previous
+    // frame's duration.
+    if (mStszTableEntries->count() == 1) {
+        lastDurationUs = 0;  // A single sample's duration
+        lastDurationTicks = 0;
+    } else {
+        ++sampleCount;  // Count for the last sample
+    }
+
+    if (mStszTableEntries->count() <= 2) {
+        addOneSttsTableEntry(1, lastDurationTicks);
+        if (sampleCount - 1 > 0) {
+            addOneSttsTableEntry(sampleCount - 1, lastDurationTicks);
+        }
+    } else {
+        addOneSttsTableEntry(sampleCount, lastDurationTicks);
+    }
+
+    // The last ctts box may not have been written yet, and this
+    // is to make sure that we write out the last ctts box.
+    if (currCttsOffsetTimeTicks == lastCttsOffsetTimeTicks) {
+        if (cttsSampleCount > 0) {
+            addOneCttsTableEntry(cttsSampleCount, lastCttsOffsetTimeTicks);
+        }
+    }
+
+    mTrackDurationUs += lastDurationUs;
+    mReachedEOS = true;
+
+    sendTrackSummary(hasMultipleTracks);
+
+    ALOGI("Received total/0-length (%d/%d) buffers and encoded %d frames. - %s",
+            count, nZeroLengthFrames, mStszTableEntries->count(), mIsAudio? "audio": "video");
+    if (mIsAudio) {
+        ALOGI("Audio track drift time: %lld us", mOwner->getDriftTimeUs());
+    }
+
+    if (err == ERROR_END_OF_STREAM) {
+        return OK;
+    }
+    return err;
+!!!1874572.cpp!!!	parseParamSet(in data : uint8_t, in length : size_t, in type : int, inout paramSetLen : size_t) : uint8_t
+
+    ALOGV("parseParamSet");
+    CHECK(type == kNalUnitTypeSeqParamSet ||
+          type == kNalUnitTypePicParamSet);
+
+    const uint8_t *nextStartCode = findNextStartCode(data, length);
+    *paramSetLen = nextStartCode - data;
+    if (*paramSetLen == 0) {
+        ALOGE("Param set is malformed, since its length is 0");
+        return NULL;
+    }
+
+    AVCParamSet paramSet(*paramSetLen, data);
+    if (type == kNalUnitTypeSeqParamSet) {
+        if (*paramSetLen < 4) {
+            ALOGE("Seq parameter set malformed");
+            return NULL;
+        }
+        if (mSeqParamSets.empty()) {
+            mProfileIdc = data[1];
+            mProfileCompatible = data[2];
+            mLevelIdc = data[3];
+        } else {
+            if (mProfileIdc != data[1] ||
+                mProfileCompatible != data[2] ||
+                mLevelIdc != data[3]) {
+                ALOGE("Inconsistent profile/level found in seq parameter sets");
+                return NULL;
+            }
+        }
+        mSeqParamSets.push_back(paramSet);
+    } else {
+        mPicParamSets.push_back(paramSet);
+    }
+    return nextStartCode;
+!!!1874700.cpp!!!	makeAVCCodecSpecificData(in data : uint8_t, in size : size_t) : status_t
+
+    if (mCodecSpecificData != NULL) {
+        ALOGE("Already have codec specific data");
+        return ERROR_MALFORMED;
+    }
+
+    if (size < 4) {
+        ALOGE("Codec specific data length too short: %d", size);
+        return ERROR_MALFORMED;
+    }
+
+    // Data is in the form of AVCCodecSpecificData
+    if (memcmp("\x00\x00\x00\x01", data, 4)) {
+        return copyAVCCodecSpecificData(data, size);
+    }
+
+    if (parseAVCCodecSpecificData(data, size) != OK) {
+        return ERROR_MALFORMED;
+    }
+
+    // ISO 14496-15: AVC file format
+    mCodecSpecificDataSize += 7;  // 7 more bytes in the header
+    mCodecSpecificData = malloc(mCodecSpecificDataSize);
+    uint8_t *header = (uint8_t *)mCodecSpecificData;
+    header[0] = 1;                     // version
+    header[1] = mProfileIdc;           // profile indication
+    header[2] = mProfileCompatible;    // profile compatibility
+    header[3] = mLevelIdc;
+
+    // 6-bit '111111' followed by 2-bit to lengthSizeMinuusOne
+    if (mOwner->useNalLengthFour()) {
+        header[4] = 0xfc | 3;  // length size == 4 bytes
+    } else {
+        header[4] = 0xfc | 1;  // length size == 2 bytes
+    }
+
+    // 3-bit '111' followed by 5-bit numSequenceParameterSets
+    int nSequenceParamSets = mSeqParamSets.size();
+    header[5] = 0xe0 | nSequenceParamSets;
+    header += 6;
+    for (List<AVCParamSet>::iterator it = mSeqParamSets.begin();
+         it != mSeqParamSets.end(); ++it) {
+        // 16-bit sequence parameter set length
+        uint16_t seqParamSetLength = it->mLength;
+        header[0] = seqParamSetLength >> 8;
+        header[1] = seqParamSetLength & 0xff;
+
+        // SPS NAL unit (sequence parameter length bytes)
+        memcpy(&header[2], it->mData, seqParamSetLength);
+        header += (2 + seqParamSetLength);
+    }
+
+    // 8-bit nPictureParameterSets
+    int nPictureParamSets = mPicParamSets.size();
+    header[0] = nPictureParamSets;
+    header += 1;
+    for (List<AVCParamSet>::iterator it = mPicParamSets.begin();
+         it != mPicParamSets.end(); ++it) {
+        // 16-bit picture parameter set length
+        uint16_t picParamSetLength = it->mLength;
+        header[0] = picParamSetLength >> 8;
+        header[1] = picParamSetLength & 0xff;
+
+        // PPS Nal unit (picture parameter set length bytes)
+        memcpy(&header[2], it->mData, picParamSetLength);
+        header += (2 + picParamSetLength);
+    }
+
+    return OK;
+!!!1874828.cpp!!!	copyAVCCodecSpecificData(in data : uint8_t, in size : size_t) : status_t
+    ALOGV("copyAVCCodecSpecificData");
+
+    // 2 bytes for each of the parameter set length field
+    // plus the 7 bytes for the header
+    if (size < 4 + 7) {
+        ALOGE("Codec specific data length too short: %d", size);
+        return ERROR_MALFORMED;
+    }
+
+    mCodecSpecificDataSize = size;
+    mCodecSpecificData = malloc(size);
+    memcpy(mCodecSpecificData, data, size);
+    return OK;
+!!!1874956.cpp!!!	parseAVCCodecSpecificData(in data : uint8_t, in size : size_t) : status_t
+
+    ALOGV("parseAVCCodecSpecificData");
+    // Data starts with a start code.
+    // SPS and PPS are separated with start codes.
+    // Also, SPS must come before PPS
+    uint8_t type = kNalUnitTypeSeqParamSet;
+    bool gotSps = false;
+    bool gotPps = false;
+    const uint8_t *tmp = data;
+    const uint8_t *nextStartCode = data;
+    size_t bytesLeft = size;
+    size_t paramSetLen = 0;
+    mCodecSpecificDataSize = 0;
+    while (bytesLeft > 4 && !memcmp("\x00\x00\x00\x01", tmp, 4)) {
+        getNalUnitType(*(tmp + 4), &type);
+        if (type == kNalUnitTypeSeqParamSet) {
+            if (gotPps) {
+                ALOGE("SPS must come before PPS");
+                return ERROR_MALFORMED;
+            }
+            if (!gotSps) {
+                gotSps = true;
+            }
+            nextStartCode = parseParamSet(tmp + 4, bytesLeft - 4, type, &paramSetLen);
+        } else if (type == kNalUnitTypePicParamSet) {
+            if (!gotSps) {
+                ALOGE("SPS must come before PPS");
+                return ERROR_MALFORMED;
+            }
+            if (!gotPps) {
+                gotPps = true;
+            }
+            nextStartCode = parseParamSet(tmp + 4, bytesLeft - 4, type, &paramSetLen);
+        } else {
+            ALOGE("Only SPS and PPS Nal units are expected");
+            return ERROR_MALFORMED;
+        }
+
+        if (nextStartCode == NULL) {
+            return ERROR_MALFORMED;
+        }
+
+        // Move on to find the next parameter set
+        bytesLeft -= nextStartCode - tmp;
+        tmp = nextStartCode;
+        mCodecSpecificDataSize += (2 + paramSetLen);
+    }
+
+    {
+        // Check on the number of seq parameter sets
+        size_t nSeqParamSets = mSeqParamSets.size();
+        if (nSeqParamSets == 0) {
+            ALOGE("Cound not find sequence parameter set");
+            return ERROR_MALFORMED;
+        }
+
+        if (nSeqParamSets > 0x1F) {
+            ALOGE("Too many seq parameter sets (%d) found", nSeqParamSets);
+            return ERROR_MALFORMED;
+        }
+    }
+
+    {
+        // Check on the number of pic parameter sets
+        size_t nPicParamSets = mPicParamSets.size();
+        if (nPicParamSets == 0) {
+            ALOGE("Cound not find picture parameter set");
+            return ERROR_MALFORMED;
+        }
+        if (nPicParamSets > 0xFF) {
+            ALOGE("Too many pic parameter sets (%d) found", nPicParamSets);
+            return ERROR_MALFORMED;
+        }
+    }
+// FIXME:
+// Add chromat_format_idc, bit depth values, etc for AVC/h264 high profile and above
+// and remove #if 0
+#if 0
+    {
+        // Check on the profiles
+        // These profiles requires additional parameter set extensions
+        if (mProfileIdc == 100 || mProfileIdc == 110 ||
+            mProfileIdc == 122 || mProfileIdc == 144) {
+            ALOGE("Sorry, no support for profile_idc: %d!", mProfileIdc);
+            return BAD_VALUE;
+        }
+    }
+#endif
+    return OK;
+!!!1875084.cpp!!!	trackProgressStatus(in timeUs : int64_t, in err : status_t = OK) : void
+    ALOGV("trackProgressStatus: %lld us", timeUs);
+
+    if (mTrackEveryTimeDurationUs > 0 &&
+        timeUs - mPreviousTrackTimeUs >= mTrackEveryTimeDurationUs) {
+        ALOGV("Fire time tracking progress status at %lld us", timeUs);
+        mOwner->trackProgressStatus(mTrackId, timeUs - mPreviousTrackTimeUs, err);
+        mPreviousTrackTimeUs = timeUs;
+    }
+!!!1875212.cpp!!!	initTrackingProgressStatus(inout params : MetaData) : void
+    ALOGV("initTrackingProgressStatus");
+    mPreviousTrackTimeUs = -1;
+    mTrackingProgressStatus = false;
+    mTrackEveryTimeDurationUs = 0;
+    {
+        int64_t timeUs;
+        if (params && params->findInt64(kKeyTrackTimeStatus, &timeUs)) {
+            ALOGV("Receive request to track progress status for every %lld us", timeUs);
+            mTrackEveryTimeDurationUs = timeUs;
+            mTrackingProgressStatus = true;
+        }
+    }
+!!!1875340.cpp!!!	getCodecSpecificDataFromInputFormatIfPossible() : void
+    const char *mime;
+    CHECK(mMeta->findCString(kKeyMIMEType, &mime));
+
+    if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)) {
+        uint32_t type;
+        const void *data;
+        size_t size;
+        if (mMeta->findData(kKeyAVCC, &type, &data, &size)) {
+            mCodecSpecificData = malloc(size);
+            mCodecSpecificDataSize = size;
+            memcpy(mCodecSpecificData, data, size);
+            mGotAllCodecSpecificData = true;
+        }
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_MPEG4)
+            || !strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
+        uint32_t type;
+        const void *data;
+        size_t size;
+        if (mMeta->findData(kKeyESDS, &type, &data, &size)) {
+            ESDS esds(data, size);
+            if (esds.getCodecSpecificInfo(&data, &size) == OK) {
+                mCodecSpecificData = malloc(size);
+                mCodecSpecificDataSize = size;
+                memcpy(mCodecSpecificData, data, size);
+                mGotAllCodecSpecificData = true;
+            }
+        }
+    }
+!!!1875468.cpp!!!	setTimeScale() : void
+    ALOGV("setTimeScale");
+    // Default time scale
+    mTimeScale = 90000;
+
+    if (mIsAudio) {
+        // Use the sampling rate as the default time scale for audio track.
+        int32_t sampleRate;
+        bool success = mMeta->findInt32(kKeySampleRate, &sampleRate);
+        CHECK(success);
+        mTimeScale = sampleRate;
+    }
+
+    // If someone would like to overwrite the timescale, use user-supplied value.
+    int32_t timeScale;
+    if (mMeta->findInt32(kKeyTimeScale, &timeScale)) {
+        mTimeScale = timeScale;
+    }
+
+    CHECK_GT(mTimeScale, 0);
+!!!1875596.cpp!!!	checkCodecSpecificData() : status_t
+    const char *mime;
+    CHECK(mMeta->findCString(kKeyMIMEType, &mime));
+    if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AAC, mime) ||
+        !strcasecmp(MEDIA_MIMETYPE_VIDEO_MPEG4, mime) ||
+        !strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime)) {
+        if (!mCodecSpecificData ||
+            mCodecSpecificDataSize <= 0) {
+            ALOGE("Missing codec specific data");
+            return ERROR_MALFORMED;
+        }
+    } else {
+        if (mCodecSpecificData ||
+            mCodecSpecificDataSize > 0) {
+            ALOGE("Unexepected codec specific data found");
+            return ERROR_MALFORMED;
+        }
+    }
+    return OK;
+!!!1875724.cpp!!!	updateTrackSizeEstimate() : void
+
+    uint32_t stcoBoxCount = (mOwner->use32BitFileOffset()
+                            ? mStcoTableEntries->count()
+                            : mCo64TableEntries->count());
+    int64_t stcoBoxSizeBytes = stcoBoxCount * 4;
+    int64_t stszBoxSizeBytes = mSamplesHaveSameSize? 4: (mStszTableEntries->count() * 4);
+
+    mEstimatedTrackSizeBytes = mMdatSizeBytes;  // media data size
+    if (!mOwner->isFileStreamable()) {
+        // Reserved free space is not large enough to hold
+        // all meta data and thus wasted.
+        mEstimatedTrackSizeBytes += mStscTableEntries->count() * 12 +  // stsc box size
+                                    mStssTableEntries->count() * 4 +   // stss box size
+                                    mSttsTableEntries->count() * 8 +   // stts box size
+                                    mCttsTableEntries->count() * 8 +   // ctts box size
+                                    stcoBoxSizeBytes +           // stco box size
+                                    stszBoxSizeBytes;            // stsz box size
+    }
+!!!1875852.cpp!!!	addOneStscTableEntry(in chunkId : size_t, in sampleId : size_t) : void
+
+        mStscTableEntries->add(htonl(chunkId));
+        mStscTableEntries->add(htonl(sampleId));
+        mStscTableEntries->add(htonl(1));
+!!!1875980.cpp!!!	addOneStssTableEntry(in sampleId : size_t) : void
+    mStssTableEntries->add(htonl(sampleId));
+!!!1876108.cpp!!!	addOneSttsTableEntry(in sampleCount : size_t, in duration : int32_t) : void
+
+    if (duration == 0) {
+        ALOGW("0-duration samples found: %d", sampleCount);
+    }
+    mSttsTableEntries->add(htonl(sampleCount));
+    mSttsTableEntries->add(htonl(duration));
+!!!1876236.cpp!!!	addOneCttsTableEntry(in sampleCount : size_t, in duration : int32_t) : void
+
+    if (mIsAudio) {
+        return;
+    }
+    mCttsTableEntries->add(htonl(sampleCount));
+    mCttsTableEntries->add(htonl(duration));
+!!!1876364.cpp!!!	isTrackMalFormed() : bool
+    if (mStszTableEntries->count() == 0) {                      // no samples written
+        ALOGE("The number of recorded samples is 0");
+        return true;
+    }
+
+    if (!mIsAudio && mStssTableEntries->count() == 0) {  // no sync frames for video
+        ALOGE("There are no sync frames for video track");
+        return true;
+    }
+
+    if (OK != checkCodecSpecificData()) {         // no codec specific data
+        return true;
+    }
+
+    return false;
+!!!1876492.cpp!!!	sendTrackSummary(in hasMultipleTracks : bool) : void
+
+    // Send track summary only if test mode is enabled.
+    if (!isTestModeEnabled()) {
+        return;
+    }
+
+    int trackNum = (mTrackId << 28);
+
+    mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_TYPE,
+                    mIsAudio? 0: 1);
+
+    mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_DURATION_MS,
+                    mTrackDurationUs / 1000);
+
+    mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_ENCODED_FRAMES,
+                    mStszTableEntries->count());
+
+    {
+        // The system delay time excluding the requested initial delay that
+        // is used to eliminate the recording sound.
+        int64_t startTimeOffsetUs = mOwner->getStartTimeOffsetMs() * 1000LL;
+        if (startTimeOffsetUs < 0) {  // Start time offset was not set
+            startTimeOffsetUs = kInitialDelayTimeUs;
+        }
+        int64_t initialDelayUs =
+            mFirstSampleTimeRealUs - mStartTimeRealUs - startTimeOffsetUs;
+
+        mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_INITIAL_DELAY_MS,
+                    (initialDelayUs) / 1000);
+    }
+
+    mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_DATA_KBYTES,
+                    mMdatSizeBytes / 1024);
+
+    if (hasMultipleTracks) {
+        mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_MAX_CHUNK_DUR_MS,
+                    mMaxChunkDurationUs / 1000);
+
+        int64_t moovStartTimeUs = mOwner->getStartTimestampUs();
+        if (mStartTimestampUs != moovStartTimeUs) {
+            int64_t startTimeOffsetUs = mStartTimestampUs - moovStartTimeUs;
+            mOwner->notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
+                    trackNum | MEDIA_RECORDER_TRACK_INFO_START_OFFSET_MS,
+                    startTimeOffsetUs / 1000);
+        }
+    }
+!!!1876620.cpp!!!	writeStcoBox(in use32BitOffset : bool) : void
+    mOwner->beginBox(use32BitOffset? "stco": "co64");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    if (use32BitOffset) {
+        mStcoTableEntries->write(mOwner);
+    } else {
+        mCo64TableEntries->write(mOwner);
+    }
+    mOwner->endBox();  // stco or co64
+!!!1876748.cpp!!!	writeStscBox() : void
+    mOwner->beginBox("stsc");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    mStscTableEntries->write(mOwner);
+    mOwner->endBox();  // stsc
+!!!1876876.cpp!!!	writeStszBox() : void
+    mOwner->beginBox("stsz");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    mOwner->writeInt32(0);
+    mStszTableEntries->write(mOwner);
+    mOwner->endBox();  // stsz
+!!!1877004.cpp!!!	writeStssBox() : void
+    mOwner->beginBox("stss");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    mStssTableEntries->write(mOwner);
+    mOwner->endBox();  // stss
+!!!1877132.cpp!!!	writeSttsBox() : void
+    mOwner->beginBox("stts");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    uint32_t duration;
+    CHECK(mSttsTableEntries->get(duration, 1));
+    duration = htonl(duration);  // Back to host byte order
+    mSttsTableEntries->set(htonl(duration + getStartTimeOffsetScaledTime()), 1);
+    mSttsTableEntries->write(mOwner);
+    mOwner->endBox();  // stts
+!!!1877260.cpp!!!	writeCttsBox() : void
+    if (mIsAudio) {  // ctts is not for audio
+        return;
+    }
+
+    // There is no B frame at all
+    if (mMinCttsOffsetTimeUs == mMaxCttsOffsetTimeUs) {
+        return;
+    }
+
+    // Do not write ctts box when there is no need to have it.
+    if (mCttsTableEntries->count() == 0) {
+        return;
+    }
+
+    ALOGV("ctts box has %d entries with range [%lld, %lld]",
+            mCttsTableEntries->count(), mMinCttsOffsetTimeUs, mMaxCttsOffsetTimeUs);
+
+    mOwner->beginBox("ctts");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    uint32_t duration;
+    CHECK(mCttsTableEntries->get(duration, 1));
+    duration = htonl(duration);  // Back host byte order
+    mCttsTableEntries->set(htonl(duration + getStartTimeOffsetScaledTime() - mMinCttsOffsetTimeUs), 1);
+    mCttsTableEntries->write(mOwner);
+    mOwner->endBox();  // ctts
+!!!1877388.cpp!!!	writeD263Box() : void
+    mOwner->beginBox("d263");
+    mOwner->writeInt32(0);  // vendor
+    mOwner->writeInt8(0);   // decoder version
+    mOwner->writeInt8(10);  // level: 10
+    mOwner->writeInt8(0);   // profile: 0
+    mOwner->endBox();  // d263
+!!!1877516.cpp!!!	writePaspBox() : void
+    mOwner->beginBox("pasp");
+    mOwner->writeInt32(1 << 16);  // hspacing
+    mOwner->writeInt32(1 << 16);  // vspacing
+    mOwner->endBox();  // pasp
+!!!1877644.cpp!!!	writeAvccBox() : void
+    CHECK(mCodecSpecificData);
+    CHECK_GE(mCodecSpecificDataSize, 5);
+
+    // Patch avcc's lengthSize field to match the number
+    // of bytes we use to indicate the size of a nal unit.
+    uint8_t *ptr = (uint8_t *)mCodecSpecificData;
+    ptr[4] = (ptr[4] & 0xfc) | (mOwner->useNalLengthFour() ? 3 : 1);
+    mOwner->beginBox("avcC");
+    mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
+    mOwner->endBox();  // avcC
+!!!1877772.cpp!!!	writeUrlBox() : void
+    // The table index here refers to the sample description index
+    // in the sample table entries.
+    mOwner->beginBox("url ");
+    mOwner->writeInt32(1);  // version=0, flags=1 (self-contained)
+    mOwner->endBox();  // url
+!!!1877900.cpp!!!	writeDrefBox() : void
+    mOwner->beginBox("dref");
+    mOwner->writeInt32(0);  // version=0, flags=0
+    mOwner->writeInt32(1);  // entry count (either url or urn)
+    writeUrlBox();
+    mOwner->endBox();  // dref
+!!!1878028.cpp!!!	writeDinfBox() : void
+    mOwner->beginBox("dinf");
+    writeDrefBox();
+    mOwner->endBox();  // dinf
+!!!1878156.cpp!!!	writeDamrBox() : void
+    // 3gpp2 Spec AMRSampleEntry fields
+    mOwner->beginBox("damr");
+    mOwner->writeCString("   ");  // vendor: 4 bytes
+    mOwner->writeInt8(0);         // decoder version
+    mOwner->writeInt16(0x83FF);   // mode set: all enabled
+    mOwner->writeInt8(0);         // mode change period
+    mOwner->writeInt8(1);         // frames per sample
+    mOwner->endBox();
+!!!1878284.cpp!!!	writeMdhdBox(in now : uint32_t) : void
+    int64_t trakDurationUs = getDurationUs();
+    mOwner->beginBox("mdhd");
+    mOwner->writeInt32(0);             // version=0, flags=0
+    mOwner->writeInt32(now);           // creation time
+    mOwner->writeInt32(now);           // modification time
+    mOwner->writeInt32(mTimeScale);    // media timescale
+    int32_t mdhdDuration = (trakDurationUs * mTimeScale + 5E5) / 1E6;
+    mOwner->writeInt32(mdhdDuration);  // use media timescale
+    // Language follows the three letter standard ISO-639-2/T
+    // 'e', 'n', 'g' for "English", for instance.
+    // Each character is packed as the difference between its ASCII value and 0x60.
+    // For "English", these are 00101, 01110, 00111.
+    // XXX: Where is the padding bit located: 0x15C7?
+    mOwner->writeInt16(0);             // language code
+    mOwner->writeInt16(0);             // predefined
+    mOwner->endBox();
+!!!1878412.cpp!!!	writeSmhdBox() : void
+    mOwner->beginBox("smhd");
+    mOwner->writeInt32(0);           // version=0, flags=0
+    mOwner->writeInt16(0);           // balance
+    mOwner->writeInt16(0);           // reserved
+    mOwner->endBox();
+!!!1878540.cpp!!!	writeVmhdBox() : void
+    mOwner->beginBox("vmhd");
+    mOwner->writeInt32(0x01);        // version=0, flags=1
+    mOwner->writeInt16(0);           // graphics mode
+    mOwner->writeInt16(0);           // opcolor
+    mOwner->writeInt16(0);
+    mOwner->writeInt16(0);
+    mOwner->endBox();
+!!!1878668.cpp!!!	writeHdlrBox() : void
+    mOwner->beginBox("hdlr");
+    mOwner->writeInt32(0);             // version=0, flags=0
+    mOwner->writeInt32(0);             // component type: should be mhlr
+    mOwner->writeFourcc(mIsAudio ? "soun" : "vide");  // component subtype
+    mOwner->writeInt32(0);             // reserved
+    mOwner->writeInt32(0);             // reserved
+    mOwner->writeInt32(0);             // reserved
+    // Removing "r" for the name string just makes the string 4 byte aligned
+    mOwner->writeCString(mIsAudio ? "SoundHandle": "VideoHandle");  // name
+    mOwner->endBox();
+!!!1878796.cpp!!!	writeTkhdBox(in now : uint32_t) : void
+    mOwner->beginBox("tkhd");
+    // Flags = 7 to indicate that the track is enabled, and
+    // part of the presentation
+    mOwner->writeInt32(0x07);          // version=0, flags=7
+    mOwner->writeInt32(now);           // creation time
+    mOwner->writeInt32(now);           // modification time
+    mOwner->writeInt32(mTrackId);      // track id starts with 1
+    mOwner->writeInt32(0);             // reserved
+    int64_t trakDurationUs = getDurationUs();
+    int32_t mvhdTimeScale = mOwner->getTimeScale();
+    int32_t tkhdDuration =
+        (trakDurationUs * mvhdTimeScale + 5E5) / 1E6;
+    mOwner->writeInt32(tkhdDuration);  // in mvhd timescale
+    mOwner->writeInt32(0);             // reserved
+    mOwner->writeInt32(0);             // reserved
+    mOwner->writeInt16(0);             // layer
+    mOwner->writeInt16(0);             // alternate group
+    mOwner->writeInt16(mIsAudio ? 0x100 : 0);  // volume
+    mOwner->writeInt16(0);             // reserved
+
+    mOwner->writeCompositionMatrix(mRotation);       // matrix
+
+    if (mIsAudio) {
+        mOwner->writeInt32(0);
+        mOwner->writeInt32(0);
+    } else {
+        int32_t width, height;
+        bool success = mMeta->findInt32(kKeyWidth, &width);
+        success = success && mMeta->findInt32(kKeyHeight, &height);
+        CHECK(success);
+
+        mOwner->writeInt32(width << 16);   // 32-bit fixed-point value
+        mOwner->writeInt32(height << 16);  // 32-bit fixed-point value
+    }
+    mOwner->endBox();  // tkhd
+!!!1878924.cpp!!!	writeMp4aEsdsBox() : void
+    mOwner->beginBox("esds");
+    CHECK(mCodecSpecificData);
+    CHECK_GT(mCodecSpecificDataSize, 0);
+
+    // Make sure all sizes encode to a single byte.
+    CHECK_LT(mCodecSpecificDataSize + 23, 128);
+
+    mOwner->writeInt32(0);     // version=0, flags=0
+    mOwner->writeInt8(0x03);   // ES_DescrTag
+    mOwner->writeInt8(23 + mCodecSpecificDataSize);
+    mOwner->writeInt16(0x0000);// ES_ID
+    mOwner->writeInt8(0x00);
+
+    mOwner->writeInt8(0x04);   // DecoderConfigDescrTag
+    mOwner->writeInt8(15 + mCodecSpecificDataSize);
+    mOwner->writeInt8(0x40);   // objectTypeIndication ISO/IEC 14492-2
+    mOwner->writeInt8(0x15);   // streamType AudioStream
+
+    mOwner->writeInt16(0x03);  // XXX
+    mOwner->writeInt8(0x00);   // buffer size 24-bit
+    mOwner->writeInt32(96000); // max bit rate
+    mOwner->writeInt32(96000); // avg bit rate
+
+    mOwner->writeInt8(0x05);   // DecoderSpecificInfoTag
+    mOwner->writeInt8(mCodecSpecificDataSize);
+    mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
+
+    static const uint8_t kData2[] = {
+        0x06,  // SLConfigDescriptorTag
+        0x01,
+        0x02
+    };
+    mOwner->write(kData2, sizeof(kData2));
+
+    mOwner->endBox();  // esds
+!!!1879052.cpp!!!	writeMp4vEsdsBox() : void
+    CHECK(mCodecSpecificData);
+    CHECK_GT(mCodecSpecificDataSize, 0);
+    mOwner->beginBox("esds");
+
+    mOwner->writeInt32(0);    // version=0, flags=0
+
+    mOwner->writeInt8(0x03);  // ES_DescrTag
+    mOwner->writeInt8(23 + mCodecSpecificDataSize);
+    mOwner->writeInt16(0x0000);  // ES_ID
+    mOwner->writeInt8(0x1f);
+
+    mOwner->writeInt8(0x04);  // DecoderConfigDescrTag
+    mOwner->writeInt8(15 + mCodecSpecificDataSize);
+    mOwner->writeInt8(0x20);  // objectTypeIndication ISO/IEC 14492-2
+    mOwner->writeInt8(0x11);  // streamType VisualStream
+
+    static const uint8_t kData[] = {
+        0x01, 0x77, 0x00,
+        0x00, 0x03, 0xe8, 0x00,
+        0x00, 0x03, 0xe8, 0x00
+    };
+    mOwner->write(kData, sizeof(kData));
+
+    mOwner->writeInt8(0x05);  // DecoderSpecificInfoTag
+
+    mOwner->writeInt8(mCodecSpecificDataSize);
+    mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
+
+    static const uint8_t kData2[] = {
+        0x06,  // SLConfigDescriptorTag
+        0x01,
+        0x02
+    };
+    mOwner->write(kData2, sizeof(kData2));
+
+    mOwner->endBox();  // esds
+!!!1879180.cpp!!!	writeAudioFourCCBox() : void
+    const char *mime;
+    bool success = mMeta->findCString(kKeyMIMEType, &mime);
+    CHECK(success);
+    const char *fourcc = NULL;
+    if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_NB, mime)) {
+        fourcc = "samr";
+    } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_WB, mime)) {
+        fourcc = "sawb";
+    } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AAC, mime)) {
+        fourcc = "mp4a";
+    } else {
+        ALOGE("Unknown mime type '%s'.", mime);
+        CHECK(!"should not be here, unknown mime type.");
+    }
+
+    mOwner->beginBox(fourcc);        // audio format
+    mOwner->writeInt32(0);           // reserved
+    mOwner->writeInt16(0);           // reserved
+    mOwner->writeInt16(0x1);         // data ref index
+    mOwner->writeInt32(0);           // reserved
+    mOwner->writeInt32(0);           // reserved
+    int32_t nChannels;
+    CHECK_EQ(true, mMeta->findInt32(kKeyChannelCount, &nChannels));
+    mOwner->writeInt16(nChannels);   // channel count
+    mOwner->writeInt16(16);          // sample size
+    mOwner->writeInt16(0);           // predefined
+    mOwner->writeInt16(0);           // reserved
+
+    int32_t samplerate;
+    success = mMeta->findInt32(kKeySampleRate, &samplerate);
+    CHECK(success);
+    mOwner->writeInt32(samplerate << 16);
+    if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AAC, mime)) {
+        writeMp4aEsdsBox();
+    } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_NB, mime) ||
+               !strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_WB, mime)) {
+        writeDamrBox();
+    }
+    mOwner->endBox();
+!!!1879308.cpp!!!	writeVideoFourCCBox() : void
+    const char *mime;
+    bool success = mMeta->findCString(kKeyMIMEType, &mime);
+    CHECK(success);
+    if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_MPEG4, mime)) {
+        mOwner->beginBox("mp4v");
+    } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_H263, mime)) {
+        mOwner->beginBox("s263");
+    } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime)) {
+        mOwner->beginBox("avc1");
+    } else {
+        ALOGE("Unknown mime type '%s'.", mime);
+        CHECK(!"should not be here, unknown mime type.");
+    }
+
+    mOwner->writeInt32(0);           // reserved
+    mOwner->writeInt16(0);           // reserved
+    mOwner->writeInt16(1);           // data ref index
+    mOwner->writeInt16(0);           // predefined
+    mOwner->writeInt16(0);           // reserved
+    mOwner->writeInt32(0);           // predefined
+    mOwner->writeInt32(0);           // predefined
+    mOwner->writeInt32(0);           // predefined
+
+    int32_t width, height;
+    success = mMeta->findInt32(kKeyWidth, &width);
+    success = success && mMeta->findInt32(kKeyHeight, &height);
+    CHECK(success);
+
+    mOwner->writeInt16(width);
+    mOwner->writeInt16(height);
+    mOwner->writeInt32(0x480000);    // horiz resolution
+    mOwner->writeInt32(0x480000);    // vert resolution
+    mOwner->writeInt32(0);           // reserved
+    mOwner->writeInt16(1);           // frame count
+    mOwner->write("                                ", 32);
+    mOwner->writeInt16(0x18);        // depth
+    mOwner->writeInt16(-1);          // predefined
+
+    CHECK_LT(23 + mCodecSpecificDataSize, 128);
+
+    if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_MPEG4, mime)) {
+        writeMp4vEsdsBox();
+    } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_H263, mime)) {
+        writeD263Box();
+    } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime)) {
+        writeAvccBox();
+    }
+
+    writePaspBox();
+    mOwner->endBox();  // mp4v, s263 or avc1
+!!!1879436.cpp!!!	writeStblBox(in use32BitOffset : bool) : void
+    mOwner->beginBox("stbl");
+    mOwner->beginBox("stsd");
+    mOwner->writeInt32(0);               // version=0, flags=0
+    mOwner->writeInt32(1);               // entry count
+    if (mIsAudio) {
+        writeAudioFourCCBox();
+    } else {
+        writeVideoFourCCBox();
+    }
+    mOwner->endBox();  // stsd
+    writeSttsBox();
+    writeCttsBox();
+    if (!mIsAudio) {
+        writeStssBox();
+    }
+    writeStszBox();
+    writeStscBox();
+    writeStcoBox(use32BitOffset);
+    mOwner->endBox();  // stbl

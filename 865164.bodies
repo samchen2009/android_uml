@@ -1,0 +1,250 @@
+class RecoverySystem
+!!!3909772.java!!!	getTrustedCerts(inout keystore : File) : HashSet<Certificate>
+        HashSet<Certificate> trusted = new HashSet<Certificate>();
+        if (keystore == null) {
+            keystore = DEFAULT_KEYSTORE;
+        }
+        ZipFile zip = new ZipFile(keystore);
+        try {
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                InputStream is = zip.getInputStream(entry);
+                try {
+                    trusted.add(cf.generateCertificate(is));
+                } finally {
+                    is.close();
+                }
+            }
+        } finally {
+            zip.close();
+        }
+        return trusted;
+!!!3909900.java!!!	verifyPackage(inout packageFile : File, inout listener : ProgressListener, inout deviceCertsZipFile : File) : void
+        long fileLen = packageFile.length();
+
+        RandomAccessFile raf = new RandomAccessFile(packageFile, "r");
+        try {
+            int lastPercent = 0;
+            long lastPublishTime = System.currentTimeMillis();
+            if (listener != null) {
+                listener.onProgress(lastPercent);
+            }
+
+            raf.seek(fileLen - 6);
+            byte[] footer = new byte[6];
+            raf.readFully(footer);
+
+            if (footer[2] != (byte)0xff || footer[3] != (byte)0xff) {
+                throw new SignatureException("no signature in file (no footer)");
+            }
+
+            int commentSize = (footer[4] & 0xff) | ((footer[5] & 0xff) << 8);
+            int signatureStart = (footer[0] & 0xff) | ((footer[1] & 0xff) << 8);
+
+            byte[] eocd = new byte[commentSize + 22];
+            raf.seek(fileLen - (commentSize + 22));
+            raf.readFully(eocd);
+
+            // Check that we have found the start of the
+            // end-of-central-directory record.
+            if (eocd[0] != (byte)0x50 || eocd[1] != (byte)0x4b ||
+                eocd[2] != (byte)0x05 || eocd[3] != (byte)0x06) {
+                throw new SignatureException("no signature in file (bad footer)");
+            }
+
+            for (int i = 4; i < eocd.length-3; ++i) {
+                if (eocd[i  ] == (byte)0x50 && eocd[i+1] == (byte)0x4b &&
+                    eocd[i+2] == (byte)0x05 && eocd[i+3] == (byte)0x06) {
+                    throw new SignatureException("EOCD marker found after start of EOCD");
+                }
+            }
+
+            // The following code is largely copied from
+            // JarUtils.verifySignature().  We could just *call* that
+            // method here if that function didn't read the entire
+            // input (ie, the whole OTA package) into memory just to
+            // compute its message digest.
+
+            BerInputStream bis = new BerInputStream(
+                new ByteArrayInputStream(eocd, commentSize+22-signatureStart, signatureStart));
+            ContentInfo info = (ContentInfo)ContentInfo.ASN1.decode(bis);
+            SignedData signedData = info.getSignedData();
+            if (signedData == null) {
+                throw new IOException("signedData is null");
+            }
+            Collection encCerts = signedData.getCertificates();
+            if (encCerts.isEmpty()) {
+                throw new IOException("encCerts is empty");
+            }
+            // Take the first certificate from the signature (packages
+            // should contain only one).
+            Iterator it = encCerts.iterator();
+            X509Certificate cert = null;
+            if (it.hasNext()) {
+                cert = new X509CertImpl((org.apache.harmony.security.x509.Certificate)it.next());
+            } else {
+                throw new SignatureException("signature contains no certificates");
+            }
+
+            List sigInfos = signedData.getSignerInfos();
+            SignerInfo sigInfo;
+            if (!sigInfos.isEmpty()) {
+                sigInfo = (SignerInfo)sigInfos.get(0);
+            } else {
+                throw new IOException("no signer infos!");
+            }
+
+            // Check that the public key of the certificate contained
+            // in the package equals one of our trusted public keys.
+
+            HashSet<Certificate> trusted = getTrustedCerts(
+                deviceCertsZipFile == null ? DEFAULT_KEYSTORE : deviceCertsZipFile);
+
+            PublicKey signatureKey = cert.getPublicKey();
+            boolean verified = false;
+            for (Certificate c : trusted) {
+                if (c.getPublicKey().equals(signatureKey)) {
+                    verified = true;
+                    break;
+                }
+            }
+            if (!verified) {
+                throw new SignatureException("signature doesn't match any trusted key");
+            }
+
+            // The signature cert matches a trusted key.  Now verify that
+            // the digest in the cert matches the actual file data.
+
+            // The verifier in recovery *only* handles SHA1withRSA
+            // signatures.  SignApk.java always uses SHA1withRSA, no
+            // matter what the cert says to use.  Ignore
+            // cert.getSigAlgName(), and instead use whatever
+            // algorithm is used by the signature (which should be
+            // SHA1withRSA).
+
+            String da = sigInfo.getDigestAlgorithm();
+            String dea = sigInfo.getDigestEncryptionAlgorithm();
+            String alg = null;
+            if (da == null || dea == null) {
+                // fall back to the cert algorithm if the sig one
+                // doesn't look right.
+                alg = cert.getSigAlgName();
+            } else {
+                alg = da + "with" + dea;
+            }
+            Signature sig = Signature.getInstance(alg);
+            sig.initVerify(cert);
+
+            // The signature covers all of the OTA package except the
+            // archive comment and its 2-byte length.
+            long toRead = fileLen - commentSize - 2;
+            long soFar = 0;
+            raf.seek(0);
+            byte[] buffer = new byte[4096];
+            boolean interrupted = false;
+            while (soFar < toRead) {
+                interrupted = Thread.interrupted();
+                if (interrupted) break;
+                int size = buffer.length;
+                if (soFar + size > toRead) {
+                    size = (int)(toRead - soFar);
+                }
+                int read = raf.read(buffer, 0, size);
+                sig.update(buffer, 0, read);
+                soFar += read;
+
+                if (listener != null) {
+                    long now = System.currentTimeMillis();
+                    int p = (int)(soFar * 100 / toRead);
+                    if (p > lastPercent &&
+                        now - lastPublishTime > PUBLISH_PROGRESS_INTERVAL_MS) {
+                        lastPercent = p;
+                        lastPublishTime = now;
+                        listener.onProgress(lastPercent);
+                    }
+                }
+            }
+            if (listener != null) {
+                listener.onProgress(100);
+            }
+
+            if (interrupted) {
+                throw new SignatureException("verification was interrupted");
+            }
+
+            if (!sig.verify(sigInfo.getEncryptedDigest())) {
+                throw new SignatureException("signature digest verification failed");
+            }
+        } finally {
+            raf.close();
+        }
+!!!3910028.java!!!	installPackage(inout context : Context, inout packageFile : File) : void
+        String filename = packageFile.getCanonicalPath();
+        Log.w(TAG, "!!! REBOOTING TO INSTALL " + filename + " !!!");
+        String arg = "--update_package=" + filename +
+            "\n--locale=" + Locale.getDefault().toString();
+        bootCommand(context, arg);
+!!!3910156.java!!!	rebootWipeUserData(inout context : Context) : void
+        final ConditionVariable condition = new ConditionVariable();
+
+        Intent intent = new Intent("android.intent.action.MASTER_CLEAR_NOTIFICATION");
+        context.sendOrderedBroadcastAsUser(intent, UserHandle.OWNER,
+                android.Manifest.permission.MASTER_CLEAR,
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        condition.open();
+                    }
+                }, null, 0, null, null);
+
+        // Block until the ordered broadcast has completed.
+        condition.block();
+
+        bootCommand(context, "--wipe_data\n--locale=" + Locale.getDefault().toString());
+!!!3910284.java!!!	rebootWipeCache(inout context : Context) : void
+        bootCommand(context, "--wipe_cache\n--locale=" + Locale.getDefault().toString());
+!!!3910412.java!!!	bootCommand(inout context : Context, in arg : String) : void
+        RECOVERY_DIR.mkdirs();  // In case we need it
+        COMMAND_FILE.delete();  // In case it's not writable
+        LOG_FILE.delete();
+
+        FileWriter command = new FileWriter(COMMAND_FILE);
+        try {
+            command.write(arg);
+            command.write("\n");
+        } finally {
+            command.close();
+        }
+
+        // Having written the command file, go ahead and reboot
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        pm.reboot("recovery");
+
+        throw new IOException("Reboot failed (no permissions?)");
+!!!3910540.java!!!	handleAftermath() : String
+        // Record the tail of the LOG_FILE
+        String log = null;
+        try {
+            log = FileUtils.readTextFile(LOG_FILE, -LOG_FILE_MAX_LENGTH, "...\n");
+        } catch (FileNotFoundException e) {
+            Log.i(TAG, "No recovery log file");
+        } catch (IOException e) {
+            Log.e(TAG, "Error reading recovery log", e);
+        }
+
+        // Delete everything in RECOVERY_DIR except those beginning
+        // with LAST_PREFIX
+        String[] names = RECOVERY_DIR.list();
+        for (int i = 0; names != null && i < names.length; i++) {
+            if (names[i].startsWith(LAST_PREFIX)) continue;
+            File f = new File(RECOVERY_DIR, names[i]);
+            if (!f.delete()) {
+                Log.e(TAG, "Can't delete: " + f);
+            } else {
+                Log.i(TAG, "Deleted: " + f);
+            }
+        }
+
+        return log;

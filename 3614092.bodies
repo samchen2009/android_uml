@@ -1,0 +1,216 @@
+class EncoderBase
+!!!15481100.cpp!!!	encode(inout stream : char, in mn : Mnemonic, in opnds : Operands) : char
+#ifdef _DEBUG
+    if (opnds.count() > 0) {
+        if (opnds[0].is_mem()) {
+            assert(getRegKind(opnds[0].base()) != OpndKind_SReg);
+        }
+        else if (opnds.count() >1 && opnds[1].is_mem()) {
+            assert(getRegKind(opnds[1].base()) != OpndKind_SReg);
+        }
+    }
+#endif
+
+#ifdef JET_PROTO
+    char* saveStream = stream;
+#endif
+
+    const OpcodeDesc * odesc = lookup(mn, opnds);
+#if !defined(_EM64T_)
+    bool copy_opcode = true;
+    Rex *prex = NULL;
+#else
+    // We need rex if
+    //  either of registers used as operand or address form is new extended register
+    //  it's explicitly specified by opcode
+    // So, if we don't have REX in opcode but need_rex, then set rex here
+    // otherwise, wait until opcode is set, and then update REX
+
+    bool copy_opcode = true;
+    unsigned char _1st = odesc->opcode[0];
+
+    Rex *prex = (Rex*)stream;
+    if (opnds.need_rex() &&
+        ((_1st == 0x66) || (_1st == 0xF2 || _1st == 0xF3) && odesc->opcode[1] == 0x0F)) {
+        // Special processing
+        //
+        copy_opcode = false;
+        //
+        *(unsigned char*)stream = _1st;
+        ++stream;
+        //
+        prex = (Rex*)stream;
+        prex->dummy = 4;
+        prex->w = 0;
+        prex->b = 0;
+        prex->x = 0;
+        prex->r = 0;
+        ++stream;
+        //
+        memcpy(stream, &odesc->opcode[1], odesc->opcode_len-1);
+        stream += odesc->opcode_len-1;
+    }
+    else if (_1st != 0x48 && opnds.need_rex()) {
+        prex = (Rex*)stream;
+        prex->dummy = 4;
+        prex->w = 0;
+        prex->b = 0;
+        prex->x = 0;
+        prex->r = 0;
+        ++stream;
+    }
+#endif  // ifndef EM64T
+
+    if (copy_opcode) {
+        if (odesc->opcode_len==1) {
+        *(unsigned char*)stream = *(unsigned char*)&odesc->opcode;
+        }
+        else if (odesc->opcode_len==2) {
+        *(unsigned short*)stream = *(unsigned short*)&odesc->opcode;
+        }
+        else if (odesc->opcode_len==3) {
+        *(unsigned short*)stream = *(unsigned short*)&odesc->opcode;
+        *(unsigned char*)(stream+2) = odesc->opcode[2];
+        }
+        else if (odesc->opcode_len==4) {
+        *(unsigned*)stream = *(unsigned*)&odesc->opcode;
+        }
+        stream += odesc->opcode_len;
+    }
+
+    unsigned argsCount = odesc->first_opnd;
+
+    if (odesc->aux0) {
+        stream = encode_aux(stream, odesc->aux0, opnds, odesc, &argsCount, prex);
+        if (odesc->aux1) {
+            stream = encode_aux(stream, odesc->aux1, opnds, odesc, &argsCount, prex);
+        }
+    }
+#ifdef JET_PROTO
+    //saveStream
+    Inst inst;
+    unsigned len = DecoderBase::decode(saveStream, &inst);
+    assert(inst.mn == mn);
+    assert(len == (unsigned)(stream-saveStream));
+    if (mn == Mnemonic_CALL || mn == Mnemonic_JMP ||
+        Mnemonic_RET == mn ||
+        (Mnemonic_JO<=mn && mn<=Mnemonic_JG)) {
+        assert(inst.argc == opnds.count());
+
+        InstructionDisassembler idi(saveStream);
+
+        for (unsigned i=0; i<inst.argc; i++) {
+            const EncoderBase::Operand& original = opnds[i];
+            const EncoderBase::Operand& decoded = inst.operands[i];
+            assert(original.kind() == decoded.kind());
+            assert(original.size() == decoded.size());
+            if (original.is_imm()) {
+                assert(original.imm() == decoded.imm());
+                assert(idi.get_opnd(0).kind == InstructionDisassembler::Kind_Imm);
+                if (mn == Mnemonic_CALL) {
+                    assert(idi.get_type() == InstructionDisassembler::RELATIVE_CALL);
+                }
+                else if (mn == Mnemonic_JMP) {
+                    assert(idi.get_type() == InstructionDisassembler::RELATIVE_JUMP);
+                }
+                else if (mn == Mnemonic_RET) {
+                    assert(idi.get_type() == InstructionDisassembler::RET);
+                }
+                else {
+                    assert(idi.get_type() == InstructionDisassembler::RELATIVE_COND_JUMP);
+                }
+            }
+            else if (original.is_mem()) {
+                assert(original.base() == decoded.base());
+                assert(original.index() == decoded.index());
+                assert(original.scale() == decoded.scale());
+                assert(original.disp() == decoded.disp());
+                assert(idi.get_opnd(0).kind == InstructionDisassembler::Kind_Mem);
+                if (mn == Mnemonic_CALL) {
+                    assert(idi.get_type() == InstructionDisassembler::INDIRECT_CALL);
+                }
+                else if (mn == Mnemonic_JMP) {
+                    assert(idi.get_type() == InstructionDisassembler::INDIRECT_JUMP);
+                }
+                else {
+                    assert(false);
+                }
+            }
+            else {
+                assert(original.is_reg());
+                assert(original.reg() == decoded.reg());
+                assert(idi.get_opnd(0).kind == InstructionDisassembler::Kind_Reg);
+                if (mn == Mnemonic_CALL) {
+                    assert(idi.get_type() == InstructionDisassembler::INDIRECT_CALL);
+                }
+                else if (mn == Mnemonic_JMP) {
+                    assert(idi.get_type() == InstructionDisassembler::INDIRECT_JUMP);
+                }
+                else {
+                    assert(false);
+                }
+            }
+        }
+
+        Inst inst2;
+        len = DecoderBase::decode(saveStream, &inst2);
+    }
+
+ //   if(idi.get_length_with_prefix() != (int)len) {
+	//__asm { int 3 };
+ //   }
+#endif
+
+    return stream;
+!!!15481228.cpp!!!	getOpndLocation(in index : int) : char
+     assert(index < 3);
+     return curRelOpnd[index];
+!!!15481356.cpp!!!	nops(inout stream : char, in howMany : uint) : char
+    // Recommended multi-byte NOPs from the Intel architecture manual
+    static const unsigned char nops[10][9] = {
+        { 0, },                                                     // 0, this line is dummy and not used in the loop below
+        { 0x90, },                                                  // 1-byte NOP
+        { 0x66, 0x90, },                                            // 2
+        { 0x0F, 0x1F, 0x00, },                                      // 3
+        { 0x0F, 0x1F, 0x40, 0x00, },                                // 4
+        { 0x0F, 0x1F, 0x44, 0x00, 0x00, },                          // 5
+        { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00, },                    // 6
+        { 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00, },              // 7
+        { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, },        // 8
+        { 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 9-byte NOP
+    };
+
+    // Start from delivering the longest possible NOPs, then proceed with shorter ones
+    for (unsigned nopSize=9; nopSize!=0; nopSize--) {
+        while(howMany>=nopSize) {
+            const unsigned char* nopBytes = nops[nopSize];
+            for (unsigned i=0; i<nopSize; i++) {
+                stream[i] = nopBytes[i];
+            }
+            stream += nopSize;
+            howMany -= nopSize;
+        }
+    }
+    char* end = stream + howMany;
+    return end;
+!!!15481484.cpp!!!	prefix(inout stream : char, in pref : InstPrefix) : char
+    if (pref== InstPrefix_Null) {
+        // nothing to do
+        return stream;
+    }
+    *stream = (char)pref;
+    return stream + 1;
+!!!15481612.cpp!!!	extAllowed(in opndExt : OpndExt, in instExt : OpndExt) : bool
+    if (instExt == opndExt || instExt == OpndExt_Any || opndExt == OpndExt_Any) {
+            return true;
+    }
+//asm("int3");
+assert(0);
+    return false;
+!!!15481868.cpp!!!	str2mnemonic(in mn_name : char) : Mnemonic
+    for (unsigned m = 1; m<Mnemonic_Count; m++) {
+        if (!strcmpi(mnemonics[m].name, mn_name)) {
+            return (Mnemonic)m;
+        }
+    }
+    return Mnemonic_Null;

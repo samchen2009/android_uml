@@ -1,0 +1,375 @@
+class PIPService
+!!!12734476.java!!!	onCreate() : void
+        super.onCreate();
+        mLog.d("onCreate");
+
+        // This is sort of a hack; we create a connection to ourselves, to
+        // prevent the system from killing us when there are no other active
+        // clients.
+        mSelfConnection = new PIPServiceConnection(this);
+        mSelfConnection.connect();
+
+        Resources res = this.getResources();
+        mDefaultOffset = new Point(res.getDimensionPixelOffset(R.dimen.pip_offset_x),
+                res.getDimensionPixelOffset(R.dimen.pip_offset_y));
+        mSmallSize = new Size(res.getDimensionPixelSize(R.dimen.pip_small_width),
+                res.getDimensionPixelSize(R.dimen.pip_small_height));
+        mLargeSize = new Size(res.getDimensionPixelSize(R.dimen.pip_large_width),
+                res.getDimensionPixelSize(R.dimen.pip_large_height));
+
+        DisplayMetrics display = res.getDisplayMetrics();
+        mScreenDensity = display.density;
+        mScreenSize = new Size(display.widthPixels, display.heightPixels);
+
+        mWindowMgr = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+        mCurrentGeometry = new WindowGeometry(PIPConstants.TOP_RIGHT, mSmallSize,
+                mDefaultOffset);
+
+        mWindowParams = new WindowManager.LayoutParams(
+                mCurrentGeometry.size.width,
+                mCurrentGeometry.size.height,
+                mCurrentGeometry.offset.x,
+                mCurrentGeometry.offset.y,
+                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
+                mFlags,
+                PixelFormat.TRANSPARENT);
+
+        mWindowParams.gravity = (Gravity.TOP | Gravity.RIGHT);
+
+        mPipWindow = new PIPWindow(this) {
+                @Override
+                protected void onMoveTo(int position) {
+                    updateGeometry(null, position, mDefaultOffset);
+                }
+
+                @Override
+                protected void onResize() {
+                    int curSize = mCurrentGeometry.getSizeType();
+                    Size newSize = new Size((curSize == PIPConstants.SMALL) ?
+                            mLargeSize : mSmallSize);
+                    mLog.d("curSize is " + curSize + " and resizing to " + newSize);
+                    updateGeometry(newSize, -1, mDefaultOffset);
+                }
+
+                @Override
+                protected void onClose() {
+                    setWindowVisible(false, false);
+                }
+
+                @Override
+                protected void onFullScreen() {
+                    setWindowVisible(false, false);
+                    startActivity(new Intent(Intent.ACTION_VIEW)
+                            .setData(getPassthroughUri())
+                            .putExtra(TvPlayerConstants.EXTRA_FROM_PIP, true)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                }
+            };
+
+
+        mMediaView = mPipWindow.getMediaView();
+        mMediaView.setOptions(MediaDevicesSessionOptions.AUTO_REACQUIRE
+                | MediaDevicesSessionOptions.KEEP_SCREEN_ON_WHILE_PLAYING);
+
+        mMediaView.setDelegate(new MediaDeviceView.BasicDelegate() {
+                @Override
+                public void onDeviceAcquired(Device device) {
+                    mDeviceHistory.addEntry(device);
+                    mMediaView.reportState(new ClientState.Builder(VISIBLE)
+                            .set(PINNED, true)
+                            .set(FOCUSED, false)
+                            .build());
+                }
+
+                @Override
+                public void onDeviceReleased(DeviceDisconnectReason reason) {
+                    mLog.w("Hiding PIP window due to loss of media device: " + reason);
+                    setWindowVisible(false, false);
+                }
+
+                @Override
+                public void onMediaUriUnavailable(
+                        final Uri uri, final MediaUriUnavailableReason reason) {
+                    setWindowVisible(false, false);
+                    startActivity(new Intent(Intent.ACTION_VIEW)
+                            .setData(getPassthroughUri())
+                            .putExtra(TvPlayerConstants.EXTRA_FROM_PIP, true)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                }
+            });
+
+        mAudioFocusHelper = new AudioFocusHelper(this, mMediaView);
+
+        mPipWindow.setVisibility(View.GONE);
+        mPipWindow.updateResizeButton(mCurrentGeometry.getSizeType());
+        mPipWindow.updateMoveButtons(mCurrentGeometry.position);
+        mWindowMgr.addView(mPipWindow, mWindowParams);
+
+        mHandler = new Handler();
+        mDeviceHistory = new DeviceHistory(this);
+
+        // Prevents the service from being killed after 30 minutes
+        Notification status = new Notification();
+        status.flags |= Notification.FLAG_ONGOING_EVENT;
+        status.contentIntent = PendingIntent.getActivity(this, 0, new Intent(getPackageName())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), 0);
+        startForeground(PIPSERVICE_STATUS, status);
+!!!12734604.java!!!	onDestroy() : void
+        mLog.d("onDestroy");
+
+        mAudioFocusHelper.releaseAudioFocus();
+        mAudioFocusHelper.dispose();
+        mAudioFocusHelper = null;
+
+        mWindowMgr.removeView(mPipWindow);
+        mMediaView.disconnect();
+
+        mSelfConnection.disconnect();
+        mSelfConnection = null;
+
+        mDeviceHistory = null;
+
+        super.onDestroy();
+!!!12734732.java!!!	onBind(inout intent : Intent) : IBinder
+
+        if (PIPConstants.ACTION_BIND_PIP_SERVICE.equals(intent.getAction())) {
+            return new IPIPService.Stub() {
+                    private WindowGeometry mSavedGeometry = null;
+
+                    @Override
+                    public void setWindowVisible(final boolean visible) {
+                        mHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    PIPService.this.setWindowVisible(visible, false);
+                                }
+                            });
+                    }
+
+                    @Override
+                    public void setWindowVisibleWithAudioFocus(final boolean visible) {
+                        mHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    PIPService.this.setWindowVisible(visible, true);
+                                }
+                            });
+                    }
+
+                    @Override
+                    public boolean isWindowVisible() {
+                        return PIPService.this.isWindowVisible();
+                    }
+
+                    @Override
+                    public boolean setWindowGeometry(final int width, final int height,
+                            final int position, final int x, final int y) {
+                        return PIPService.this.setWindowGeometry(width, height, position, x, y);
+                    }
+
+                    @Override
+                    public void saveWindowGeometry() {
+                        if (mSavedGeometry == null) {
+                            mSavedGeometry = new WindowGeometry(mCurrentGeometry);
+                        } else {
+                            mSavedGeometry.copyFrom(mCurrentGeometry);
+                        }
+                    }
+
+                    @Override
+                    public void restoreWindowGeometry() {
+                        mLog.d("restoreWindowGeometry; saved=" + mSavedGeometry);
+                        if (mSavedGeometry != null) {
+                            updateGeometryAsync(mSavedGeometry.size, mSavedGeometry.position,
+                                    mSavedGeometry.offset);
+                            mSavedGeometry = null;
+                        }
+                    }
+
+                    @Override
+                    public boolean setWindowPosition(int position) {
+                        if ((position < PIPConstants.TOP_RIGHT)
+                                || (position > PIPConstants.TOP_LEFT)) {
+                            return false;
+                        }
+
+                        updateGeometryAsync(null, position, mDefaultOffset);
+                        return true;
+                    }
+
+                    @Override
+                    public int getWindowPosition() {
+                        return mCurrentGeometry.position;
+                    }
+
+                    @Override
+                    public boolean setWindowSize(int size) {
+                        Size newSize = null;
+
+                        switch (size) {
+                            case PIPConstants.SMALL:
+                                newSize = new Size(mSmallSize);
+                                break;
+
+                            case PIPConstants.LARGE:
+                                newSize = new Size(mLargeSize);
+                                break;
+
+                            default:
+                                return false;
+                        }
+
+                        updateGeometryAsync(newSize, -1, null);
+                        return true;
+                    }
+
+                    @Override
+                    public int getWindowSize() {
+                        return mCurrentGeometry.getSizeType();
+                    }
+
+                    @Override
+                    public void setCurrentDevice(final String deviceId) {
+                        mHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    PIPService.this.setCurrentDevice(deviceId);
+                                }
+                            });
+                    }
+
+                    @Override
+                    public void setMediaUri(final Uri mediaUri) {
+                        mHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    PIPService.this.setMediaUri(mediaUri);
+                                }
+                            });
+                    }
+                };
+        } else {
+            mLog.e("Invalid action: " + intent.getAction());
+            return null;
+        }
+!!!12734860.java!!!	getPassthroughUri() : Uri
+        final String deviceId = mDeviceHistory.getLatestDeviceId();
+        Uri uri = TvUriUtils.PASSTHROUGH_URI;
+        if (deviceId != null) {
+            uri = TvUriUtils.addDeviceId(uri, deviceId);
+        }
+        return uri;
+!!!12734988.java!!!	setWindowVisible(inout visible : boolean, inout takeAudioFocus : boolean) : void
+        if (mPipWindow == null) return;
+
+        final boolean wasVisible = isWindowVisible();
+        if (wasVisible == visible) return;  // There's nothing to do.
+
+        mLog.d("setting window visibility to " + visible + ", takeAudioFocus=" + takeAudioFocus);
+        // TODO(mlindner): Maybe do a fade like the old PIP window does.
+        mPipWindow.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (visible) {
+            if (!mMediaView.isConnected()) {
+                mMediaView.connect();
+            }
+
+            // Tune to the latest device that TvPlayer has used.
+            mMediaView.setMediaUri(getPassthroughUri());
+
+            mLog.d("starting playback");
+            mMediaView.startPlayback();
+
+            mLog.d("grabbing focus");
+            mAudioFocusHelper.grabAudioFocus();
+        } else {
+            mMediaView.reportState(new ClientState.Builder().build());
+            mMediaView.stopPlayback();
+            mAudioFocusHelper.releaseAudioFocus();
+        }
+
+        // Broadcast the state change.
+        Intent intent = new Intent(visible ? PIPConstants.ACTION_PIP_SHOWN
+                : PIPConstants.ACTION_PIP_HIDDEN);
+        sendBroadcast(intent);
+!!!12735116.java!!!	isWindowVisible() : boolean
+        return (mPipWindow != null) && (mPipWindow.getVisibility() == View.VISIBLE);
+!!!12735244.java!!!	setWindowGeometry(in width : int, in height : int, in position : int, in xOffset : int, in yOffset : int) : boolean
+        // Convert dip to px
+        width *= mScreenDensity;
+        height *= mScreenDensity;
+        xOffset *= mScreenDensity;
+        yOffset *= mScreenDensity;
+
+        if ((width < 0) || (width > mScreenSize.width)
+                || (height < 0) || (height > mScreenSize.height)
+                || (position < PIPConstants.TOP_RIGHT) || (position > PIPConstants.TOP_LEFT)
+                || (xOffset < 0) || (xOffset > mScreenSize.width - width)
+                || (yOffset < 0) || (yOffset > mScreenSize.height - height)) {
+            return false;
+        }
+
+        updateGeometryAsync(new Size(width, height), position, new Point(xOffset, yOffset));
+        return true;
+!!!12735372.java!!!	setCurrentDevice(in deviceId : String) : void
+        mMediaUri = TvUriUtils.addDeviceId(TvUriUtils.PASSTHROUGH_URI, deviceId);
+        mMediaView.setMediaUri(mMediaUri);
+!!!12735500.java!!!	setMediaUri(inout mediaUri : Uri) : void
+        if (TvUriUtils.isTvUri(mediaUri)) {
+            mMediaUri = mediaUri;
+            mMediaView.setMediaUri(mMediaUri);
+        }
+!!!12735628.java!!!	updateGeometryAsync(in size : Size, in position : int, in offset : Point) : void
+        mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    updateGeometry(size, position, offset);
+                }
+            });
+!!!12735756.java!!!	updateGeometry(in size : Size, in position : int, in offset : Point) : void
+        if (size != null) {
+            mCurrentGeometry.setSize(size);
+            mWindowParams.width = size.width;
+            mWindowParams.height = size.height;
+            mPipWindow.updateResizeButton(mCurrentGeometry.getSizeType());
+        }
+
+        if (offset != null) {
+            mCurrentGeometry.setOffset(offset);
+            mWindowParams.x = offset.x;
+            mWindowParams.y = offset.y;
+        }
+
+        if (position != -1) {
+            mCurrentGeometry.position = position;
+
+            int gravity = -1;
+            switch (position) {
+                case PIPConstants.TOP_RIGHT:
+                    gravity = (Gravity.TOP | Gravity.RIGHT);
+                    break;
+
+                case PIPConstants.BOTTOM_RIGHT:
+                    gravity = (Gravity.BOTTOM | Gravity.RIGHT);
+                    break;
+
+                case PIPConstants.BOTTOM_LEFT:
+                    gravity = (Gravity.BOTTOM | Gravity.LEFT);
+                    break;
+
+                case PIPConstants.TOP_LEFT:
+                    gravity = (Gravity.TOP | Gravity.LEFT);
+                    break;
+
+                default:
+                    break;
+            }
+
+            mPipWindow.updateMoveButtons(mCurrentGeometry.position);
+
+            if (gravity != -1) {
+                mWindowParams.gravity = gravity;
+            }
+        }
+
+        mWindowMgr.updateViewLayout(mPipWindow, mWindowParams);

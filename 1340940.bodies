@@ -1,0 +1,445 @@
+class PerformBackupTask
+!!!8044300.java!!!	PerformBackupTask(inout transport : IBackupTransport, inout queue : ArrayList<BackupRequest>, inout journal : File)
+            mTransport = transport;
+            mOriginalQueue = queue;
+            mJournal = journal;
+
+            try {
+                mStateDir = new File(mBaseStateDir, transport.transportDirName());
+            } catch (RemoteException e) {
+                // can't happen; the transport is local
+            }
+
+            mCurrentState = BackupState.INITIAL;
+            mFinished = false;
+
+            addBackupTrace("STATE => INITIAL");
+!!!8044428.java!!!	execute() : void
+            switch (mCurrentState) {
+                case INITIAL:
+                    beginBackup();
+                    break;
+
+                case RUNNING_QUEUE:
+                    invokeNextAgent();
+                    break;
+
+                case FINAL:
+                    if (!mFinished) finalizeBackup();
+                    else {
+                        Slog.e(TAG, "Duplicate finish");
+                    }
+                    mFinished = true;
+                    break;
+            }
+!!!8044556.java!!!	beginBackup() : void
+            if (DEBUG_BACKUP_TRACE) {
+                clearBackupTrace();
+                StringBuilder b = new StringBuilder(256);
+                b.append("beginBackup: [");
+                for (BackupRequest req : mOriginalQueue) {
+                    b.append(' ');
+                    b.append(req.packageName);
+                }
+                b.append(" ]");
+                addBackupTrace(b.toString());
+            }
+
+            mStatus = BackupConstants.TRANSPORT_OK;
+
+            // Sanity check: if the queue is empty we have no work to do.
+            if (mOriginalQueue.isEmpty()) {
+                Slog.w(TAG, "Backup begun with an empty queue - nothing to do.");
+                addBackupTrace("queue empty at begin");
+                executeNextState(BackupState.FINAL);
+                return;
+            }
+
+            // We need to retain the original queue contents in case of transport
+            // failure, but we want a working copy that we can manipulate along
+            // the way.
+            mQueue = (ArrayList<BackupRequest>) mOriginalQueue.clone();
+
+            if (DEBUG) Slog.v(TAG, "Beginning backup of " + mQueue.size() + " targets");
+
+            File pmState = new File(mStateDir, PACKAGE_MANAGER_SENTINEL);
+            try {
+                final String transportName = mTransport.transportDirName();
+                EventLog.writeEvent(EventLogTags.BACKUP_START, transportName);
+
+                // If we haven't stored package manager metadata yet, we must init the transport.
+                if (mStatus == BackupConstants.TRANSPORT_OK && pmState.length() <= 0) {
+                    Slog.i(TAG, "Initializing (wiping) backup state and transport storage");
+                    addBackupTrace("initializing transport " + transportName);
+                    resetBackupState(mStateDir);  // Just to make sure.
+                    mStatus = mTransport.initializeDevice();
+
+                    addBackupTrace("transport.initializeDevice() == " + mStatus);
+                    if (mStatus == BackupConstants.TRANSPORT_OK) {
+                        EventLog.writeEvent(EventLogTags.BACKUP_INITIALIZE);
+                    } else {
+                        EventLog.writeEvent(EventLogTags.BACKUP_TRANSPORT_FAILURE, "(initialize)");
+                        Slog.e(TAG, "Transport error in initializeDevice()");
+                    }
+                }
+
+                // The package manager doesn't have a proper <application> etc, but since
+                // it's running here in the system process we can just set up its agent
+                // directly and use a synthetic BackupRequest.  We always run this pass
+                // because it's cheap and this way we guarantee that we don't get out of
+                // step even if we're selecting among various transports at run time.
+                if (mStatus == BackupConstants.TRANSPORT_OK) {
+                    PackageManagerBackupAgent pmAgent = new PackageManagerBackupAgent(
+                            mPackageManager, allAgentPackages());
+                    mStatus = invokeAgentForBackup(PACKAGE_MANAGER_SENTINEL,
+                            IBackupAgent.Stub.asInterface(pmAgent.onBind()), mTransport);
+                    addBackupTrace("PMBA invoke: " + mStatus);
+                }
+
+                if (mStatus == BackupConstants.TRANSPORT_NOT_INITIALIZED) {
+                    // The backend reports that our dataset has been wiped.  Note this in
+                    // the event log; the no-success code below will reset the backup
+                    // state as well.
+                    EventLog.writeEvent(EventLogTags.BACKUP_RESET, mTransport.transportDirName());
+                }
+            } catch (Exception e) {
+                Slog.e(TAG, "Error in backup thread", e);
+                addBackupTrace("Exception in backup thread: " + e);
+                mStatus = BackupConstants.TRANSPORT_ERROR;
+            } finally {
+                // If we've succeeded so far, invokeAgentForBackup() will have run the PM
+                // metadata and its completion/timeout callback will continue the state
+                // machine chain.  If it failed that won't happen; we handle that now.
+                addBackupTrace("exiting prelim: " + mStatus);
+                if (mStatus != BackupConstants.TRANSPORT_OK) {
+                    // if things went wrong at this point, we need to
+                    // restage everything and try again later.
+                    resetBackupState(mStateDir);  // Just to make sure.
+                    executeNextState(BackupState.FINAL);
+                }
+            }
+!!!8044684.java!!!	invokeNextAgent() : void
+            mStatus = BackupConstants.TRANSPORT_OK;
+            addBackupTrace("invoke q=" + mQueue.size());
+
+            // Sanity check that we have work to do.  If not, skip to the end where
+            // we reestablish the wakelock invariants etc.
+            if (mQueue.isEmpty()) {
+                if (DEBUG) Slog.i(TAG, "queue now empty");
+                executeNextState(BackupState.FINAL);
+                return;
+            }
+
+            // pop the entry we're going to process on this step
+            BackupRequest request = mQueue.get(0);
+            mQueue.remove(0);
+
+            Slog.d(TAG, "starting agent for backup of " + request);
+            addBackupTrace("launch agent for " + request.packageName);
+
+            // Verify that the requested app exists; it might be something that
+            // requested a backup but was then uninstalled.  The request was
+            // journalled and rather than tamper with the journal it's safer
+            // to sanity-check here.  This also gives us the classname of the
+            // package's backup agent.
+            try {
+                mCurrentPackage = mPackageManager.getPackageInfo(request.packageName,
+                        PackageManager.GET_SIGNATURES);
+                if (mCurrentPackage.applicationInfo.backupAgentName == null) {
+                    // The manifest has changed but we had a stale backup request pending.
+                    // This won't happen again because the app won't be requesting further
+                    // backups.
+                    Slog.i(TAG, "Package " + request.packageName
+                            + " no longer supports backup; skipping");
+                    addBackupTrace("skipping - no agent, completion is noop");
+                    executeNextState(BackupState.RUNNING_QUEUE);
+                    return;
+                }
+
+                IBackupAgent agent = null;
+                try {
+                    mWakelock.setWorkSource(new WorkSource(mCurrentPackage.applicationInfo.uid));
+                    agent = bindToAgentSynchronous(mCurrentPackage.applicationInfo,
+                            IApplicationThread.BACKUP_MODE_INCREMENTAL);
+                    addBackupTrace("agent bound; a? = " + (agent != null));
+                    if (agent != null) {
+                        mStatus = invokeAgentForBackup(request.packageName, agent, mTransport);
+                        // at this point we'll either get a completion callback from the
+                        // agent, or a timeout message on the main handler.  either way, we're
+                        // done here as long as we're successful so far.
+                    } else {
+                        // Timeout waiting for the agent
+                        mStatus = BackupConstants.AGENT_ERROR;
+                    }
+                } catch (SecurityException ex) {
+                    // Try for the next one.
+                    Slog.d(TAG, "error in bind/backup", ex);
+                    mStatus = BackupConstants.AGENT_ERROR;
+                            addBackupTrace("agent SE");
+                }
+            } catch (NameNotFoundException e) {
+                Slog.d(TAG, "Package does not exist; skipping");
+                addBackupTrace("no such package");
+                mStatus = BackupConstants.AGENT_UNKNOWN;
+            } finally {
+                mWakelock.setWorkSource(null);
+
+                // If there was an agent error, no timeout/completion handling will occur.
+                // That means we need to direct to the next state ourselves.
+                if (mStatus != BackupConstants.TRANSPORT_OK) {
+                    BackupState nextState = BackupState.RUNNING_QUEUE;
+
+                    // An agent-level failure means we reenqueue this one agent for
+                    // a later retry, but otherwise proceed normally.
+                    if (mStatus == BackupConstants.AGENT_ERROR) {
+                        if (MORE_DEBUG) Slog.i(TAG, "Agent failure for " + request.packageName
+                                + " - restaging");
+                        dataChangedImpl(request.packageName);
+                        mStatus = BackupConstants.TRANSPORT_OK;
+                        if (mQueue.isEmpty()) nextState = BackupState.FINAL;
+                    } else if (mStatus == BackupConstants.AGENT_UNKNOWN) {
+                        // Failed lookup of the app, so we couldn't bring up an agent, but
+                        // we're otherwise fine.  Just drop it and go on to the next as usual.
+                        mStatus = BackupConstants.TRANSPORT_OK;
+                    } else {
+                        // Transport-level failure means we reenqueue everything
+                        revertAndEndBackup();
+                        nextState = BackupState.FINAL;
+                    }
+
+                    executeNextState(nextState);
+                } else {
+                    addBackupTrace("expecting completion/timeout callback");
+                }
+            }
+!!!8044812.java!!!	finalizeBackup() : void
+            addBackupTrace("finishing");
+
+            // Either backup was successful, in which case we of course do not need
+            // this pass's journal any more; or it failed, in which case we just
+            // re-enqueued all of these packages in the current active journal.
+            // Either way, we no longer need this pass's journal.
+            if (mJournal != null && !mJournal.delete()) {
+                Slog.e(TAG, "Unable to remove backup journal file " + mJournal);
+            }
+
+            // If everything actually went through and this is the first time we've
+            // done a backup, we can now record what the current backup dataset token
+            // is.
+            if ((mCurrentToken == 0) && (mStatus == BackupConstants.TRANSPORT_OK)) {
+                addBackupTrace("success; recording token");
+                try {
+                    mCurrentToken = mTransport.getCurrentRestoreSet();
+                } catch (RemoteException e) {} // can't happen
+                writeRestoreTokens();
+            }
+
+            // Set up the next backup pass - at this point we can set mBackupRunning
+            // to false to allow another pass to fire, because we're done with the
+            // state machine sequence and the wakelock is refcounted.
+            synchronized (mQueueLock) {
+                mBackupRunning = false;
+                if (mStatus == BackupConstants.TRANSPORT_NOT_INITIALIZED) {
+                    // Make sure we back up everything and perform the one-time init
+                    clearMetadata();
+                    if (DEBUG) Slog.d(TAG, "Server requires init; rerunning");
+                    addBackupTrace("init required; rerunning");
+                    backupNow();
+                }
+            }
+
+            // Only once we're entirely finished do we release the wakelock
+            clearBackupTrace();
+            Slog.i(TAG, "Backup pass finished.");
+            mWakelock.release();
+!!!8044940.java!!!	clearMetadata() : void
+            final File pmState = new File(mStateDir, PACKAGE_MANAGER_SENTINEL);
+            if (pmState.exists()) pmState.delete();
+!!!8045068.java!!!	invokeAgentForBackup(in packageName : String, inout agent : IBackupAgent, inout transport : IBackupTransport) : int
+            if (DEBUG) Slog.d(TAG, "invokeAgentForBackup on " + packageName);
+            addBackupTrace("invoking " + packageName);
+
+            mSavedStateName = new File(mStateDir, packageName);
+            mBackupDataName = new File(mDataDir, packageName + ".data");
+            mNewStateName = new File(mStateDir, packageName + ".new");
+
+            mSavedState = null;
+            mBackupData = null;
+            mNewState = null;
+
+            final int token = generateToken();
+            try {
+                // Look up the package info & signatures.  This is first so that if it
+                // throws an exception, there's no file setup yet that would need to
+                // be unraveled.
+                if (packageName.equals(PACKAGE_MANAGER_SENTINEL)) {
+                    // The metadata 'package' is synthetic; construct one and make
+                    // sure our global state is pointed at it
+                    mCurrentPackage = new PackageInfo();
+                    mCurrentPackage.packageName = packageName;
+                }
+
+                // In a full backup, we pass a null ParcelFileDescriptor as
+                // the saved-state "file". This is by definition an incremental,
+                // so we build a saved state file to pass.
+                mSavedState = ParcelFileDescriptor.open(mSavedStateName,
+                        ParcelFileDescriptor.MODE_READ_ONLY |
+                        ParcelFileDescriptor.MODE_CREATE);  // Make an empty file if necessary
+
+                mBackupData = ParcelFileDescriptor.open(mBackupDataName,
+                        ParcelFileDescriptor.MODE_READ_WRITE |
+                        ParcelFileDescriptor.MODE_CREATE |
+                        ParcelFileDescriptor.MODE_TRUNCATE);
+
+                mNewState = ParcelFileDescriptor.open(mNewStateName,
+                        ParcelFileDescriptor.MODE_READ_WRITE |
+                        ParcelFileDescriptor.MODE_CREATE |
+                        ParcelFileDescriptor.MODE_TRUNCATE);
+
+                // Initiate the target's backup pass
+                addBackupTrace("setting timeout");
+                prepareOperationTimeout(token, TIMEOUT_BACKUP_INTERVAL, this);
+                addBackupTrace("calling agent doBackup()");
+                agent.doBackup(mSavedState, mBackupData, mNewState, token, mBackupManagerBinder);
+            } catch (Exception e) {
+                Slog.e(TAG, "Error invoking for backup on " + packageName);
+                addBackupTrace("exception: " + e);
+                EventLog.writeEvent(EventLogTags.BACKUP_AGENT_FAILURE, packageName,
+                        e.toString());
+                agentErrorCleanup();
+                return BackupConstants.AGENT_ERROR;
+            }
+
+            // At this point the agent is off and running.  The next thing to happen will
+            // either be a callback from the agent, at which point we'll process its data
+            // for transport, or a timeout.  Either way the next phase will happen in
+            // response to the TimeoutHandler interface callbacks.
+            addBackupTrace("invoke success");
+            return BackupConstants.TRANSPORT_OK;
+!!!8045196.java!!!	operationComplete() : void
+            // Okay, the agent successfully reported back to us.  Spin the data off to the
+            // transport and proceed with the next stage.
+            if (MORE_DEBUG) Slog.v(TAG, "operationComplete(): sending data to transport for "
+                    + mCurrentPackage.packageName);
+            mBackupHandler.removeMessages(MSG_TIMEOUT);
+            clearAgentState();
+            addBackupTrace("operation complete");
+
+            ParcelFileDescriptor backupData = null;
+            mStatus = BackupConstants.TRANSPORT_OK;
+            try {
+                int size = (int) mBackupDataName.length();
+                if (size > 0) {
+                    if (mStatus == BackupConstants.TRANSPORT_OK) {
+                        backupData = ParcelFileDescriptor.open(mBackupDataName,
+                                ParcelFileDescriptor.MODE_READ_ONLY);
+                        addBackupTrace("sending data to transport");
+                        mStatus = mTransport.performBackup(mCurrentPackage, backupData);
+                    }
+
+                    // TODO - We call finishBackup() for each application backed up, because
+                    // we need to know now whether it succeeded or failed.  Instead, we should
+                    // hold off on finishBackup() until the end, which implies holding off on
+                    // renaming *all* the output state files (see below) until that happens.
+
+                    addBackupTrace("data delivered: " + mStatus);
+                    if (mStatus == BackupConstants.TRANSPORT_OK) {
+                        addBackupTrace("finishing op on transport");
+                        mStatus = mTransport.finishBackup();
+                        addBackupTrace("finished: " + mStatus);
+                    }
+                } else {
+                    if (DEBUG) Slog.i(TAG, "no backup data written; not calling transport");
+                    addBackupTrace("no data to send");
+                }
+
+                // After successful transport, delete the now-stale data
+                // and juggle the files so that next time we supply the agent
+                // with the new state file it just created.
+                if (mStatus == BackupConstants.TRANSPORT_OK) {
+                    mBackupDataName.delete();
+                    mNewStateName.renameTo(mSavedStateName);
+                    EventLog.writeEvent(EventLogTags.BACKUP_PACKAGE,
+                            mCurrentPackage.packageName, size);
+                    logBackupComplete(mCurrentPackage.packageName);
+                } else {
+                    EventLog.writeEvent(EventLogTags.BACKUP_TRANSPORT_FAILURE,
+                            mCurrentPackage.packageName);
+                }
+            } catch (Exception e) {
+                Slog.e(TAG, "Transport error backing up " + mCurrentPackage.packageName, e);
+                EventLog.writeEvent(EventLogTags.BACKUP_TRANSPORT_FAILURE,
+                        mCurrentPackage.packageName);
+                mStatus = BackupConstants.TRANSPORT_ERROR;
+            } finally {
+                try { if (backupData != null) backupData.close(); } catch (IOException e) {}
+            }
+
+            // If we encountered an error here it's a transport-level failure.  That
+            // means we need to halt everything and reschedule everything for next time.
+            final BackupState nextState;
+            if (mStatus != BackupConstants.TRANSPORT_OK) {
+                revertAndEndBackup();
+                nextState = BackupState.FINAL;
+            } else {
+                // Success!  Proceed with the next app if any, otherwise we're done.
+                nextState = (mQueue.isEmpty()) ? BackupState.FINAL : BackupState.RUNNING_QUEUE;
+            }
+
+            executeNextState(nextState);
+!!!8045324.java!!!	handleTimeout() : void
+            // Whoops, the current agent timed out running doBackup().  Tidy up and restage
+            // it for the next time we run a backup pass.
+            // !!! TODO: keep track of failure counts per agent, and blacklist those which
+            // fail repeatedly (i.e. have proved themselves to be buggy).
+            Slog.e(TAG, "Timeout backing up " + mCurrentPackage.packageName);
+            EventLog.writeEvent(EventLogTags.BACKUP_AGENT_FAILURE, mCurrentPackage.packageName,
+                    "timeout");
+            addBackupTrace("timeout of " + mCurrentPackage.packageName);
+            agentErrorCleanup();
+            dataChangedImpl(mCurrentPackage.packageName);
+!!!8045452.java!!!	revertAndEndBackup() : void
+            if (MORE_DEBUG) Slog.i(TAG, "Reverting backup queue - restaging everything");
+            addBackupTrace("transport error; reverting");
+            for (BackupRequest request : mOriginalQueue) {
+                dataChangedImpl(request.packageName);
+            }
+            // We also want to reset the backup schedule based on whatever
+            // the transport suggests by way of retry/backoff time.
+            restartBackupAlarm();
+!!!8045580.java!!!	agentErrorCleanup() : void
+            mBackupDataName.delete();
+            mNewStateName.delete();
+            clearAgentState();
+
+            executeNextState(mQueue.isEmpty() ? BackupState.FINAL : BackupState.RUNNING_QUEUE);
+!!!8045708.java!!!	clearAgentState() : void
+            try { if (mSavedState != null) mSavedState.close(); } catch (IOException e) {}
+            try { if (mBackupData != null) mBackupData.close(); } catch (IOException e) {}
+            try { if (mNewState != null) mNewState.close(); } catch (IOException e) {}
+            mSavedState = mBackupData = mNewState = null;
+            synchronized (mCurrentOpLock) {
+                mCurrentOperations.clear();
+            }
+
+            // If this was a pseudopackage there's no associated Activity Manager state
+            if (mCurrentPackage.applicationInfo != null) {
+                addBackupTrace("unbinding " + mCurrentPackage.packageName);
+                try {  // unbind even on timeout, just in case
+                    mActivityManager.unbindBackupAgent(mCurrentPackage.applicationInfo);
+                } catch (RemoteException e) {}
+            }
+!!!8045836.java!!!	restartBackupAlarm() : void
+            addBackupTrace("setting backup trigger");
+            synchronized (mQueueLock) {
+                try {
+                    startBackupAlarmsLocked(mTransport.requestBackupTime());
+                } catch (RemoteException e) { /* cannot happen */ }
+            }
+!!!8045964.java!!!	executeNextState(inout nextState : BackupState) : void
+            if (MORE_DEBUG) Slog.i(TAG, " => executing next step on "
+                    + this + " nextState=" + nextState);
+            addBackupTrace("executeNextState => " + nextState);
+            mCurrentState = nextState;
+            Message msg = mBackupHandler.obtainMessage(MSG_BACKUP_RESTORE_STEP, this);
+            mBackupHandler.sendMessage(msg);

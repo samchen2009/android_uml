@@ -1,0 +1,159 @@
+class PairingServer
+!!!13420300.java!!!	PairingServer(in listenPort : int, inout format : WireFormat, inout keyStoreManager : KeyStoreManager, inout delegate : Delegate)
+        mListenPort = listenPort;
+        mWireFormat = format;
+        mDelegate = delegate;
+        mListener = createPairingListener();
+        mKeyStoreManager = keyStoreManager;
+        mHandler = new Handler();
+
+        setupPairingServer();
+        Log.i(LOG_TAG, "PairingServerThread init complete!");
+!!!13420428.java!!!	createPairingListener() : PairingListener
+        return new PairingListener() {
+
+            @Override
+            public void onLogMessage(LogLevel level, String message) {
+                Log.d(LOG_TAG, message + "(" + level + ")");
+            }
+
+            @Override
+            public void onPerformInputDeviceRole(PairingSession session) {
+                throw new UnsupportedOperationException("Server only.");
+            }
+
+            @Override
+            public void onPerformOutputDeviceRole(
+                    final PairingSession session, byte[] gamma) {
+                final String encoded = session
+                        .getEncoder().encodeToString(gamma).toUpperCase();
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        mDelegate.presentSecret(session.getPeerName(), encoded);
+                    }
+                });
+            }
+
+            @Override
+            public void onSessionCreated(PairingSession session) {
+                Log.d(LOG_TAG, "SessionCreated: " + session.getServiceName());
+            }
+
+            @Override
+            public void onSessionEnded(PairingSession session) {
+                Log.d(LOG_TAG, "SessionEnded: " + session.getServiceName());
+            }
+        };
+!!!13420556.java!!!	run() : void
+        while (!mQuit) {
+            try {
+                // Handle one pairing session at a time.
+                handleNextPairingSession(mServerSocket);
+            } catch (IOException e) {
+                Log.w(LOG_TAG, "Pairing failed due to exception.", e);
+            } catch (PoloException e) {
+                Log.w(LOG_TAG, "Pairing failed due to exception.", e);
+            }
+        }
+!!!13420684.java!!!	stopAccepting() : void
+        mQuit = true;
+        synchronized (this) {
+            if (mServerSocket != null) {
+                try {
+                    mServerSocket.close();
+                } catch (IOException e) {
+                    // Nothing to do
+                }
+                mServerSocket = null;
+            }
+        }
+        cancelCurrentSession();
+        try {
+            join(STOP_TIMEOUT);
+        } catch (InterruptedException e) {
+            Log.v(LOG_TAG, "Interrupted exception", e);
+        }
+!!!13420812.java!!!	cancelCurrentSession() : boolean
+        if (mSession == null) {
+            return false;
+        }
+        mSession.teardown();
+        mSession = null;
+        return true;
+!!!13420940.java!!!	setupPairingServer() : void
+        try {
+            Log.d(LOG_TAG, "Getting key managers ...");
+            KeyManagerFactory km = KeyManagerFactory.getInstance("X509");
+            KeyManager keyManagers[] = mKeyStoreManager.getKeyManagers();
+            setupServerSocket(keyManagers);
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("Error setting up server.", e);
+        } catch (IOException e) {
+            throw new IllegalStateException("Error setting up server.", e);
+        }
+!!!13421068.java!!!	setupServerSocket(inout keyManagers : KeyManager) : void
+        Log.i(LOG_TAG, "Creating socket factory");
+        SSLServerSocketFactory socketFactory = DummySSLServerSocketFactory
+                .fromKeyManagers(keyManagers);
+        SSLServerSocket serverSocket = (SSLServerSocket) socketFactory
+                .createServerSocket(mListenPort, 1);
+
+        // The client must present a certificate; otherwise, we cannot pair.
+        serverSocket.setNeedClientAuth(true);
+        serverSocket.setUseClientMode(false); // should be the default
+        mServerSocket = serverSocket;
+!!!13421196.java!!!	handleNextPairingSession(inout serverSocket : SSLServerSocket) : void
+        if (serverSocket == null || serverSocket.isClosed()) {
+            Log.w(LOG_TAG, "Server socket not available, terminating.");
+            return;
+        }
+
+        Log.d(LOG_TAG,
+                "Waiting for new client... @ " + serverSocket.getLocalPort());
+        SSLSocket clientSocket = (SSLSocket) serverSocket.accept();
+
+        Log.d(LOG_TAG, "New client connected: "
+                + clientSocket.getRemoteSocketAddress());
+
+        PairingContext context = PairingContext.fromSslSocket(
+                clientSocket, true);
+        PoloWireInterface protocol = mWireFormat.getWireInterface(context);
+        final ServerPairingSession session =
+                new ServerPairingSession(protocol, context);
+        mSession = session;
+
+        EncodingOption hexEnc = new EncodingOption(
+                EncodingOption.EncodingType.ENCODING_HEXADECIMAL, 4);
+        session.addInputEncoding(hexEnc);
+        session.addOutputEncoding(hexEnc);
+
+        // We may have been asked to quit in the time since the thread spun up.
+        // If so, bail out now. Beyond this point, stop() will cause orderly
+        // exit of the session.
+        if (mQuit) {
+            return;
+        }
+
+        boolean success = session.doPair(mListener);
+        if (success) {
+            final String id =
+                    "cert-" + context.getClientCertificate().hashCode();
+            Log.d(LOG_TAG, "SUCCESS storing: " + id);
+            mKeyStoreManager.storeCertificate(
+                    context.getClientCertificate(), id);
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mDelegate.onPaired(id, session.getPeerName());
+                }
+            });
+        } else {
+            Log.d(LOG_TAG, "FAIL");
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mDelegate.onFailed(session.getPeerName());
+                }
+            });
+        }

@@ -1,0 +1,769 @@
+class AVIExtractor
+!!!596236.cpp!!!	AVIExtractor(in dataSource : sp<DataSource>)
+    mInitCheck = parseHeaders();
+
+    if (mInitCheck != OK) {
+        mTracks.clear();
+    }
+!!!596364.cpp!!!	countTracks() : size_t
+    return mTracks.size();
+!!!596492.cpp!!!	getTrack(in index : size_t) : sp<MediaSource>
+    return index < mTracks.size() ? new AVISource(this, index) : NULL;
+!!!596620.cpp!!!	getTrackMetaData(in index : size_t, in flags : uint32_t) : sp<MetaData>
+    return index < mTracks.size() ? mTracks.editItemAt(index).mMeta : NULL;
+!!!596748.cpp!!!	getMetaData() : sp<MetaData>
+    sp<MetaData> meta = new MetaData;
+
+    if (mInitCheck == OK) {
+        meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_CONTAINER_AVI);
+    }
+
+    return meta;
+!!!597004.cpp!!!	parseChunk(in offset : off64_t, in size : off64_t, in depth : int = 0) : ssize_t
+    if (size >= 0 && size < 8) {
+        return ERROR_MALFORMED;
+    }
+
+    uint8_t tmp[12];
+    ssize_t n = mDataSource->readAt(offset, tmp, 8);
+
+    if (n < 8) {
+        return (n < 0) ? n : (ssize_t)ERROR_MALFORMED;
+    }
+
+    uint32_t fourcc = U32_AT(tmp);
+    uint32_t chunkSize = U32LE_AT(&tmp[4]);
+
+    if (size >= 0 && chunkSize + 8 > size) {
+        return ERROR_MALFORMED;
+    }
+
+    static const char kPrefix[] = "                              ";
+    const char *prefix = &kPrefix[strlen(kPrefix) - 2 * depth];
+
+    if (fourcc == FOURCC('L', 'I', 'S', 'T')
+            || fourcc == FOURCC('R', 'I', 'F', 'F')) {
+        // It's a list of chunks
+
+        if (size >= 0 && size < 12) {
+            return ERROR_MALFORMED;
+        }
+
+        n = mDataSource->readAt(offset + 8, &tmp[8], 4);
+
+        if (n < 4) {
+            return (n < 0) ? n : (ssize_t)ERROR_MALFORMED;
+        }
+
+        uint32_t subFourcc = U32_AT(&tmp[8]);
+
+        ALOGV("%s offset 0x%08llx LIST of '%c%c%c%c', size %d",
+             prefix,
+             offset,
+             (char)(subFourcc >> 24),
+             (char)((subFourcc >> 16) & 0xff),
+             (char)((subFourcc >> 8) & 0xff),
+             (char)(subFourcc & 0xff),
+             chunkSize - 4);
+
+        if (subFourcc == FOURCC('m', 'o', 'v', 'i')) {
+            // We're not going to parse this, but will take note of the
+            // offset.
+
+            mMovieOffset = offset;
+        } else {
+            off64_t subOffset = offset + 12;
+            off64_t subOffsetLimit = subOffset + chunkSize - 4;
+            while (subOffset < subOffsetLimit) {
+                ssize_t res =
+                    parseChunk(subOffset, subOffsetLimit - subOffset, depth + 1);
+
+                if (res < 0) {
+                    return res;
+                }
+
+                subOffset += res;
+            }
+        }
+    } else {
+        ALOGV("%s offset 0x%08llx CHUNK '%c%c%c%c'",
+             prefix,
+             offset,
+             (char)(fourcc >> 24),
+             (char)((fourcc >> 16) & 0xff),
+             (char)((fourcc >> 8) & 0xff),
+             (char)(fourcc & 0xff));
+
+        status_t err = OK;
+
+        switch (fourcc) {
+            case FOURCC('s', 't', 'r', 'h'):
+            {
+                err = parseStreamHeader(offset + 8, chunkSize);
+                break;
+            }
+
+            case FOURCC('s', 't', 'r', 'f'):
+            {
+                err = parseStreamFormat(offset + 8, chunkSize);
+                break;
+            }
+
+            case FOURCC('i', 'd', 'x', '1'):
+            {
+                err = parseIndex(offset + 8, chunkSize);
+                break;
+            }
+
+            default:
+                break;
+        }
+
+        if (err != OK) {
+            return err;
+        }
+    }
+
+    if (chunkSize & 1) {
+        ++chunkSize;
+    }
+
+    return chunkSize + 8;
+!!!597132.cpp!!!	parseStreamHeader(in offset : off64_t, in size : size_t) : status_t
+    if (size != 56) {
+        return ERROR_MALFORMED;
+    }
+
+    if (mTracks.size() > 99) {
+        return -ERANGE;
+    }
+
+    sp<ABuffer> buffer = new ABuffer(size);
+    ssize_t n = mDataSource->readAt(offset, buffer->data(), buffer->size());
+
+    if (n < (ssize_t)size) {
+        return n < 0 ? (status_t)n : ERROR_MALFORMED;
+    }
+
+    const uint8_t *data = buffer->data();
+
+    uint32_t type = U32_AT(data);
+    uint32_t handler = U32_AT(&data[4]);
+    uint32_t flags = U32LE_AT(&data[8]);
+
+    sp<MetaData> meta = new MetaData;
+
+    uint32_t rate = U32LE_AT(&data[20]);
+    uint32_t scale = U32LE_AT(&data[24]);
+
+    uint32_t sampleSize = U32LE_AT(&data[44]);
+
+    const char *mime = NULL;
+    Track::Kind kind = Track::OTHER;
+
+    if (type == FOURCC('v', 'i', 'd', 's')) {
+        mime = GetMIMETypeForHandler(handler);
+
+        if (mime && strncasecmp(mime, "video/", 6)) {
+            return ERROR_MALFORMED;
+        }
+
+        if (mime == NULL) {
+            ALOGW("Unsupported video format '%c%c%c%c'",
+                 (char)(handler >> 24),
+                 (char)((handler >> 16) & 0xff),
+                 (char)((handler >> 8) & 0xff),
+                 (char)(handler & 0xff));
+        }
+
+        kind = Track::VIDEO;
+    } else if (type == FOURCC('a', 'u', 'd', 's')) {
+        if (mime && strncasecmp(mime, "audio/", 6)) {
+            return ERROR_MALFORMED;
+        }
+
+        kind = Track::AUDIO;
+    }
+
+    if (!mime) {
+        mime = "application/octet-stream";
+    }
+
+    meta->setCString(kKeyMIMEType, mime);
+
+    mTracks.push();
+    Track *track = &mTracks.editItemAt(mTracks.size() - 1);
+
+    track->mMeta = meta;
+    track->mRate = rate;
+    track->mScale = scale;
+    track->mBytesPerSample = sampleSize;
+    track->mKind = kind;
+    track->mNumSyncSamples = 0;
+    track->mThumbnailSampleSize = 0;
+    track->mThumbnailSampleIndex = -1;
+    track->mMaxSampleSize = 0;
+    track->mAvgChunkSize = 1.0;
+    track->mFirstChunkSize = 0;
+
+    return OK;
+!!!597260.cpp!!!	parseStreamFormat(in offset : off64_t, in size : size_t) : status_t
+    if (mTracks.isEmpty()) {
+        return ERROR_MALFORMED;
+    }
+
+    Track *track = &mTracks.editItemAt(mTracks.size() - 1);
+
+    if (track->mKind == Track::OTHER) {
+        // We don't support this content, but that's not a parsing error.
+        return OK;
+    }
+
+    bool isVideo = (track->mKind == Track::VIDEO);
+
+    if ((isVideo && size < 40) || (!isVideo && size < 16)) {
+        // Expected a BITMAPINFO or WAVEFORMAT(EX) structure, respectively.
+        return ERROR_MALFORMED;
+    }
+
+    sp<ABuffer> buffer = new ABuffer(size);
+    ssize_t n = mDataSource->readAt(offset, buffer->data(), buffer->size());
+
+    if (n < (ssize_t)size) {
+        return n < 0 ? (status_t)n : ERROR_MALFORMED;
+    }
+
+    const uint8_t *data = buffer->data();
+
+    if (isVideo) {
+        uint32_t width = U32LE_AT(&data[4]);
+        uint32_t height = U32LE_AT(&data[8]);
+
+        track->mMeta->setInt32(kKeyWidth, width);
+        track->mMeta->setInt32(kKeyHeight, height);
+    } else {
+        uint32_t format = U16LE_AT(data);
+
+        if (format == 0x55) {
+            track->mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG);
+        } else {
+            ALOGW("Unsupported audio format = 0x%04x", format);
+        }
+
+        uint32_t numChannels = U16LE_AT(&data[2]);
+        uint32_t sampleRate = U32LE_AT(&data[4]);
+
+        track->mMeta->setInt32(kKeyChannelCount, numChannels);
+        track->mMeta->setInt32(kKeySampleRate, sampleRate);
+    }
+
+    return OK;
+!!!597388.cpp!!!	parseIndex(in offset : off64_t, in size : size_t) : status_t
+    if ((size % 16) != 0) {
+        return ERROR_MALFORMED;
+    }
+
+    sp<ABuffer> buffer = new ABuffer(size);
+    ssize_t n = mDataSource->readAt(offset, buffer->data(), buffer->size());
+
+    if (n < (ssize_t)size) {
+        return n < 0 ? (status_t)n : ERROR_MALFORMED;
+    }
+
+    const uint8_t *data = buffer->data();
+
+    while (size > 0) {
+        uint32_t chunkType = U32_AT(data);
+
+        uint8_t hi = chunkType >> 24;
+        uint8_t lo = (chunkType >> 16) & 0xff;
+
+        if (hi < '0' || hi > '9' || lo < '0' || lo > '9') {
+            return ERROR_MALFORMED;
+        }
+
+        size_t trackIndex = 10 * (hi - '0') + (lo - '0');
+
+        if (trackIndex >= mTracks.size()) {
+            return ERROR_MALFORMED;
+        }
+
+        Track *track = &mTracks.editItemAt(trackIndex);
+
+        if (!IsCorrectChunkType(-1, track->mKind, chunkType)) {
+            return ERROR_MALFORMED;
+        }
+
+        if (track->mKind == Track::OTHER) {
+            data += 16;
+            size -= 16;
+            continue;
+        }
+
+        uint32_t flags = U32LE_AT(&data[4]);
+        uint32_t offset = U32LE_AT(&data[8]);
+        uint32_t chunkSize = U32LE_AT(&data[12]);
+
+        if (chunkSize > track->mMaxSampleSize) {
+            track->mMaxSampleSize = chunkSize;
+        }
+
+        track->mSamples.push();
+
+        SampleInfo *info =
+            &track->mSamples.editItemAt(track->mSamples.size() - 1);
+
+        info->mOffset = offset;
+        info->mIsKey = (flags & 0x10) != 0;
+
+        if (info->mIsKey) {
+            static const size_t kMaxNumSyncSamplesToScan = 20;
+
+            if (track->mNumSyncSamples < kMaxNumSyncSamplesToScan) {
+                if (chunkSize > track->mThumbnailSampleSize) {
+                    track->mThumbnailSampleSize = chunkSize;
+
+                    track->mThumbnailSampleIndex =
+                        track->mSamples.size() - 1;
+                }
+            }
+
+            ++track->mNumSyncSamples;
+        }
+
+        data += 16;
+        size -= 16;
+    }
+
+    if (!mTracks.isEmpty()) {
+        off64_t offset;
+        size_t size;
+        bool isKey;
+        int64_t timeUs;
+        status_t err = getSampleInfo(0, 0, &offset, &size, &isKey, &timeUs);
+
+        if (err != OK) {
+            mOffsetsAreAbsolute = !mOffsetsAreAbsolute;
+            err = getSampleInfo(0, 0, &offset, &size, &isKey, &timeUs);
+
+            if (err != OK) {
+                return err;
+            }
+        }
+
+        ALOGV("Chunk offsets are %s",
+             mOffsetsAreAbsolute ? "absolute" : "movie-chunk relative");
+    }
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        Track *track = &mTracks.editItemAt(i);
+
+        if (track->mBytesPerSample > 0) {
+            // Assume all chunks are roughly the same size for now.
+
+            // Compute the avg. size of the first 128 chunks (if there are
+            // that many), but exclude the size of the first one, since
+            // it may be an outlier.
+            size_t numSamplesToAverage = track->mSamples.size();
+            if (numSamplesToAverage > 256) {
+                numSamplesToAverage = 256;
+            }
+
+            double avgChunkSize = 0;
+            size_t j;
+            for (j = 0; j <= numSamplesToAverage; ++j) {
+                off64_t offset;
+                size_t size;
+                bool isKey;
+                int64_t dummy;
+
+                status_t err =
+                    getSampleInfo(
+                            i, j,
+                            &offset, &size, &isKey, &dummy);
+
+                if (err != OK) {
+                    return err;
+                }
+
+                if (j == 0) {
+                    track->mFirstChunkSize = size;
+                    continue;
+                }
+
+                avgChunkSize += size;
+            }
+
+            avgChunkSize /= numSamplesToAverage;
+
+            track->mAvgChunkSize = avgChunkSize;
+        }
+
+        int64_t durationUs;
+        CHECK_EQ((status_t)OK,
+                 getSampleTime(i, track->mSamples.size() - 1, &durationUs));
+
+        ALOGV("track %d duration = %.2f secs", i, durationUs / 1E6);
+
+        track->mMeta->setInt64(kKeyDuration, durationUs);
+        track->mMeta->setInt32(kKeyMaxInputSize, track->mMaxSampleSize);
+
+        const char *tmp;
+        CHECK(track->mMeta->findCString(kKeyMIMEType, &tmp));
+
+        AString mime = tmp;
+
+        if (!strncasecmp("video/", mime.c_str(), 6)) {
+            if (track->mThumbnailSampleIndex >= 0) {
+                int64_t thumbnailTimeUs;
+                CHECK_EQ((status_t)OK,
+                         getSampleTime(i, track->mThumbnailSampleIndex,
+                                       &thumbnailTimeUs));
+
+                track->mMeta->setInt64(kKeyThumbnailTime, thumbnailTimeUs);
+            }
+
+            status_t err = OK;
+
+            if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_VIDEO_MPEG4)) {
+                err = addMPEG4CodecSpecificData(i);
+            } else if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_VIDEO_AVC)) {
+                err = addH264CodecSpecificData(i);
+            }
+
+            if (err != OK) {
+                return err;
+            }
+        }
+    }
+
+    mFoundIndex = true;
+
+    return OK;
+!!!597516.cpp!!!	parseHeaders() : status_t
+    mTracks.clear();
+    mMovieOffset = 0;
+    mFoundIndex = false;
+    mOffsetsAreAbsolute = false;
+
+    ssize_t res = parseChunk(0ll, -1ll);
+
+    if (res < 0) {
+        return (status_t)res;
+    }
+
+    if (mMovieOffset == 0ll || !mFoundIndex) {
+        return ERROR_MALFORMED;
+    }
+
+    return OK;
+!!!597644.cpp!!!	getSampleInfo(in trackIndex : size_t, in sampleIndex : size_t, inout offset : off64_t, inout size : size_t, inout isKey : bool, inout sampleTimeUs : int64_t) : status_t
+    if (trackIndex >= mTracks.size()) {
+        return -ERANGE;
+    }
+
+    const Track &track = mTracks.itemAt(trackIndex);
+
+    if (sampleIndex >= track.mSamples.size()) {
+        return -ERANGE;
+    }
+
+    const SampleInfo &info = track.mSamples.itemAt(sampleIndex);
+
+    if (!mOffsetsAreAbsolute) {
+        *offset = info.mOffset + mMovieOffset + 8;
+    } else {
+        *offset = info.mOffset;
+    }
+
+    *size = 0;
+
+    uint8_t tmp[8];
+    ssize_t n = mDataSource->readAt(*offset, tmp, 8);
+
+    if (n < 8) {
+        return n < 0 ? (status_t)n : (status_t)ERROR_MALFORMED;
+    }
+
+    uint32_t chunkType = U32_AT(tmp);
+
+    if (!IsCorrectChunkType(trackIndex, track.mKind, chunkType)) {
+        return ERROR_MALFORMED;
+    }
+
+    *offset += 8;
+    *size = U32LE_AT(&tmp[4]);
+
+    *isKey = info.mIsKey;
+
+    if (track.mBytesPerSample > 0) {
+        size_t sampleStartInBytes;
+        if (sampleIndex == 0) {
+            sampleStartInBytes = 0;
+        } else {
+            sampleStartInBytes =
+                track.mFirstChunkSize + track.mAvgChunkSize * (sampleIndex - 1);
+        }
+
+        sampleIndex = sampleStartInBytes / track.mBytesPerSample;
+    }
+
+    *sampleTimeUs = (sampleIndex * 1000000ll * track.mRate) / track.mScale;
+
+    return OK;
+!!!597772.cpp!!!	getSampleTime(in trackIndex : size_t, in sampleIndex : size_t, inout sampleTimeUs : int64_t) : status_t
+    off64_t offset;
+    size_t size;
+    bool isKey;
+    return getSampleInfo(
+            trackIndex, sampleIndex, &offset, &size, &isKey, sampleTimeUs);
+!!!597900.cpp!!!	getSampleIndexAtTime(in trackIndex : size_t, in timeUs : int64_t, in mode : SeekMode, inout sampleIndex : size_t) : status_t
+    if (trackIndex >= mTracks.size()) {
+        return -ERANGE;
+    }
+
+    const Track &track = mTracks.itemAt(trackIndex);
+
+    ssize_t closestSampleIndex;
+
+    if (track.mBytesPerSample > 0) {
+        size_t closestByteOffset =
+            (timeUs * track.mBytesPerSample)
+                / track.mRate * track.mScale / 1000000ll;
+
+        if (closestByteOffset <= track.mFirstChunkSize) {
+            closestSampleIndex = 0;
+        } else {
+            closestSampleIndex =
+                (closestByteOffset - track.mFirstChunkSize)
+                    / track.mAvgChunkSize;
+        }
+    } else {
+        // Each chunk contains a single sample.
+        closestSampleIndex = timeUs / track.mRate * track.mScale / 1000000ll;
+    }
+
+    ssize_t numSamples = track.mSamples.size();
+
+    if (closestSampleIndex < 0) {
+        closestSampleIndex = 0;
+    } else if (closestSampleIndex >= numSamples) {
+        closestSampleIndex = numSamples - 1;
+    }
+
+    if (mode == MediaSource::ReadOptions::SEEK_CLOSEST) {
+        *sampleIndex = closestSampleIndex;
+
+        return OK;
+    }
+
+    ssize_t prevSyncSampleIndex = closestSampleIndex;
+    while (prevSyncSampleIndex >= 0) {
+        const SampleInfo &info =
+            track.mSamples.itemAt(prevSyncSampleIndex);
+
+        if (info.mIsKey) {
+            break;
+        }
+
+        --prevSyncSampleIndex;
+    }
+
+    ssize_t nextSyncSampleIndex = closestSampleIndex;
+    while (nextSyncSampleIndex < numSamples) {
+        const SampleInfo &info =
+            track.mSamples.itemAt(nextSyncSampleIndex);
+
+        if (info.mIsKey) {
+            break;
+        }
+
+        ++nextSyncSampleIndex;
+    }
+
+    switch (mode) {
+        case MediaSource::ReadOptions::SEEK_PREVIOUS_SYNC:
+        {
+            *sampleIndex = prevSyncSampleIndex;
+
+            return prevSyncSampleIndex >= 0 ? OK : UNKNOWN_ERROR;
+        }
+
+        case MediaSource::ReadOptions::SEEK_NEXT_SYNC:
+        {
+            *sampleIndex = nextSyncSampleIndex;
+
+            return nextSyncSampleIndex < numSamples ? OK : UNKNOWN_ERROR;
+        }
+
+        case MediaSource::ReadOptions::SEEK_CLOSEST_SYNC:
+        {
+            if (prevSyncSampleIndex < 0 && nextSyncSampleIndex >= numSamples) {
+                return UNKNOWN_ERROR;
+            }
+
+            if (prevSyncSampleIndex < 0) {
+                *sampleIndex = nextSyncSampleIndex;
+                return OK;
+            }
+
+            if (nextSyncSampleIndex >= numSamples) {
+                *sampleIndex = prevSyncSampleIndex;
+                return OK;
+            }
+
+            size_t dist1 = closestSampleIndex - prevSyncSampleIndex;
+            size_t dist2 = nextSyncSampleIndex - closestSampleIndex;
+
+            *sampleIndex =
+                (dist1 < dist2) ? prevSyncSampleIndex : nextSyncSampleIndex;
+
+            return OK;
+        }
+
+        default:
+            TRESPASS();
+            break;
+    }
+!!!598028.cpp!!!	addMPEG4CodecSpecificData(in trackIndex : size_t) : status_t
+    Track *track = &mTracks.editItemAt(trackIndex);
+
+    off64_t offset;
+    size_t size;
+    bool isKey;
+    int64_t timeUs;
+    status_t err =
+        getSampleInfo(trackIndex, 0, &offset, &size, &isKey, &timeUs);
+
+    if (err != OK) {
+        return err;
+    }
+
+    sp<ABuffer> buffer = new ABuffer(size);
+    ssize_t n = mDataSource->readAt(offset, buffer->data(), buffer->size());
+
+    if (n < (ssize_t)size) {
+        return n < 0 ? (status_t)n : ERROR_MALFORMED;
+    }
+
+    // Extract everything up to the first VOP start code from the first
+    // frame's encoded data and use it to construct an ESDS with the
+    // codec specific data.
+
+    size_t i = 0;
+    bool found = false;
+    while (i + 3 < buffer->size()) {
+        if (!memcmp("\x00\x00\x01\xb6", &buffer->data()[i], 4)) {
+            found = true;
+            break;
+        }
+
+        ++i;
+    }
+
+    if (!found) {
+        return ERROR_MALFORMED;
+    }
+
+    buffer->setRange(0, i);
+
+    sp<ABuffer> csd = MakeMPEG4VideoCodecSpecificData(buffer);
+    track->mMeta->setData(kKeyESDS, kTypeESDS, csd->data(), csd->size());
+
+    return OK;
+!!!598156.cpp!!!	addH264CodecSpecificData(in trackIndex : size_t) : status_t
+    Track *track = &mTracks.editItemAt(trackIndex);
+
+    off64_t offset;
+    size_t size;
+    bool isKey;
+    int64_t timeUs;
+
+    // Extract codec specific data from the first non-empty sample.
+
+    size_t sampleIndex = 0;
+    for (;;) {
+        status_t err =
+            getSampleInfo(
+                    trackIndex, sampleIndex, &offset, &size, &isKey, &timeUs);
+
+        if (err != OK) {
+            return err;
+        }
+
+        if (size > 0) {
+            break;
+        }
+
+        ++sampleIndex;
+    }
+
+    sp<ABuffer> buffer = new ABuffer(size);
+    ssize_t n = mDataSource->readAt(offset, buffer->data(), buffer->size());
+
+    if (n < (ssize_t)size) {
+        return n < 0 ? (status_t)n : ERROR_MALFORMED;
+    }
+
+    sp<MetaData> meta = MakeAVCCodecSpecificData(buffer);
+
+    if (meta == NULL) {
+        ALOGE("Unable to extract AVC codec specific data");
+        return ERROR_MALFORMED;
+    }
+
+    int32_t width, height;
+    CHECK(meta->findInt32(kKeyWidth, &width));
+    CHECK(meta->findInt32(kKeyHeight, &height));
+
+    uint32_t type;
+    const void *csd;
+    size_t csdSize;
+    CHECK(meta->findData(kKeyAVCC, &type, &csd, &csdSize));
+
+    track->mMeta->setInt32(kKeyWidth, width);
+    track->mMeta->setInt32(kKeyHeight, height);
+    track->mMeta->setData(kKeyAVCC, type, csd, csdSize);
+
+    return OK;
+!!!598284.cpp!!!	IsCorrectChunkType(in trackIndex : ssize_t, in kind : Track::Kind, in chunkType : uint32_t) : bool
+    uint32_t chunkBase = chunkType & 0xffff;
+
+    switch (kind) {
+        case Track::VIDEO:
+        {
+            if (chunkBase != FOURCC(0, 0, 'd', 'c')
+                    && chunkBase != FOURCC(0, 0, 'd', 'b')) {
+                return false;
+            }
+            break;
+        }
+
+        case Track::AUDIO:
+        {
+            if (chunkBase != FOURCC(0, 0, 'w', 'b')) {
+                return false;
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    if (trackIndex < 0) {
+        return true;
+    }
+
+    uint8_t hi = chunkType >> 24;
+    uint8_t lo = (chunkType >> 16) & 0xff;
+
+    if (hi < '0' || hi > '9' || lo < '0' || lo > '9') {
+        return false;
+    }
+
+    if (trackIndex != (10 * (hi - '0') + (lo - '0'))) {
+        return false;
+    }
+
+    return true;

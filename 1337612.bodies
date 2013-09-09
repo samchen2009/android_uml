@@ -1,0 +1,1621 @@
+class AppWidgetServiceImpl
+!!!8025612.java!!!	AppWidgetServiceImpl(inout context : Context, in userId : int, inout saveStateHandler : Handler)
+        mContext = context;
+        mPm = AppGlobals.getPackageManager();
+        mAlarmManager = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
+        mUserId = userId;
+        mSaveStateHandler = saveStateHandler;
+        computeMaximumWidgetBitmapMemory();
+!!!8025740.java!!!	computeMaximumWidgetBitmapMemory() : void
+        WindowManager wm = (WindowManager) mContext.getSystemService(Context.WINDOW_SERVICE);
+        Display display = wm.getDefaultDisplay();
+        Point size = new Point();
+        display.getRealSize(size);
+        // Cap memory usage at 1.5 times the size of the display
+        // 1.5 * 4 bytes/pixel * w * h ==> 6 * w * h
+        mMaxWidgetBitmapMemory = 6 * size.x * size.y;
+!!!8025868.java!!!	systemReady(inout safeMode : boolean) : void
+        mSafeMode = safeMode;
+
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+        }
+!!!8025996.java!!!	log(in msg : String) : void
+        Slog.i(TAG, "u=" + mUserId + ": " + msg);
+!!!8026124.java!!!	onConfigurationChanged() : void
+        if (DBG) log("Got onConfigurationChanged()");
+        Locale revised = Locale.getDefault();
+        if (revised == null || mLocale == null || !(revised.equals(mLocale))) {
+            mLocale = revised;
+
+            synchronized (mAppWidgetIds) {
+                ensureStateLoadedLocked();
+                // Note: updateProvidersForPackageLocked() may remove providers, so we must copy the
+                // list of installed providers and skip providers that we don't need to update.
+                // Also note that remove the provider does not clear the Provider component data.
+                ArrayList<Provider> installedProviders =
+                        new ArrayList<Provider>(mInstalledProviders);
+                HashSet<ComponentName> removedProviders = new HashSet<ComponentName>();
+                int N = installedProviders.size();
+                for (int i = N - 1; i >= 0; i--) {
+                    Provider p = installedProviders.get(i);
+                    ComponentName cn = p.info.provider;
+                    if (!removedProviders.contains(cn)) {
+                        updateProvidersForPackageLocked(cn.getPackageName(), removedProviders);
+                    }
+                }
+                saveStateAsync();
+            }
+        }
+!!!8026252.java!!!	onBroadcastReceived(inout intent : Intent) : void
+        if (DBG) log("onBroadcast " + intent);
+        final String action = intent.getAction();
+        boolean added = false;
+        boolean changed = false;
+        boolean providersModified = false;
+        String pkgList[] = null;
+        if (Intent.ACTION_EXTERNAL_APPLICATIONS_AVAILABLE.equals(action)) {
+            pkgList = intent.getStringArrayExtra(Intent.EXTRA_CHANGED_PACKAGE_LIST);
+            added = true;
+        } else if (Intent.ACTION_EXTERNAL_APPLICATIONS_UNAVAILABLE.equals(action)) {
+            pkgList = intent.getStringArrayExtra(Intent.EXTRA_CHANGED_PACKAGE_LIST);
+            added = false;
+        } else {
+            Uri uri = intent.getData();
+            if (uri == null) {
+                return;
+            }
+            String pkgName = uri.getSchemeSpecificPart();
+            if (pkgName == null) {
+                return;
+            }
+            pkgList = new String[] { pkgName };
+            added = Intent.ACTION_PACKAGE_ADDED.equals(action);
+            changed = Intent.ACTION_PACKAGE_CHANGED.equals(action);
+        }
+        if (pkgList == null || pkgList.length == 0) {
+            return;
+        }
+        if (added || changed) {
+            synchronized (mAppWidgetIds) {
+                ensureStateLoadedLocked();
+                Bundle extras = intent.getExtras();
+                if (changed
+                        || (extras != null && extras.getBoolean(Intent.EXTRA_REPLACING, false))) {
+                    for (String pkgName : pkgList) {
+                        // The package was just upgraded
+                        providersModified |= updateProvidersForPackageLocked(pkgName, null);
+                    }
+                } else {
+                    // The package was just added
+                    for (String pkgName : pkgList) {
+                        providersModified |= addProvidersForPackageLocked(pkgName);
+                    }
+                }
+                saveStateAsync();
+            }
+        } else {
+            Bundle extras = intent.getExtras();
+            if (extras != null && extras.getBoolean(Intent.EXTRA_REPLACING, false)) {
+                // The package is being updated. We'll receive a PACKAGE_ADDED shortly.
+            } else {
+                synchronized (mAppWidgetIds) {
+                    ensureStateLoadedLocked();
+                    for (String pkgName : pkgList) {
+                        providersModified |= removeProvidersForPackageLocked(pkgName);
+                        saveStateAsync();
+                    }
+                }
+            }
+        }
+
+        if (providersModified) {
+            // If the set of providers has been modified, notify each active AppWidgetHost
+            synchronized (mAppWidgetIds) {
+                ensureStateLoadedLocked();
+                notifyHostsForProvidersChangedLocked();
+            }
+        }
+!!!8026380.java!!!	dumpProvider(inout p : Provider, in index : int, inout pw : PrintWriter) : void
+        AppWidgetProviderInfo info = p.info;
+        pw.print("  ["); pw.print(index); pw.print("] provider ");
+                pw.print(info.provider.flattenToShortString());
+                pw.println(':');
+        pw.print("    min=("); pw.print(info.minWidth);
+                pw.print("x"); pw.print(info.minHeight);
+        pw.print(")   minResize=("); pw.print(info.minResizeWidth);
+                pw.print("x"); pw.print(info.minResizeHeight);
+                pw.print(") updatePeriodMillis=");
+                pw.print(info.updatePeriodMillis);
+                pw.print(" resizeMode=");
+                pw.print(info.resizeMode);
+                pw.print(info.widgetCategory);
+                pw.print(" autoAdvanceViewId=");
+                pw.print(info.autoAdvanceViewId);
+                pw.print(" initialLayout=#");
+                pw.print(Integer.toHexString(info.initialLayout));
+                pw.print(" uid="); pw.print(p.uid);
+                pw.print(" zombie="); pw.println(p.zombie);
+!!!8026508.java!!!	dumpHost(inout host : Host, in index : int, inout pw : PrintWriter) : void
+        pw.print("  ["); pw.print(index); pw.print("] hostId=");
+                pw.print(host.hostId); pw.print(' ');
+                pw.print(host.packageName); pw.print('/');
+        pw.print(host.uid); pw.println(':');
+        pw.print("    callbacks="); pw.println(host.callbacks);
+        pw.print("    instances.size="); pw.print(host.instances.size());
+                pw.print(" zombie="); pw.println(host.zombie);
+!!!8026636.java!!!	dumpAppWidgetId(inout id : AppWidgetId, in index : int, inout pw : PrintWriter) : void
+        pw.print("  ["); pw.print(index); pw.print("] id=");
+                pw.println(id.appWidgetId);
+        pw.print("    hostId=");
+                pw.print(id.host.hostId); pw.print(' ');
+                pw.print(id.host.packageName); pw.print('/');
+                pw.println(id.host.uid);
+        if (id.provider != null) {
+            pw.print("    provider=");
+                    pw.println(id.provider.info.provider.flattenToShortString());
+        }
+        if (id.host != null) {
+            pw.print("    host.callbacks="); pw.println(id.host.callbacks);
+        }
+        if (id.views != null) {
+            pw.print("    views="); pw.println(id.views);
+        }
+!!!8026764.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        synchronized (mAppWidgetIds) {
+            int N = mInstalledProviders.size();
+            pw.println("Providers:");
+            for (int i=0; i<N; i++) {
+                dumpProvider(mInstalledProviders.get(i), i, pw);
+            }
+
+            N = mAppWidgetIds.size();
+            pw.println(" ");
+            pw.println("AppWidgetIds:");
+            for (int i=0; i<N; i++) {
+                dumpAppWidgetId(mAppWidgetIds.get(i), i, pw);
+            }
+
+            N = mHosts.size();
+            pw.println(" ");
+            pw.println("Hosts:");
+            for (int i=0; i<N; i++) {
+                dumpHost(mHosts.get(i), i, pw);
+            }
+
+            N = mDeletedProviders.size();
+            pw.println(" ");
+            pw.println("Deleted Providers:");
+            for (int i=0; i<N; i++) {
+                dumpProvider(mDeletedProviders.get(i), i, pw);
+            }
+
+            N = mDeletedHosts.size();
+            pw.println(" ");
+            pw.println("Deleted Hosts:");
+            for (int i=0; i<N; i++) {
+                dumpHost(mDeletedHosts.get(i), i, pw);
+            }
+        }
+!!!8026892.java!!!	ensureStateLoadedLocked() : void
+        if (!mStateLoaded) {
+            loadAppWidgetListLocked();
+            loadStateLocked();
+            mStateLoaded = true;
+        }
+!!!8027020.java!!!	allocateAppWidgetId(in packageName : String, in hostId : int) : int
+        int callingUid = enforceSystemOrCallingUid(packageName);
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            int appWidgetId = mNextAppWidgetId++;
+
+            Host host = lookupOrAddHostLocked(callingUid, packageName, hostId);
+
+            AppWidgetId id = new AppWidgetId();
+            id.appWidgetId = appWidgetId;
+            id.host = host;
+
+            host.instances.add(id);
+            mAppWidgetIds.add(id);
+
+            saveStateAsync();
+            if (DBG) log("Allocating AppWidgetId for " + packageName + " host=" + hostId
+                    + " id=" + appWidgetId);
+            return appWidgetId;
+        }
+!!!8027148.java!!!	deleteAppWidgetId(in appWidgetId : int) : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+            if (id != null) {
+                deleteAppWidgetLocked(id);
+                saveStateAsync();
+            }
+        }
+!!!8027276.java!!!	deleteHost(in hostId : int) : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            int callingUid = Binder.getCallingUid();
+            Host host = lookupHostLocked(callingUid, hostId);
+            if (host != null) {
+                deleteHostLocked(host);
+                saveStateAsync();
+            }
+        }
+!!!8027404.java!!!	deleteAllHosts() : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            int callingUid = Binder.getCallingUid();
+            final int N = mHosts.size();
+            boolean changed = false;
+            for (int i = N - 1; i >= 0; i--) {
+                Host host = mHosts.get(i);
+                if (host.uidMatches(callingUid)) {
+                    deleteHostLocked(host);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                saveStateAsync();
+            }
+        }
+!!!8027532.java!!!	deleteHostLocked(inout host : Host) : void
+        final int N = host.instances.size();
+        for (int i = N - 1; i >= 0; i--) {
+            AppWidgetId id = host.instances.get(i);
+            deleteAppWidgetLocked(id);
+        }
+        host.instances.clear();
+        mHosts.remove(host);
+        mDeletedHosts.add(host);
+        // it's gone or going away, abruptly drop the callback connection
+        host.callbacks = null;
+!!!8027660.java!!!	deleteAppWidgetLocked(inout id : AppWidgetId) : void
+        // We first unbind all services that are bound to this id
+        unbindAppWidgetRemoteViewsServicesLocked(id);
+
+        Host host = id.host;
+        host.instances.remove(id);
+        pruneHostLocked(host);
+
+        mAppWidgetIds.remove(id);
+
+        Provider p = id.provider;
+        if (p != null) {
+            p.instances.remove(id);
+            if (!p.zombie) {
+                // send the broacast saying that this appWidgetId has been deleted
+                Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_DELETED);
+                intent.setComponent(p.info.provider);
+                intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id.appWidgetId);
+                mContext.sendBroadcastAsUser(intent, new UserHandle(mUserId));
+                if (p.instances.size() == 0) {
+                    // cancel the future updates
+                    cancelBroadcasts(p);
+
+                    // send the broacast saying that the provider is not in use any more
+                    intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_DISABLED);
+                    intent.setComponent(p.info.provider);
+                    mContext.sendBroadcastAsUser(intent, new UserHandle(mUserId));
+                }
+            }
+        }
+!!!8027788.java!!!	cancelBroadcasts(inout p : Provider) : void
+        if (DBG) log("cancelBroadcasts for " + p);
+        if (p.broadcast != null) {
+            mAlarmManager.cancel(p.broadcast);
+            long token = Binder.clearCallingIdentity();
+            try {
+                p.broadcast.cancel();
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+            p.broadcast = null;
+        }
+!!!8027916.java!!!	bindAppWidgetIdImpl(in appWidgetId : int, inout provider : ComponentName, inout options : Bundle) : void
+        if (DBG) log("bindAppWidgetIdImpl appwid=" + appWidgetId
+                + " provider=" + provider);
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            synchronized (mAppWidgetIds) {
+                options = cloneIfLocalBinder(options);
+                ensureStateLoadedLocked();
+                AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+                if (id == null) {
+                    throw new IllegalArgumentException("bad appWidgetId");
+                }
+                if (id.provider != null) {
+                    throw new IllegalArgumentException("appWidgetId " + appWidgetId
+                            + " already bound to " + id.provider.info.provider);
+                }
+                Provider p = lookupProviderLocked(provider);
+                if (p == null) {
+                    throw new IllegalArgumentException("not a appwidget provider: " + provider);
+                }
+                if (p.zombie) {
+                    throw new IllegalArgumentException("can't bind to a 3rd party provider in"
+                            + " safe mode: " + provider);
+                }
+
+                id.provider = p;
+                if (options == null) {
+                    options = new Bundle();
+                }
+                id.options = options;
+
+                // We need to provide a default value for the widget category if it is not specified
+                if (!options.containsKey(AppWidgetManager.OPTION_APPWIDGET_HOST_CATEGORY)) {
+                    options.putInt(AppWidgetManager.OPTION_APPWIDGET_HOST_CATEGORY,
+                            AppWidgetProviderInfo.WIDGET_CATEGORY_HOME_SCREEN);
+                }
+
+                p.instances.add(id);
+                int instancesSize = p.instances.size();
+                if (instancesSize == 1) {
+                    // tell the provider that it's ready
+                    sendEnableIntentLocked(p);
+                }
+
+                // send an update now -- We need this update now, and just for this appWidgetId.
+                // It's less critical when the next one happens, so when we schedule the next one,
+                // we add updatePeriodMillis to its start time. That time will have some slop,
+                // but that's okay.
+                sendUpdateIntentLocked(p, new int[] { appWidgetId });
+
+                // schedule the future updates
+                registerForBroadcastsLocked(p, getAppWidgetIds(p));
+                saveStateAsync();
+            }
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8028044.java!!!	bindAppWidgetId(in appWidgetId : int, inout provider : ComponentName, inout options : Bundle) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BIND_APPWIDGET,
+            "bindAppWidgetId appWidgetId=" + appWidgetId + " provider=" + provider);
+        bindAppWidgetIdImpl(appWidgetId, provider, options);
+!!!8028172.java!!!	bindAppWidgetIdIfAllowed(in packageName : String, in appWidgetId : int, inout provider : ComponentName, inout options : Bundle) : boolean
+        try {
+            mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BIND_APPWIDGET, null);
+        } catch (SecurityException se) {
+            if (!callerHasBindAppWidgetPermission(packageName)) {
+                return false;
+            }
+        }
+        bindAppWidgetIdImpl(appWidgetId, provider, options);
+        return true;
+!!!8028300.java!!!	callerHasBindAppWidgetPermission(in packageName : String) : boolean
+        int callingUid = Binder.getCallingUid();
+        try {
+            if (!UserHandle.isSameApp(callingUid, getUidForPackage(packageName))) {
+                return false;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            return mPackagesWithBindWidgetPermission.contains(packageName);
+        }
+!!!8028428.java!!!	hasBindAppWidgetPermission(in packageName : String) : boolean
+        mContext.enforceCallingPermission(
+                android.Manifest.permission.MODIFY_APPWIDGET_BIND_PERMISSIONS,
+                "hasBindAppWidgetPermission packageName=" + packageName);
+
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            return mPackagesWithBindWidgetPermission.contains(packageName);
+        }
+!!!8028556.java!!!	setBindAppWidgetPermission(in packageName : String, inout permission : boolean) : void
+        mContext.enforceCallingPermission(
+                android.Manifest.permission.MODIFY_APPWIDGET_BIND_PERMISSIONS,
+                "setBindAppWidgetPermission packageName=" + packageName);
+
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            if (permission) {
+                mPackagesWithBindWidgetPermission.add(packageName);
+            } else {
+                mPackagesWithBindWidgetPermission.remove(packageName);
+            }
+            saveStateAsync();
+        }
+!!!8028684.java!!!	bindRemoteViewsService(in appWidgetId : int, inout intent : Intent, inout connection : IBinder) : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+            if (id == null) {
+                throw new IllegalArgumentException("bad appWidgetId");
+            }
+            final ComponentName componentName = intent.getComponent();
+            try {
+                final ServiceInfo si = AppGlobals.getPackageManager().getServiceInfo(componentName,
+                        PackageManager.GET_PERMISSIONS, mUserId);
+                if (!android.Manifest.permission.BIND_REMOTEVIEWS.equals(si.permission)) {
+                    throw new SecurityException("Selected service does not require "
+                            + android.Manifest.permission.BIND_REMOTEVIEWS + ": " + componentName);
+                }
+            } catch (RemoteException e) {
+                throw new IllegalArgumentException("Unknown component " + componentName);
+            }
+
+            // If there is already a connection made for this service intent, then disconnect from
+            // that first. (This does not allow multiple connections to the same service under
+            // the same key)
+            ServiceConnectionProxy conn = null;
+            FilterComparison fc = new FilterComparison(intent);
+            Pair<Integer, FilterComparison> key = Pair.create(appWidgetId, fc);
+            if (mBoundRemoteViewsServices.containsKey(key)) {
+                conn = (ServiceConnectionProxy) mBoundRemoteViewsServices.get(key);
+                conn.disconnect();
+                mContext.unbindService(conn);
+                mBoundRemoteViewsServices.remove(key);
+            }
+
+            int userId = UserHandle.getUserId(id.provider.uid);
+            if (userId != mUserId) {
+                Slog.w(TAG, "AppWidgetServiceImpl of user " + mUserId
+                        + " binding to provider on user " + userId);
+            }
+            // Bind to the RemoteViewsService (which will trigger a callback to the
+            // RemoteViewsAdapter.onServiceConnected())
+            final long token = Binder.clearCallingIdentity();
+            try {
+                conn = new ServiceConnectionProxy(key, connection);
+                mContext.bindService(intent, conn, Context.BIND_AUTO_CREATE, userId);
+                mBoundRemoteViewsServices.put(key, conn);
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+
+            // Add it to the mapping of RemoteViewsService to appWidgetIds so that we can determine
+            // when we can call back to the RemoteViewsService later to destroy associated
+            // factories.
+            incrementAppWidgetServiceRefCount(appWidgetId, fc);
+        }
+!!!8028812.java!!!	unbindRemoteViewsService(in appWidgetId : int, inout intent : Intent) : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            // Unbind from the RemoteViewsService (which will trigger a callback to the bound
+            // RemoteViewsAdapter)
+            Pair<Integer, FilterComparison> key = Pair.create(appWidgetId, new FilterComparison(
+                    intent));
+            if (mBoundRemoteViewsServices.containsKey(key)) {
+                // We don't need to use the appWidgetId until after we are sure there is something
+                // to unbind. Note that this may mask certain issues with apps calling unbind()
+                // more than necessary.
+                AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+                if (id == null) {
+                    throw new IllegalArgumentException("bad appWidgetId");
+                }
+
+                ServiceConnectionProxy conn = (ServiceConnectionProxy) mBoundRemoteViewsServices
+                        .get(key);
+                conn.disconnect();
+                mContext.unbindService(conn);
+                mBoundRemoteViewsServices.remove(key);
+            }
+        }
+!!!8028940.java!!!	unbindAppWidgetRemoteViewsServicesLocked(inout id : AppWidgetId) : void
+        int appWidgetId = id.appWidgetId;
+        // Unbind all connections to Services bound to this AppWidgetId
+        Iterator<Pair<Integer, Intent.FilterComparison>> it = mBoundRemoteViewsServices.keySet()
+                .iterator();
+        while (it.hasNext()) {
+            final Pair<Integer, Intent.FilterComparison> key = it.next();
+            if (key.first.intValue() == appWidgetId) {
+                final ServiceConnectionProxy conn = (ServiceConnectionProxy) mBoundRemoteViewsServices
+                        .get(key);
+                conn.disconnect();
+                mContext.unbindService(conn);
+                it.remove();
+            }
+        }
+
+        // Check if we need to destroy any services (if no other app widgets are
+        // referencing the same service)
+        decrementAppWidgetServiceRefCount(id);
+!!!8029068.java!!!	destroyRemoteViewsService(in intent : Intent, inout id : AppWidgetId) : void
+        final ServiceConnection conn = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder service) {
+                final IRemoteViewsFactory cb = IRemoteViewsFactory.Stub.asInterface(service);
+                try {
+                    cb.onDestroy(intent);
+                } catch (RemoteException e) {
+                    e.printStackTrace();
+                } catch (RuntimeException e) {
+                    e.printStackTrace();
+                }
+                mContext.unbindService(this);
+            }
+
+            @Override
+            public void onServiceDisconnected(android.content.ComponentName name) {
+                // Do nothing
+            }
+        };
+
+        int userId = UserHandle.getUserId(id.provider.uid);
+        // Bind to the service and remove the static intent->factory mapping in the
+        // RemoteViewsService.
+        final long token = Binder.clearCallingIdentity();
+        try {
+            mContext.bindService(intent, conn, Context.BIND_AUTO_CREATE, userId);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8029196.java!!!	incrementAppWidgetServiceRefCount(in appWidgetId : int, inout fc : FilterComparison) : void
+        HashSet<Integer> appWidgetIds = null;
+        if (mRemoteViewsServicesAppWidgets.containsKey(fc)) {
+            appWidgetIds = mRemoteViewsServicesAppWidgets.get(fc);
+        } else {
+            appWidgetIds = new HashSet<Integer>();
+            mRemoteViewsServicesAppWidgets.put(fc, appWidgetIds);
+        }
+        appWidgetIds.add(appWidgetId);
+!!!8029324.java!!!	decrementAppWidgetServiceRefCount(inout id : AppWidgetId) : void
+        Iterator<FilterComparison> it = mRemoteViewsServicesAppWidgets.keySet().iterator();
+        while (it.hasNext()) {
+            final FilterComparison key = it.next();
+            final HashSet<Integer> ids = mRemoteViewsServicesAppWidgets.get(key);
+            if (ids.remove(id.appWidgetId)) {
+                // If we have removed the last app widget referencing this service, then we
+                // should destroy it and remove it from this set
+                if (ids.isEmpty()) {
+                    destroyRemoteViewsService(key.getIntent(), id);
+                    it.remove();
+                }
+            }
+        }
+!!!8029452.java!!!	getAppWidgetInfo(in appWidgetId : int) : AppWidgetProviderInfo
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+            if (id != null && id.provider != null && !id.provider.zombie) {
+                return cloneIfLocalBinder(id.provider.info);
+            }
+            return null;
+        }
+!!!8029580.java!!!	getAppWidgetViews(in appWidgetId : int) : RemoteViews
+        if (DBG) log("getAppWidgetViews id=" + appWidgetId);
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+            if (id != null) {
+                return cloneIfLocalBinder(id.views);
+            }
+            if (DBG) log("   couldn't find appwidgetid");
+            return null;
+        }
+!!!8029708.java!!!	getInstalledProviders(in categoryFilter : int) : AppWidgetProviderInfo
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            final int N = mInstalledProviders.size();
+            ArrayList<AppWidgetProviderInfo> result = new ArrayList<AppWidgetProviderInfo>(N);
+            for (int i = 0; i < N; i++) {
+                Provider p = mInstalledProviders.get(i);
+                if (!p.zombie && (p.info.widgetCategory & categoryFilter) != 0) {
+                    result.add(cloneIfLocalBinder(p.info));
+                }
+            }
+            return result;
+        }
+!!!8029836.java!!!	updateAppWidgetIds(inout appWidgetIds : int, inout views : RemoteViews) : void
+        if (appWidgetIds == null) {
+            return;
+        }
+        if (DBG) log("updateAppWidgetIds views: " + views);
+        int bitmapMemoryUsage = 0;
+        if (views != null) {
+            bitmapMemoryUsage = views.estimateMemoryUsage();
+        }
+        if (bitmapMemoryUsage > mMaxWidgetBitmapMemory) {
+            throw new IllegalArgumentException("RemoteViews for widget update exceeds maximum" +
+                    " bitmap memory usage (used: " + bitmapMemoryUsage + ", max: " +
+                    mMaxWidgetBitmapMemory + ") The total memory cannot exceed that required to" +
+                    " fill the device's screen once.");
+        }
+
+        if (appWidgetIds.length == 0) {
+            return;
+        }
+        final int N = appWidgetIds.length;
+
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            for (int i = 0; i < N; i++) {
+                AppWidgetId id = lookupAppWidgetIdLocked(appWidgetIds[i]);
+                updateAppWidgetInstanceLocked(id, views);
+            }
+        }
+!!!8029964.java!!!	saveStateAsync() : void
+        mSaveStateHandler.post(mSaveStateRunnable);
+!!!8030092.java!!!	updateAppWidgetOptions(in appWidgetId : int, inout options : Bundle) : void
+        synchronized (mAppWidgetIds) {
+            options = cloneIfLocalBinder(options);
+            ensureStateLoadedLocked();
+            AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+
+            if (id == null) {
+                return;
+            }
+
+            Provider p = id.provider;
+            // Merge the options
+            id.options.putAll(options);
+
+            // send the broacast saying that this appWidgetId has been deleted
+            Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_OPTIONS_CHANGED);
+            intent.setComponent(p.info.provider);
+            intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id.appWidgetId);
+            intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_OPTIONS, id.options);
+            mContext.sendBroadcastAsUser(intent, new UserHandle(mUserId));
+            saveStateAsync();
+        }
+!!!8030220.java!!!	getAppWidgetOptions(in appWidgetId : int) : Bundle
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            AppWidgetId id = lookupAppWidgetIdLocked(appWidgetId);
+            if (id != null && id.options != null) {
+                return cloneIfLocalBinder(id.options);
+            } else {
+                return Bundle.EMPTY;
+            }
+        }
+!!!8030348.java!!!	partiallyUpdateAppWidgetIds(inout appWidgetIds : int, inout views : RemoteViews) : void
+        if (appWidgetIds == null) {
+            return;
+        }
+        if (appWidgetIds.length == 0) {
+            return;
+        }
+        final int N = appWidgetIds.length;
+
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            for (int i = 0; i < N; i++) {
+                AppWidgetId id = lookupAppWidgetIdLocked(appWidgetIds[i]);
+                if (id == null) {
+                    Slog.w(TAG, "widget id " + appWidgetIds[i] + " not found!");
+                } else if (id.views != null) {
+                    // Only trigger a partial update for a widget if it has received a full update
+                    updateAppWidgetInstanceLocked(id, views, true);
+                }
+            }
+        }
+!!!8030476.java!!!	notifyAppWidgetViewDataChanged(inout appWidgetIds : int, in viewId : int) : void
+        if (appWidgetIds == null) {
+            return;
+        }
+        if (appWidgetIds.length == 0) {
+            return;
+        }
+        final int N = appWidgetIds.length;
+
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            for (int i = 0; i < N; i++) {
+                AppWidgetId id = lookupAppWidgetIdLocked(appWidgetIds[i]);
+                notifyAppWidgetViewDataChangedInstanceLocked(id, viewId);
+            }
+        }
+!!!8030604.java!!!	updateAppWidgetProvider(inout provider : ComponentName, inout views : RemoteViews) : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            Provider p = lookupProviderLocked(provider);
+            if (p == null) {
+                Slog.w(TAG, "updateAppWidgetProvider: provider doesn't exist: " + provider);
+                return;
+            }
+            ArrayList<AppWidgetId> instances = p.instances;
+            final int callingUid = Binder.getCallingUid();
+            final int N = instances.size();
+            for (int i = 0; i < N; i++) {
+                AppWidgetId id = instances.get(i);
+                if (canAccessAppWidgetId(id, callingUid)) {
+                    updateAppWidgetInstanceLocked(id, views);
+                }
+            }
+        }
+!!!8030732.java!!!	updateAppWidgetInstanceLocked(inout id : AppWidgetId, inout views : RemoteViews) : void
+        updateAppWidgetInstanceLocked(id, views, false);
+!!!8030860.java!!!	updateAppWidgetInstanceLocked(inout id : AppWidgetId, inout views : RemoteViews, inout isPartialUpdate : boolean) : void
+        // allow for stale appWidgetIds and other badness
+        // lookup also checks that the calling process can access the appWidgetId
+        // drop unbound appWidgetIds (shouldn't be possible under normal circumstances)
+        if (id != null && id.provider != null && !id.provider.zombie && !id.host.zombie) {
+
+            if (!isPartialUpdate) {
+                // For a full update we replace the RemoteViews completely.
+                id.views = views;
+            } else {
+                // For a partial update, we merge the new RemoteViews with the old.
+                id.views.mergeRemoteViews(views);
+            }
+
+            // is anyone listening?
+            if (id.host.callbacks != null) {
+                try {
+                    // the lock is held, but this is a oneway call
+                    id.host.callbacks.updateAppWidget(id.appWidgetId, views);
+                } catch (RemoteException e) {
+                    // It failed; remove the callback. No need to prune because
+                    // we know that this host is still referenced by this instance.
+                    id.host.callbacks = null;
+                }
+            }
+        }
+!!!8030988.java!!!	notifyAppWidgetViewDataChangedInstanceLocked(inout id : AppWidgetId, in viewId : int) : void
+        // allow for stale appWidgetIds and other badness
+        // lookup also checks that the calling process can access the appWidgetId
+        // drop unbound appWidgetIds (shouldn't be possible under normal circumstances)
+        if (id != null && id.provider != null && !id.provider.zombie && !id.host.zombie) {
+            // is anyone listening?
+            if (id.host.callbacks != null) {
+                try {
+                    // the lock is held, but this is a oneway call
+                    id.host.callbacks.viewDataChanged(id.appWidgetId, viewId);
+                } catch (RemoteException e) {
+                    // It failed; remove the callback. No need to prune because
+                    // we know that this host is still referenced by this instance.
+                    id.host.callbacks = null;
+                }
+            }
+
+            // If the host is unavailable, then we call the associated
+            // RemoteViewsFactory.onDataSetChanged() directly
+            if (id.host.callbacks == null) {
+                Set<FilterComparison> keys = mRemoteViewsServicesAppWidgets.keySet();
+                for (FilterComparison key : keys) {
+                    if (mRemoteViewsServicesAppWidgets.get(key).contains(id.appWidgetId)) {
+                        Intent intent = key.getIntent();
+
+                        final ServiceConnection conn = new ServiceConnection() {
+                            @Override
+                            public void onServiceConnected(ComponentName name, IBinder service) {
+                                IRemoteViewsFactory cb = IRemoteViewsFactory.Stub
+                                        .asInterface(service);
+                                try {
+                                    cb.onDataSetChangedAsync();
+                                } catch (RemoteException e) {
+                                    e.printStackTrace();
+                                } catch (RuntimeException e) {
+                                    e.printStackTrace();
+                                }
+                                mContext.unbindService(this);
+                            }
+
+                            @Override
+                            public void onServiceDisconnected(android.content.ComponentName name) {
+                                // Do nothing
+                            }
+                        };
+
+                        int userId = UserHandle.getUserId(id.provider.uid);
+                        // Bind to the service and call onDataSetChanged()
+                        final long token = Binder.clearCallingIdentity();
+                        try {
+                            mContext.bindService(intent, conn, Context.BIND_AUTO_CREATE, userId);
+                        } finally {
+                            Binder.restoreCallingIdentity(token);
+                        }
+                    }
+                }
+            }
+        }
+!!!8031116.java!!!	isLocalBinder() : boolean
+        return Process.myPid() == Binder.getCallingPid();
+!!!8031244.java!!!	cloneIfLocalBinder(inout rv : RemoteViews) : RemoteViews
+        if (isLocalBinder() && rv != null) {
+            return rv.clone();
+        }
+        return rv;
+!!!8031372.java!!!	cloneIfLocalBinder(inout info : AppWidgetProviderInfo) : AppWidgetProviderInfo
+        if (isLocalBinder() && info != null) {
+            return info.clone();
+        }
+        return info;
+!!!8031500.java!!!	cloneIfLocalBinder(inout bundle : Bundle) : Bundle
+        // Note: this is only a shallow copy. For now this will be fine, but it could be problematic
+        // if we start adding objects to the options. Further, it would only be an issue if keyguard
+        // used such options.
+        if (isLocalBinder() && bundle != null) {
+            return (Bundle) bundle.clone();
+        }
+        return bundle;
+!!!8031628.java!!!	startListening(inout callbacks : IAppWidgetHost, in packageName : String, in hostId : int, inout updatedViews : List<RemoteViews>) : int
+        int callingUid = enforceCallingUid(packageName);
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            Host host = lookupOrAddHostLocked(callingUid, packageName, hostId);
+            host.callbacks = callbacks;
+
+            updatedViews.clear();
+
+            ArrayList<AppWidgetId> instances = host.instances;
+            int N = instances.size();
+            int[] updatedIds = new int[N];
+            for (int i = 0; i < N; i++) {
+                AppWidgetId id = instances.get(i);
+                updatedIds[i] = id.appWidgetId;
+                updatedViews.add(cloneIfLocalBinder(id.views));
+            }
+            return updatedIds;
+        }
+!!!8031756.java!!!	stopListening(in hostId : int) : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            Host host = lookupHostLocked(Binder.getCallingUid(), hostId);
+            if (host != null) {
+                host.callbacks = null;
+                pruneHostLocked(host);
+            }
+        }
+!!!8031884.java!!!	canAccessAppWidgetId(inout id : AppWidgetId, in callingUid : int) : boolean
+        if (id.host.uidMatches(callingUid)) {
+            // Apps hosting the AppWidget have access to it.
+            return true;
+        }
+        if (id.provider != null && id.provider.uid == callingUid) {
+            // Apps providing the AppWidget have access to it (if the appWidgetId has been bound)
+            return true;
+        }
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.BIND_APPWIDGET) == PackageManager.PERMISSION_GRANTED) {
+            // Apps that can bind have access to all appWidgetIds.
+            return true;
+        }
+        // Nobody else can access it.
+        return false;
+!!!8032012.java!!!	lookupAppWidgetIdLocked(in appWidgetId : int) : AppWidgetId
+        int callingUid = Binder.getCallingUid();
+        final int N = mAppWidgetIds.size();
+        for (int i = 0; i < N; i++) {
+            AppWidgetId id = mAppWidgetIds.get(i);
+            if (id.appWidgetId == appWidgetId && canAccessAppWidgetId(id, callingUid)) {
+                return id;
+            }
+        }
+        return null;
+!!!8032140.java!!!	lookupProviderLocked(inout provider : ComponentName) : Provider
+        final int N = mInstalledProviders.size();
+        for (int i = 0; i < N; i++) {
+            Provider p = mInstalledProviders.get(i);
+            if (p.info.provider.equals(provider)) {
+                return p;
+            }
+        }
+        return null;
+!!!8032268.java!!!	lookupHostLocked(in uid : int, in hostId : int) : Host
+        final int N = mHosts.size();
+        for (int i = 0; i < N; i++) {
+            Host h = mHosts.get(i);
+            if (h.uidMatches(uid) && h.hostId == hostId) {
+                return h;
+            }
+        }
+        return null;
+!!!8032396.java!!!	lookupOrAddHostLocked(in uid : int, in packageName : String, in hostId : int) : Host
+        final int N = mHosts.size();
+        for (int i = 0; i < N; i++) {
+            Host h = mHosts.get(i);
+            if (h.hostId == hostId && h.packageName.equals(packageName)) {
+                return h;
+            }
+        }
+        Host host = new Host();
+        host.packageName = packageName;
+        host.uid = uid;
+        host.hostId = hostId;
+        mHosts.add(host);
+        return host;
+!!!8032524.java!!!	pruneHostLocked(inout host : Host) : void
+        if (host.instances.size() == 0 && host.callbacks == null) {
+            mHosts.remove(host);
+        }
+!!!8032652.java!!!	loadAppWidgetListLocked() : void
+        Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+        try {
+            List<ResolveInfo> broadcastReceivers = mPm.queryIntentReceivers(intent,
+                    intent.resolveTypeIfNeeded(mContext.getContentResolver()),
+                    PackageManager.GET_META_DATA, mUserId);
+
+            final int N = broadcastReceivers == null ? 0 : broadcastReceivers.size();
+            for (int i = 0; i < N; i++) {
+                ResolveInfo ri = broadcastReceivers.get(i);
+                addProviderLocked(ri);
+            }
+        } catch (RemoteException re) {
+            // Shouldn't happen, local call
+        }
+!!!8032780.java!!!	addProviderLocked(inout ri : ResolveInfo) : boolean
+        if ((ri.activityInfo.applicationInfo.flags & ApplicationInfo.FLAG_EXTERNAL_STORAGE) != 0) {
+            return false;
+        }
+        if (!ri.activityInfo.isEnabled()) {
+            return false;
+        }
+        Provider p = parseProviderInfoXml(new ComponentName(ri.activityInfo.packageName,
+                ri.activityInfo.name), ri);
+        if (p != null) {
+            mInstalledProviders.add(p);
+            return true;
+        } else {
+            return false;
+        }
+!!!8032908.java!!!	removeProviderLocked(in index : int, inout p : Provider) : void
+        int N = p.instances.size();
+        for (int i = 0; i < N; i++) {
+            AppWidgetId id = p.instances.get(i);
+            // Call back with empty RemoteViews
+            updateAppWidgetInstanceLocked(id, null);
+            // Stop telling the host about updates for this from now on
+            cancelBroadcasts(p);
+            // clear out references to this appWidgetId
+            id.host.instances.remove(id);
+            mAppWidgetIds.remove(id);
+            id.provider = null;
+            pruneHostLocked(id.host);
+            id.host = null;
+        }
+        p.instances.clear();
+        mInstalledProviders.remove(index);
+        mDeletedProviders.add(p);
+        // no need to send the DISABLE broadcast, since the receiver is gone anyway
+        cancelBroadcasts(p);
+!!!8033036.java!!!	sendEnableIntentLocked(inout p : Provider) : void
+        Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_ENABLED);
+        intent.setComponent(p.info.provider);
+        mContext.sendBroadcastAsUser(intent, new UserHandle(mUserId));
+!!!8033164.java!!!	sendUpdateIntentLocked(inout p : Provider, inout appWidgetIds : int) : void
+        if (appWidgetIds != null && appWidgetIds.length > 0) {
+            Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+            intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, appWidgetIds);
+            intent.setComponent(p.info.provider);
+            mContext.sendBroadcastAsUser(intent, new UserHandle(mUserId));
+        }
+!!!8033292.java!!!	registerForBroadcastsLocked(inout p : Provider, inout appWidgetIds : int) : void
+        if (p.info.updatePeriodMillis > 0) {
+            // if this is the first instance, set the alarm. otherwise,
+            // rely on the fact that we've already set it and that
+            // PendingIntent.getBroadcast will update the extras.
+            boolean alreadyRegistered = p.broadcast != null;
+            Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+            intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, appWidgetIds);
+            intent.setComponent(p.info.provider);
+            long token = Binder.clearCallingIdentity();
+            try {
+                p.broadcast = PendingIntent.getBroadcastAsUser(mContext, 1, intent,
+                        PendingIntent.FLAG_UPDATE_CURRENT, new UserHandle(mUserId));
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+            if (!alreadyRegistered) {
+                long period = p.info.updatePeriodMillis;
+                if (period < MIN_UPDATE_PERIOD) {
+                    period = MIN_UPDATE_PERIOD;
+                }
+                mAlarmManager.setInexactRepeating(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock
+                        .elapsedRealtime()
+                        + period, period, p.broadcast);
+            }
+        }
+!!!8033420.java!!!	getAppWidgetIds(inout p : Provider) : int
+        int instancesSize = p.instances.size();
+        int appWidgetIds[] = new int[instancesSize];
+        for (int i = 0; i < instancesSize; i++) {
+            appWidgetIds[i] = p.instances.get(i).appWidgetId;
+        }
+        return appWidgetIds;
+!!!8033548.java!!!	getAppWidgetIds(inout provider : ComponentName) : int
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            Provider p = lookupProviderLocked(provider);
+            if (p != null && Binder.getCallingUid() == p.uid) {
+                return getAppWidgetIds(p);
+            } else {
+                return new int[0];
+            }
+        }
+!!!8033676.java!!!	getAppWidgetIds(inout h : Host) : int
+        int instancesSize = h.instances.size();
+        int appWidgetIds[] = new int[instancesSize];
+        for (int i = 0; i < instancesSize; i++) {
+            appWidgetIds[i] = h.instances.get(i).appWidgetId;
+        }
+        return appWidgetIds;
+!!!8033804.java!!!	getAppWidgetIdsForHost(in hostId : int) : int
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            int callingUid = Binder.getCallingUid();
+            Host host = lookupHostLocked(callingUid, hostId);
+            if (host != null) {
+                return getAppWidgetIds(host);
+            } else {
+                return new int[0];
+            }
+        }
+!!!8033932.java!!!	parseProviderInfoXml(inout component : ComponentName, inout ri : ResolveInfo) : Provider
+        Provider p = null;
+
+        ActivityInfo activityInfo = ri.activityInfo;
+        XmlResourceParser parser = null;
+        try {
+            parser = activityInfo.loadXmlMetaData(mContext.getPackageManager(),
+                    AppWidgetManager.META_DATA_APPWIDGET_PROVIDER);
+            if (parser == null) {
+                Slog.w(TAG, "No " + AppWidgetManager.META_DATA_APPWIDGET_PROVIDER
+                        + " meta-data for " + "AppWidget provider '" + component + '\'');
+                return null;
+            }
+
+            AttributeSet attrs = Xml.asAttributeSet(parser);
+
+            int type;
+            while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+                    && type != XmlPullParser.START_TAG) {
+                // drain whitespace, comments, etc.
+            }
+
+            String nodeName = parser.getName();
+            if (!"appwidget-provider".equals(nodeName)) {
+                Slog.w(TAG, "Meta-data does not start with appwidget-provider tag for"
+                        + " AppWidget provider '" + component + '\'');
+                return null;
+            }
+
+            p = new Provider();
+            AppWidgetProviderInfo info = p.info = new AppWidgetProviderInfo();
+            info.provider = component;
+            p.uid = activityInfo.applicationInfo.uid;
+
+            Resources res = mContext.getPackageManager()
+                    .getResourcesForApplicationAsUser(activityInfo.packageName, mUserId);
+
+            TypedArray sa = res.obtainAttributes(attrs,
+                    com.android.internal.R.styleable.AppWidgetProviderInfo);
+
+            // These dimensions has to be resolved in the application's context.
+            // We simply send back the raw complex data, which will be
+            // converted to dp in {@link AppWidgetManager#getAppWidgetInfo}.
+            TypedValue value = sa
+                    .peekValue(com.android.internal.R.styleable.AppWidgetProviderInfo_minWidth);
+            info.minWidth = value != null ? value.data : 0;
+            value = sa.peekValue(com.android.internal.R.styleable.AppWidgetProviderInfo_minHeight);
+            info.minHeight = value != null ? value.data : 0;
+            value = sa.peekValue(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_minResizeWidth);
+            info.minResizeWidth = value != null ? value.data : info.minWidth;
+            value = sa.peekValue(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_minResizeHeight);
+            info.minResizeHeight = value != null ? value.data : info.minHeight;
+            info.updatePeriodMillis = sa.getInt(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_updatePeriodMillis, 0);
+            info.initialLayout = sa.getResourceId(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_initialLayout, 0);
+            info.initialKeyguardLayout = sa.getResourceId(com.android.internal.R.styleable.
+                    AppWidgetProviderInfo_initialKeyguardLayout, 0);
+            String className = sa
+                    .getString(com.android.internal.R.styleable.AppWidgetProviderInfo_configure);
+            if (className != null) {
+                info.configure = new ComponentName(component.getPackageName(), className);
+            }
+            info.label = activityInfo.loadLabel(mContext.getPackageManager()).toString();
+            info.icon = ri.getIconResource();
+            info.previewImage = sa.getResourceId(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_previewImage, 0);
+            info.autoAdvanceViewId = sa.getResourceId(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_autoAdvanceViewId, -1);
+            info.resizeMode = sa.getInt(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_resizeMode,
+                    AppWidgetProviderInfo.RESIZE_NONE);
+            info.widgetCategory = sa.getInt(
+                    com.android.internal.R.styleable.AppWidgetProviderInfo_widgetCategory,
+                    AppWidgetProviderInfo.WIDGET_CATEGORY_HOME_SCREEN);
+
+            sa.recycle();
+        } catch (Exception e) {
+            // Ok to catch Exception here, because anything going wrong because
+            // of what a client process passes to us should not be fatal for the
+            // system process.
+            Slog.w(TAG, "XML parsing failed for AppWidget provider '" + component + '\'', e);
+            return null;
+        } finally {
+            if (parser != null)
+                parser.close();
+        }
+        return p;
+!!!8034060.java!!!	getUidForPackage(in packageName : String) : int
+        PackageInfo pkgInfo = null;
+        try {
+            pkgInfo = mPm.getPackageInfo(packageName, 0, mUserId);
+        } catch (RemoteException re) {
+            // Shouldn't happen, local call
+        }
+        if (pkgInfo == null || pkgInfo.applicationInfo == null) {
+            throw new PackageManager.NameNotFoundException();
+        }
+        return pkgInfo.applicationInfo.uid;
+!!!8034188.java!!!	enforceSystemOrCallingUid(in packageName : String) : int
+        int callingUid = Binder.getCallingUid();
+        if (UserHandle.getAppId(callingUid) == Process.SYSTEM_UID || callingUid == 0) {
+            return callingUid;
+        }
+        return enforceCallingUid(packageName);
+!!!8034316.java!!!	enforceCallingUid(in packageName : String) : int
+        int callingUid = Binder.getCallingUid();
+        int packageUid;
+        try {
+            packageUid = getUidForPackage(packageName);
+        } catch (PackageManager.NameNotFoundException ex) {
+            throw new IllegalArgumentException("packageName and uid don't match packageName="
+                    + packageName);
+        }
+        if (!UserHandle.isSameApp(callingUid, packageUid)) {
+            throw new IllegalArgumentException("packageName and uid don't match packageName="
+                    + packageName);
+        }
+        return callingUid;
+!!!8034444.java!!!	sendInitialBroadcasts() : void
+        synchronized (mAppWidgetIds) {
+            ensureStateLoadedLocked();
+            final int N = mInstalledProviders.size();
+            for (int i = 0; i < N; i++) {
+                Provider p = mInstalledProviders.get(i);
+                if (p.instances.size() > 0) {
+                    sendEnableIntentLocked(p);
+                    int[] appWidgetIds = getAppWidgetIds(p);
+                    sendUpdateIntentLocked(p, appWidgetIds);
+                    registerForBroadcastsLocked(p, appWidgetIds);
+                }
+            }
+        }
+!!!8034572.java!!!	loadStateLocked() : void
+        AtomicFile file = savedStateFile();
+        try {
+            FileInputStream stream = file.openRead();
+            readStateFromFileLocked(stream);
+
+            if (stream != null) {
+                try {
+                    stream.close();
+                } catch (IOException e) {
+                    Slog.w(TAG, "Failed to close state FileInputStream " + e);
+                }
+            }
+        } catch (FileNotFoundException e) {
+            Slog.w(TAG, "Failed to read state: " + e);
+        }
+!!!8034700.java!!!	saveStateLocked() : void
+        AtomicFile file = savedStateFile();
+        FileOutputStream stream;
+        try {
+            stream = file.startWrite();
+            if (writeStateToFileLocked(stream)) {
+                file.finishWrite(stream);
+            } else {
+                file.failWrite(stream);
+                Slog.w(TAG, "Failed to save state, restoring backup.");
+            }
+        } catch (IOException e) {
+            Slog.w(TAG, "Failed open state file for write: " + e);
+        }
+!!!8034828.java!!!	writeStateToFileLocked(inout stream : FileOutputStream) : boolean
+        int N;
+
+        try {
+            XmlSerializer out = new FastXmlSerializer();
+            out.setOutput(stream, "utf-8");
+            out.startDocument(null, true);
+            out.startTag(null, "gs");
+
+            int providerIndex = 0;
+            N = mInstalledProviders.size();
+            for (int i = 0; i < N; i++) {
+                Provider p = mInstalledProviders.get(i);
+                if (p.instances.size() > 0) {
+                    out.startTag(null, "p");
+                    out.attribute(null, "pkg", p.info.provider.getPackageName());
+                    out.attribute(null, "cl", p.info.provider.getClassName());
+                    out.endTag(null, "p");
+                    p.tag = providerIndex;
+                    providerIndex++;
+                }
+            }
+
+            N = mHosts.size();
+            for (int i = 0; i < N; i++) {
+                Host host = mHosts.get(i);
+                out.startTag(null, "h");
+                out.attribute(null, "pkg", host.packageName);
+                out.attribute(null, "id", Integer.toHexString(host.hostId));
+                out.endTag(null, "h");
+                host.tag = i;
+            }
+
+            N = mAppWidgetIds.size();
+            for (int i = 0; i < N; i++) {
+                AppWidgetId id = mAppWidgetIds.get(i);
+                out.startTag(null, "g");
+                out.attribute(null, "id", Integer.toHexString(id.appWidgetId));
+                out.attribute(null, "h", Integer.toHexString(id.host.tag));
+                if (id.provider != null) {
+                    out.attribute(null, "p", Integer.toHexString(id.provider.tag));
+                }
+                if (id.options != null) {
+                    out.attribute(null, "min_width", Integer.toHexString(id.options.getInt(
+                            AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH)));
+                    out.attribute(null, "min_height", Integer.toHexString(id.options.getInt(
+                            AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT)));
+                    out.attribute(null, "max_width", Integer.toHexString(id.options.getInt(
+                            AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH)));
+                    out.attribute(null, "max_height", Integer.toHexString(id.options.getInt(
+                            AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT)));
+                    out.attribute(null, "host_category", Integer.toHexString(id.options.getInt(
+                            AppWidgetManager.OPTION_APPWIDGET_HOST_CATEGORY)));
+                }
+                out.endTag(null, "g");
+            }
+
+            Iterator<String> it = mPackagesWithBindWidgetPermission.iterator();
+            while (it.hasNext()) {
+                out.startTag(null, "b");
+                out.attribute(null, "packageName", it.next());
+                out.endTag(null, "b");
+            }
+
+            out.endTag(null, "gs");
+
+            out.endDocument();
+            return true;
+        } catch (IOException e) {
+            Slog.w(TAG, "Failed to write state: " + e);
+            return false;
+        }
+!!!8034956.java!!!	readStateFromFileLocked(inout stream : FileInputStream) : void
+        boolean success = false;
+        try {
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setInput(stream, null);
+
+            int type;
+            int providerIndex = 0;
+            HashMap<Integer, Provider> loadedProviders = new HashMap<Integer, Provider>();
+            do {
+                type = parser.next();
+                if (type == XmlPullParser.START_TAG) {
+                    String tag = parser.getName();
+                    if ("p".equals(tag)) {
+                        // TODO: do we need to check that this package has the same signature
+                        // as before?
+                        String pkg = parser.getAttributeValue(null, "pkg");
+                        String cl = parser.getAttributeValue(null, "cl");
+
+                        final IPackageManager packageManager = AppGlobals.getPackageManager();
+                        try {
+                            packageManager.getReceiverInfo(new ComponentName(pkg, cl), 0, mUserId);
+                        } catch (RemoteException e) {
+                            String[] pkgs = mContext.getPackageManager()
+                                    .currentToCanonicalPackageNames(new String[] { pkg });
+                            pkg = pkgs[0];
+                        }
+
+                        Provider p = lookupProviderLocked(new ComponentName(pkg, cl));
+                        if (p == null && mSafeMode) {
+                            // if we're in safe mode, make a temporary one
+                            p = new Provider();
+                            p.info = new AppWidgetProviderInfo();
+                            p.info.provider = new ComponentName(pkg, cl);
+                            p.zombie = true;
+                            mInstalledProviders.add(p);
+                        }
+                        if (p != null) {
+                            // if it wasn't uninstalled or something
+                            loadedProviders.put(providerIndex, p);
+                        }
+                        providerIndex++;
+                    } else if ("h".equals(tag)) {
+                        Host host = new Host();
+
+                        // TODO: do we need to check that this package has the same signature
+                        // as before?
+                        host.packageName = parser.getAttributeValue(null, "pkg");
+                        try {
+                            host.uid = getUidForPackage(host.packageName);
+                        } catch (PackageManager.NameNotFoundException ex) {
+                            host.zombie = true;
+                        }
+                        if (!host.zombie || mSafeMode) {
+                            // In safe mode, we don't discard the hosts we don't recognize
+                            // so that they're not pruned from our list. Otherwise, we do.
+                            host.hostId = Integer
+                                    .parseInt(parser.getAttributeValue(null, "id"), 16);
+                            mHosts.add(host);
+                        }
+                    } else if ("b".equals(tag)) {
+                        String packageName = parser.getAttributeValue(null, "packageName");
+                        if (packageName != null) {
+                            mPackagesWithBindWidgetPermission.add(packageName);
+                        }
+                    } else if ("g".equals(tag)) {
+                        AppWidgetId id = new AppWidgetId();
+                        id.appWidgetId = Integer.parseInt(parser.getAttributeValue(null, "id"), 16);
+                        if (id.appWidgetId >= mNextAppWidgetId) {
+                            mNextAppWidgetId = id.appWidgetId + 1;
+                        }
+
+                        Bundle options = new Bundle();
+                        String minWidthString = parser.getAttributeValue(null, "min_width");
+                        if (minWidthString != null) {
+                            options.putInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH,
+                                    Integer.parseInt(minWidthString, 16));
+                        }
+                        String minHeightString = parser.getAttributeValue(null, "min_height");
+                        if (minHeightString != null) {
+                            options.putInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT,
+                                    Integer.parseInt(minHeightString, 16));
+                        }
+                        String maxWidthString = parser.getAttributeValue(null, "max_width");
+                        if (maxWidthString != null) {
+                            options.putInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH,
+                                    Integer.parseInt(maxWidthString, 16));
+                        }
+                        String maxHeightString = parser.getAttributeValue(null, "max_height");
+                        if (maxHeightString != null) {
+                            options.putInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT,
+                                    Integer.parseInt(maxHeightString, 16));
+                        }
+                        String categoryString = parser.getAttributeValue(null, "host_category");
+                        if (categoryString != null) {
+                            options.putInt(AppWidgetManager.OPTION_APPWIDGET_HOST_CATEGORY,
+                                    Integer.parseInt(categoryString, 16));
+                        }
+                        id.options = options;
+
+                        String providerString = parser.getAttributeValue(null, "p");
+                        if (providerString != null) {
+                            // there's no provider if it hasn't been bound yet.
+                            // maybe we don't have to save this, but it brings the system
+                            // to the state it was in.
+                            int pIndex = Integer.parseInt(providerString, 16);
+                            id.provider = loadedProviders.get(pIndex);
+                            if (false) {
+                                Slog.d(TAG, "bound appWidgetId=" + id.appWidgetId + " to provider "
+                                        + pIndex + " which is " + id.provider);
+                            }
+                            if (id.provider == null) {
+                                // This provider is gone. We just let the host figure out
+                                // that this happened when it fails to load it.
+                                continue;
+                            }
+                        }
+
+                        int hIndex = Integer.parseInt(parser.getAttributeValue(null, "h"), 16);
+                        id.host = mHosts.get(hIndex);
+                        if (id.host == null) {
+                            // This host is gone.
+                            continue;
+                        }
+
+                        if (id.provider != null) {
+                            id.provider.instances.add(id);
+                        }
+                        id.host.instances.add(id);
+                        mAppWidgetIds.add(id);
+                    }
+                }
+            } while (type != XmlPullParser.END_DOCUMENT);
+            success = true;
+        } catch (NullPointerException e) {
+            Slog.w(TAG, "failed parsing " + e);
+        } catch (NumberFormatException e) {
+            Slog.w(TAG, "failed parsing " + e);
+        } catch (XmlPullParserException e) {
+            Slog.w(TAG, "failed parsing " + e);
+        } catch (IOException e) {
+            Slog.w(TAG, "failed parsing " + e);
+        } catch (IndexOutOfBoundsException e) {
+            Slog.w(TAG, "failed parsing " + e);
+        }
+
+        if (success) {
+            // delete any hosts that didn't manage to get connected (should happen)
+            // if it matters, they'll be reconnected.
+            for (int i = mHosts.size() - 1; i >= 0; i--) {
+                pruneHostLocked(mHosts.get(i));
+            }
+        } else {
+            // failed reading, clean up
+            Slog.w(TAG, "Failed to read state, clearing widgets and hosts.");
+
+            mAppWidgetIds.clear();
+            mHosts.clear();
+            final int N = mInstalledProviders.size();
+            for (int i = 0; i < N; i++) {
+                mInstalledProviders.get(i).instances.clear();
+            }
+        }
+!!!8035084.java!!!	getSettingsFile(in userId : int) : File
+        return new File(Environment.getUserSystemDirectory(userId), SETTINGS_FILENAME);
+!!!8035212.java!!!	savedStateFile() : AtomicFile
+        File dir = Environment.getUserSystemDirectory(mUserId);
+        File settingsFile = getSettingsFile(mUserId);
+        if (!settingsFile.exists() && mUserId == 0) {
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
+            // Migrate old data
+            File oldFile = new File("/data/system/" + SETTINGS_FILENAME);
+            // Method doesn't throw an exception on failure. Ignore any errors
+            // in moving the file (like non-existence)
+            oldFile.renameTo(settingsFile);
+        }
+        return new AtomicFile(settingsFile);
+!!!8035340.java!!!	onUserStopping() : void
+        // prune the ones we don't want to keep
+        int N = mInstalledProviders.size();
+        for (int i = N - 1; i >= 0; i--) {
+            Provider p = mInstalledProviders.get(i);
+            cancelBroadcasts(p);
+        }
+!!!8035468.java!!!	onUserRemoved() : void
+        getSettingsFile(mUserId).delete();
+!!!8035596.java!!!	addProvidersForPackageLocked(in pkgName : String) : boolean
+        boolean providersAdded = false;
+        Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+        intent.setPackage(pkgName);
+        List<ResolveInfo> broadcastReceivers;
+        try {
+            broadcastReceivers = mPm.queryIntentReceivers(intent,
+                    intent.resolveTypeIfNeeded(mContext.getContentResolver()),
+                    PackageManager.GET_META_DATA, mUserId);
+        } catch (RemoteException re) {
+            // Shouldn't happen, local call
+            return false;
+        }
+        final int N = broadcastReceivers == null ? 0 : broadcastReceivers.size();
+        for (int i = 0; i < N; i++) {
+            ResolveInfo ri = broadcastReceivers.get(i);
+            ActivityInfo ai = ri.activityInfo;
+            if ((ai.applicationInfo.flags & ApplicationInfo.FLAG_EXTERNAL_STORAGE) != 0) {
+                continue;
+            }
+            if (pkgName.equals(ai.packageName)) {
+                addProviderLocked(ri);
+                providersAdded = true;
+            }
+        }
+
+        return providersAdded;
+!!!8035724.java!!!	updateProvidersForPackageLocked(in pkgName : String, inout removedProviders : Set<ComponentName>) : boolean
+        boolean providersUpdated = false;
+        HashSet<String> keep = new HashSet<String>();
+        Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+        intent.setPackage(pkgName);
+        List<ResolveInfo> broadcastReceivers;
+        try {
+            broadcastReceivers = mPm.queryIntentReceivers(intent,
+                intent.resolveTypeIfNeeded(mContext.getContentResolver()),
+                PackageManager.GET_META_DATA, mUserId);
+        } catch (RemoteException re) {
+            // Shouldn't happen, local call
+            return false;
+        }
+
+        // add the missing ones and collect which ones to keep
+        int N = broadcastReceivers == null ? 0 : broadcastReceivers.size();
+        for (int i = 0; i < N; i++) {
+            ResolveInfo ri = broadcastReceivers.get(i);
+            ActivityInfo ai = ri.activityInfo;
+            if ((ai.applicationInfo.flags & ApplicationInfo.FLAG_EXTERNAL_STORAGE) != 0) {
+                continue;
+            }
+            if (pkgName.equals(ai.packageName)) {
+                ComponentName component = new ComponentName(ai.packageName, ai.name);
+                Provider p = lookupProviderLocked(component);
+                if (p == null) {
+                    if (addProviderLocked(ri)) {
+                        keep.add(ai.name);
+                        providersUpdated = true;
+                    }
+                } else {
+                    Provider parsed = parseProviderInfoXml(component, ri);
+                    if (parsed != null) {
+                        keep.add(ai.name);
+                        // Use the new AppWidgetProviderInfo.
+                        p.info = parsed.info;
+                        // If it's enabled
+                        final int M = p.instances.size();
+                        if (M > 0) {
+                            int[] appWidgetIds = getAppWidgetIds(p);
+                            // Reschedule for the new updatePeriodMillis (don't worry about handling
+                            // it specially if updatePeriodMillis didn't change because we just sent
+                            // an update, and the next one will be updatePeriodMillis from now).
+                            cancelBroadcasts(p);
+                            registerForBroadcastsLocked(p, appWidgetIds);
+                            // If it's currently showing, call back with the new
+                            // AppWidgetProviderInfo.
+                            for (int j = 0; j < M; j++) {
+                                AppWidgetId id = p.instances.get(j);
+                                id.views = null;
+                                if (id.host != null && id.host.callbacks != null) {
+                                    try {
+                                        id.host.callbacks.providerChanged(id.appWidgetId, p.info);
+                                    } catch (RemoteException ex) {
+                                        // It failed; remove the callback. No need to prune because
+                                        // we know that this host is still referenced by this
+                                        // instance.
+                                        id.host.callbacks = null;
+                                    }
+                                }
+                            }
+                            // Now that we've told the host, push out an update.
+                            sendUpdateIntentLocked(p, appWidgetIds);
+                            providersUpdated = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // prune the ones we don't want to keep
+        N = mInstalledProviders.size();
+        for (int i = N - 1; i >= 0; i--) {
+            Provider p = mInstalledProviders.get(i);
+            if (pkgName.equals(p.info.provider.getPackageName())
+                    && !keep.contains(p.info.provider.getClassName())) {
+                if (removedProviders != null) {
+                    removedProviders.add(p.info.provider);
+                }
+                removeProviderLocked(i, p);
+                providersUpdated = true;
+            }
+        }
+
+        return providersUpdated;
+!!!8035852.java!!!	removeProvidersForPackageLocked(in pkgName : String) : boolean
+        boolean providersRemoved = false;
+        int N = mInstalledProviders.size();
+        for (int i = N - 1; i >= 0; i--) {
+            Provider p = mInstalledProviders.get(i);
+            if (pkgName.equals(p.info.provider.getPackageName())) {
+                removeProviderLocked(i, p);
+                providersRemoved = true;
+            }
+        }
+
+        // Delete the hosts for this package too
+        //
+        // By now, we have removed any AppWidgets that were in any hosts here,
+        // so we don't need to worry about sending DISABLE broadcasts to them.
+        N = mHosts.size();
+        for (int i = N - 1; i >= 0; i--) {
+            Host host = mHosts.get(i);
+            if (pkgName.equals(host.packageName)) {
+                deleteHostLocked(host);
+            }
+        }
+
+        return providersRemoved;
+!!!8035980.java!!!	notifyHostsForProvidersChangedLocked() : void
+        final int N = mHosts.size();
+        for (int i = N - 1; i >= 0; i--) {
+            Host host = mHosts.get(i);
+            try {
+                if (host.callbacks != null) {
+                    host.callbacks.providersChanged();
+                }
+            } catch (RemoteException ex) {
+                // It failed; remove the callback. No need to prune because
+                // we know that this host is still referenced by this
+                // instance.
+                host.callbacks = null;
+            }
+        }

@@ -1,0 +1,270 @@
+class AACWriter
+!!!339980.cpp!!!	AACWriter(in filename : char)
+
+    ALOGV("AACWriter Constructor");
+
+    mFd = open(filename, O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
+    if (mFd >= 0) {
+        mInitCheck = OK;
+    }
+!!!340236.cpp!!!	initCheck() : status_t
+    return mInitCheck;
+!!!340364.cpp!!!	addSource(in source : sp<MediaSource>) : status_t
+    if (mInitCheck != OK) {
+        return mInitCheck;
+    }
+
+    if (mSource != NULL) {
+        ALOGE("AAC files only support a single track of audio.");
+        return UNKNOWN_ERROR;
+    }
+
+    sp<MetaData> meta = source->getFormat();
+
+    const char *mime;
+    CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+    CHECK(!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC));
+    CHECK(meta->findInt32(kKeyChannelCount, &mChannelCount));
+    CHECK(meta->findInt32(kKeySampleRate, &mSampleRate));
+    CHECK(mChannelCount >= 1 && mChannelCount <= 2);
+
+    // Optionally, we want to check whether AACProfile is also set.
+    if (meta->findInt32(kKeyAACProfile, &mAACProfile)) {
+        ALOGI("AAC profile is changed to %d", mAACProfile);
+    }
+
+    mSource = source;
+    return OK;
+!!!340492.cpp!!!	reachedEOS() : bool
+    return mReachedEOS;
+!!!340620.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    if (mInitCheck != OK) {
+        return mInitCheck;
+    }
+
+    if (mSource == NULL) {
+        return UNKNOWN_ERROR;
+    }
+
+    if (mStarted && mPaused) {
+        mPaused = false;
+        mResumed = true;
+        return OK;
+    } else if (mStarted) {
+        // Already started, does nothing
+        return OK;
+    }
+
+    mFrameDurationUs = (kSamplesPerFrame * 1000000LL + (mSampleRate >> 1))
+                            / mSampleRate;
+
+    status_t err = mSource->start();
+
+    if (err != OK) {
+        return err;
+    }
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    mReachedEOS = false;
+    mDone = false;
+
+    pthread_create(&mThread, &attr, ThreadWrapper, this);
+    pthread_attr_destroy(&attr);
+
+    mStarted = true;
+
+    return OK;
+!!!340876.cpp!!!	pause() : status_t
+    if (!mStarted) {
+        return OK;
+    }
+    mPaused = true;
+    return OK;
+!!!341004.cpp!!!	~AACWriter()
+    if (mStarted) {
+        reset();
+    }
+
+    if (mFd != -1) {
+        close(mFd);
+        mFd = -1;
+    }
+!!!341132.cpp!!!	ThreadWrapper(inout me : void) : void
+    return (void *) static_cast<AACWriter *>(me)->threadFunc();
+!!!341260.cpp!!!	threadFunc() : status_t
+    mEstimatedDurationUs = 0;
+    mEstimatedSizeBytes = 0;
+    int64_t previousPausedDurationUs = 0;
+    int64_t maxTimestampUs = 0;
+    status_t err = OK;
+    bool stoppedPrematurely = true;
+
+    prctl(PR_SET_NAME, (unsigned long)"AACWriterThread", 0, 0, 0);
+
+    while (!mDone && err == OK) {
+        MediaBuffer *buffer;
+        err = mSource->read(&buffer);
+
+        if (err != OK) {
+            break;
+        }
+
+        if (mPaused) {
+            buffer->release();
+            buffer = NULL;
+            continue;
+        }
+
+        mEstimatedSizeBytes += kAdtsHeaderLength + buffer->range_length();
+        if (exceedsFileSizeLimit()) {
+            buffer->release();
+            buffer = NULL;
+            notify(MEDIA_RECORDER_EVENT_INFO, MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED, 0);
+            break;
+        }
+
+        int32_t isCodecSpecific = 0;
+        if (buffer->meta_data()->findInt32(kKeyIsCodecConfig, &isCodecSpecific) && isCodecSpecific) {
+            ALOGV("Drop codec specific info buffer");
+            buffer->release();
+            buffer = NULL;
+            continue;
+        }
+
+        int64_t timestampUs;
+        CHECK(buffer->meta_data()->findInt64(kKeyTime, &timestampUs));
+        if (timestampUs > mEstimatedDurationUs) {
+            mEstimatedDurationUs = timestampUs;
+        }
+        if (mResumed) {
+            previousPausedDurationUs += (timestampUs - maxTimestampUs - mFrameDurationUs);
+            mResumed = false;
+        }
+        timestampUs -= previousPausedDurationUs;
+        ALOGV("time stamp: %lld, previous paused duration: %lld",
+            timestampUs, previousPausedDurationUs);
+        if (timestampUs > maxTimestampUs) {
+            maxTimestampUs = timestampUs;
+        }
+
+        if (exceedsFileDurationLimit()) {
+            buffer->release();
+            buffer = NULL;
+            notify(MEDIA_RECORDER_EVENT_INFO, MEDIA_RECORDER_INFO_MAX_DURATION_REACHED, 0);
+            break;
+        }
+
+        // Each output AAC audio frame to the file contains
+        // 1. an ADTS header, followed by
+        // 2. the compressed audio data.
+        ssize_t dataLength = buffer->range_length();
+        uint8_t *data = (uint8_t *)buffer->data() + buffer->range_offset();
+        if (writeAdtsHeader(kAdtsHeaderLength + dataLength) != OK ||
+            dataLength != write(mFd, data, dataLength)) {
+            err = ERROR_IO;
+        }
+
+        buffer->release();
+        buffer = NULL;
+
+        if (err != OK) {
+            break;
+        }
+
+        if (stoppedPrematurely) {
+            stoppedPrematurely = false;
+        }
+    }
+
+    if ((err == OK || err == ERROR_END_OF_STREAM) && stoppedPrematurely) {
+        err = ERROR_MALFORMED;
+    }
+
+    close(mFd);
+    mFd = -1;
+    mReachedEOS = true;
+    if (err == ERROR_END_OF_STREAM) {
+        return OK;
+    }
+    return err;
+!!!341388.cpp!!!	exceedsFileSizeLimit() : bool
+    if (mMaxFileSizeLimitBytes == 0) {
+        return false;
+    }
+    return mEstimatedSizeBytes >= mMaxFileSizeLimitBytes;
+!!!341516.cpp!!!	exceedsFileDurationLimit() : bool
+    if (mMaxFileDurationLimitUs == 0) {
+        return false;
+    }
+    return mEstimatedDurationUs >= mMaxFileDurationLimitUs;
+!!!341644.cpp!!!	writeAdtsHeader(in frameLength : uint32_t) : status_t
+    uint8_t data = 0xFF;
+    write(mFd, &data, 1);
+
+    const uint8_t kFieldId = 0;
+    const uint8_t kMpegLayer = 0;
+    const uint8_t kProtectionAbsense = 1;  // 1: kAdtsHeaderLength = 7
+    data = 0xF0;
+    data |= (kFieldId << 3);
+    data |= (kMpegLayer << 1);
+    data |= kProtectionAbsense;
+    write(mFd, &data, 1);
+
+    const uint8_t kProfileCode = mAACProfile - 1;
+    uint8_t kSampleFreqIndex;
+    CHECK(getSampleRateTableIndex(mSampleRate, &kSampleFreqIndex));
+    const uint8_t kPrivateStream = 0;
+    const uint8_t kChannelConfigCode = mChannelCount;
+    data = (kProfileCode << 6);
+    data |= (kSampleFreqIndex << 2);
+    data |= (kPrivateStream << 1);
+    data |= (kChannelConfigCode >> 2);
+    write(mFd, &data, 1);
+
+    // 4 bits from originality to copyright start
+    const uint8_t kCopyright = 0;
+    const uint32_t kFrameLength = frameLength;
+    data = ((kChannelConfigCode & 3) << 6);
+    data |= (kCopyright << 2);
+    data |= ((kFrameLength & 0x1800) >> 11);
+    write(mFd, &data, 1);
+
+    data = ((kFrameLength & 0x07F8) >> 3);
+    write(mFd, &data, 1);
+
+    const uint32_t kBufferFullness = 0x7FF;  // VBR
+    data = ((kFrameLength & 0x07) << 5);
+    data |= ((kBufferFullness & 0x07C0) >> 6);
+    write(mFd, &data, 1);
+
+    const uint8_t kFrameCount = 0;
+    data = ((kBufferFullness & 0x03F) << 2);
+    data |= kFrameCount;
+    write(mFd, &data, 1);
+
+    return OK;
+!!!341772.cpp!!!	reset() : status_t
+    if (!mStarted) {
+        return OK;
+    }
+
+    mDone = true;
+
+    void *dummy;
+    pthread_join(mThread, &dummy);
+
+    status_t err = (status_t) dummy;
+    {
+        status_t status = mSource->stop();
+        if (err == OK &&
+            (status != OK && status != ERROR_END_OF_STREAM)) {
+            err = status;
+        }
+    }
+
+    mStarted = false;
+    return err;

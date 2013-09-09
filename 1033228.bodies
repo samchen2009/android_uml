@@ -1,0 +1,450 @@
+class ZygoteInit
+!!!5528588.java!!!	invokeStaticMain(inout loader : ClassLoader, in className : String, inout argv : String) : void
+        Class<?> cl;
+
+        try {
+            cl = loader.loadClass(className);
+        } catch (ClassNotFoundException ex) {
+            throw new RuntimeException(
+                    "Missing class when invoking static main " + className,
+                    ex);
+        }
+
+        Method m;
+        try {
+            m = cl.getMethod("main", new Class[] { String[].class });
+        } catch (NoSuchMethodException ex) {
+            throw new RuntimeException(
+                    "Missing static main on " + className, ex);
+        } catch (SecurityException ex) {
+            throw new RuntimeException(
+                    "Problem getting static main on " + className, ex);
+        }
+
+        int modifiers = m.getModifiers();
+        if (! (Modifier.isStatic(modifiers) && Modifier.isPublic(modifiers))) {
+            throw new RuntimeException(
+                    "Main method is not public and static on " + className);
+        }
+
+        /*
+         * This throw gets caught in ZygoteInit.main(), which responds
+         * by invoking the exception's run() method. This arrangement
+         * clears up all the stack frames that were required in setting
+         * up the process.
+         */
+        throw new ZygoteInit.MethodAndArgsCaller(m, argv);
+!!!5528716.java!!!	registerZygoteSocket() : void
+        if (sServerSocket == null) {
+            int fileDesc;
+            try {
+                String env = System.getenv(ANDROID_SOCKET_ENV);
+                fileDesc = Integer.parseInt(env);
+            } catch (RuntimeException ex) {
+                throw new RuntimeException(
+                        ANDROID_SOCKET_ENV + " unset or invalid", ex);
+            }
+
+            try {
+                sServerSocket = new LocalServerSocket(
+                        createFileDescriptor(fileDesc));
+            } catch (IOException ex) {
+                throw new RuntimeException(
+                        "Error binding to local socket '" + fileDesc + "'", ex);
+            }
+        }
+!!!5528844.java!!!	acceptCommandPeer() : ZygoteConnection
+        try {
+            return new ZygoteConnection(sServerSocket.accept());
+        } catch (IOException ex) {
+            throw new RuntimeException(
+                    "IOException during accept()", ex);
+        }
+!!!5528972.java!!!	closeServerSocket() : void
+        try {
+            if (sServerSocket != null) {
+                sServerSocket.close();
+            }
+        } catch (IOException ex) {
+            Log.e(TAG, "Zygote:  error closing sockets", ex);
+        }
+
+        sServerSocket = null;
+!!!5529100.java!!!	setEffectiveUser(in uid : int) : void
+        int errno = setreuid(ROOT_UID, uid);
+        if (errno != 0) {
+            Log.e(TAG, "setreuid() failed. errno: " + errno);
+        }
+!!!5529228.java!!!	setEffectiveGroup(in gid : int) : void
+        int errno = setregid(ROOT_GID, gid);
+        if (errno != 0) {
+            Log.e(TAG, "setregid() failed. errno: " + errno);
+        }
+!!!5529356.java!!!	preload() : void
+        preloadClasses();
+        preloadResources();
+!!!5529484.java!!!	preloadClasses() : void
+        final VMRuntime runtime = VMRuntime.getRuntime();
+
+        InputStream is = ClassLoader.getSystemClassLoader().getResourceAsStream(
+                PRELOADED_CLASSES);
+        if (is == null) {
+            Log.e(TAG, "Couldn't find " + PRELOADED_CLASSES + ".");
+        } else {
+            Log.i(TAG, "Preloading classes...");
+            long startTime = SystemClock.uptimeMillis();
+
+            // Drop root perms while running static initializers.
+            setEffectiveGroup(UNPRIVILEGED_GID);
+            setEffectiveUser(UNPRIVILEGED_UID);
+
+            // Alter the target heap utilization.  With explicit GCs this
+            // is not likely to have any effect.
+            float defaultUtilization = runtime.getTargetHeapUtilization();
+            runtime.setTargetHeapUtilization(0.8f);
+
+            // Start with a clean slate.
+            System.gc();
+            runtime.runFinalizationSync();
+            Debug.startAllocCounting();
+
+            try {
+                BufferedReader br
+                    = new BufferedReader(new InputStreamReader(is), 256);
+
+                int count = 0;
+                String line;
+                while ((line = br.readLine()) != null) {
+                    // Skip comments and blank lines.
+                    line = line.trim();
+                    if (line.startsWith("#") || line.equals("")) {
+                        continue;
+                    }
+
+                    try {
+                        if (false) {
+                            Log.v(TAG, "Preloading " + line + "...");
+                        }
+                        Class.forName(line);
+                        if (Debug.getGlobalAllocSize() > PRELOAD_GC_THRESHOLD) {
+                            if (false) {
+                                Log.v(TAG,
+                                    " GC at " + Debug.getGlobalAllocSize());
+                            }
+                            System.gc();
+                            runtime.runFinalizationSync();
+                            Debug.resetGlobalAllocSize();
+                        }
+                        count++;
+                    } catch (ClassNotFoundException e) {
+                        Log.w(TAG, "Class not found for preloading: " + line);
+                    } catch (Throwable t) {
+                        Log.e(TAG, "Error preloading " + line + ".", t);
+                        if (t instanceof Error) {
+                            throw (Error) t;
+                        }
+                        if (t instanceof RuntimeException) {
+                            throw (RuntimeException) t;
+                        }
+                        throw new RuntimeException(t);
+                    }
+                }
+
+                Log.i(TAG, "...preloaded " + count + " classes in "
+                        + (SystemClock.uptimeMillis()-startTime) + "ms.");
+            } catch (IOException e) {
+                Log.e(TAG, "Error reading " + PRELOADED_CLASSES + ".", e);
+            } finally {
+                IoUtils.closeQuietly(is);
+                // Restore default.
+                runtime.setTargetHeapUtilization(defaultUtilization);
+
+                Debug.stopAllocCounting();
+
+                // Bring back root. We'll need it later.
+                setEffectiveUser(ROOT_UID);
+                setEffectiveGroup(ROOT_GID);
+            }
+        }
+!!!5529612.java!!!	preloadResources() : void
+        final VMRuntime runtime = VMRuntime.getRuntime();
+
+        Debug.startAllocCounting();
+        try {
+            System.gc();
+            runtime.runFinalizationSync();
+            mResources = Resources.getSystem();
+            mResources.startPreloading();
+            if (PRELOAD_RESOURCES) {
+                Log.i(TAG, "Preloading resources...");
+
+                long startTime = SystemClock.uptimeMillis();
+                TypedArray ar = mResources.obtainTypedArray(
+                        com.android.internal.R.array.preloaded_drawables);
+                int N = preloadDrawables(runtime, ar);
+                ar.recycle();
+                Log.i(TAG, "...preloaded " + N + " resources in "
+                        + (SystemClock.uptimeMillis()-startTime) + "ms.");
+
+                startTime = SystemClock.uptimeMillis();
+                ar = mResources.obtainTypedArray(
+                        com.android.internal.R.array.preloaded_color_state_lists);
+                N = preloadColorStateLists(runtime, ar);
+                ar.recycle();
+                Log.i(TAG, "...preloaded " + N + " resources in "
+                        + (SystemClock.uptimeMillis()-startTime) + "ms.");
+            }
+            mResources.finishPreloading();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Failure preloading resources", e);
+        } finally {
+            Debug.stopAllocCounting();
+        }
+!!!5529740.java!!!	preloadColorStateLists(inout runtime : VMRuntime, inout ar : TypedArray) : int
+        int N = ar.length();
+        for (int i=0; i<N; i++) {
+            if (Debug.getGlobalAllocSize() > PRELOAD_GC_THRESHOLD) {
+                if (false) {
+                    Log.v(TAG, " GC at " + Debug.getGlobalAllocSize());
+                }
+                System.gc();
+                runtime.runFinalizationSync();
+                Debug.resetGlobalAllocSize();
+            }
+            int id = ar.getResourceId(i, 0);
+            if (false) {
+                Log.v(TAG, "Preloading resource #" + Integer.toHexString(id));
+            }
+            if (id != 0) {
+                if (mResources.getColorStateList(id) == null) {
+                    throw new IllegalArgumentException(
+                            "Unable to find preloaded color resource #0x"
+                            + Integer.toHexString(id)
+                            + " (" + ar.getString(i) + ")");
+                }
+            }
+        }
+        return N;
+!!!5529868.java!!!	preloadDrawables(inout runtime : VMRuntime, inout ar : TypedArray) : int
+        int N = ar.length();
+        for (int i=0; i<N; i++) {
+            if (Debug.getGlobalAllocSize() > PRELOAD_GC_THRESHOLD) {
+                if (false) {
+                    Log.v(TAG, " GC at " + Debug.getGlobalAllocSize());
+                }
+                System.gc();
+                runtime.runFinalizationSync();
+                Debug.resetGlobalAllocSize();
+            }
+            int id = ar.getResourceId(i, 0);
+            if (false) {
+                Log.v(TAG, "Preloading resource #" + Integer.toHexString(id));
+            }
+            if (id != 0) {
+                if (mResources.getDrawable(id) == null) {
+                    throw new IllegalArgumentException(
+                            "Unable to find preloaded drawable resource #0x"
+                            + Integer.toHexString(id)
+                            + " (" + ar.getString(i) + ")");
+                }
+            }
+        }
+        return N;
+!!!5529996.java!!!	gc() : void
+        final VMRuntime runtime = VMRuntime.getRuntime();
+
+        /* runFinalizationSync() lets finalizers be called in Zygote,
+         * which doesn't have a HeapWorker thread.
+         */
+        System.gc();
+        runtime.runFinalizationSync();
+        System.gc();
+        runtime.runFinalizationSync();
+        System.gc();
+        runtime.runFinalizationSync();
+!!!5530124.java!!!	handleSystemServerProcess(inout parsedArgs : Arguments) : void
+
+        closeServerSocket();
+
+        // set umask to 0077 so new files and directories will default to owner-only permissions.
+        Libcore.os.umask(S_IRWXG | S_IRWXO);
+
+        if (parsedArgs.niceName != null) {
+            Process.setArgV0(parsedArgs.niceName);
+        }
+
+        if (parsedArgs.invokeWith != null) {
+            WrapperInit.execApplication(parsedArgs.invokeWith,
+                    parsedArgs.niceName, parsedArgs.targetSdkVersion,
+                    null, parsedArgs.remainingArgs);
+        } else {
+            /*
+             * Pass the remaining arguments to SystemServer.
+             */
+            RuntimeInit.zygoteInit(parsedArgs.targetSdkVersion, parsedArgs.remainingArgs);
+        }
+
+        /* should never reach here */
+!!!5530252.java!!!	startSystemServer() : boolean
+        /* Hardcoded command line to start the system server */
+        String args[] = {
+            "--setuid=1000",
+            "--setgid=1000",
+            "--setgroups=1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1018,3001,3002,3003,3006,3007",
+            "--capabilities=130104352,130104352",
+            "--runtime-init",
+            "--nice-name=system_server",
+            "com.android.server.SystemServer",
+        };
+        ZygoteConnection.Arguments parsedArgs = null;
+
+        int pid;
+
+        try {
+            parsedArgs = new ZygoteConnection.Arguments(args);
+            ZygoteConnection.applyDebuggerSystemProperty(parsedArgs);
+            ZygoteConnection.applyInvokeWithSystemProperty(parsedArgs);
+
+            /* Request to fork the system server process */
+            pid = Zygote.forkSystemServer(
+                    parsedArgs.uid, parsedArgs.gid,
+                    parsedArgs.gids,
+                    parsedArgs.debugFlags,
+                    null,
+                    parsedArgs.permittedCapabilities,
+                    parsedArgs.effectiveCapabilities);
+        } catch (IllegalArgumentException ex) {
+            throw new RuntimeException(ex);
+        }
+
+        /* For child process */
+        if (pid == 0) {
+            handleSystemServerProcess(parsedArgs);
+        }
+
+        return true;
+!!!5530380.java!!!	main(inout argv : String) : void
+        try {
+            // Start profiling the zygote initialization.
+            SamplingProfilerIntegration.start();
+
+            registerZygoteSocket();
+            EventLog.writeEvent(LOG_BOOT_PROGRESS_PRELOAD_START,
+                SystemClock.uptimeMillis());
+            preload();
+            EventLog.writeEvent(LOG_BOOT_PROGRESS_PRELOAD_END,
+                SystemClock.uptimeMillis());
+
+            // Finish profiling the zygote initialization.
+            SamplingProfilerIntegration.writeZygoteSnapshot();
+
+            // Do an initial gc to clean up after startup
+            gc();
+
+            // If requested, start system server directly from Zygote
+            if (argv.length != 2) {
+                throw new RuntimeException(argv[0] + USAGE_STRING);
+            }
+
+            if (argv[1].equals("start-system-server")) {
+                startSystemServer();
+            } else if (!argv[1].equals("")) {
+                throw new RuntimeException(argv[0] + USAGE_STRING);
+            }
+
+            Log.i(TAG, "Accepting command socket connections");
+
+            if (ZYGOTE_FORK_MODE) {
+                runForkMode();
+            } else {
+                runSelectLoopMode();
+            }
+
+            closeServerSocket();
+        } catch (MethodAndArgsCaller caller) {
+            caller.run();
+        } catch (RuntimeException ex) {
+            Log.e(TAG, "Zygote died with exception", ex);
+            closeServerSocket();
+            throw ex;
+        }
+!!!5530508.java!!!	runForkMode() : void
+        while (true) {
+            ZygoteConnection peer = acceptCommandPeer();
+
+            int pid;
+
+            pid = Zygote.fork();
+
+            if (pid == 0) {
+                // The child process should handle the peer requests
+
+                // The child does not accept any more connections
+                try {
+                    sServerSocket.close();
+                } catch (IOException ex) {
+                    Log.e(TAG, "Zygote Child: error closing sockets", ex);
+                } finally {
+                    sServerSocket = null;
+                }
+
+                peer.run();
+                break;
+            } else if (pid > 0) {
+                peer.closeSocket();
+            } else {
+                throw new RuntimeException("Error invoking fork()");
+            }
+        }
+!!!5530636.java!!!	runSelectLoopMode() : void
+        ArrayList<FileDescriptor> fds = new ArrayList();
+        ArrayList<ZygoteConnection> peers = new ArrayList();
+        FileDescriptor[] fdArray = new FileDescriptor[4];
+
+        fds.add(sServerSocket.getFileDescriptor());
+        peers.add(null);
+
+        int loopCount = GC_LOOP_COUNT;
+        while (true) {
+            int index;
+
+            /*
+             * Call gc() before we block in select().
+             * It's work that has to be done anyway, and it's better
+             * to avoid making every child do it.  It will also
+             * madvise() any free memory as a side-effect.
+             *
+             * Don't call it every time, because walking the entire
+             * heap is a lot of overhead to free a few hundred bytes.
+             */
+            if (loopCount <= 0) {
+                gc();
+                loopCount = GC_LOOP_COUNT;
+            } else {
+                loopCount--;
+            }
+
+
+            try {
+                fdArray = fds.toArray(fdArray);
+                index = selectReadable(fdArray);
+            } catch (IOException ex) {
+                throw new RuntimeException("Error in select()", ex);
+            }
+
+            if (index < 0) {
+                throw new RuntimeException("Error in select()");
+            } else if (index == 0) {
+                ZygoteConnection newPeer = acceptCommandPeer();
+                peers.add(newPeer);
+                fds.add(newPeer.getFileDesciptor());
+            } else {
+                boolean done;
+                done = peers.get(index).runOnce();
+
+                if (done) {
+                    peers.remove(index);
+                    fds.remove(index);
+                }
+            }
+        }

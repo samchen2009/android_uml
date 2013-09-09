@@ -1,0 +1,281 @@
+class FLACParser
+!!!1860236.cpp!!!	FLACParser(in dataSource : sp<DataSource>, in fileMetadata : sp<MetaData> = 0, in trackMetadata : sp<MetaData> = 0)
+    ALOGV("FLACParser::FLACParser");
+    memset(&mStreamInfo, 0, sizeof(mStreamInfo));
+    memset(&mWriteHeader, 0, sizeof(mWriteHeader));
+    mInitCheck = init();
+!!!1861132.cpp!!!	allocateBuffers() : void
+    CHECK(mGroup == NULL);
+    mGroup = new MediaBufferGroup;
+    mMaxBufferSize = getMaxBlockSize() * getChannels() * sizeof(short);
+    mGroup->add_buffer(new MediaBuffer(mMaxBufferSize));
+!!!1861260.cpp!!!	releaseBuffers() : void
+    CHECK(mGroup != NULL);
+    delete mGroup;
+    mGroup = NULL;
+!!!1861644.cpp!!!	~FLACParser()
+    ALOGV("FLACParser::~FLACParser");
+    if (mDecoder != NULL) {
+        FLAC__stream_decoder_delete(mDecoder);
+        mDecoder = NULL;
+    }
+!!!1861772.cpp!!!	init() : status_t
+    // setup libFLAC parser
+    mDecoder = FLAC__stream_decoder_new();
+    if (mDecoder == NULL) {
+        // The new should succeed, since probably all it does is a malloc
+        // that always succeeds in Android.  But to avoid dependence on the
+        // libFLAC internals, we check and log here.
+        ALOGE("new failed");
+        return NO_INIT;
+    }
+    FLAC__stream_decoder_set_md5_checking(mDecoder, false);
+    FLAC__stream_decoder_set_metadata_ignore_all(mDecoder);
+    FLAC__stream_decoder_set_metadata_respond(
+            mDecoder, FLAC__METADATA_TYPE_STREAMINFO);
+    FLAC__stream_decoder_set_metadata_respond(
+            mDecoder, FLAC__METADATA_TYPE_PICTURE);
+    FLAC__stream_decoder_set_metadata_respond(
+            mDecoder, FLAC__METADATA_TYPE_VORBIS_COMMENT);
+    FLAC__StreamDecoderInitStatus initStatus;
+    initStatus = FLAC__stream_decoder_init_stream(
+            mDecoder,
+            read_callback, seek_callback, tell_callback,
+            length_callback, eof_callback, write_callback,
+            metadata_callback, error_callback, (void *) this);
+    if (initStatus != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        // A failure here probably indicates a programming error and so is
+        // unlikely to happen. But we check and log here similarly to above.
+        ALOGE("init_stream failed %d", initStatus);
+        return NO_INIT;
+    }
+    // parse all metadata
+    if (!FLAC__stream_decoder_process_until_end_of_metadata(mDecoder)) {
+        ALOGE("end_of_metadata failed");
+        return NO_INIT;
+    }
+    if (mStreamInfoValid) {
+        // check channel count
+        switch (getChannels()) {
+        case 1:
+        case 2:
+            break;
+        default:
+            ALOGE("unsupported channel count %u", getChannels());
+            return NO_INIT;
+        }
+        // check bit depth
+        switch (getBitsPerSample()) {
+        case 8:
+        case 16:
+        case 24:
+            break;
+        default:
+            ALOGE("unsupported bits per sample %u", getBitsPerSample());
+            return NO_INIT;
+        }
+        // check sample rate
+        switch (getSampleRate()) {
+        case  8000:
+        case 11025:
+        case 12000:
+        case 16000:
+        case 22050:
+        case 24000:
+        case 32000:
+        case 44100:
+        case 48000:
+            break;
+        default:
+            // 96000 would require a proper downsampler in AudioFlinger
+            ALOGE("unsupported sample rate %u", getSampleRate());
+            return NO_INIT;
+        }
+        // configure the appropriate copy function, defaulting to trespass
+        static const struct {
+            unsigned mChannels;
+            unsigned mBitsPerSample;
+            void (*mCopy)(short *dst, const int *const *src, unsigned nSamples);
+        } table[] = {
+            { 1,  8, copyMono8    },
+            { 2,  8, copyStereo8  },
+            { 1, 16, copyMono16   },
+            { 2, 16, copyStereo16 },
+            { 1, 24, copyMono24   },
+            { 2, 24, copyStereo24 },
+        };
+        for (unsigned i = 0; i < sizeof(table)/sizeof(table[0]); ++i) {
+            if (table[i].mChannels == getChannels() &&
+                    table[i].mBitsPerSample == getBitsPerSample()) {
+                mCopy = table[i].mCopy;
+                break;
+            }
+        }
+        // populate track metadata
+        if (mTrackMetadata != 0) {
+            mTrackMetadata->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_RAW);
+            mTrackMetadata->setInt32(kKeyChannelCount, getChannels());
+            mTrackMetadata->setInt32(kKeySampleRate, getSampleRate());
+            // sample rate is non-zero, so division by zero not possible
+            mTrackMetadata->setInt64(kKeyDuration,
+                    (getTotalSamples() * 1000000LL) / getSampleRate());
+        }
+    } else {
+        ALOGE("missing STREAMINFO");
+        return NO_INIT;
+    }
+    if (mFileMetadata != 0) {
+        mFileMetadata->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_FLAC);
+    }
+    return OK;
+!!!1861900.cpp!!!	readBuffer(in doSeek : bool, in sample : FLAC__uint64) : MediaBuffer
+    mWriteRequested = true;
+    mWriteCompleted = false;
+    if (doSeek) {
+        // We implement the seek callback, so this works without explicit flush
+        if (!FLAC__stream_decoder_seek_absolute(mDecoder, sample)) {
+            ALOGE("FLACParser::readBuffer seek to sample %llu failed", sample);
+            return NULL;
+        }
+        ALOGV("FLACParser::readBuffer seek to sample %llu succeeded", sample);
+    } else {
+        if (!FLAC__stream_decoder_process_single(mDecoder)) {
+            ALOGE("FLACParser::readBuffer process_single failed");
+            return NULL;
+        }
+    }
+    if (!mWriteCompleted) {
+        ALOGV("FLACParser::readBuffer write did not complete");
+        return NULL;
+    }
+    // verify that block header keeps the promises made by STREAMINFO
+    unsigned blocksize = mWriteHeader.blocksize;
+    if (blocksize == 0 || blocksize > getMaxBlockSize()) {
+        ALOGE("FLACParser::readBuffer write invalid blocksize %u", blocksize);
+        return NULL;
+    }
+    if (mWriteHeader.sample_rate != getSampleRate() ||
+        mWriteHeader.channels != getChannels() ||
+        mWriteHeader.bits_per_sample != getBitsPerSample()) {
+        ALOGE("FLACParser::readBuffer write changed parameters mid-stream");
+    }
+    // acquire a media buffer
+    CHECK(mGroup != NULL);
+    MediaBuffer *buffer;
+    status_t err = mGroup->acquire_buffer(&buffer);
+    if (err != OK) {
+        return NULL;
+    }
+    size_t bufferSize = blocksize * getChannels() * sizeof(short);
+    CHECK(bufferSize <= mMaxBufferSize);
+    short *data = (short *) buffer->data();
+    buffer->set_range(0, bufferSize);
+    // copy PCM from FLAC write buffer to our media buffer, with interleaving
+    (*mCopy)(data, mWriteBuffer, blocksize);
+    // fill in buffer metadata
+    CHECK(mWriteHeader.number_type == FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER);
+    FLAC__uint64 sampleNumber = mWriteHeader.number.sample_number;
+    int64_t timeUs = (1000000LL * sampleNumber) / getSampleRate();
+    buffer->meta_data()->setInt64(kKeyTime, timeUs);
+    buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+    return buffer;
+!!!1862284.cpp!!!	readCallback(in buffer : FLAC__byte, inout bytes : size_t) : FLAC__StreamDecoderReadStatus
+    size_t requested = *bytes;
+    ssize_t actual = mDataSource->readAt(mCurrentPos, buffer, requested);
+    if (0 > actual) {
+        *bytes = 0;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    } else if (0 == actual) {
+        *bytes = 0;
+        mEOF = true;
+        return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+    } else {
+        assert(actual <= requested);
+        *bytes = actual;
+        mCurrentPos += actual;
+        return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+    }
+!!!1862412.cpp!!!	seekCallback(in absolute_byte_offset : FLAC__uint64) : FLAC__StreamDecoderSeekStatus
+    mCurrentPos = absolute_byte_offset;
+    mEOF = false;
+    return FLAC__STREAM_DECODER_SEEK_STATUS_OK;
+!!!1862540.cpp!!!	tellCallback(inout absolute_byte_offset : FLAC__uint64) : FLAC__StreamDecoderTellStatus
+    *absolute_byte_offset = mCurrentPos;
+    return FLAC__STREAM_DECODER_TELL_STATUS_OK;
+!!!1862668.cpp!!!	lengthCallback(inout stream_length : FLAC__uint64) : FLAC__StreamDecoderLengthStatus
+    off64_t size;
+    if (OK == mDataSource->getSize(&size)) {
+        *stream_length = size;
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_OK;
+    } else {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_UNSUPPORTED;
+    }
+!!!1862796.cpp!!!	eofCallback() : FLAC__bool
+    return mEOF;
+!!!1862924.cpp!!!	writeCallback(in frame : FLAC__Frame, in buffer : FLAC__int32) : FLAC__StreamDecoderWriteStatus
+    if (mWriteRequested) {
+        mWriteRequested = false;
+        // FLAC parser doesn't free or realloc buffer until next frame or finish
+        mWriteHeader = frame->header;
+        mWriteBuffer = buffer;
+        mWriteCompleted = true;
+        return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+    } else {
+        ALOGE("FLACParser::writeCallback unexpected");
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+!!!1863052.cpp!!!	metadataCallback(in metadata : FLAC__StreamMetadata) : void
+    switch (metadata->type) {
+    case FLAC__METADATA_TYPE_STREAMINFO:
+        if (!mStreamInfoValid) {
+            mStreamInfo = metadata->data.stream_info;
+            mStreamInfoValid = true;
+        } else {
+            ALOGE("FLACParser::metadataCallback unexpected STREAMINFO");
+        }
+        break;
+    case FLAC__METADATA_TYPE_VORBIS_COMMENT:
+        {
+        const FLAC__StreamMetadata_VorbisComment *vc;
+        vc = &metadata->data.vorbis_comment;
+        for (FLAC__uint32 i = 0; i < vc->num_comments; ++i) {
+            FLAC__StreamMetadata_VorbisComment_Entry *vce;
+            vce = &vc->comments[i];
+            if (mFileMetadata != 0 && vce->entry != NULL) {
+                parseVorbisComment(mFileMetadata, (const char *) vce->entry,
+                        vce->length);
+            }
+        }
+        }
+        break;
+    case FLAC__METADATA_TYPE_PICTURE:
+        if (mFileMetadata != 0) {
+            const FLAC__StreamMetadata_Picture *p = &metadata->data.picture;
+            mFileMetadata->setData(kKeyAlbumArt,
+                    MetaData::TYPE_NONE, p->data, p->data_length);
+            mFileMetadata->setCString(kKeyAlbumArtMIME, p->mime_type);
+        }
+        break;
+    default:
+        ALOGW("FLACParser::metadataCallback unexpected type %u", metadata->type);
+        break;
+    }
+!!!1863180.cpp!!!	errorCallback(in status : FLAC__StreamDecoderErrorStatus) : void
+    ALOGE("FLACParser::errorCallback status=%d", status);
+    mErrorStatus = status;
+!!!1863308.cpp!!!	read_callback(in decoder : FLAC__StreamDecoder, in buffer : FLAC__byte, inout bytes : size_t, inout client_data : void) : FLAC__StreamDecoderReadStatus
+    return ((FLACParser *) client_data)->readCallback(buffer, bytes);
+!!!1863436.cpp!!!	seek_callback(in decoder : FLAC__StreamDecoder, in absolute_byte_offset : FLAC__uint64, inout client_data : void) : FLAC__StreamDecoderSeekStatus
+    return ((FLACParser *) client_data)->seekCallback(absolute_byte_offset);
+!!!1863564.cpp!!!	tell_callback(in decoder : FLAC__StreamDecoder, inout absolute_byte_offset : FLAC__uint64, inout client_data : void) : FLAC__StreamDecoderTellStatus
+    return ((FLACParser *) client_data)->tellCallback(absolute_byte_offset);
+!!!1863692.cpp!!!	length_callback(in decoder : FLAC__StreamDecoder, inout stream_length : FLAC__uint64, inout client_data : void) : FLAC__StreamDecoderLengthStatus
+    return ((FLACParser *) client_data)->lengthCallback(stream_length);
+!!!1863820.cpp!!!	eof_callback(in decoder : FLAC__StreamDecoder, inout client_data : void) : FLAC__bool
+    return ((FLACParser *) client_data)->eofCallback();
+!!!1863948.cpp!!!	write_callback(in decoder : FLAC__StreamDecoder, in frame : FLAC__Frame, in buffer : FLAC__int32, inout client_data : void) : FLAC__StreamDecoderWriteStatus
+    return ((FLACParser *) client_data)->writeCallback(frame, buffer);
+!!!1864076.cpp!!!	metadata_callback(in decoder : FLAC__StreamDecoder, in metadata : FLAC__StreamMetadata, inout client_data : void) : void
+    ((FLACParser *) client_data)->metadataCallback(metadata);
+!!!1864204.cpp!!!	error_callback(in decoder : FLAC__StreamDecoder, in status : FLAC__StreamDecoderErrorStatus, inout client_data : void) : void
+    ((FLACParser *) client_data)->errorCallback(status);

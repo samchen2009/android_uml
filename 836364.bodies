@@ -1,0 +1,168 @@
+class DnsPinger
+!!!3592204.java!!!	DnsPinger(inout context : Context, in TAG : String, inout looper : Looper, inout target : Handler, in connectionType : int)
+        super(looper);
+        this.TAG = TAG;
+        mContext = context;
+        mTarget = target;
+        mConnectionType = connectionType;
+        if (!ConnectivityManager.isNetworkTypeValid(connectionType)) {
+            throw new IllegalArgumentException("Invalid connectionType in constructor: "
+                    + connectionType);
+        }
+        mDefaultDns = new ArrayList<InetAddress>();
+        mDefaultDns.add(getDefaultDns());
+        mEventCounter = 0;
+!!!3592332.java!!!	handleMessage(inout msg : Message) : void
+        switch (msg.what) {
+            case ACTION_PING_DNS:
+                DnsArg dnsArg = (DnsArg) msg.obj;
+                if (dnsArg.seq != mCurrentToken.get()) {
+                    break;
+                }
+                try {
+                    ActivePing newActivePing = new ActivePing();
+                    InetAddress dnsAddress = dnsArg.dns;
+                    newActivePing.internalId = msg.arg1;
+                    newActivePing.timeout = msg.arg2;
+                    newActivePing.socket = new DatagramSocket();
+                    // Set some socket properties
+                    newActivePing.socket.setSoTimeout(SOCKET_TIMEOUT_MS);
+
+                    // Try to bind but continue ping if bind fails
+                    try {
+                        newActivePing.socket.setNetworkInterface(NetworkInterface.getByName(
+                                getCurrentLinkProperties().getInterfaceName()));
+                    } catch (Exception e) {
+                        loge("sendDnsPing::Error binding to socket " + e);
+                    }
+
+                    newActivePing.packetId = (short) sRandom.nextInt();
+                    byte[] buf = mDnsQuery.clone();
+                    buf[0] = (byte) (newActivePing.packetId >> 8);
+                    buf[1] = (byte) newActivePing.packetId;
+
+                    // Send the DNS query
+                    DatagramPacket packet = new DatagramPacket(buf,
+                            buf.length, dnsAddress, DNS_PORT);
+                    if (DBG) {
+                        log("Sending a ping " + newActivePing.internalId +
+                                " to " + dnsAddress.getHostAddress()
+                                + " with packetId " + newActivePing.packetId + ".");
+                    }
+
+                    newActivePing.socket.send(packet);
+                    mActivePings.add(newActivePing);
+                    mEventCounter++;
+                    sendMessageDelayed(obtainMessage(ACTION_LISTEN_FOR_RESPONSE, mEventCounter, 0),
+                            RECEIVE_POLL_INTERVAL_MS);
+                } catch (IOException e) {
+                    sendResponse(msg.arg1, -9999, SOCKET_EXCEPTION);
+                }
+                break;
+            case ACTION_LISTEN_FOR_RESPONSE:
+                if (msg.arg1 != mEventCounter) {
+                    break;
+                }
+                for (ActivePing curPing : mActivePings) {
+                    try {
+                        /** Each socket will block for {@link #SOCKET_TIMEOUT_MS} in receive() */
+                        byte[] responseBuf = new byte[2];
+                        DatagramPacket replyPacket = new DatagramPacket(responseBuf, 2);
+                        curPing.socket.receive(replyPacket);
+                        // Check that ID field matches (we're throwing out the rest of the packet)
+                        if (responseBuf[0] == (byte) (curPing.packetId >> 8) &&
+                                responseBuf[1] == (byte) curPing.packetId) {
+                            curPing.result =
+                                    (int) (SystemClock.elapsedRealtime() - curPing.start);
+                        } else {
+                            if (DBG) {
+                                log("response ID didn't match, ignoring packet");
+                            }
+                        }
+                    } catch (SocketTimeoutException e) {
+                        // A timeout here doesn't mean anything - squelsh this exception
+                    } catch (Exception e) {
+                        if (DBG) {
+                            log("DnsPinger.pingDns got socket exception: " + e);
+                        }
+                        curPing.result = SOCKET_EXCEPTION;
+                    }
+                }
+                Iterator<ActivePing> iter = mActivePings.iterator();
+                while (iter.hasNext()) {
+                   ActivePing curPing = iter.next();
+                   if (curPing.result != null) {
+                       sendResponse(curPing.internalId, curPing.packetId, curPing.result);
+                       curPing.socket.close();
+                       iter.remove();
+                   } else if (SystemClock.elapsedRealtime() >
+                                  curPing.start + curPing.timeout) {
+                       sendResponse(curPing.internalId, curPing.packetId, TIMEOUT);
+                       curPing.socket.close();
+                       iter.remove();
+                   }
+                }
+                if (!mActivePings.isEmpty()) {
+                    sendMessageDelayed(obtainMessage(ACTION_LISTEN_FOR_RESPONSE, mEventCounter, 0),
+                            RECEIVE_POLL_INTERVAL_MS);
+                }
+                break;
+            case ACTION_CANCEL_ALL_PINGS:
+                for (ActivePing activePing : mActivePings)
+                    activePing.socket.close();
+                mActivePings.clear();
+                break;
+        }
+!!!3592460.java!!!	getDnsList() : List<InetAddress>
+        LinkProperties curLinkProps = getCurrentLinkProperties();
+        if (curLinkProps == null) {
+            loge("getCurLinkProperties:: LP for type" + mConnectionType + " is null!");
+            return mDefaultDns;
+        }
+
+        Collection<InetAddress> dnses = curLinkProps.getDnses();
+        if (dnses == null || dnses.size() == 0) {
+            loge("getDns::LinkProps has null dns - returning default");
+            return mDefaultDns;
+        }
+
+        return new ArrayList<InetAddress>(dnses);
+!!!3592588.java!!!	pingDnsAsync(inout dns : InetAddress, in timeout : int, in delay : int) : int
+        int id = sCounter.incrementAndGet();
+        sendMessageDelayed(obtainMessage(ACTION_PING_DNS, id, timeout,
+                new DnsArg(dns, mCurrentToken.get())), delay);
+        return id;
+!!!3592716.java!!!	cancelPings() : void
+        mCurrentToken.incrementAndGet();
+        obtainMessage(ACTION_CANCEL_ALL_PINGS).sendToTarget();
+!!!3592844.java!!!	sendResponse(in internalId : int, in externalId : int, in responseVal : int) : void
+        if(DBG) {
+            log("Responding to packet " + internalId +
+                    " externalId " + externalId +
+                    " and val " + responseVal);
+        }
+        mTarget.sendMessage(obtainMessage(DNS_PING_RESULT, internalId, responseVal));
+!!!3592972.java!!!	getCurrentLinkProperties() : LinkProperties
+        if (mConnectivityManager == null) {
+            mConnectivityManager = (ConnectivityManager) mContext.getSystemService(
+                    Context.CONNECTIVITY_SERVICE);
+        }
+
+        return mConnectivityManager.getLinkProperties(mConnectionType);
+!!!3593100.java!!!	getDefaultDns() : InetAddress
+        String dns = Settings.Global.getString(mContext.getContentResolver(),
+                Settings.Global.DEFAULT_DNS_SERVER);
+        if (dns == null || dns.length() == 0) {
+            dns = mContext.getResources().getString(
+                    com.android.internal.R.string.config_default_dns_server);
+        }
+        try {
+            return NetworkUtils.numericToInetAddress(dns);
+        } catch (IllegalArgumentException e) {
+            loge("getDefaultDns::malformed default dns address");
+            return null;
+        }
+!!!3593228.java!!!	log(in s : String) : void
+        Log.d(TAG, s);
+!!!3593356.java!!!	loge(in s : String) : void
+        Log.e(TAG, s);

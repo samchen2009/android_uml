@@ -1,0 +1,125 @@
+class L2ConnectedState
+!!!9758860.java!!!	enter() : void
+            if (DBG) log(getName() + "\n");
+            EventLog.writeEvent(EVENTLOG_WIFI_STATE_CHANGED, getName());
+            mRssiPollToken++;
+            if (mEnableRssiPolling) {
+                sendMessage(obtainMessage(CMD_RSSI_POLL, mRssiPollToken, 0));
+            }
+!!!9758988.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) log(getName() + message.toString() + "\n");
+            switch (message.what) {
+              case DhcpStateMachine.CMD_PRE_DHCP_ACTION:
+                  handlePreDhcpSetup();
+                  mDhcpStateMachine.sendMessage(DhcpStateMachine.CMD_PRE_DHCP_ACTION_COMPLETE);
+                  break;
+              case DhcpStateMachine.CMD_POST_DHCP_ACTION:
+                  handlePostDhcpSetup();
+                  if (message.arg1 == DhcpStateMachine.DHCP_SUCCESS) {
+                      if (DBG) log("DHCP successful");
+                      handleSuccessfulIpConfiguration((DhcpInfoInternal) message.obj);
+                      transitionTo(mVerifyingLinkState);
+                  } else if (message.arg1 == DhcpStateMachine.DHCP_FAILURE) {
+                      if (DBG) log("DHCP failed");
+                      handleFailedIpConfiguration();
+                      transitionTo(mDisconnectingState);
+                  }
+                  break;
+                case CMD_DISCONNECT:
+                    mWifiNative.disconnect();
+                    transitionTo(mDisconnectingState);
+                    break;
+                case WifiP2pService.DISCONNECT_WIFI_REQUEST:
+                    if (message.arg1 == 1) {
+                        mWifiNative.disconnect();
+                        mTemporarilyDisconnectWifi = true;
+                        transitionTo(mDisconnectingState);
+                    }
+                    break;
+                case CMD_SET_SCAN_MODE:
+                    if (message.arg1 == SCAN_ONLY_MODE) {
+                        sendMessage(CMD_DISCONNECT);
+                        deferMessage(message);
+                    }
+                    break;
+                case CMD_START_SCAN:
+                    /* When the network is connected, re-scanning can trigger
+                     * a reconnection. Put it in scan-only mode during scan.
+                     * When scan results are received, the mode is switched
+                     * back to CONNECT_MODE.
+                     */
+                    mWifiNative.setScanResultHandling(SCAN_ONLY_MODE);
+                    /* Have the parent state handle the rest */
+                    return NOT_HANDLED;
+                    /* Ignore connection to same network */
+                case WifiManager.CONNECT_NETWORK:
+                    int netId = message.arg1;
+                    if (mWifiInfo.getNetworkId() == netId) {
+                        break;
+                    }
+                    return NOT_HANDLED;
+                case WifiManager.SAVE_NETWORK:
+                    WifiConfiguration config = (WifiConfiguration) message.obj;
+                    NetworkUpdateResult result = mWifiConfigStore.saveNetwork(config);
+                    if (mWifiInfo.getNetworkId() == result.getNetworkId()) {
+                        if (result.hasIpChanged()) {
+                            log("Reconfiguring IP on connection");
+                            transitionTo(mObtainingIpState);
+                        }
+                        if (result.hasProxyChanged()) {
+                            log("Reconfiguring proxy on connection");
+                            configureLinkProperties();
+                            sendLinkConfigurationChangedBroadcast();
+                        }
+                    }
+
+                    if (result.getNetworkId() != WifiConfiguration.INVALID_NETWORK_ID) {
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_SUCCEEDED);
+                    } else {
+                        loge("Failed to save network");
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                    }
+                    break;
+                    /* Ignore */
+                case WifiMonitor.NETWORK_CONNECTION_EVENT:
+                    break;
+                case CMD_RSSI_POLL:
+                    if (message.arg1 == mRssiPollToken) {
+                        // Get Info and continue polling
+                        fetchRssiAndLinkSpeedNative();
+                        sendMessageDelayed(obtainMessage(CMD_RSSI_POLL,
+                                mRssiPollToken, 0), POLL_RSSI_INTERVAL_MSECS);
+                    } else {
+                        // Polling has completed
+                    }
+                    break;
+                case CMD_ENABLE_RSSI_POLL:
+                    mEnableRssiPolling = (message.arg1 == 1);
+                    mRssiPollToken++;
+                    if (mEnableRssiPolling) {
+                        // first poll
+                        fetchRssiAndLinkSpeedNative();
+                        sendMessageDelayed(obtainMessage(CMD_RSSI_POLL,
+                                mRssiPollToken, 0), POLL_RSSI_INTERVAL_MSECS);
+                    }
+                    break;
+                case WifiManager.RSSI_PKTCNT_FETCH:
+                    RssiPacketCountInfo info = new RssiPacketCountInfo();
+                    fetchRssiAndLinkSpeedNative();
+                    info.rssi = mWifiInfo.getRssi();
+                    fetchPktcntNative(info);
+                    replyToMessage(message, WifiManager.RSSI_PKTCNT_FETCH_SUCCEEDED, info);
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+
+            return HANDLED;
+!!!9759116.java!!!	exit() : void
+            /* If a scan result is pending in connected state, the supplicant
+             * is in SCAN_ONLY_MODE. Restore CONNECT_MODE on exit
+             */
+            if (mScanResultIsPending) {
+                mWifiNative.setScanResultHandling(CONNECT_MODE);
+            }

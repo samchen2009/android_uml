@@ -1,0 +1,558 @@
+class BerlinSourceHandler
+!!!10942988.cpp!!!	BerlinSourceHandler()
+    ALOGD("construct");
+!!!10943244.cpp!!!	Init(in av_settings : sp<AVSettings>) : bool
+    ALOGD("Init");
+    status_t status = android::OK;
+#ifdef AVIN_PIPELINE
+    HRESULT result = SUCCESS;
+    // AMP init
+    MV_OSAL_Init();
+    ALOGD("AMP init");
+    CHECK(AMP_Initialize(2, client_argv, &factory_handle_) == SUCCESS);
+    CHECK(AMP_GetFactory(&factory_handle_) == SUCCESS);
+
+    /* Create AVIN Component */
+    AMP_RPC(result, AMP_FACTORY_CreateComponent,
+        factory_handle_, AMP_COMPONENT_AVIN, 1, &avin_cmp_);
+    AVS_CHECK(result, "AMP_FACTORY_CreateComponent");
+
+    AMP_COMPONENT_CONFIG config;
+    memset(&config, 0, sizeof(config));
+    /* Open AVIN Component */
+    config._d = AMP_COMPONENT_AVIN;
+    config._u.pAVIN.mode = AMP_TUNNEL;
+    config._u.pAVIN.uiRegisterNotifyNum = 16;
+    config._u.pAVIN.bOpenVideoPort = FALSE;
+    config._u.pAVIN.bOpenVbiPort = FALSE;
+    config._u.pAVIN.bOpenAudioPort = FALSE;
+
+    /* Open AVIN component */
+    AMP_RPC(result, AMP_AVIN_Open, avin_cmp_, &config);
+    AVS_CHECK(result, "AVIN component Open failed");
+
+    /* Create a callback listener */
+    ALOGD("create a callback listener.\n");
+    avin_listener_ = AMP_Event_CreateListener(AMP_EVENT_TYPE_MAX, 0);
+    /* Register listener to avin */
+    ALOGD("register a notify.\n");
+    avin_serviceId_ = AMP_Event_GetServiceID(avin_listener_);
+    AMP_RPC(result, AMP_AVIN_RegisterNotify, avin_cmp_, avin_serviceId_,
+        AMP_EVENT_API_AVIN_SRC_CONNECTION_CHANGED/*not used yet*/);
+    AVS_CHECK(result, "RegisterNotify() for avin_serviceId_(%d) failed");
+
+    AMP_Event_RegisterCallback(avin_listener_, AMP_EVENT_API_AVIN_SRC_CONNECTION_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler, this);
+    AMP_Event_RegisterCallback(avin_listener_, AMP_EVENT_API_AVIN_LOCK_STATUS_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler, this);
+    AMP_Event_RegisterCallback(avin_listener_, AMP_EVENT_API_AVIN_VIDEO_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler, this);
+    AMP_Event_RegisterCallback(avin_listener_, AMP_EVENT_API_AVIN_AUDIO_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler, this);
+    AMP_Event_RegisterCallback(avin_listener_, AMP_EVENT_API_AVIN_AVMUTE_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler, this);
+
+    //start AVIN
+    //AMP_RPC(result, AMP_AVIN_SetState, avin_cmp_, AMP_EXECUTING);
+#endif
+    //get model index from fs lib
+    model_index_ = -1;
+    source_context_vector_ = NULL;
+    // Init supported sources
+    if (android::OK != initSupportedSources()) {
+        ALOGE("initSupportedSources fail");
+        return false;
+    }
+
+    int32_t model_index;
+    MV_FMISL_GetModelIndex(&model_index);
+    setModelIndex(model_index);
+
+    // Register avsettings observer
+    status = av_settings->RegisterObserver(
+            MRVL_AVSETTINGS_SOURCE_PREFIX,
+            sp<IAVSettingObserver>(this));
+    if (android::OK != status) {
+        ALOGE("Failed to register observer for prefix %s"
+             " (status = %d)", MRVL_AVSETTINGS_OUTPUT_PREFIX, status);
+        return false;
+    }
+    av_settings_handle_ = (BerlinAVSettings*)av_settings.get();
+    return true;
+
+bailout:
+    ALOGE("Init fail");
+    return false;
+!!!10943372.cpp!!!	Destroy() : void
+    ALOGD("Destroy");
+    HRESULT result = ERR_RCPERROR;
+
+    for (unsigned int i = 0; i < source_context_list_.size(); i++) {
+        SourceContextVector* context_vector = source_context_list_.valueAt(i);
+
+        for(unsigned int j = 0; j< context_vector->size(); j++)
+            delete context_vector->valueAt(j);
+
+        delete context_vector;
+    }
+
+#ifdef AVIN_PIPELINE
+    ALOGD("unregister the callback.\n");
+    result = AMP_Event_UnregisterCallback(avin_listener_,
+        AMP_EVENT_API_AVIN_SRC_CONNECTION_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler);
+    result = AMP_Event_UnregisterCallback(avin_listener_,
+        AMP_EVENT_API_AVIN_LOCK_STATUS_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler);
+    result = AMP_Event_UnregisterCallback(avin_listener_,
+        AMP_EVENT_API_AVIN_VIDEO_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler);
+    result = AMP_Event_UnregisterCallback(avin_listener_,
+        AMP_EVENT_API_AVIN_AUDIO_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler);
+    result = AMP_Event_UnregisterCallback(avin_listener_,
+        AMP_EVENT_API_AVIN_AVMUTE_CHANGED,
+        BerlinSourceHandler::staticAVINCompEventHandler);
+
+    // unregister notify from AV-IN Component
+    AMP_RPC(result, AMP_AVIN_UnregisterNotify, avin_cmp_,
+            avin_serviceId_, AMP_EVENT_API_AVIN_SRC_CONNECTION_CHANGED/*not used yet*/);
+
+    // Destroy the listener
+    AVSLOGD("destroy the listener.\n");
+    result = AMP_Event_DestroyListener(avin_listener_);
+    AVS_CHECK(result, "AMP_Event_DestroyListener() failed");
+    avin_listener_ = NULL;
+
+    AVSLOGD("Ready to AMP_AVIN_Close()");
+    AMP_RPC(result, AMP_AVIN_Close, avin_cmp_);
+    AVS_CHECK(result, "AVIN component Close failed");
+    AVSLOGD("Ready to AMP_AVIN_Destroy()");
+    AMP_RPC(result, AMP_AVIN_Destroy, avin_cmp_);
+    AVS_CHECK(result, "AVIN component Destroy failed");
+    AMP_FACTORY_Release(avin_cmp_);
+    avin_cmp_ = NULL;
+#endif
+
+bailout:
+    ALOGE("Destroy fail");
+!!!10943500.cpp!!!	ApplySetting(in name : char, in value : AVSettingValue, in persisted : bool) : status_t
+    ALOGD("ApplySetting, (%s, %s, %d)",
+            name, value.getFormattedValue().string(), persisted);
+    if (strstr(name, MRVL_AVSETTINGS_SOURCE_PREFIX)) {
+        /*int32_t source_id;
+        char subkey[MAX_KEY_LEN];
+        if (AVSettingsHelper::ParseSourceKey(
+                name, MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, subkey)) {
+
+            ALOGD("ApplySetting, source id %d subkey: %s", source_id, subkey);
+            if (!strcmp(subkey, kInputLocked)) {
+                // Only notify player about the input locked status, no need to save
+                return android::OK;
+            }
+        }*/
+        output_Settings_->GetHandler()->ApplySetting(name, value, persisted);
+    }
+    return android::OK;
+!!!10943628.cpp!!!	ReadSetting(in name : char, inout value : AVSettingValue, in persisted : bool) : status_t
+    ALOGD("ReadSetting, name %s", name);
+    char subkey[MAX_KEY_LEN];
+    if (strstr(name, MRVL_AVSETTINGS_SOURCE_PREFIX)) {
+        AVSettingsHelper::ParseKey(
+                name, MRVL_AVSETTINGS_SOURCE_PREFIX, subkey);
+        ALOGV("ReadSetting, [src] key: %s", subkey);
+        if (!strcmp(subkey, kDeviceSupportedSources)) {
+            // Return supported source attribute array
+            Vector<String8> sourceAttrArray;
+            for (unsigned int i = 0; i < source_context_vector_->size(); i++) {
+                SourceAttr attr;
+                source_context_vector_->valueAt(i)->GetSourceAttr(&attr);
+                sourceAttrArray.push(attr.ToString());
+            }
+            value->setStringArray(sourceAttrArray);
+            return android::OK;
+        }
+        else if (!strcmp(subkey, kSourceID)) {
+            int32_t source_id = getSource(TV_VIDEO_MainPlane);
+            if( source_id != -1) {
+                value->setInt(source_id);
+                return android::OK;
+            } else {
+                //value->setInt(TV_SourceStream);
+                //ALOGW("getCurrentSource, source not found, default to %d", TV_SourceStream);
+                //return android::OK;
+                ALOGW("getCurrentSource, source not found");
+                return android::BAD_VALUE;
+            }
+        } else {
+            output_Settings_->GetHandler()->ReadSetting(name, value, persisted);
+        }
+    }
+    return android::OK;
+!!!10943756.cpp!!!	OnSettingUpdate(in name : char, in value : AVSettingValue) : void
+    if (strstr(name, MRVL_AVSETTINGS_SOURCE_PREFIX)) {
+        int32_t source_id, prop_id;
+        String8 key;
+        if(strstr(name, kFactoryProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name, MRVL_AVSETTINGS_SOURCE_PREFIX,
+                &source_id, kFactoryProperty, &prop_id)) {
+                if( prop_id == TV_FACTORY_ModelIndex) {
+                    int32_t model_index = value.getInt();
+                    ALOGD("set model index to %d", model_index);
+                    //update source list
+                    if(setModelIndex(model_index)) {
+                        //change pq db
+                        key = AVSettingsHelper::GetPropertyKey(MRVL_AVSETTINGS_SOURCE_PREFIX,
+                        source_id, kVideoProperty, TV_PICTURE_ModelIndex);
+                        output_Settings_->GetHandler()->ApplySetting(key, value, true);
+
+                        //change aq db
+                        key = AVSettingsHelper::GetPropertyKey(MRVL_AVSETTINGS_SOURCE_PREFIX,
+                        source_id, kAudioProperty, TV_AUDIO_ModelIndex);
+                        output_Settings_->GetHandler()->ApplySetting(key, value, true);
+                    }
+                }
+                else if( prop_id == TV_FACTORY_PROPERTY_PanelType) {
+                    AVSettingValue avValue;
+                    avValue.setInt(model_index_);
+                    key = AVSettingsHelper::GetPropertyKey(MRVL_AVSETTINGS_SOURCE_PREFIX,
+                        source_id, kVideoProperty, TV_PICTURE_ModelIndex);
+                    output_Settings_->GetHandler()->ApplySetting(key, avValue, true);
+                }
+                else if( prop_id == TV_FACTORY_PROPERTY_SpeakerType) {
+                    AVSettingValue avValue;
+                    avValue.setInt(model_index_);
+                    key = AVSettingsHelper::GetPropertyKey(MRVL_AVSETTINGS_SOURCE_PREFIX,
+                        source_id, kAudioProperty, TV_AUDIO_ModelIndex);
+                    output_Settings_->GetHandler()->ApplySetting(key, value, true);
+                }
+                else if(prop_id == TV_FACTORY_Reset) {
+                    //reset pq db
+                    key = AVSettingsHelper::GetPropertyKey(MRVL_AVSETTINGS_SOURCE_PREFIX,
+                    source_id, kVideoProperty, TV_PICTURE_Reset);
+                    output_Settings_->GetHandler()->ApplySetting(key, value, true);
+
+                    //reset aq db
+                    key = AVSettingsHelper::GetPropertyKey(MRVL_AVSETTINGS_SOURCE_PREFIX,
+                    source_id, kAudioProperty, TV_AUDIO_Reset);
+                    output_Settings_->GetHandler()->ApplySetting(key, value, true);
+                }
+            }
+        }
+        ((BerlinOutputHandler*)(output_Settings_->GetHandler()))->OnSettingUpdate(name, value);
+    }
+!!!10944524.cpp!!!	setParameter(in key : int32_t, in request : Parcel) : status_t
+    // Parse out the first paramter: source id
+    int source_id = request.readInt32();
+    ALOGV("setParameter, key %d, source id %d", key, source_id);
+    if (source_context_vector_->indexOfKey(source_id) < 0) {
+        AVSLOGE("invalid source id %d", source_id);
+        return android::BAD_VALUE;
+    }
+
+    // Handle by source context
+    BerlinSourceContext* pSrcCtx = source_context_vector_->valueFor(source_id);
+    status_t status = checkSourceType(key, source_id, pSrcCtx);
+    if (status != android::OK) {
+        return status;
+    }
+    return pSrcCtx->setParameter(key, request);
+!!!10944652.cpp!!!	getParameter(in key : int32_t, inout reply : Parcel) : status_t
+    ALOGV("getParameter, key %d", key);
+
+    return android::INVALID_OPERATION ;
+!!!10944780.cpp!!!	invoke(in request : Parcel, inout reply : Parcel) : status_t
+    int32_t origin_data_pos = request.dataPosition();
+    int32_t key = request.readInt32();
+    HRESULT result = SUCCESS;
+    if (key == GET_SOURCE) {
+        int32_t video_channel = request.readInt32();
+        int32_t source_id = getSource(video_channel);
+        if( source_id != -1) {
+            reply->writeInt32(source_id);
+            return android::OK;
+        }
+
+        ALOGW("getSource, channel %d, source not found", video_channel);
+        return android::BAD_VALUE;
+    }
+#ifdef AVIN_PIPELINE
+    else if (key == TV_GET_AVIN_CONNECTSTATUS) {
+        int32_t source_id = request.readInt32();
+        AMP_AVIN_SOURCE_LIST source_list;
+        AMP_RPC(result, AMP_AVIN_GetActiveSourceList, avin_cmp_, &source_list);
+
+        for(unsigned int i = 0; i < source_list.size; i++) {
+            if(source_id == phy2logSource(source_list.source[i])) {
+                reply->writeInt32(1);
+                return android::OK;
+            }
+        }
+        reply->writeInt32(0);
+        return android::OK;
+    }
+    else if (key == TV_GET_AVIN_LOCKSTATUS) {
+        AMP_AVIN_INPUT_PARAMS input_param;
+        AMP_RPC(result, AMP_AVIN_GetInputParams, avin_cmp_, &input_param);
+        reply->writeInt32(input_param.state);
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_AUTOADJUST) {
+        AMP_AVIN_VGA_VIDEO_PROP det_param;
+        AMP_RPC(result, AMP_AVIN_SetVgaAutoAdjustment, avin_cmp_, &det_param);
+        reply->writeInt32(det_param.ulPhase);
+        reply->writeInt32(det_param.xshift);
+        reply->writeInt32(det_param.yshift);
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_CLOCK) {
+        int32_t clock = request.readInt32();
+        AMP_RPC(result, AMP_AVIN_SetVgaClock, avin_cmp_, clock);
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_PHASE) {
+        int32_t phase = request.readInt32();
+        AMP_RPC(result, AMP_AVIN_SetVgaPhase, avin_cmp_, phase);
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_HPOSITION) {
+        int32_t hpos = request.readInt32();
+        AMP_RPC(result, AMP_AVIN_SetVgaHShift, avin_cmp_, hpos);
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_VPOSITION) {
+        int32_t vpos = request.readInt32();
+        AMP_RPC(result, AMP_AVIN_SetVgaVShift, avin_cmp_, vpos);
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_HSIZE) {
+        return android::OK;
+    }
+    else if (key == TV_SET_VGA_VSIZE) {
+        return android::OK;
+    }
+    else if (key == TV_GET_AVIN_VIDEOPARAM) {
+        AMP_AVIN_INPUT_PARAMS input_param;
+        AMP_RPC(result, AMP_AVIN_GetInputParams, avin_cmp_, &input_param);
+        if(input_param.state == AMP_AVIN_SOURCE_STATE_STABLE) {
+            AvinVideoParam::WriteToParcel(reply, input_param.videoParams);
+            return android::OK;
+        }
+        else {
+            return android::BAD_VALUE;
+        }
+    }
+    else if (key == TV_GET_AVIN_AUDIOPARAM) {
+        AMP_AVIN_INPUT_PARAMS input_param;
+        AMP_RPC(result, AMP_AVIN_GetInputParams, avin_cmp_, &input_param);
+        if(input_param.state == AMP_AVIN_SOURCE_STATE_STABLE) {
+            AvinAudioParam::WriteToParcel(reply, input_param.audioParams);
+            return android::OK;
+        }
+        else {
+            return android::BAD_VALUE;
+        }
+    }
+#endif
+
+    int32_t source_id = request.readInt32();
+    // Other invoke  handled by source context
+    if (source_context_vector_->indexOfKey(source_id) < 0) {
+        int32_t sub_source = source_id;
+        source_id  = -1;
+        BerlinSourceContext* source_ctx = NULL;
+        //check subsource
+        for (unsigned int i = 0; i < source_context_vector_->size(); i++) {
+            source_ctx = source_context_vector_->valueAt(i);
+            if(source_ctx->isVideoSource()) {
+                if(((BerlinVideoSourceContext*)source_ctx)->GetSubSource() == sub_source) {
+                    source_id = source_context_vector_->keyAt(i);
+                    ALOGD("getSource, source_id %d, sub_source %d",source_id, sub_source);
+                    break;
+                }
+            }
+        }
+        if(source_id == -1) {
+            AVSLOGE("invalid source_id %d for sub_source %d", source_id, sub_source);
+            return android::BAD_VALUE;
+        }
+    }
+    // Recover data position
+    request.setDataPosition(origin_data_pos);
+    BerlinSourceContext* pSrcCtx = source_context_vector_->valueFor(source_id);
+    status_t status = checkSourceType(key, source_id, pSrcCtx);
+    if (status != android::OK) {
+        return status;
+    }
+
+    return pSrcCtx->invoke(request, reply);
+!!!10944908.cpp!!!	notifyHandlerObservers(in ext : int32_t, in obj : Parcel) : void
+    notify(ext, obj);
+    av_settings_handle_->NotifyHandlerObservers(GetHandledPrefix().string(), ext, obj);
+!!!10945036.cpp!!!	getOutput3DMode(in input : String8, inout output : DisplayMode) : status_t
+    if (display_mode_mapping_3d_.indexOfKey(input) < 0) {
+        ALOGW("getOutput3DMode, no output match %s", input.string());
+        return android::BAD_VALUE;
+    }
+    if (output != NULL && DisplayMode::FromString(
+            (display_mode_mapping_3d_.valueFor(input)).string(), output)) {
+        return android::OK;
+    }
+    return android::UNKNOWN_ERROR;
+!!!10945164.cpp!!!	initSupportedSources() : status_t
+    ALOGD("initSupportedSources");
+    // Parse device supported source from
+    // configuration file /system/etc/avsettings.xml
+    xmlXPathContextPtr context = NULL;
+    xmlXPathObjectPtr result = NULL;
+    xmlDocPtr doc = xmlParseFile(kAVSettingsConfig);
+    status_t status = android::OK;
+    source_context_list_.clear();
+
+    if (doc == NULL) {
+        ALOGE("invalid config file: %s", kAVSettingsConfig);
+        status = android::UNKNOWN_ERROR;
+        goto bail;
+    }
+    context = xmlXPathNewContext(doc);
+    if (context == NULL) {
+        ALOGE("fail to create context");
+        status = android::UNKNOWN_ERROR;
+        goto bail;
+    }
+
+    result = xmlXPathEvalExpression(BAD_CAST"//Model", context);
+    if (result == NULL) {
+        ALOGE("invalid xpath expression");
+        status = android::UNKNOWN_ERROR;
+        goto bail;
+    }
+
+    if (xmlXPathNodeSetIsEmpty(result->nodesetval)) {
+        ALOGE("no source node found");
+        status = android::UNKNOWN_ERROR;
+        goto bail;
+    }
+
+    for (int i = 0; i < result->nodesetval->nodeNr; i++) {
+        xmlNodePtr node = result->nodesetval->nodeTab[i];
+        int32_t model;
+        model = atoi(reinterpret_cast<char *>(xmlGetProp(node, BAD_CAST"id")));
+        SourceContextVector *source_vector = new SourceContextVector;
+
+        xmlNodePtr child = node->xmlChildrenNode;
+        while(child != NULL) {
+            if ((!xmlStrcmp(child->name, (const xmlChar *)"SourceList"))) {
+                xmlNodePtr descendant = child->xmlChildrenNode;
+                while(descendant != NULL) {
+                    if ((!xmlStrcmp(descendant->name, (const xmlChar *)"source"))) {
+                        SourceAttr src_attr;
+                        src_attr.id = atoi(
+                            reinterpret_cast<char *>(xmlGetProp(descendant, BAD_CAST"id")));
+                        src_attr.type.setTo(
+                            reinterpret_cast<char *>(xmlGetProp(descendant, BAD_CAST"type")));
+                        src_attr.uri.setTo(
+                            reinterpret_cast<char *>(xmlGetProp(descendant, BAD_CAST"uri")));
+                        src_attr.hw_id = atoi(
+                            reinterpret_cast<char *>(xmlGetProp(descendant, BAD_CAST"hw_id")));
+                        BerlinSourceContext* pSrcCtx = NULL;
+                        if (src_attr.type == String8("adec") || src_attr.type == String8("aren") ) {
+                            pSrcCtx = new BerlinAudioSourceContext(this, src_attr.id);
+                        } else {
+                            pSrcCtx = new BerlinVideoSourceContext(this, src_attr.id);
+                        }
+                        pSrcCtx->Reset();
+                        pSrcCtx->SetSourceAttr(src_attr);
+                        source_vector->add(src_attr.id, pSrcCtx);
+                    }
+                    descendant = descendant->next;
+                }
+            }
+            child = child->next;
+        }
+        source_context_list_.add(model, source_vector);
+    }
+
+bail:
+    if (NULL != result) xmlXPathFreeObject(result);
+    if (NULL != context) xmlXPathFreeContext(context);
+    if (NULL != doc) xmlFreeDoc(doc);
+
+    return status;
+!!!10945292.cpp!!!	checkSourceType(in msg : int32_t, in source_id : int32_t) : status_t
+    BerlinSourceContext* pSrcCtx = supported_sources.valueFor(source_id);
+    if (msg == EXIT_SOURCE) {
+        // Message defined for both video and audio
+    } else if (msg == NOTIFY_SOURCE_AUDIO_INFO ||
+            msg == APPLY_AQ ||
+            msg == GET_STEREO_MODE ||
+            msg == GET_DUAL_MODE ||
+            msg == GET_DRC_MODE ||
+            msg == GET_SOURCE_GAIN ||
+            msg == GET_CHANNEL_MAP) {
+        // Message define for audio, but could be invoked by binded video source
+    } else if (msg == BIND_VIDEO_SOURCE) {
+        // Message defined for audio only
+        CHECK_SOURCE_TYPE(pSrcCtx->isAudioSource(), source_id);
+    } else {
+        // Message defined for video only
+        CHECK_SOURCE_TYPE(pSrcCtx->isVideoSource(), source_id);
+    }
+    return android::OK;
+!!!10945420.cpp!!!	getSource(in video_channel : int32_t, inout source_id : int32_t) : status_t
+    ALOGD("getSource, video channel %d", video_channel);
+    for (unsigned int i = 0; i < supported_sources.size(); i++) {
+        BerlinSourceContext* pSrcCtx = supported_sources.valueAt(i);
+        if (!pSrcCtx->isAudioSource() &&
+                ((BerlinVideoSourceContext*)pSrcCtx)->GetChannel() == video_channel) {
+            int32_t id = supported_sources.keyAt(i);
+            ALOGD("getSource, return source_id %d", id);
+            *source_id = id;
+            return android::OK;
+        }
+    }
+    ALOGW("getSource, source not found");
+    return android::BAD_VALUE;
+!!!10945548.cpp!!!	init3DDisplayModeMapping() : void
+    // Frame Packing
+    display_mode_mapping_3d_.add(String8("1280x720p@59.94FP"), String8("1280x720p@59.94FP"));
+    display_mode_mapping_3d_.add(String8("1280x720p@60.00FP"), String8("1280x720p@60.00FP"));
+    display_mode_mapping_3d_.add(String8("1280x720p@50.00FP"), String8("1280x720p@50.00FP"));
+    display_mode_mapping_3d_.add(String8("1280x720p@23.98FP"), String8("1920x1080p@23.98FP"));
+    display_mode_mapping_3d_.add(String8("1280x720p@24.00FP"), String8("1920x1080p@24.00FP"));
+    display_mode_mapping_3d_.add(String8("1280x720p@29.97FP"), String8("1920x1080p@29.97FP"));
+    display_mode_mapping_3d_.add(String8("1280x720p@30.00FP"), String8("1920x1080p@30.00FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@23.98FP"), String8("1920x1080p@23.98FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@24.00FP"), String8("1920x1080p@24.00FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@29.97FP"), String8("1920x1080p@29.97FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@30.00FP"), String8("1920x1080p@30.00FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080i@59.94FP"), String8("1280x720p@59.94FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080i@60.00FP"), String8("1280x720p@60.00FP"));
+    display_mode_mapping_3d_.add(String8("1920x1080i@50.00FP"), String8("1280x720p@50.00FP"));
+
+    // SBS
+    display_mode_mapping_3d_.add(String8("1280x720p@59.94SBS"), String8("1280x720p@59.94SBS"));
+    display_mode_mapping_3d_.add(String8("1280x720p@60.00SBS"), String8("1280x720p@60.00SBS"));
+    display_mode_mapping_3d_.add(String8("1280x720p@50.00SBS"), String8("1280x720p@50.00SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@23.98SBS"), String8("1920x1080p@23.98SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@24.00SBS"), String8("1920x1080p@24.00SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@29.97SBS"), String8("1920x1080p@29.97SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@30.00SBS"), String8("1920x1080p@30.00SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@59.94SBS"), String8("1280x720p@59.94SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@60.00SBS"), String8("1280x720p@60.00SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@50.00SBS"), String8("1280x720p@50.00SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080i@59.94SBS"), String8("1280x720p@59.94SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080i@60.00SBS"), String8("1280x720p@60.00SBS"));
+    display_mode_mapping_3d_.add(String8("1920x1080i@50.00SBS"), String8("1280x720p@59.94SBS"));
+
+    // Top Bottom
+    display_mode_mapping_3d_.add(String8("1280x720p@59.94TB"), String8("1280x720p@59.94TB"));
+    display_mode_mapping_3d_.add(String8("1280x720p@60.00TB"), String8("1280x720p@60.00TB"));
+    display_mode_mapping_3d_.add(String8("1280x720p@50.00TB"), String8("1280x720p@50.00TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@23.98TB"), String8("1920x1080p@23.98TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@24.00TB"), String8("1920x1080p@24.00TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@29.97TB"), String8("1920x1080p@29.97TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@30.00TB"), String8("1920x1080p@30.00TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@59.94TB"), String8("1280x720p@59.94TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@60.00TB"), String8("1280x720p@60.00TB"));
+    display_mode_mapping_3d_.add(String8("1920x1080p@50.00TB"), String8("1280x720p@50.00TB"));

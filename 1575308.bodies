@@ -1,0 +1,117 @@
+class BssidStatistics
+!!!9771020.java!!!	BssidStatistics(in bssid : String)
+            this.mBssid = bssid;
+            mRssiBase = BSSID_STAT_RANGE_LOW_DBM;
+            mEntriesSize = BSSID_STAT_RANGE_HIGH_DBM - BSSID_STAT_RANGE_LOW_DBM + 1;
+            mEntries = new VolumeWeightedEMA[mEntriesSize];
+            for (int i = 0; i < mEntriesSize; i++)
+                mEntries[i] = new VolumeWeightedEMA(EXP_COEFFICIENT_RECORD);
+!!!9771148.java!!!	updateLoss(in rssi : int, in value : double, in volume : int) : void
+            if (volume <= 0) return;
+            int index = rssi - mRssiBase;
+            if (index < 0 || index >= mEntriesSize) return;
+            mEntries[index].update(value, volume);
+            if (DBG) {
+                DecimalFormat df = new DecimalFormat("#.##");
+                logd("Cache updated: loss[" + rssi + "]=" + df.format(mEntries[index].mValue * 100)
+                        + "% volume=" + df.format(mEntries[index].mVolume));
+            }
+!!!9771276.java!!!	presetLoss(in rssi : int) : double
+            if (rssi <= -90) return 1.0;
+            if (rssi > 0) return 0.0;
+
+            if (sPresetLoss == null) {
+                // pre-calculate all preset losses only once, then reuse them
+                final int size = 90;
+                sPresetLoss = new double[size];
+                for (int i = 0; i < size; i++) sPresetLoss[i] = 1.0 / Math.pow(90 - i, 1.5);
+            }
+            return sPresetLoss[-rssi];
+!!!9771404.java!!!	poorLinkDetected(in rssi : int) : boolean
+            if (DBG) logd("Poor link detected, rssi=" + rssi);
+
+            long now = SystemClock.elapsedRealtime();
+            long lastGood = now - mLastTimeGood;
+            long lastPoor = now - mLastTimePoor;
+
+            // reduce the difficulty of good link target if last avoidance was long time ago
+            while (mGoodLinkTargetIndex > 0
+                    && lastPoor >= GOOD_LINK_TARGET[mGoodLinkTargetIndex - 1].REDUCE_TIME_MS)
+                mGoodLinkTargetIndex--;
+            mGoodLinkTargetCount = GOOD_LINK_TARGET[mGoodLinkTargetIndex].SAMPLE_COUNT;
+
+            // scan for a target RSSI at which the link is good
+            int from = rssi + GOOD_LINK_RSSI_RANGE_MIN;
+            int to = rssi + GOOD_LINK_RSSI_RANGE_MAX;
+            mGoodLinkTargetRssi = findRssiTarget(from, to, GOOD_LINK_LOSS_THRESHOLD);
+            mGoodLinkTargetRssi += GOOD_LINK_TARGET[mGoodLinkTargetIndex].RSSI_ADJ_DBM;
+            if (mGoodLinkTargetIndex < GOOD_LINK_TARGET.length - 1) mGoodLinkTargetIndex++;
+
+            // calculate max avoidance time to prevent avoiding forever
+            int p = 0, pmax = MAX_AVOID_TIME.length - 1;
+            while (p < pmax && rssi >= MAX_AVOID_TIME[p + 1].MIN_RSSI_DBM) p++;
+            long avoidMax = MAX_AVOID_TIME[p].TIME_MS;
+
+            // don't avoid if max avoidance time is 0 (RSSI is super high)
+            if (avoidMax <= 0) return false;
+
+            // set max avoidance time, send poor link notification
+            mBssidAvoidTimeMax = now + avoidMax;
+
+            if (DBG) logd("goodRssi=" + mGoodLinkTargetRssi + " goodCount=" + mGoodLinkTargetCount
+                    + " lastGood=" + lastGood + " lastPoor=" + lastPoor + " avoidMax=" + avoidMax);
+
+            return true;
+!!!9771532.java!!!	newLinkDetected() : void
+            // if this BSSID is currently being avoided, the reuse those values
+            if (mBssidAvoidTimeMax > 0) {
+                if (DBG) logd("Previous avoidance still in effect, rssi=" + mGoodLinkTargetRssi
+                        + " count=" + mGoodLinkTargetCount);
+                return;
+            }
+
+            // calculate a new RSSI threshold for new link verifying
+            int from = BSSID_STAT_RANGE_LOW_DBM;
+            int to = BSSID_STAT_RANGE_HIGH_DBM;
+            mGoodLinkTargetRssi = findRssiTarget(from, to, GOOD_LINK_LOSS_THRESHOLD);
+            mGoodLinkTargetCount = 1;
+            mBssidAvoidTimeMax = SystemClock.elapsedRealtime() + MAX_AVOID_TIME[0].TIME_MS;
+            if (DBG) logd("New link verifying target set, rssi=" + mGoodLinkTargetRssi + " count="
+                    + mGoodLinkTargetCount);
+!!!9771660.java!!!	findRssiTarget(in from : int, in to : int, in threshold : double) : int
+            from -= mRssiBase;
+            to -= mRssiBase;
+            int emptyCount = 0;
+            int d = from < to ? 1 : -1;
+            for (int i = from; i != to; i += d)
+                // don't use a data point if it volume is too small (statistically unreliable)
+                if (i >= 0 && i < mEntriesSize && mEntries[i].mVolume > 1.0) {
+                    emptyCount = 0;
+                    if (mEntries[i].mValue < threshold) {
+                        // scan target found
+                        int rssi = mRssiBase + i;
+                        if (DBG) {
+                            DecimalFormat df = new DecimalFormat("#.##");
+                            logd("Scan target found: rssi=" + rssi + " threshold="
+                                    + df.format(threshold * 100) + "% value="
+                                    + df.format(mEntries[i].mValue * 100) + "% volume="
+                                    + df.format(mEntries[i].mVolume));
+                        }
+                        return rssi;
+                    }
+                } else if (++emptyCount >= BSSID_STAT_EMPTY_COUNT) {
+                    // cache has insufficient data around this RSSI, use preset loss instead
+                    int rssi = mRssiBase + i;
+                    double lossPreset = presetLoss(rssi);
+                    if (lossPreset < threshold) {
+                        if (DBG) {
+                            DecimalFormat df = new DecimalFormat("#.##");
+                            logd("Scan target found: rssi=" + rssi + " threshold="
+                                    + df.format(threshold * 100) + "% value="
+                                    + df.format(lossPreset * 100) + "% volume=preset");
+                        }
+                        return rssi;
+                    }
+                }
+
+            return mRssiBase + to;

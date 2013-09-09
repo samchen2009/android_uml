@@ -1,0 +1,226 @@
+class BackupHandler
+!!!8039052.java!!!	BackupHandler(inout looper : Looper)
+            super(looper);
+!!!8039180.java!!!	handleMessage(inout msg : Message) : void
+
+            switch (msg.what) {
+            case MSG_RUN_BACKUP:
+            {
+                mLastBackupPass = System.currentTimeMillis();
+                mNextBackupPass = mLastBackupPass + BACKUP_INTERVAL;
+
+                IBackupTransport transport = getTransport(mCurrentTransport);
+                if (transport == null) {
+                    Slog.v(TAG, "Backup requested but no transport available");
+                    synchronized (mQueueLock) {
+                        mBackupRunning = false;
+                    }
+                    mWakelock.release();
+                    break;
+                }
+
+                // snapshot the pending-backup set and work on that
+                ArrayList<BackupRequest> queue = new ArrayList<BackupRequest>();
+                File oldJournal = mJournal;
+                synchronized (mQueueLock) {
+                    // Do we have any work to do?  Construct the work queue
+                    // then release the synchronization lock to actually run
+                    // the backup.
+                    if (mPendingBackups.size() > 0) {
+                        for (BackupRequest b: mPendingBackups.values()) {
+                            queue.add(b);
+                        }
+                        if (DEBUG) Slog.v(TAG, "clearing pending backups");
+                        mPendingBackups.clear();
+
+                        // Start a new backup-queue journal file too
+                        mJournal = null;
+
+                    }
+                }
+
+                // At this point, we have started a new journal file, and the old
+                // file identity is being passed to the backup processing task.
+                // When it completes successfully, that old journal file will be
+                // deleted.  If we crash prior to that, the old journal is parsed
+                // at next boot and the journaled requests fulfilled.
+                if (queue.size() > 0) {
+                    // Spin up a backup state sequence and set it running
+                    PerformBackupTask pbt = new PerformBackupTask(transport, queue, oldJournal);
+                    Message pbtMessage = obtainMessage(MSG_BACKUP_RESTORE_STEP, pbt);
+                    sendMessage(pbtMessage);
+                } else {
+                    Slog.v(TAG, "Backup requested but nothing pending");
+                    synchronized (mQueueLock) {
+                        mBackupRunning = false;
+                    }
+                    mWakelock.release();
+                }
+                break;
+            }
+
+            case MSG_BACKUP_RESTORE_STEP:
+            {
+                try {
+                    BackupRestoreTask task = (BackupRestoreTask) msg.obj;
+                    if (MORE_DEBUG) Slog.v(TAG, "Got next step for " + task + ", executing");
+                    task.execute();
+                } catch (ClassCastException e) {
+                    Slog.e(TAG, "Invalid backup task in flight, obj=" + msg.obj);
+                }
+                break;
+            }
+
+            case MSG_OP_COMPLETE:
+            {
+                try {
+                    BackupRestoreTask task = (BackupRestoreTask) msg.obj;
+                    task.operationComplete();
+                } catch (ClassCastException e) {
+                    Slog.e(TAG, "Invalid completion in flight, obj=" + msg.obj);
+                }
+                break;
+            }
+
+            case MSG_RUN_FULL_BACKUP:
+            {
+                // TODO: refactor full backup to be a looper-based state machine
+                // similar to normal backup/restore.
+                FullBackupParams params = (FullBackupParams)msg.obj;
+                PerformFullBackupTask task = new PerformFullBackupTask(params.fd,
+                        params.observer, params.includeApks,
+                        params.includeShared, params.curPassword, params.encryptPassword,
+                        params.allApps, params.includeSystem, params.packages, params.latch);
+                (new Thread(task)).start();
+                break;
+            }
+
+            case MSG_RUN_RESTORE:
+            {
+                RestoreParams params = (RestoreParams)msg.obj;
+                Slog.d(TAG, "MSG_RUN_RESTORE observer=" + params.observer);
+                PerformRestoreTask task = new PerformRestoreTask(
+                        params.transport, params.observer,
+                        params.token, params.pkgInfo, params.pmToken,
+                        params.needFullBackup, params.filterSet);
+                Message restoreMsg = obtainMessage(MSG_BACKUP_RESTORE_STEP, task);
+                sendMessage(restoreMsg);
+                break;
+            }
+
+            case MSG_RUN_FULL_RESTORE:
+            {
+                // TODO: refactor full restore to be a looper-based state machine
+                // similar to normal backup/restore.
+                FullRestoreParams params = (FullRestoreParams)msg.obj;
+                PerformFullRestoreTask task = new PerformFullRestoreTask(params.fd,
+                        params.curPassword, params.encryptPassword,
+                        params.observer, params.latch);
+                (new Thread(task)).start();
+                break;
+            }
+
+            case MSG_RUN_CLEAR:
+            {
+                ClearParams params = (ClearParams)msg.obj;
+                (new PerformClearTask(params.transport, params.packageInfo)).run();
+                break;
+            }
+
+            case MSG_RUN_INITIALIZE:
+            {
+                HashSet<String> queue;
+
+                // Snapshot the pending-init queue and work on that
+                synchronized (mQueueLock) {
+                    queue = new HashSet<String>(mPendingInits);
+                    mPendingInits.clear();
+                }
+
+                (new PerformInitializeTask(queue)).run();
+                break;
+            }
+
+            case MSG_RUN_GET_RESTORE_SETS:
+            {
+                // Like other async operations, this is entered with the wakelock held
+                RestoreSet[] sets = null;
+                RestoreGetSetsParams params = (RestoreGetSetsParams)msg.obj;
+                try {
+                    sets = params.transport.getAvailableRestoreSets();
+                    // cache the result in the active session
+                    synchronized (params.session) {
+                        params.session.mRestoreSets = sets;
+                    }
+                    if (sets == null) EventLog.writeEvent(EventLogTags.RESTORE_TRANSPORT_FAILURE);
+                } catch (Exception e) {
+                    Slog.e(TAG, "Error from transport getting set list");
+                } finally {
+                    if (params.observer != null) {
+                        try {
+                            params.observer.restoreSetsAvailable(sets);
+                        } catch (RemoteException re) {
+                            Slog.e(TAG, "Unable to report listing to observer");
+                        } catch (Exception e) {
+                            Slog.e(TAG, "Restore observer threw", e);
+                        }
+                    }
+
+                    // Done: reset the session timeout clock
+                    removeMessages(MSG_RESTORE_TIMEOUT);
+                    sendEmptyMessageDelayed(MSG_RESTORE_TIMEOUT, TIMEOUT_RESTORE_INTERVAL);
+
+                    mWakelock.release();
+                }
+                break;
+            }
+
+            case MSG_TIMEOUT:
+            {
+                handleTimeout(msg.arg1, msg.obj);
+                break;
+            }
+
+            case MSG_RESTORE_TIMEOUT:
+            {
+                synchronized (BackupManagerService.this) {
+                    if (mActiveRestoreSession != null) {
+                        // Client app left the restore session dangling.  We know that it
+                        // can't be in the middle of an actual restore operation because
+                        // the timeout is suspended while a restore is in progress.  Clean
+                        // up now.
+                        Slog.w(TAG, "Restore session timed out; aborting");
+                        post(mActiveRestoreSession.new EndRestoreRunnable(
+                                BackupManagerService.this, mActiveRestoreSession));
+                    }
+                }
+            }
+
+            case MSG_FULL_CONFIRMATION_TIMEOUT:
+            {
+                synchronized (mFullConfirmations) {
+                    FullParams params = mFullConfirmations.get(msg.arg1);
+                    if (params != null) {
+                        Slog.i(TAG, "Full backup/restore timed out waiting for user confirmation");
+
+                        // Release the waiter; timeout == completion
+                        signalFullBackupRestoreCompletion(params);
+
+                        // Remove the token from the set
+                        mFullConfirmations.delete(msg.arg1);
+
+                        // Report a timeout to the observer, if any
+                        if (params.observer != null) {
+                            try {
+                                params.observer.onTimeout();
+                            } catch (RemoteException e) {
+                                /* don't care if the app has gone away */
+                            }
+                        }
+                    } else {
+                        Slog.d(TAG, "couldn't find params for token " + msg.arg1);
+                    }
+                }
+                break;
+            }
+            }

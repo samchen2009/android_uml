@@ -1,0 +1,169 @@
+class FastMixerDumpState
+!!!875916.cpp!!!	FastMixerDumpState()
+    mMeasuredWarmupTs.tv_sec = 0;
+    mMeasuredWarmupTs.tv_nsec = 0;
+    // sample arrays aren't accessed atomically with respect to the bounds,
+    // so clearing reduces chance for dumpsys to read random uninitialized samples
+    memset(&mMonotonicNs, 0, sizeof(mMonotonicNs));
+    memset(&mLoadNs, 0, sizeof(mLoadNs));
+#ifdef CPU_FREQUENCY_STATISTICS
+    memset(&mCpukHz, 0, sizeof(mCpukHz));
+#endif
+!!!876172.cpp!!!	dump(in fd : int) : void
+    if (mCommand == FastMixerState::INITIAL) {
+        fdprintf(fd, "FastMixer not initialized\n");
+        return;
+    }
+#define COMMAND_MAX 32
+    char string[COMMAND_MAX];
+    switch (mCommand) {
+    case FastMixerState::INITIAL:
+        strcpy(string, "INITIAL");
+        break;
+    case FastMixerState::HOT_IDLE:
+        strcpy(string, "HOT_IDLE");
+        break;
+    case FastMixerState::COLD_IDLE:
+        strcpy(string, "COLD_IDLE");
+        break;
+    case FastMixerState::EXIT:
+        strcpy(string, "EXIT");
+        break;
+    case FastMixerState::MIX:
+        strcpy(string, "MIX");
+        break;
+    case FastMixerState::WRITE:
+        strcpy(string, "WRITE");
+        break;
+    case FastMixerState::MIX_WRITE:
+        strcpy(string, "MIX_WRITE");
+        break;
+    default:
+        snprintf(string, COMMAND_MAX, "%d", mCommand);
+        break;
+    }
+    double measuredWarmupMs = (mMeasuredWarmupTs.tv_sec * 1000.0) +
+            (mMeasuredWarmupTs.tv_nsec / 1000000.0);
+    double mixPeriodSec = (double) mFrameCount / (double) mSampleRate;
+    fdprintf(fd, "FastMixer command=%s writeSequence=%u framesWritten=%u\n"
+                 "          numTracks=%u writeErrors=%u underruns=%u overruns=%u\n"
+                 "          sampleRate=%u frameCount=%u measuredWarmup=%.3g ms, warmupCycles=%u\n"
+                 "          mixPeriod=%.2f ms\n",
+                 string, mWriteSequence, mFramesWritten,
+                 mNumTracks, mWriteErrors, mUnderruns, mOverruns,
+                 mSampleRate, mFrameCount, measuredWarmupMs, mWarmupCycles,
+                 mixPeriodSec * 1e3);
+#ifdef FAST_MIXER_STATISTICS
+    // find the interval of valid samples
+    uint32_t bounds = mBounds;
+    uint32_t newestOpen = bounds & 0xFFFF;
+    uint32_t oldestClosed = bounds >> 16;
+    uint32_t n = (newestOpen - oldestClosed) & 0xFFFF;
+    if (n > kSamplingN) {
+        ALOGE("too many samples %u", n);
+        n = kSamplingN;
+    }
+    // statistics for monotonic (wall clock) time, thread raw CPU load in time, CPU clock frequency,
+    // and adjusted CPU load in MHz normalized for CPU clock frequency
+    CentralTendencyStatistics wall, loadNs;
+#ifdef CPU_FREQUENCY_STATISTICS
+    CentralTendencyStatistics kHz, loadMHz;
+    uint32_t previousCpukHz = 0;
+#endif
+    // Assuming a normal distribution for cycle times, three standard deviations on either side of
+    // the mean account for 99.73% of the population.  So if we take each tail to be 1/1000 of the
+    // sample set, we get 99.8% combined, or close to three standard deviations.
+    static const uint32_t kTailDenominator = 1000;
+    uint32_t *tail = n >= kTailDenominator ? new uint32_t[n] : NULL;
+    // loop over all the samples
+    for (uint32_t j = 0; j < n; ++j) {
+        size_t i = oldestClosed++ & (kSamplingN - 1);
+        uint32_t wallNs = mMonotonicNs[i];
+        if (tail != NULL) {
+            tail[j] = wallNs;
+        }
+        wall.sample(wallNs);
+        uint32_t sampleLoadNs = mLoadNs[i];
+        loadNs.sample(sampleLoadNs);
+#ifdef CPU_FREQUENCY_STATISTICS
+        uint32_t sampleCpukHz = mCpukHz[i];
+        // skip bad kHz samples
+        if ((sampleCpukHz & ~0xF) != 0) {
+            kHz.sample(sampleCpukHz >> 4);
+            if (sampleCpukHz == previousCpukHz) {
+                double megacycles = (double) sampleLoadNs * (double) (sampleCpukHz >> 4) * 1e-12;
+                double adjMHz = megacycles / mixPeriodSec;  // _not_ wallNs * 1e9
+                loadMHz.sample(adjMHz);
+            }
+        }
+        previousCpukHz = sampleCpukHz;
+#endif
+    }
+    fdprintf(fd, "Simple moving statistics over last %.1f seconds:\n", wall.n() * mixPeriodSec);
+    fdprintf(fd, "  wall clock time in ms per mix cycle:\n"
+                 "    mean=%.2f min=%.2f max=%.2f stddev=%.2f\n",
+                 wall.mean()*1e-6, wall.minimum()*1e-6, wall.maximum()*1e-6, wall.stddev()*1e-6);
+    fdprintf(fd, "  raw CPU load in us per mix cycle:\n"
+                 "    mean=%.0f min=%.0f max=%.0f stddev=%.0f\n",
+                 loadNs.mean()*1e-3, loadNs.minimum()*1e-3, loadNs.maximum()*1e-3,
+                 loadNs.stddev()*1e-3);
+#ifdef CPU_FREQUENCY_STATISTICS
+    fdprintf(fd, "  CPU clock frequency in MHz:\n"
+                 "    mean=%.0f min=%.0f max=%.0f stddev=%.0f\n",
+                 kHz.mean()*1e-3, kHz.minimum()*1e-3, kHz.maximum()*1e-3, kHz.stddev()*1e-3);
+    fdprintf(fd, "  adjusted CPU load in MHz (i.e. normalized for CPU clock frequency):\n"
+                 "    mean=%.1f min=%.1f max=%.1f stddev=%.1f\n",
+                 loadMHz.mean(), loadMHz.minimum(), loadMHz.maximum(), loadMHz.stddev());
+#endif
+    if (tail != NULL) {
+        qsort(tail, n, sizeof(uint32_t), compare_uint32_t);
+        // assume same number of tail samples on each side, left and right
+        uint32_t count = n / kTailDenominator;
+        CentralTendencyStatistics left, right;
+        for (uint32_t i = 0; i < count; ++i) {
+            left.sample(tail[i]);
+            right.sample(tail[n - (i + 1)]);
+        }
+        fdprintf(fd, "Distribution of mix cycle times in ms for the tails (> ~3 stddev outliers):\n"
+                     "  left tail: mean=%.2f min=%.2f max=%.2f stddev=%.2f\n"
+                     "  right tail: mean=%.2f min=%.2f max=%.2f stddev=%.2f\n",
+                     left.mean()*1e-6, left.minimum()*1e-6, left.maximum()*1e-6, left.stddev()*1e-6,
+                     right.mean()*1e-6, right.minimum()*1e-6, right.maximum()*1e-6,
+                     right.stddev()*1e-6);
+        delete[] tail;
+    }
+#endif
+    // The active track mask and track states are updated non-atomically.
+    // So if we relied on isActive to decide whether to display,
+    // then we might display an obsolete track or omit an active track.
+    // Instead we always display all tracks, with an indication
+    // of whether we think the track is active.
+    uint32_t trackMask = mTrackMask;
+    fdprintf(fd, "Fast tracks: kMaxFastTracks=%u activeMask=%#x\n",
+            FastMixerState::kMaxFastTracks, trackMask);
+    fdprintf(fd, "Index Active Full Partial Empty  Recent Ready\n");
+    for (uint32_t i = 0; i < FastMixerState::kMaxFastTracks; ++i, trackMask >>= 1) {
+        bool isActive = trackMask & 1;
+        const FastTrackDump *ftDump = &mTracks[i];
+        const FastTrackUnderruns& underruns = ftDump->mUnderruns;
+        const char *mostRecent;
+        switch (underruns.mBitFields.mMostRecent) {
+        case UNDERRUN_FULL:
+            mostRecent = "full";
+            break;
+        case UNDERRUN_PARTIAL:
+            mostRecent = "partial";
+            break;
+        case UNDERRUN_EMPTY:
+            mostRecent = "empty";
+            break;
+        default:
+            mostRecent = "?";
+            break;
+        }
+        fdprintf(fd, "%5u %6s %4u %7u %5u %7s %5u\n", i, isActive ? "yes" : "no",
+                (underruns.mBitFields.mFull) & UNDERRUN_MASK,
+                (underruns.mBitFields.mPartial) & UNDERRUN_MASK,
+                (underruns.mBitFields.mEmpty) & UNDERRUN_MASK,
+                mostRecent, ftDump->mFramesReady);
+    }

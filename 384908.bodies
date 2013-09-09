@@ -1,0 +1,82 @@
+class AudioWatchdog
+!!!874124.cpp!!!	requestExit() : void
+    // must be in this order to avoid a race condition
+    Thread::requestExit();
+    resume();
+!!!874252.cpp!!!	pause() : void
+    AutoMutex _l(mMyLock);
+    mPaused = true;
+!!!874380.cpp!!!	resume() : void
+    AutoMutex _l(mMyLock);
+    if (mPaused) {
+        mPaused = false;
+        mMyCond.signal();
+    }
+!!!874508.cpp!!!	setDump(inout dump : AudioWatchdogDump) : void
+    mDump = dump != NULL ? dump : &mDummyDump;
+!!!874636.cpp!!!	threadLoop() : bool
+    {
+        AutoMutex _l(mMyLock);
+        if (mPaused) {
+            mMyCond.wait(mMyLock);
+            // ignore previous timestamp after resume()
+            mOldTsValid = false;
+            // force an immediate log on first underrun after resume()
+            mLogTs.tv_sec = MIN_TIME_BETWEEN_LOGS_SEC;
+            mLogTs.tv_nsec = 0;
+            // caller will check for exitPending()
+            return true;
+        }
+    }
+    struct timespec newTs;
+    int rc = clock_gettime(CLOCK_MONOTONIC, &newTs);
+    if (rc != 0) {
+        pause();
+        return false;
+    }
+    if (!mOldTsValid) {
+        mOldTs = newTs;
+        mOldTsValid = true;
+        return true;
+    }
+    time_t sec = newTs.tv_sec - mOldTs.tv_sec;
+    long nsec = newTs.tv_nsec - mOldTs.tv_nsec;
+    if (nsec < 0) {
+        --sec;
+        nsec += 1000000000;
+    }
+    mOldTs = newTs;
+    // cycleNs is same as sec*1e9 + nsec, but limited to about 4 seconds
+    uint32_t cycleNs = nsec;
+    if (sec > 0) {
+        if (sec < 4) {
+            cycleNs += sec * 1000000000;
+        } else {
+            cycleNs = 4000000000u;
+        }
+    }
+    mLogTs.tv_sec += sec;
+    if ((mLogTs.tv_nsec += nsec) >= 1000000000) {
+        mLogTs.tv_sec++;
+        mLogTs.tv_nsec -= 1000000000;
+    }
+    if (cycleNs > mMaxCycleNs) {
+        mDump->mUnderruns = ++mUnderruns;
+        if (mLogTs.tv_sec >= MIN_TIME_BETWEEN_LOGS_SEC) {
+            mDump->mLogs = ++mLogs;
+            mDump->mMostRecent = time(NULL);
+            ALOGW("Insufficient CPU for load: expected=%.1f actual=%.1f ms; underruns=%u logs=%u",
+                mPeriodNs * 1e-6, cycleNs * 1e-6, mUnderruns, mLogs);
+            mLogTs.tv_sec = 0;
+            mLogTs.tv_nsec = 0;
+        }
+    }
+    struct timespec req;
+    req.tv_sec = 0;
+    req.tv_nsec = mPeriodNs;
+    rc = nanosleep(&req, NULL);
+    if (!((rc == 0) || (rc == -1 && errno == EINTR))) {
+        pause();
+        return false;
+    }
+    return true;

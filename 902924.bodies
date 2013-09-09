@@ -1,0 +1,113 @@
+class NameValueCache
+!!!4090380.java!!!	NameValueCache(in versionSystemProperty : String, inout uri : Uri, in getCommand : String, in setCommand : String)
+            mVersionSystemProperty = versionSystemProperty;
+            mUri = uri;
+            mCallGetCommand = getCommand;
+            mCallSetCommand = setCommand;
+!!!4090508.java!!!	lazyGetProvider(inout cr : ContentResolver) : IContentProvider
+            IContentProvider cp = null;
+            synchronized (this) {
+                cp = mContentProvider;
+                if (cp == null) {
+                    cp = mContentProvider = cr.acquireProvider(mUri.getAuthority());
+                }
+            }
+            return cp;
+!!!4090636.java!!!	putStringForUser(inout cr : ContentResolver, in name : String, in value : String, in userHandle : int) : boolean
+            try {
+                Bundle arg = new Bundle();
+                arg.putString(Settings.NameValueTable.VALUE, value);
+                arg.putInt(CALL_METHOD_USER_KEY, userHandle);
+                IContentProvider cp = lazyGetProvider(cr);
+                cp.call(mCallSetCommand, name, arg);
+            } catch (RemoteException e) {
+                Log.w(TAG, "Can't set key " + name + " in " + mUri, e);
+                return false;
+            }
+            return true;
+!!!4090764.java!!!	getStringForUser(inout cr : ContentResolver, in name : String, in userHandle : int) : String
+            final boolean isSelf = (userHandle == UserHandle.myUserId());
+            if (isSelf) {
+                long newValuesVersion = SystemProperties.getLong(mVersionSystemProperty, 0);
+
+                // Our own user's settings data uses a client-side cache
+                synchronized (this) {
+                    if (mValuesVersion != newValuesVersion) {
+                        if (LOCAL_LOGV || false) {
+                            Log.v(TAG, "invalidate [" + mUri.getLastPathSegment() + "]: current "
+                                    + newValuesVersion + " != cached " + mValuesVersion);
+                        }
+
+                        mValues.clear();
+                        mValuesVersion = newValuesVersion;
+                    }
+
+                    if (mValues.containsKey(name)) {
+                        return mValues.get(name);  // Could be null, that's OK -- negative caching
+                    }
+                }
+            } else {
+                if (LOCAL_LOGV) Log.v(TAG, "get setting for user " + userHandle
+                        + " by user " + UserHandle.myUserId() + " so skipping cache");
+            }
+
+            IContentProvider cp = lazyGetProvider(cr);
+
+            // Try the fast path first, not using query().  If this
+            // fails (alternate Settings provider that doesn't support
+            // this interface?) then we fall back to the query/table
+            // interface.
+            if (mCallGetCommand != null) {
+                try {
+                    Bundle args = null;
+                    if (!isSelf) {
+                        args = new Bundle();
+                        args.putInt(CALL_METHOD_USER_KEY, userHandle);
+                    }
+                    Bundle b = cp.call(mCallGetCommand, name, args);
+                    if (b != null) {
+                        String value = b.getPairValue();
+                        // Don't update our cache for reads of other users' data
+                        if (isSelf) {
+                            synchronized (this) {
+                                mValues.put(name, value);
+                            }
+                        } else {
+                            if (LOCAL_LOGV) Log.i(TAG, "call-query of user " + userHandle
+                                    + " by " + UserHandle.myUserId()
+                                    + " so not updating cache");
+                        }
+                        return value;
+                    }
+                    // If the response Bundle is null, we fall through
+                    // to the query interface below.
+                } catch (RemoteException e) {
+                    // Not supported by the remote side?  Fall through
+                    // to query().
+                }
+            }
+
+            Cursor c = null;
+            try {
+                c = cp.query(mUri, SELECT_VALUE, NAME_EQ_PLACEHOLDER,
+                             new String[]{name}, null, null);
+                if (c == null) {
+                    Log.w(TAG, "Can't get key " + name + " from " + mUri);
+                    return null;
+                }
+
+                String value = c.moveToNext() ? c.getString(0) : null;
+                synchronized (this) {
+                    mValues.put(name, value);
+                }
+                if (LOCAL_LOGV) {
+                    Log.v(TAG, "cache miss [" + mUri.getLastPathSegment() + "]: " +
+                            name + " = " + (value == null ? "(null)" : value));
+                }
+                return value;
+            } catch (RemoteException e) {
+                Log.w(TAG, "Can't get key " + name + " from " + mUri, e);
+                return null;  // Return null, but don't cache it.
+            } finally {
+                if (c != null) c.close();
+            }

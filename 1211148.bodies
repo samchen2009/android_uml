@@ -1,0 +1,572 @@
+class MyMediaScannerClient
+!!!6833036.java!!!	beginFile(in path : String, in mimeType : String, in lastModified : long, in fileSize : long, inout isDirectory : boolean, inout noMedia : boolean) : FileEntry
+            mMimeType = mimeType;
+            mFileType = 0;
+            mFileSize = fileSize;
+
+            if (!isDirectory) {
+                if (!noMedia && isNoMediaFile(path)) {
+                    noMedia = true;
+                }
+                mNoMedia = noMedia;
+
+                // try mimeType first, if it is specified
+                if (mimeType != null) {
+                    mFileType = MediaFile.getFileTypeForMimeType(mimeType);
+                }
+
+                // if mimeType was not specified, compute file type based on file extension.
+                if (mFileType == 0) {
+                    MediaFile.MediaFileType mediaFileType = MediaFile.getFileType(path);
+                    if (mediaFileType != null) {
+                        mFileType = mediaFileType.fileType;
+                        if (mMimeType == null) {
+                            mMimeType = mediaFileType.mimeType;
+                        }
+                    }
+                }
+
+                if (isDrmEnabled() && MediaFile.isDrmFileType(mFileType)) {
+                    mFileType = getFileTypeFromDrm(path);
+                }
+            }
+
+            FileEntry entry = makeEntryFor(path);
+            // add some slack to avoid a rounding error
+            long delta = (entry != null) ? (lastModified - entry.mLastModified) : 0;
+            boolean wasModified = delta > 1 || delta < -1;
+            if (entry == null || wasModified) {
+                if (wasModified) {
+                    entry.mLastModified = lastModified;
+                } else {
+                    entry = new FileEntry(0, path, lastModified,
+                            (isDirectory ? MtpConstants.FORMAT_ASSOCIATION : 0));
+                }
+                entry.mLastModifiedChanged = true;
+            }
+
+            if (mProcessPlaylists && MediaFile.isPlayListFileType(mFileType)) {
+                mPlayLists.add(entry);
+                // we don't process playlists in the main scan, so return null
+                return null;
+            }
+
+            // clear all the metadata
+            mArtist = null;
+            mAlbumArtist = null;
+            mAlbum = null;
+            mTitle = null;
+            mComposer = null;
+            mGenre = null;
+            mTrack = 0;
+            mYear = 0;
+            mDuration = 0;
+            mPath = path;
+            mLastModified = lastModified;
+            mWriter = null;
+            mCompilation = 0;
+            mIsDrm = false;
+            mWidth = 0;
+            mHeight = 0;
+
+            return entry;
+!!!6833164.java!!!	scanFile(in path : String, in lastModified : long, in fileSize : long, inout isDirectory : boolean, inout noMedia : boolean) : void
+            // This is the callback funtion from native codes.
+            // Log.v(TAG, "scanFile: "+path);
+            doScanFile(path, null, lastModified, fileSize, isDirectory, false, noMedia);
+!!!6833292.java!!!	doScanFile(in path : String, in mimeType : String, in lastModified : long, in fileSize : long, inout isDirectory : boolean, inout scanAlways : boolean, inout noMedia : boolean) : Uri
+            Uri result = null;
+//            long t1 = System.currentTimeMillis();
+            try {
+                FileEntry entry = beginFile(path, mimeType, lastModified,
+                        fileSize, isDirectory, noMedia);
+
+                // if this file was just inserted via mtp, set the rowid to zero
+                // (even though it already exists in the database), to trigger
+                // the correct code path for updating its entry
+                if (mMtpObjectHandle != 0) {
+                    entry.mRowId = 0;
+                }
+                // rescan for metadata if file was modified since last scan
+                if (entry != null && (entry.mLastModifiedChanged || scanAlways)) {
+                    if (noMedia) {
+                        result = endFile(entry, false, false, false, false, false);
+                    } else {
+                        String lowpath = path.toLowerCase();
+                        boolean ringtones = (lowpath.indexOf(RINGTONES_DIR) > 0);
+                        boolean notifications = (lowpath.indexOf(NOTIFICATIONS_DIR) > 0);
+                        boolean alarms = (lowpath.indexOf(ALARMS_DIR) > 0);
+                        boolean podcasts = (lowpath.indexOf(PODCAST_DIR) > 0);
+                        boolean music = (lowpath.indexOf(MUSIC_DIR) > 0) ||
+                            (!ringtones && !notifications && !alarms && !podcasts);
+
+                        boolean isaudio = MediaFile.isAudioFileType(mFileType);
+                        boolean isvideo = MediaFile.isVideoFileType(mFileType);
+                        boolean isimage = MediaFile.isImageFileType(mFileType);
+
+                        if (isaudio || isvideo || isimage) {
+                            if (mExternalIsEmulated && path.startsWith(mExternalStoragePath)) {
+                                // try to rewrite the path to bypass the sd card fuse layer
+                                String directPath = Environment.getMediaStorageDirectory() +
+                                        path.substring(mExternalStoragePath.length());
+                                File f = new File(directPath);
+                                if (f.exists()) {
+                                    path = directPath;
+                                }
+                            }
+                        }
+
+                        // we only extract metadata for audio and video files
+                        if (isaudio || isvideo) {
+                            processFile(path, mimeType, this);
+                        }
+
+                        if (isimage) {
+                            processImageFile(path);
+                        }
+
+                        result = endFile(entry, ringtones, notifications, alarms, music, podcasts);
+                    }
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "RemoteException in MediaScanner.scanFile()", e);
+            }
+//            long t2 = System.currentTimeMillis();
+//            Log.v(TAG, "scanFile: " + path + " took " + (t2-t1));
+            return result;
+!!!6833420.java!!!	parseSubstring(in s : String, in start : int, in defaultValue : int) : int
+            int length = s.length();
+            if (start == length) return defaultValue;
+
+            char ch = s.charAt(start++);
+            // return defaultValue if we have no integer at all
+            if (ch < '0' || ch > '9') return defaultValue;
+
+            int result = ch - '0';
+            while (start < length) {
+                ch = s.charAt(start++);
+                if (ch < '0' || ch > '9') return result;
+                result = result * 10 + (ch - '0');
+            }
+
+            return result;
+!!!6833548.java!!!	handleStringTag(in name : String, in value : String) : void
+            if (name.equalsIgnoreCase("title") || name.startsWith("title;")) {
+                // Don't trim() here, to preserve the special \001 character
+                // used to force sorting. The media provider will trim() before
+                // inserting the title in to the database.
+                mTitle = value;
+            } else if (name.equalsIgnoreCase("artist") || name.startsWith("artist;")) {
+                mArtist = value.trim();
+            } else if (name.equalsIgnoreCase("albumartist") || name.startsWith("albumartist;")
+                    || name.equalsIgnoreCase("band") || name.startsWith("band;")) {
+                mAlbumArtist = value.trim();
+            } else if (name.equalsIgnoreCase("album") || name.startsWith("album;")) {
+                mAlbum = value.trim();
+            } else if (name.equalsIgnoreCase("composer") || name.startsWith("composer;")) {
+                mComposer = value.trim();
+            } else if (mProcessGenres &&
+                    (name.equalsIgnoreCase("genre") || name.startsWith("genre;"))) {
+                mGenre = getGenreName(value);
+            } else if (name.equalsIgnoreCase("year") || name.startsWith("year;")) {
+                mYear = parseSubstring(value, 0, 0);
+            } else if (name.equalsIgnoreCase("tracknumber") || name.startsWith("tracknumber;")) {
+                // track number might be of the form "2/12"
+                // we just read the number before the slash
+                int num = parseSubstring(value, 0, 0);
+                mTrack = (mTrack / 1000) * 1000 + num;
+            } else if (name.equalsIgnoreCase("discnumber") ||
+                    name.equals("set") || name.startsWith("set;")) {
+                // set number might be of the form "1/3"
+                // we just read the number before the slash
+                int num = parseSubstring(value, 0, 0);
+                mTrack = (num * 1000) + (mTrack % 1000);
+            } else if (name.equalsIgnoreCase("duration")) {
+                mDuration = parseSubstring(value, 0, 0);
+            } else if (name.equalsIgnoreCase("writer") || name.startsWith("writer;")) {
+                mWriter = value.trim();
+            } else if (name.equalsIgnoreCase("compilation")) {
+                mCompilation = parseSubstring(value, 0, 0);
+            } else if (name.equalsIgnoreCase("isdrm")) {
+                mIsDrm = (parseSubstring(value, 0, 0) == 1);
+            } else if (name.equalsIgnoreCase("width")) {
+                mWidth = parseSubstring(value, 0, 0);
+            } else if (name.equalsIgnoreCase("height")) {
+                mHeight = parseSubstring(value, 0, 0);
+            } else {
+                //Log.v(TAG, "unknown tag: " + name + " (" + mProcessGenres + ")");
+            }
+!!!6833676.java!!!	convertGenreCode(in input : String, in expected : String) : boolean
+            String output = getGenreName(input);
+            if (output.equals(expected)) {
+                return true;
+            } else {
+                Log.d(TAG, "'" + input + "' -> '" + output + "', expected '" + expected + "'");
+                return false;
+            }
+!!!6833804.java!!!	testGenreNameConverter() : void
+            convertGenreCode("2", "Country");
+            convertGenreCode("(2)", "Country");
+            convertGenreCode("(2", "(2");
+            convertGenreCode("2 Foo", "Country");
+            convertGenreCode("(2) Foo", "Country");
+            convertGenreCode("(2 Foo", "(2 Foo");
+            convertGenreCode("2Foo", "2Foo");
+            convertGenreCode("(2)Foo", "Country");
+            convertGenreCode("200 Foo", "Foo");
+            convertGenreCode("(200) Foo", "Foo");
+            convertGenreCode("200Foo", "200Foo");
+            convertGenreCode("(200)Foo", "Foo");
+            convertGenreCode("200)Foo", "200)Foo");
+            convertGenreCode("200) Foo", "200) Foo");
+!!!6833932.java!!!	getGenreName(in genreTagValue : String) : String
+
+            if (genreTagValue == null) {
+                return null;
+            }
+            final int length = genreTagValue.length();
+
+            if (length > 0) {
+                boolean parenthesized = false;
+                StringBuffer number = new StringBuffer();
+                int i = 0;
+                for (; i < length; ++i) {
+                    char c = genreTagValue.charAt(i);
+                    if (i == 0 && c == '(') {
+                        parenthesized = true;
+                    } else if (Character.isDigit(c)) {
+                        number.append(c);
+                    } else {
+                        break;
+                    }
+                }
+                char charAfterNumber = i < length ? genreTagValue.charAt(i) : ' ';
+                if ((parenthesized && charAfterNumber == ')')
+                        || !parenthesized && Character.isWhitespace(charAfterNumber)) {
+                    try {
+                        short genreIndex = Short.parseShort(number.toString());
+                        if (genreIndex >= 0) {
+                            if (genreIndex < ID3_GENRES.length) {
+                                return ID3_GENRES[genreIndex];
+                            } else if (genreIndex == 0xFF) {
+                                return null;
+                            } else if (genreIndex < 0xFF && (i + 1) < length) {
+                                // genre is valid but unknown,
+                                // if there is a string after the value we take it
+                                if (parenthesized && charAfterNumber == ')') {
+                                    i++;
+                                }
+                                String ret = genreTagValue.substring(i).trim();
+                                if (ret.length() != 0) {
+                                    return ret;
+                                }
+                            } else {
+                                // else return the number, without parentheses
+                                return number.toString();
+                            }
+                        }
+                    } catch (NumberFormatException e) {
+                    }
+                }
+            }
+
+            return genreTagValue;
+!!!6834060.java!!!	processImageFile(in path : String) : void
+            try {
+                mBitmapOptions.outWidth = 0;
+                mBitmapOptions.outHeight = 0;
+                BitmapFactory.decodeFile(path, mBitmapOptions);
+                mWidth = mBitmapOptions.outWidth;
+                mHeight = mBitmapOptions.outHeight;
+            } catch (Throwable th) {
+                // ignore;
+            }
+!!!6834188.java!!!	setMimeType(in mimeType : String) : void
+            if ("audio/mp4".equals(mMimeType) &&
+                    mimeType.startsWith("video")) {
+                // for feature parity with Donut, we force m4a files to keep the
+                // audio/mp4 mimetype, even if they are really "enhanced podcasts"
+                // with a video track
+                return;
+            }
+            mMimeType = mimeType;
+            mFileType = MediaFile.getFileTypeForMimeType(mimeType);
+!!!6834316.java!!!	toValues() : ContentValues
+            ContentValues map = new ContentValues();
+
+            map.put(MediaStore.MediaColumns.DATA, mPath);
+            map.put(MediaStore.MediaColumns.TITLE, mTitle);
+            map.put(MediaStore.MediaColumns.DATE_MODIFIED, mLastModified);
+            map.put(MediaStore.MediaColumns.SIZE, mFileSize);
+            map.put(MediaStore.MediaColumns.MIME_TYPE, mMimeType);
+            map.put(MediaStore.MediaColumns.IS_DRM, mIsDrm);
+
+            String resolution = null;
+            if (mWidth > 0 && mHeight > 0) {
+                map.put(MediaStore.MediaColumns.WIDTH, mWidth);
+                map.put(MediaStore.MediaColumns.HEIGHT, mHeight);
+                resolution = mWidth + "x" + mHeight;
+            }
+
+            if (!mNoMedia) {
+                if (MediaFile.isVideoFileType(mFileType)) {
+                    map.put(Video.Media.ARTIST, (mArtist != null && mArtist.length() > 0
+                            ? mArtist : MediaStore.UNKNOWN_STRING));
+                    map.put(Video.Media.ALBUM, (mAlbum != null && mAlbum.length() > 0
+                            ? mAlbum : MediaStore.UNKNOWN_STRING));
+                    map.put(Video.Media.DURATION, mDuration);
+                    if (resolution != null) {
+                        map.put(Video.Media.RESOLUTION, resolution);
+                    }
+                } else if (MediaFile.isImageFileType(mFileType)) {
+                    // FIXME - add DESCRIPTION
+                } else if (MediaFile.isAudioFileType(mFileType)) {
+                    map.put(Audio.Media.ARTIST, (mArtist != null && mArtist.length() > 0) ?
+                            mArtist : MediaStore.UNKNOWN_STRING);
+                    map.put(Audio.Media.ALBUM_ARTIST, (mAlbumArtist != null &&
+                            mAlbumArtist.length() > 0) ? mAlbumArtist : null);
+                    map.put(Audio.Media.ALBUM, (mAlbum != null && mAlbum.length() > 0) ?
+                            mAlbum : MediaStore.UNKNOWN_STRING);
+                    map.put(Audio.Media.COMPOSER, mComposer);
+                    map.put(Audio.Media.GENRE, mGenre);
+                    if (mYear != 0) {
+                        map.put(Audio.Media.YEAR, mYear);
+                    }
+                    map.put(Audio.Media.TRACK, mTrack);
+                    map.put(Audio.Media.DURATION, mDuration);
+                    map.put(Audio.Media.COMPILATION, mCompilation);
+                }
+            }
+            return map;
+!!!6834444.java!!!	endFile(inout entry : FileEntry, inout ringtones : boolean, inout notifications : boolean, inout alarms : boolean, inout music : boolean, inout podcasts : boolean) : Uri
+            // update database
+
+            // use album artist if artist is missing
+            if (mArtist == null || mArtist.length() == 0) {
+                mArtist = mAlbumArtist;
+            }
+
+            ContentValues values = toValues();
+            String title = values.getAsString(MediaStore.MediaColumns.TITLE);
+            if (title == null || TextUtils.isEmpty(title.trim())) {
+                title = MediaFile.getFileTitle(values.getAsString(MediaStore.MediaColumns.DATA));
+                values.put(MediaStore.MediaColumns.TITLE, title);
+            }
+            String album = values.getAsString(Audio.Media.ALBUM);
+            if (MediaStore.UNKNOWN_STRING.equals(album)) {
+                album = values.getAsString(MediaStore.MediaColumns.DATA);
+                // extract last path segment before file name
+                int lastSlash = album.lastIndexOf('/');
+                if (lastSlash >= 0) {
+                    int previousSlash = 0;
+                    while (true) {
+                        int idx = album.indexOf('/', previousSlash + 1);
+                        if (idx < 0 || idx >= lastSlash) {
+                            break;
+                        }
+                        previousSlash = idx;
+                    }
+                    if (previousSlash != 0) {
+                        album = album.substring(previousSlash + 1, lastSlash);
+                        values.put(Audio.Media.ALBUM, album);
+                    }
+                }
+            }
+            long rowId = entry.mRowId;
+            if (MediaFile.isAudioFileType(mFileType) && (rowId == 0 || mMtpObjectHandle != 0)) {
+                // Only set these for new entries. For existing entries, they
+                // may have been modified later, and we want to keep the current
+                // values so that custom ringtones still show up in the ringtone
+                // picker.
+                values.put(Audio.Media.IS_RINGTONE, ringtones);
+                values.put(Audio.Media.IS_NOTIFICATION, notifications);
+                values.put(Audio.Media.IS_ALARM, alarms);
+                values.put(Audio.Media.IS_MUSIC, music);
+                values.put(Audio.Media.IS_PODCAST, podcasts);
+            } else if (mFileType == MediaFile.FILE_TYPE_JPEG && !mNoMedia) {
+                ExifInterface exif = null;
+                try {
+                    exif = new ExifInterface(entry.mPath);
+                } catch (IOException ex) {
+                    // exif is null
+                }
+                if (exif != null) {
+                    float[] latlng = new float[2];
+                    if (exif.getLatLong(latlng)) {
+                        values.put(Images.Media.LATITUDE, latlng[0]);
+                        values.put(Images.Media.LONGITUDE, latlng[1]);
+                    }
+
+                    long time = exif.getGpsDateTime();
+                    if (time != -1) {
+                        values.put(Images.Media.DATE_TAKEN, time);
+                    } else {
+                        // If no time zone information is available, we should consider using
+                        // EXIF local time as taken time if the difference between file time
+                        // and EXIF local time is not less than 1 Day, otherwise MediaProvider
+                        // will use file time as taken time.
+                        time = exif.getDateTime();
+                        if (time != -1 && Math.abs(mLastModified * 1000 - time) >= 86400000) {
+                            values.put(Images.Media.DATE_TAKEN, time);
+                        }
+                    }
+
+                    int orientation = exif.getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION, -1);
+                    if (orientation != -1) {
+                        // We only recognize a subset of orientation tag values.
+                        int degree;
+                        switch(orientation) {
+                            case ExifInterface.ORIENTATION_ROTATE_90:
+                                degree = 90;
+                                break;
+                            case ExifInterface.ORIENTATION_ROTATE_180:
+                                degree = 180;
+                                break;
+                            case ExifInterface.ORIENTATION_ROTATE_270:
+                                degree = 270;
+                                break;
+                            default:
+                                degree = 0;
+                                break;
+                        }
+                        values.put(Images.Media.ORIENTATION, degree);
+                    }
+                }
+            }
+
+            Uri tableUri = mFilesUri;
+            MediaInserter inserter = mMediaInserter;
+            if (!mNoMedia) {
+                if (MediaFile.isVideoFileType(mFileType)) {
+                    tableUri = mVideoUri;
+                } else if (MediaFile.isImageFileType(mFileType)) {
+                    tableUri = mImagesUri;
+                } else if (MediaFile.isAudioFileType(mFileType)) {
+                    tableUri = mAudioUri;
+                }
+            }
+            Uri result = null;
+            boolean needToSetSettings = false;
+            if (rowId == 0) {
+                if (mMtpObjectHandle != 0) {
+                    values.put(MediaStore.MediaColumns.MEDIA_SCANNER_NEW_OBJECT_ID, mMtpObjectHandle);
+                }
+                if (tableUri == mFilesUri) {
+                    int format = entry.mFormat;
+                    if (format == 0) {
+                        format = MediaFile.getFormatCode(entry.mPath, mMimeType);
+                    }
+                    values.put(Files.FileColumns.FORMAT, format);
+                }
+                // Setting a flag in order not to use bulk insert for the file related with
+                // notifications, ringtones, and alarms, because the rowId of the inserted file is
+                // needed.
+                if (mWasEmptyPriorToScan) {
+                    if (notifications && !mDefaultNotificationSet) {
+                        if (TextUtils.isEmpty(mDefaultNotificationFilename) ||
+                                doesPathHaveFilename(entry.mPath, mDefaultNotificationFilename)) {
+                            needToSetSettings = true;
+                        }
+                    } else if (ringtones && !mDefaultRingtoneSet) {
+                        if (TextUtils.isEmpty(mDefaultRingtoneFilename) ||
+                                doesPathHaveFilename(entry.mPath, mDefaultRingtoneFilename)) {
+                            needToSetSettings = true;
+                        }
+                    } else if (alarms && !mDefaultAlarmSet) {
+                        if (TextUtils.isEmpty(mDefaultAlarmAlertFilename) ||
+                                doesPathHaveFilename(entry.mPath, mDefaultAlarmAlertFilename)) {
+                            needToSetSettings = true;
+                        }
+                    }
+                }
+
+                // New file, insert it.
+                // Directories need to be inserted before the files they contain, so they
+                // get priority when bulk inserting.
+                // If the rowId of the inserted file is needed, it gets inserted immediately,
+                // bypassing the bulk inserter.
+                if (inserter == null || needToSetSettings) {
+                    result = mMediaProvider.insert(tableUri, values);
+                } else if (entry.mFormat == MtpConstants.FORMAT_ASSOCIATION) {
+                    inserter.insertwithPriority(tableUri, values);
+                } else {
+                    inserter.insert(tableUri, values);
+                }
+
+                if (result != null) {
+                    rowId = ContentUris.parseId(result);
+                    entry.mRowId = rowId;
+                }
+            } else {
+                // updated file
+                result = ContentUris.withAppendedId(tableUri, rowId);
+                // path should never change, and we want to avoid replacing mixed cased paths
+                // with squashed lower case paths
+                values.remove(MediaStore.MediaColumns.DATA);
+
+                int mediaType = 0;
+                if (!MediaScanner.isNoMediaPath(entry.mPath)) {
+                    int fileType = MediaFile.getFileTypeForMimeType(mMimeType);
+                    if (MediaFile.isAudioFileType(fileType)) {
+                        mediaType = FileColumns.MEDIA_TYPE_AUDIO;
+                    } else if (MediaFile.isVideoFileType(fileType)) {
+                        mediaType = FileColumns.MEDIA_TYPE_VIDEO;
+                    } else if (MediaFile.isImageFileType(fileType)) {
+                        mediaType = FileColumns.MEDIA_TYPE_IMAGE;
+                    } else if (MediaFile.isPlayListFileType(fileType)) {
+                        mediaType = FileColumns.MEDIA_TYPE_PLAYLIST;
+                    }
+                    values.put(FileColumns.MEDIA_TYPE, mediaType);
+                }
+                mMediaProvider.update(result, values, null, null);
+            }
+
+            if(needToSetSettings) {
+                if (notifications) {
+                    setSettingIfNotSet(Settings.System.NOTIFICATION_SOUND, tableUri, rowId);
+                    mDefaultNotificationSet = true;
+                } else if (ringtones) {
+                    setSettingIfNotSet(Settings.System.RINGTONE, tableUri, rowId);
+                    mDefaultRingtoneSet = true;
+                } else if (alarms) {
+                    setSettingIfNotSet(Settings.System.ALARM_ALERT, tableUri, rowId);
+                    mDefaultAlarmSet = true;
+                }
+            }
+
+            return result;
+!!!6834572.java!!!	doesPathHaveFilename(in path : String, in filename : String) : boolean
+            int pathFilenameStart = path.lastIndexOf(File.separatorChar) + 1;
+            int filenameLength = filename.length();
+            return path.regionMatches(pathFilenameStart, filename, 0, filenameLength) &&
+                    pathFilenameStart + filenameLength == path.length();
+!!!6834700.java!!!	setSettingIfNotSet(in settingName : String, inout uri : Uri, in rowId : long) : void
+
+            String existingSettingValue = Settings.System.getString(mContext.getContentResolver(),
+                    settingName);
+
+            if (TextUtils.isEmpty(existingSettingValue)) {
+                // Set the setting to the given URI
+                Settings.System.putString(mContext.getContentResolver(), settingName,
+                        ContentUris.withAppendedId(uri, rowId).toString());
+            }
+!!!6834828.java!!!	getFileTypeFromDrm(in path : String) : int
+            if (!isDrmEnabled()) {
+                return 0;
+            }
+
+            int resultFileType = 0;
+
+            if (mDrmManagerClient == null) {
+                mDrmManagerClient = new DrmManagerClient(mContext);
+            }
+
+            if (mDrmManagerClient.canHandle(path, null)) {
+                String drmMimetype = mDrmManagerClient.getOriginalMimeType(path);
+                if (drmMimetype != null) {
+                    mMimeType = drmMimetype;
+                    resultFileType = MediaFile.getFileTypeForMimeType(drmMimetype);
+                }
+            }
+            return resultFileType;

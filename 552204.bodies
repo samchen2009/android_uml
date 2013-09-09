@@ -1,0 +1,231 @@
+class FramebufferNativeWindow
+!!!1537676.cpp!!!	FramebufferNativeWindow()
+    hw_module_t const* module;
+    if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &module) == 0) {
+        int stride;
+        int err;
+        int i;
+        err = framebuffer_open(module, &fbDev);
+        ALOGE_IF(err, "couldn't open framebuffer HAL (%s)", strerror(-err));
+        
+        err = gralloc_open(module, &grDev);
+        ALOGE_IF(err, "couldn't open gralloc HAL (%s)", strerror(-err));
+
+        // bail out if we can't initialize the modules
+        if (!fbDev || !grDev)
+            return;
+        
+        mUpdateOnDemand = (fbDev->setUpdateRect != 0);
+        
+        // initialize the buffer FIFO
+        if(fbDev->numFramebuffers >= MIN_NUM_FRAME_BUFFERS &&
+           fbDev->numFramebuffers <= MAX_NUM_FRAME_BUFFERS){
+            mNumBuffers = fbDev->numFramebuffers;
+        } else {
+            mNumBuffers = MIN_NUM_FRAME_BUFFERS;
+        }
+        mNumFreeBuffers = mNumBuffers;
+        mBufferHead = mNumBuffers-1;
+
+        /*
+         * This does not actually change the framebuffer format. It merely
+         * fakes this format to surfaceflinger so that when it creates
+         * framebuffer surfaces it will use this format. It's really a giant
+         * HACK to allow interworking with buggy gralloc+GPU driver
+         * implementations. You should *NEVER* need to set this for shipping
+         * devices.
+         */
+#ifdef FRAMEBUFFER_FORCE_FORMAT
+        *((uint32_t *)&fbDev->format) = FRAMEBUFFER_FORCE_FORMAT;
+#endif
+
+        for (i = 0; i < mNumBuffers; i++)
+        {
+                buffers[i] = new NativeBuffer(
+                        fbDev->width, fbDev->height, fbDev->format, GRALLOC_USAGE_HW_FB);
+        }
+
+        for (i = 0; i < mNumBuffers; i++)
+        {
+                err = grDev->alloc(grDev,
+                        fbDev->width, fbDev->height, fbDev->format,
+                        GRALLOC_USAGE_HW_FB, &buffers[i]->handle, &buffers[i]->stride);
+
+                ALOGE_IF(err, "fb buffer %d allocation failed w=%d, h=%d, err=%s",
+                        i, fbDev->width, fbDev->height, strerror(-err));
+
+                if (err)
+                {
+                        mNumBuffers = i;
+                        mNumFreeBuffers = i;
+                        mBufferHead = mNumBuffers-1;
+                        break;
+                }
+        }
+
+        const_cast<uint32_t&>(ANativeWindow::flags) = fbDev->flags; 
+        const_cast<float&>(ANativeWindow::xdpi) = fbDev->xdpi;
+        const_cast<float&>(ANativeWindow::ydpi) = fbDev->ydpi;
+        const_cast<int&>(ANativeWindow::minSwapInterval) = 
+            fbDev->minSwapInterval;
+        const_cast<int&>(ANativeWindow::maxSwapInterval) = 
+            fbDev->maxSwapInterval;
+    } else {
+        ALOGE("Couldn't get gralloc module");
+    }
+
+    ANativeWindow::setSwapInterval = setSwapInterval;
+    ANativeWindow::dequeueBuffer = dequeueBuffer;
+    ANativeWindow::queueBuffer = queueBuffer;
+    ANativeWindow::query = query;
+    ANativeWindow::perform = perform;
+
+    ANativeWindow::dequeueBuffer_DEPRECATED = dequeueBuffer_DEPRECATED;
+    ANativeWindow::lockBuffer_DEPRECATED = lockBuffer_DEPRECATED;
+    ANativeWindow::queueBuffer_DEPRECATED = queueBuffer_DEPRECATED;
+!!!1538060.cpp!!!	setUpdateRectangle(in r : Rect) : status_t
+    if (!mUpdateOnDemand) {
+        return INVALID_OPERATION;
+    }
+    return fbDev->setUpdateRect(fbDev, r.left, r.top, r.width(), r.height());
+!!!1538188.cpp!!!	compositionComplete() : status_t
+    if (fbDev->compositionComplete) {
+        return fbDev->compositionComplete(fbDev);
+    }
+    return INVALID_OPERATION;
+!!!1538316.cpp!!!	dump(inout result : String8) : void
+    if (fbDev->common.version >= 1 && fbDev->dump) {
+        const size_t SIZE = 4096;
+        char buffer[SIZE];
+
+        fbDev->dump(fbDev, buffer, SIZE);
+        result.append(buffer);
+    }
+!!!1538444.cpp!!!	getCurrentBufferIndex() : int
+    Mutex::Autolock _l(mutex);
+    const int index = mCurrentBufferIndex;
+    return index;
+!!!1538572.cpp!!!	~FramebufferNativeWindow()
+    if (grDev) {
+        for(int i = 0; i < mNumBuffers; i++) {
+            if (buffers[i] != NULL) {
+                grDev->free(grDev, buffers[i]->handle);
+            }
+        }
+        gralloc_close(grDev);
+    }
+
+    if (fbDev) {
+        framebuffer_close(fbDev);
+    }
+!!!1538700.cpp!!!	setSwapInterval(inout window : ANativeWindow, in interval : int) : int
+    framebuffer_device_t* fb = getSelf(window)->fbDev;
+    return fb->setSwapInterval(fb, interval);
+!!!1538828.cpp!!!	dequeueBuffer(inout window : ANativeWindow, inout buffer : ANativeWindowBuffer, inout fenceFd : int) : int
+    FramebufferNativeWindow* self = getSelf(window);
+    Mutex::Autolock _l(self->mutex);
+    framebuffer_device_t* fb = self->fbDev;
+
+    int index = self->mBufferHead++;
+    if (self->mBufferHead >= self->mNumBuffers)
+        self->mBufferHead = 0;
+
+    // wait for a free non-front buffer
+    while (self->mNumFreeBuffers < 2) {
+        self->mCondition.wait(self->mutex);
+    }
+    ALOG_ASSERT(self->buffers[index] != self->front);
+
+    // get this buffer
+    self->mNumFreeBuffers--;
+    self->mCurrentBufferIndex = index;
+
+    *buffer = self->buffers[index].get();
+    *fenceFd = -1;
+
+    return 0;
+!!!1538956.cpp!!!	queueBuffer(inout window : ANativeWindow, inout buffer : ANativeWindowBuffer, in fenceFd : int) : int
+    FramebufferNativeWindow* self = getSelf(window);
+    Mutex::Autolock _l(self->mutex);
+    framebuffer_device_t* fb = self->fbDev;
+    buffer_handle_t handle = static_cast<NativeBuffer*>(buffer)->handle;
+
+    sp<Fence> fence(new Fence(fenceFd));
+    fence->wait(Fence::TIMEOUT_NEVER);
+
+    const int index = self->mCurrentBufferIndex;
+    int res = fb->post(fb, handle);
+    self->front = static_cast<NativeBuffer*>(buffer);
+    self->mNumFreeBuffers++;
+    self->mCondition.broadcast();
+    return res;
+!!!1539084.cpp!!!	query(in window : ANativeWindow, in what : int, inout value : int) : int
+    const FramebufferNativeWindow* self = getSelf(window);
+    Mutex::Autolock _l(self->mutex);
+    framebuffer_device_t* fb = self->fbDev;
+    switch (what) {
+        case NATIVE_WINDOW_WIDTH:
+            *value = fb->width;
+            return NO_ERROR;
+        case NATIVE_WINDOW_HEIGHT:
+            *value = fb->height;
+            return NO_ERROR;
+        case NATIVE_WINDOW_FORMAT:
+            *value = fb->format;
+            return NO_ERROR;
+        case NATIVE_WINDOW_CONCRETE_TYPE:
+            *value = NATIVE_WINDOW_FRAMEBUFFER;
+            return NO_ERROR;
+        case NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER:
+            *value = 0;
+            return NO_ERROR;
+        case NATIVE_WINDOW_DEFAULT_WIDTH:
+            *value = fb->width;
+            return NO_ERROR;
+        case NATIVE_WINDOW_DEFAULT_HEIGHT:
+            *value = fb->height;
+            return NO_ERROR;
+        case NATIVE_WINDOW_TRANSFORM_HINT:
+            *value = 0;
+            return NO_ERROR;
+    }
+    *value = 0;
+    return BAD_VALUE;
+!!!1539212.cpp!!!	perform(inout window : ANativeWindow, in operation : int) : int
+    switch (operation) {
+        case NATIVE_WINDOW_CONNECT:
+        case NATIVE_WINDOW_DISCONNECT:
+        case NATIVE_WINDOW_SET_USAGE:
+        case NATIVE_WINDOW_SET_BUFFERS_GEOMETRY:
+        case NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS:
+        case NATIVE_WINDOW_SET_BUFFERS_FORMAT:
+        case NATIVE_WINDOW_SET_BUFFERS_TRANSFORM:
+        case NATIVE_WINDOW_API_CONNECT:
+        case NATIVE_WINDOW_API_DISCONNECT:
+            // TODO: we should implement these
+            return NO_ERROR;
+
+        case NATIVE_WINDOW_LOCK:
+        case NATIVE_WINDOW_UNLOCK_AND_POST:
+        case NATIVE_WINDOW_SET_CROP:
+        case NATIVE_WINDOW_SET_BUFFER_COUNT:
+        case NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP:
+        case NATIVE_WINDOW_SET_SCALING_MODE:
+            return INVALID_OPERATION;
+    }
+    return NAME_NOT_FOUND;
+!!!1539340.cpp!!!	dequeueBuffer_DEPRECATED(inout window : ANativeWindow, inout buffer : ANativeWindowBuffer) : int
+    int fenceFd = -1;
+    int result = dequeueBuffer(window, buffer, &fenceFd);
+    sp<Fence> fence(new Fence(fenceFd));
+    int waitResult = fence->wait(Fence::TIMEOUT_NEVER);
+    if (waitResult != OK) {
+        ALOGE("dequeueBuffer_DEPRECATED: Fence::wait returned an "
+                "error: %d", waitResult);
+        return waitResult;
+    }
+    return result;
+!!!1539468.cpp!!!	queueBuffer_DEPRECATED(inout window : ANativeWindow, inout buffer : ANativeWindowBuffer) : int
+    return queueBuffer(window, buffer, -1);
+!!!1539596.cpp!!!	lockBuffer_DEPRECATED(inout window : ANativeWindow, inout buffer : ANativeWindowBuffer) : int
+    return NO_ERROR;

@@ -1,0 +1,158 @@
+class STOU
+!!!13398668.java!!!	execute(in session : FtpIoSession, in context : FtpServerContext, in request : FtpRequest) : void
+
+        try {
+            // check free size of the storage
+            if (!Util.hasEnoughStorage()) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_552_REQUESTED_FILE_ACTION_ABORTED_EXCEEDED_STORAGE,
+                        "STOU: Disk is not enough or read-only."));
+                return;
+            }
+
+            // 24-10-2007 - added check if PORT or PASV is issued, see
+            // https://issues.apache.org/jira/browse/FTPSERVER-110
+            DataConnectionFactory connFactory = session.getDataConnection();
+            if (connFactory instanceof IODataConnectionFactory) {
+                InetAddress address = ((IODataConnectionFactory) connFactory)
+                        .getInetAddress();
+                if (address == null) {
+                    session.write(new DefaultFtpReply(
+                            FtpReply.REPLY_503_BAD_SEQUENCE_OF_COMMANDS,
+                            "PORT or PASV must be issued first"));
+                    return;
+                }
+            }
+
+            // reset state variables
+            session.resetState();
+
+            String pathName = request.getArgument();
+
+            // get filenames
+            FtpFile file = null;
+            try {
+                String filePrefix;
+                if (pathName == null) {
+                    filePrefix = "ftp.dat";
+                } else {
+                    FtpFile dir = session.getFileSystemView().getFile(
+                            pathName);
+                    if (dir.isDirectory()) {
+                        filePrefix = pathName + "/ftp.dat";
+                    } else {
+                        filePrefix = pathName;
+                    }
+                }
+
+                file = session.getFileSystemView().getFile(filePrefix);
+                if (file != null) {
+                    file = getUniqueFile(session, file);
+                }
+            } catch (Exception ex) {
+                LOG.debug("Exception getting file object", ex);
+            }
+
+            if (file == null) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_550_REQUESTED_ACTION_NOT_TAKEN, "STOU"));
+                return;
+            }
+            String fileName = file.getAbsolutePath();
+
+            // check permission
+            if (!file.isWritable()) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_550_REQUESTED_ACTION_NOT_TAKEN,
+                        "STOU: " + fileName + " file permission error."));
+                return;
+            }
+
+            // get data connection
+            session.write(new DefaultFtpReply(
+                    FtpReply.REPLY_150_FILE_STATUS_OKAY, "FILE: " + fileName));
+
+            // get data from client
+            boolean failure = false;
+            OutputStream os = null;
+
+            DataConnection dataConnection;
+            try {
+                dataConnection = session.getDataConnection().openConnection();
+            } catch (Exception e) {
+                LOG.debug("Exception getting the input data stream", e);
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_425_CANT_OPEN_DATA_CONNECTION,
+                        "STOU: cannot open data connection for " + fileName + "."));
+                return;
+            }
+
+            long transSz = 0L;
+            try {
+
+                // open streams
+                os = file.createOutputStream(0L);
+
+                // transfer data
+                transSz = dataConnection.transferFromClient(session.getFtpletSession(),
+                        new FreeSpaceControlledOutputStream(os));
+
+                // attempt to close the output stream so that errors in
+                // closing it will return an error to the client (FTPSERVER-119)
+                if(os != null) {
+                    os.close();
+                }
+
+                LOG.info("File uploaded {}", fileName);
+
+                // notify the statistics component
+                ServerFtpStatistics ftpStat = (ServerFtpStatistics) context
+                        .getFtpStatistics();
+                if (ftpStat != null) {
+                    ftpStat.setUpload(session, file, transSz);
+                }
+
+            } catch (SocketException ex) {
+                LOG.debug("Socket exception during data transfer", ex);
+                failure = true;
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_426_CONNECTION_CLOSED_TRANSFER_ABORTED,
+                        "STOU: socket exception during data transfer of " + fileName + "."));
+            } catch (LowStorageSpaceException ex) {
+                LOG.debug("LowStorageSpaceException during data transfer", ex);
+                failure = true;
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_552_REQUESTED_FILE_ACTION_ABORTED_EXCEEDED_STORAGE,
+                        "STOU: " + ex.toString()));
+            } catch (IOException ex) {
+                LOG.debug("IOException during data transfer", ex);
+                failure = true;
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_551_REQUESTED_ACTION_ABORTED_PAGE_TYPE_UNKNOWN,
+                        "STOU: " + ex.toString()));
+            } finally {
+                // make sure we really close the output stream
+                IoUtils.close(os);
+            }
+
+            // if data transfer ok - send transfer complete message
+            if (!failure) {
+                session.write(new DefaultFtpReply(FtpReply.REPLY_226_CLOSING_DATA_CONNECTION,
+                        "STOU: " + fileName + " was transferred."));
+            }
+        } finally {
+            session.getDataConnection().closeDataConnection();
+        }
+
+!!!13398796.java!!!	getUniqueFile(inout session : FtpIoSession, inout oldFile : FtpFile) : FtpFile
+        FtpFile newFile = oldFile;
+        FileSystemView fsView = session.getFileSystemView();
+        String fileName = newFile.getAbsolutePath();
+        while (newFile.doesExist()) {
+            newFile = fsView.getFile(fileName + '.'
+                    + System.currentTimeMillis());
+            if (newFile == null) {
+                break;
+            }
+        }
+        return newFile;

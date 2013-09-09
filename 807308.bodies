@@ -1,0 +1,739 @@
+class SQLiteConnection
+!!!3304844.java!!!	SQLiteConnection(inout pool : SQLiteConnectionPool, inout configuration : SQLiteDatabaseConfiguration, in connectionId : int, inout primaryConnection : boolean)
+        mPool = pool;
+        mConfiguration = new SQLiteDatabaseConfiguration(configuration);
+        mConnectionId = connectionId;
+        mIsPrimaryConnection = primaryConnection;
+        mIsReadOnlyConnection = (configuration.openFlags & SQLiteDatabase.OPEN_READONLY) != 0;
+        mPreparedStatementCache = new PreparedStatementCache(
+                mConfiguration.maxSqlCacheSize);
+        mCloseGuard.open("close");
+!!!3304972.java!!!	finalize() : void
+        try {
+            if (mPool != null && mConnectionPtr != 0) {
+                mPool.onConnectionLeaked();
+            }
+
+            dispose(true);
+        } finally {
+            super.finalize();
+        }
+!!!3305100.java!!!	open(inout pool : SQLiteConnectionPool, inout configuration : SQLiteDatabaseConfiguration, in connectionId : int, inout primaryConnection : boolean) : SQLiteConnection
+        SQLiteConnection connection = new SQLiteConnection(pool, configuration,
+                connectionId, primaryConnection);
+        try {
+            connection.open();
+            return connection;
+        } catch (SQLiteException ex) {
+            connection.dispose(false);
+            throw ex;
+        }
+!!!3305228.java!!!	close() : void
+        dispose(false);
+!!!3305356.java!!!	open() : void
+        mConnectionPtr = nativeOpen(mConfiguration.path, mConfiguration.openFlags,
+                mConfiguration.label,
+                SQLiteDebug.DEBUG_SQL_STATEMENTS, SQLiteDebug.DEBUG_SQL_TIME);
+
+        setPageSize();
+        setForeignKeyModeFromConfiguration();
+        setWalModeFromConfiguration();
+        setJournalSizeLimit();
+        setAutoCheckpointInterval();
+        setLocaleFromConfiguration();
+!!!3305484.java!!!	dispose(inout finalized : boolean) : void
+        if (mCloseGuard != null) {
+            if (finalized) {
+                mCloseGuard.warnIfOpen();
+            }
+            mCloseGuard.close();
+        }
+
+        if (mConnectionPtr != 0) {
+            final int cookie = mRecentOperations.beginOperation("close", null, null);
+            try {
+                mPreparedStatementCache.evictAll();
+                nativeClose(mConnectionPtr);
+                mConnectionPtr = 0;
+            } finally {
+                mRecentOperations.endOperation(cookie);
+            }
+        }
+!!!3305612.java!!!	setPageSize() : void
+        if (!mConfiguration.isInMemoryDb() && !mIsReadOnlyConnection) {
+            final long newValue = SQLiteGlobal.getDefaultPageSize();
+            long value = executeForLong("PRAGMA page_size", null, null);
+            if (value != newValue) {
+                execute("PRAGMA page_size=" + newValue, null, null);
+            }
+        }
+!!!3305740.java!!!	setAutoCheckpointInterval() : void
+        if (!mConfiguration.isInMemoryDb() && !mIsReadOnlyConnection) {
+            final long newValue = SQLiteGlobal.getWALAutoCheckpoint();
+            long value = executeForLong("PRAGMA wal_autocheckpoint", null, null);
+            if (value != newValue) {
+                executeForLong("PRAGMA wal_autocheckpoint=" + newValue, null, null);
+            }
+        }
+!!!3305868.java!!!	setJournalSizeLimit() : void
+        if (!mConfiguration.isInMemoryDb() && !mIsReadOnlyConnection) {
+            final long newValue = SQLiteGlobal.getJournalSizeLimit();
+            long value = executeForLong("PRAGMA journal_size_limit", null, null);
+            if (value != newValue) {
+                executeForLong("PRAGMA journal_size_limit=" + newValue, null, null);
+            }
+        }
+!!!3305996.java!!!	setForeignKeyModeFromConfiguration() : void
+        if (!mIsReadOnlyConnection) {
+            final long newValue = mConfiguration.foreignKeyConstraintsEnabled ? 1 : 0;
+            long value = executeForLong("PRAGMA foreign_keys", null, null);
+            if (value != newValue) {
+                execute("PRAGMA foreign_keys=" + newValue, null, null);
+            }
+        }
+!!!3306124.java!!!	setWalModeFromConfiguration() : void
+        if (!mConfiguration.isInMemoryDb() && !mIsReadOnlyConnection) {
+            if ((mConfiguration.openFlags & SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING) != 0) {
+                setJournalMode("WAL");
+                setSyncMode(SQLiteGlobal.getWALSyncMode());
+            } else {
+                setJournalMode(SQLiteGlobal.getDefaultJournalMode());
+                setSyncMode(SQLiteGlobal.getDefaultSyncMode());
+            }
+        }
+!!!3306252.java!!!	setSyncMode(in newValue : String) : void
+        String value = executeForString("PRAGMA synchronous", null, null);
+        if (!canonicalizeSyncMode(value).equalsIgnoreCase(
+                canonicalizeSyncMode(newValue))) {
+            execute("PRAGMA synchronous=" + newValue, null, null);
+        }
+!!!3306380.java!!!	canonicalizeSyncMode(in value : String) : String
+        if (value.equals("0")) {
+            return "OFF";
+        } else if (value.equals("1")) {
+            return "NORMAL";
+        } else if (value.equals("2")) {
+            return "FULL";
+        }
+        return value;
+!!!3306508.java!!!	setJournalMode(in newValue : String) : void
+        String value = executeForString("PRAGMA journal_mode", null, null);
+        if (!value.equalsIgnoreCase(newValue)) {
+            try {
+                String result = executeForString("PRAGMA journal_mode=" + newValue, null, null);
+                if (result.equalsIgnoreCase(newValue)) {
+                    return;
+                }
+                // PRAGMA journal_mode silently fails and returns the original journal
+                // mode in some cases if the journal mode could not be changed.
+            } catch (SQLiteDatabaseLockedException ex) {
+                // This error (SQLITE_BUSY) occurs if one connection has the database
+                // open in WAL mode and another tries to change it to non-WAL.
+            }
+            // Because we always disable WAL mode when a database is first opened
+            // (even if we intend to re-enable it), we can encounter problems if
+            // there is another open connection to the database somewhere.
+            // This can happen for a variety of reasons such as an application opening
+            // the same database in multiple processes at the same time or if there is a
+            // crashing content provider service that the ActivityManager has
+            // removed from its registry but whose process hasn't quite died yet
+            // by the time it is restarted in a new process.
+            //
+            // If we don't change the journal mode, nothing really bad happens.
+            // In the worst case, an application that enables WAL might not actually
+            // get it, although it can still use connection pooling.
+            Log.w(TAG, "Could not change the database journal mode of '"
+                    + mConfiguration.label + "' from '" + value + "' to '" + newValue
+                    + "' because the database is locked.  This usually means that "
+                    + "there are other open connections to the database which prevents "
+                    + "the database from enabling or disabling write-ahead logging mode.  "
+                    + "Proceeding without changing the journal mode.");
+        }
+!!!3306636.java!!!	setLocaleFromConfiguration() : void
+        if ((mConfiguration.openFlags & SQLiteDatabase.NO_LOCALIZED_COLLATORS) != 0) {
+            return;
+        }
+
+        // Register the localized collators.
+        final String newLocale = mConfiguration.locale.toString();
+        nativeRegisterLocalizedCollators(mConnectionPtr, newLocale);
+
+        // If the database is read-only, we cannot modify the android metadata table
+        // or existing indexes.
+        if (mIsReadOnlyConnection) {
+            return;
+        }
+
+        try {
+            // Ensure the android metadata table exists.
+            execute("CREATE TABLE IF NOT EXISTS android_metadata (locale TEXT)", null, null);
+
+            // Check whether the locale was actually changed.
+            final String oldLocale = executeForString("SELECT locale FROM android_metadata "
+                    + "UNION SELECT NULL ORDER BY locale DESC LIMIT 1", null, null);
+            if (oldLocale != null && oldLocale.equals(newLocale)) {
+                return;
+            }
+
+            // Go ahead and update the indexes using the new locale.
+            execute("BEGIN", null, null);
+            boolean success = false;
+            try {
+                execute("DELETE FROM android_metadata", null, null);
+                execute("INSERT INTO android_metadata (locale) VALUES(?)",
+                        new Object[] { newLocale }, null);
+                execute("REINDEX LOCALIZED", null, null);
+                success = true;
+            } finally {
+                execute(success ? "COMMIT" : "ROLLBACK", null, null);
+            }
+        } catch (RuntimeException ex) {
+            throw new SQLiteException("Failed to change locale for db '" + mConfiguration.label
+                    + "' to '" + newLocale + "'.", ex);
+        }
+!!!3306764.java!!!	reconfigure(inout configuration : SQLiteDatabaseConfiguration) : void
+        mOnlyAllowReadOnlyOperations = false;
+
+        // Register custom functions.
+        final int functionCount = configuration.customFunctions.size();
+        for (int i = 0; i < functionCount; i++) {
+            SQLiteCustomFunction function = configuration.customFunctions.get(i);
+            if (!mConfiguration.customFunctions.contains(function)) {
+                nativeRegisterCustomFunction(mConnectionPtr, function);
+            }
+        }
+
+        // Remember what changed.
+        boolean foreignKeyModeChanged = configuration.foreignKeyConstraintsEnabled
+                != mConfiguration.foreignKeyConstraintsEnabled;
+        boolean walModeChanged = ((configuration.openFlags ^ mConfiguration.openFlags)
+                & SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING) != 0;
+        boolean localeChanged = !configuration.locale.equals(mConfiguration.locale);
+
+        // Update configuration parameters.
+        mConfiguration.updateParametersFrom(configuration);
+
+        // Update prepared statement cache size.
+        mPreparedStatementCache.resize(configuration.maxSqlCacheSize);
+
+        // Update foreign key mode.
+        if (foreignKeyModeChanged) {
+            setForeignKeyModeFromConfiguration();
+        }
+
+        // Update WAL.
+        if (walModeChanged) {
+            setWalModeFromConfiguration();
+        }
+
+        // Update locale.
+        if (localeChanged) {
+            setLocaleFromConfiguration();
+        }
+!!!3306892.java!!!	setOnlyAllowReadOnlyOperations(inout readOnly : boolean) : void
+        mOnlyAllowReadOnlyOperations = readOnly;
+!!!3307020.java!!!	isPreparedStatementInCache(in sql : String) : boolean
+        return mPreparedStatementCache.get(sql) != null;
+!!!3307148.java!!!	getConnectionId() : int
+        return mConnectionId;
+!!!3307276.java!!!	isPrimaryConnection() : boolean
+        return mIsPrimaryConnection;
+!!!3307404.java!!!	prepare(in sql : String, inout outStatementInfo : SQLiteStatementInfo) : void
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        final int cookie = mRecentOperations.beginOperation("prepare", sql, null);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                if (outStatementInfo != null) {
+                    outStatementInfo.numParameters = statement.mNumParameters;
+                    outStatementInfo.readOnly = statement.mReadOnly;
+
+                    final int columnCount = nativeGetColumnCount(
+                            mConnectionPtr, statement.mStatementPtr);
+                    if (columnCount == 0) {
+                        outStatementInfo.columnNames = EMPTY_STRING_ARRAY;
+                    } else {
+                        outStatementInfo.columnNames = new String[columnCount];
+                        for (int i = 0; i < columnCount; i++) {
+                            outStatementInfo.columnNames[i] = nativeGetColumnName(
+                                    mConnectionPtr, statement.mStatementPtr, i);
+                        }
+                    }
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            mRecentOperations.endOperation(cookie);
+        }
+!!!3307532.java!!!	execute(in sql : String, inout bindArgs : Object, inout cancellationSignal : CancellationSignal) : void
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        final int cookie = mRecentOperations.beginOperation("execute", sql, bindArgs);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                throwIfStatementForbidden(statement);
+                bindArguments(statement, bindArgs);
+                applyBlockGuardPolicy(statement);
+                attachCancellationSignal(cancellationSignal);
+                try {
+                    nativeExecute(mConnectionPtr, statement.mStatementPtr);
+                } finally {
+                    detachCancellationSignal(cancellationSignal);
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            mRecentOperations.endOperation(cookie);
+        }
+!!!3307660.java!!!	executeForLong(in sql : String, inout bindArgs : Object, inout cancellationSignal : CancellationSignal) : long
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        final int cookie = mRecentOperations.beginOperation("executeForLong", sql, bindArgs);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                throwIfStatementForbidden(statement);
+                bindArguments(statement, bindArgs);
+                applyBlockGuardPolicy(statement);
+                attachCancellationSignal(cancellationSignal);
+                try {
+                    return nativeExecuteForLong(mConnectionPtr, statement.mStatementPtr);
+                } finally {
+                    detachCancellationSignal(cancellationSignal);
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            mRecentOperations.endOperation(cookie);
+        }
+!!!3307788.java!!!	executeForString(in sql : String, inout bindArgs : Object, inout cancellationSignal : CancellationSignal) : String
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        final int cookie = mRecentOperations.beginOperation("executeForString", sql, bindArgs);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                throwIfStatementForbidden(statement);
+                bindArguments(statement, bindArgs);
+                applyBlockGuardPolicy(statement);
+                attachCancellationSignal(cancellationSignal);
+                try {
+                    return nativeExecuteForString(mConnectionPtr, statement.mStatementPtr);
+                } finally {
+                    detachCancellationSignal(cancellationSignal);
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            mRecentOperations.endOperation(cookie);
+        }
+!!!3307916.java!!!	executeForBlobFileDescriptor(in sql : String, inout bindArgs : Object, inout cancellationSignal : CancellationSignal) : ParcelFileDescriptor
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        final int cookie = mRecentOperations.beginOperation("executeForBlobFileDescriptor",
+                sql, bindArgs);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                throwIfStatementForbidden(statement);
+                bindArguments(statement, bindArgs);
+                applyBlockGuardPolicy(statement);
+                attachCancellationSignal(cancellationSignal);
+                try {
+                    int fd = nativeExecuteForBlobFileDescriptor(
+                            mConnectionPtr, statement.mStatementPtr);
+                    return fd >= 0 ? ParcelFileDescriptor.adoptFd(fd) : null;
+                } finally {
+                    detachCancellationSignal(cancellationSignal);
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            mRecentOperations.endOperation(cookie);
+        }
+!!!3308044.java!!!	executeForChangedRowCount(in sql : String, inout bindArgs : Object, inout cancellationSignal : CancellationSignal) : int
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        int changedRows = 0;
+        final int cookie = mRecentOperations.beginOperation("executeForChangedRowCount",
+                sql, bindArgs);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                throwIfStatementForbidden(statement);
+                bindArguments(statement, bindArgs);
+                applyBlockGuardPolicy(statement);
+                attachCancellationSignal(cancellationSignal);
+                try {
+                    changedRows = nativeExecuteForChangedRowCount(
+                            mConnectionPtr, statement.mStatementPtr);
+                    return changedRows;
+                } finally {
+                    detachCancellationSignal(cancellationSignal);
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            if (mRecentOperations.endOperationDeferLog(cookie)) {
+                mRecentOperations.logOperation(cookie, "changedRows=" + changedRows);
+            }
+        }
+!!!3308172.java!!!	executeForLastInsertedRowId(in sql : String, inout bindArgs : Object, inout cancellationSignal : CancellationSignal) : long
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        final int cookie = mRecentOperations.beginOperation("executeForLastInsertedRowId",
+                sql, bindArgs);
+        try {
+            final PreparedStatement statement = acquirePreparedStatement(sql);
+            try {
+                throwIfStatementForbidden(statement);
+                bindArguments(statement, bindArgs);
+                applyBlockGuardPolicy(statement);
+                attachCancellationSignal(cancellationSignal);
+                try {
+                    return nativeExecuteForLastInsertedRowId(
+                            mConnectionPtr, statement.mStatementPtr);
+                } finally {
+                    detachCancellationSignal(cancellationSignal);
+                }
+            } finally {
+                releasePreparedStatement(statement);
+            }
+        } catch (RuntimeException ex) {
+            mRecentOperations.failOperation(cookie, ex);
+            throw ex;
+        } finally {
+            mRecentOperations.endOperation(cookie);
+        }
+!!!3308300.java!!!	executeForCursorWindow(in sql : String, inout bindArgs : Object, inout window : CursorWindow, in startPos : int, in requiredPos : int, inout countAllRows : boolean, inout cancellationSignal : CancellationSignal) : int
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+        if (window == null) {
+            throw new IllegalArgumentException("window must not be null.");
+        }
+
+        window.acquireReference();
+        try {
+            int actualPos = -1;
+            int countedRows = -1;
+            int filledRows = -1;
+            final int cookie = mRecentOperations.beginOperation("executeForCursorWindow",
+                    sql, bindArgs);
+            try {
+                final PreparedStatement statement = acquirePreparedStatement(sql);
+                try {
+                    throwIfStatementForbidden(statement);
+                    bindArguments(statement, bindArgs);
+                    applyBlockGuardPolicy(statement);
+                    attachCancellationSignal(cancellationSignal);
+                    try {
+                        final long result = nativeExecuteForCursorWindow(
+                                mConnectionPtr, statement.mStatementPtr, window.mWindowPtr,
+                                startPos, requiredPos, countAllRows);
+                        actualPos = (int)(result >> 32);
+                        countedRows = (int)result;
+                        filledRows = window.getNumRows();
+                        window.setStartPosition(actualPos);
+                        return countedRows;
+                    } finally {
+                        detachCancellationSignal(cancellationSignal);
+                    }
+                } finally {
+                    releasePreparedStatement(statement);
+                }
+            } catch (RuntimeException ex) {
+                mRecentOperations.failOperation(cookie, ex);
+                throw ex;
+            } finally {
+                if (mRecentOperations.endOperationDeferLog(cookie)) {
+                    mRecentOperations.logOperation(cookie, "window='" + window
+                            + "', startPos=" + startPos
+                            + ", actualPos=" + actualPos
+                            + ", filledRows=" + filledRows
+                            + ", countedRows=" + countedRows);
+                }
+            }
+        } finally {
+            window.releaseReference();
+        }
+!!!3308428.java!!!	acquirePreparedStatement(in sql : String) : PreparedStatement
+        PreparedStatement statement = mPreparedStatementCache.get(sql);
+        boolean skipCache = false;
+        if (statement != null) {
+            if (!statement.mInUse) {
+                return statement;
+            }
+            // The statement is already in the cache but is in use (this statement appears
+            // to be not only re-entrant but recursive!).  So prepare a new copy of the
+            // statement but do not cache it.
+            skipCache = true;
+        }
+
+        final int statementPtr = nativePrepareStatement(mConnectionPtr, sql);
+        try {
+            final int numParameters = nativeGetParameterCount(mConnectionPtr, statementPtr);
+            final int type = DatabaseUtils.getSqlStatementType(sql);
+            final boolean readOnly = nativeIsReadOnly(mConnectionPtr, statementPtr);
+            statement = obtainPreparedStatement(sql, statementPtr, numParameters, type, readOnly);
+            if (!skipCache && isCacheable(type)) {
+                mPreparedStatementCache.put(sql, statement);
+                statement.mInCache = true;
+            }
+        } catch (RuntimeException ex) {
+            // Finalize the statement if an exception occurred and we did not add
+            // it to the cache.  If it is already in the cache, then leave it there.
+            if (statement == null || !statement.mInCache) {
+                nativeFinalizeStatement(mConnectionPtr, statementPtr);
+            }
+            throw ex;
+        }
+        statement.mInUse = true;
+        return statement;
+!!!3308556.java!!!	releasePreparedStatement(inout statement : PreparedStatement) : void
+        statement.mInUse = false;
+        if (statement.mInCache) {
+            try {
+                nativeResetStatementAndClearBindings(mConnectionPtr, statement.mStatementPtr);
+            } catch (SQLiteException ex) {
+                // The statement could not be reset due to an error.  Remove it from the cache.
+                // When remove() is called, the cache will invoke its entryRemoved() callback,
+                // which will in turn call finalizePreparedStatement() to finalize and
+                // recycle the statement.
+                if (DEBUG) {
+                    Log.d(TAG, "Could not reset prepared statement due to an exception.  "
+                            + "Removing it from the cache.  SQL: "
+                            + trimSqlForDisplay(statement.mSql), ex);
+                }
+
+                mPreparedStatementCache.remove(statement.mSql);
+            }
+        } else {
+            finalizePreparedStatement(statement);
+        }
+!!!3308684.java!!!	finalizePreparedStatement(inout statement : PreparedStatement) : void
+        nativeFinalizeStatement(mConnectionPtr, statement.mStatementPtr);
+        recyclePreparedStatement(statement);
+!!!3308812.java!!!	attachCancellationSignal(inout cancellationSignal : CancellationSignal) : void
+        if (cancellationSignal != null) {
+            cancellationSignal.throwIfCanceled();
+
+            mCancellationSignalAttachCount += 1;
+            if (mCancellationSignalAttachCount == 1) {
+                // Reset cancellation flag before executing the statement.
+                nativeResetCancel(mConnectionPtr, true /*cancelable*/);
+
+                // After this point, onCancel() may be called concurrently.
+                cancellationSignal.setOnCancelListener(this);
+            }
+        }
+!!!3308940.java!!!	detachCancellationSignal(inout cancellationSignal : CancellationSignal) : void
+        if (cancellationSignal != null) {
+            assert mCancellationSignalAttachCount > 0;
+
+            mCancellationSignalAttachCount -= 1;
+            if (mCancellationSignalAttachCount == 0) {
+                // After this point, onCancel() cannot be called concurrently.
+                cancellationSignal.setOnCancelListener(null);
+
+                // Reset cancellation flag after executing the statement.
+                nativeResetCancel(mConnectionPtr, false /*cancelable*/);
+            }
+        }
+!!!3309068.java!!!	onCancel() : void
+        nativeCancel(mConnectionPtr);
+!!!3309196.java!!!	bindArguments(inout statement : PreparedStatement, inout bindArgs : Object) : void
+        final int count = bindArgs != null ? bindArgs.length : 0;
+        if (count != statement.mNumParameters) {
+            throw new SQLiteBindOrColumnIndexOutOfRangeException(
+                    "Expected " + statement.mNumParameters + " bind arguments but "
+                    + bindArgs.length + " were provided.");
+        }
+        if (count == 0) {
+            return;
+        }
+
+        final int statementPtr = statement.mStatementPtr;
+        for (int i = 0; i < count; i++) {
+            final Object arg = bindArgs[i];
+            switch (DatabaseUtils.getTypeOfObject(arg)) {
+                case Cursor.FIELD_TYPE_NULL:
+                    nativeBindNull(mConnectionPtr, statementPtr, i + 1);
+                    break;
+                case Cursor.FIELD_TYPE_INTEGER:
+                    nativeBindLong(mConnectionPtr, statementPtr, i + 1,
+                            ((Number)arg).longValue());
+                    break;
+                case Cursor.FIELD_TYPE_FLOAT:
+                    nativeBindDouble(mConnectionPtr, statementPtr, i + 1,
+                            ((Number)arg).doubleValue());
+                    break;
+                case Cursor.FIELD_TYPE_BLOB:
+                    nativeBindBlob(mConnectionPtr, statementPtr, i + 1, (byte[])arg);
+                    break;
+                case Cursor.FIELD_TYPE_STRING:
+                default:
+                    if (arg instanceof Boolean) {
+                        // Provide compatibility with legacy applications which may pass
+                        // Boolean values in bind args.
+                        nativeBindLong(mConnectionPtr, statementPtr, i + 1,
+                                ((Boolean)arg).booleanValue() ? 1 : 0);
+                    } else {
+                        nativeBindString(mConnectionPtr, statementPtr, i + 1, arg.toString());
+                    }
+                    break;
+            }
+        }
+!!!3309324.java!!!	throwIfStatementForbidden(inout statement : PreparedStatement) : void
+        if (mOnlyAllowReadOnlyOperations && !statement.mReadOnly) {
+            throw new SQLiteException("Cannot execute this statement because it "
+                    + "might modify the database but the connection is read-only.");
+        }
+!!!3309452.java!!!	isCacheable(in statementType : int) : boolean
+        if (statementType == DatabaseUtils.STATEMENT_UPDATE
+                || statementType == DatabaseUtils.STATEMENT_SELECT) {
+            return true;
+        }
+        return false;
+!!!3309580.java!!!	applyBlockGuardPolicy(inout statement : PreparedStatement) : void
+        if (!mConfiguration.isInMemoryDb()) {
+            if (statement.mReadOnly) {
+                BlockGuard.getThreadPolicy().onReadFromDisk();
+            } else {
+                BlockGuard.getThreadPolicy().onWriteToDisk();
+            }
+        }
+!!!3309708.java!!!	dump(inout printer : Printer, inout verbose : boolean) : void
+        dumpUnsafe(printer, verbose);
+!!!3309836.java!!!	dumpUnsafe(inout printer : Printer, inout verbose : boolean) : void
+        printer.println("Connection #" + mConnectionId + ":");
+        if (verbose) {
+            printer.println("  connectionPtr: 0x" + Integer.toHexString(mConnectionPtr));
+        }
+        printer.println("  isPrimaryConnection: " + mIsPrimaryConnection);
+        printer.println("  onlyAllowReadOnlyOperations: " + mOnlyAllowReadOnlyOperations);
+
+        mRecentOperations.dump(printer);
+
+        if (verbose) {
+            mPreparedStatementCache.dump(printer);
+        }
+!!!3309964.java!!!	describeCurrentOperationUnsafe() : String
+        return mRecentOperations.describeCurrentOperation();
+!!!3310092.java!!!	collectDbStats(inout dbStatsList : ArrayList<DbStats>) : void
+        // Get information about the main database.
+        int lookaside = nativeGetDbLookaside(mConnectionPtr);
+        long pageCount = 0;
+        long pageSize = 0;
+        try {
+            pageCount = executeForLong("PRAGMA page_count;", null, null);
+            pageSize = executeForLong("PRAGMA page_size;", null, null);
+        } catch (SQLiteException ex) {
+            // Ignore.
+        }
+        dbStatsList.add(getMainDbStatsUnsafe(lookaside, pageCount, pageSize));
+
+        // Get information about attached databases.
+        // We ignore the first row in the database list because it corresponds to
+        // the main database which we have already described.
+        CursorWindow window = new CursorWindow("collectDbStats");
+        try {
+            executeForCursorWindow("PRAGMA database_list;", null, window, 0, 0, false, null);
+            for (int i = 1; i < window.getNumRows(); i++) {
+                String name = window.getString(i, 1);
+                String path = window.getString(i, 2);
+                pageCount = 0;
+                pageSize = 0;
+                try {
+                    pageCount = executeForLong("PRAGMA " + name + ".page_count;", null, null);
+                    pageSize = executeForLong("PRAGMA " + name + ".page_size;", null, null);
+                } catch (SQLiteException ex) {
+                    // Ignore.
+                }
+                String label = "  (attached) " + name;
+                if (!path.isEmpty()) {
+                    label += ": " + path;
+                }
+                dbStatsList.add(new DbStats(label, pageCount, pageSize, 0, 0, 0, 0));
+            }
+        } catch (SQLiteException ex) {
+            // Ignore.
+        } finally {
+            window.close();
+        }
+!!!3310220.java!!!	collectDbStatsUnsafe(inout dbStatsList : ArrayList<DbStats>) : void
+        dbStatsList.add(getMainDbStatsUnsafe(0, 0, 0));
+!!!3310348.java!!!	getMainDbStatsUnsafe(in lookaside : int, in pageCount : long, in pageSize : long) : DbStats
+        // The prepared statement cache is thread-safe so we can access its statistics
+        // even if we do not own the database connection.
+        String label = mConfiguration.path;
+        if (!mIsPrimaryConnection) {
+            label += " (" + mConnectionId + ")";
+        }
+        return new DbStats(label, pageCount, pageSize, lookaside,
+                mPreparedStatementCache.hitCount(),
+                mPreparedStatementCache.missCount(),
+                mPreparedStatementCache.size());
+!!!3310476.java!!!	toString() : String
+        return "SQLiteConnection: " + mConfiguration.path + " (" + mConnectionId + ")";
+!!!3310604.java!!!	obtainPreparedStatement(in sql : String, in statementPtr : int, in numParameters : int, in type : int, inout readOnly : boolean) : PreparedStatement
+        PreparedStatement statement = mPreparedStatementPool;
+        if (statement != null) {
+            mPreparedStatementPool = statement.mPoolNext;
+            statement.mPoolNext = null;
+            statement.mInCache = false;
+        } else {
+            statement = new PreparedStatement();
+        }
+        statement.mSql = sql;
+        statement.mStatementPtr = statementPtr;
+        statement.mNumParameters = numParameters;
+        statement.mType = type;
+        statement.mReadOnly = readOnly;
+        return statement;
+!!!3310732.java!!!	recyclePreparedStatement(inout statement : PreparedStatement) : void
+        statement.mSql = null;
+        statement.mPoolNext = mPreparedStatementPool;
+        mPreparedStatementPool = statement;
+!!!3310860.java!!!	trimSqlForDisplay(in sql : String) : String
+        return TRIM_SQL_PATTERN.matcher(sql).replaceAll(" ");

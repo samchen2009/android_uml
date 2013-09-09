@@ -1,0 +1,227 @@
+class Runtime
+!!!379291.java!!!	Runtime()
+        String pathList = System.getProperty("java.library.path", ".");
+        String pathSep = System.getProperty("path.separator", ":");
+        String fileSep = System.getProperty("file.separator", "/");
+
+        mLibPaths = pathList.split(pathSep);
+
+        // Add a '/' to the end so we don't have to do the property lookup
+        // and concatenation later.
+        for (int i = 0; i < mLibPaths.length; i++) {
+            if (!mLibPaths[i].endsWith(fileSep)) {
+                mLibPaths[i] += fileSep;
+            }
+        }
+!!!379419.java!!!	exec(inout progArray : String) : Process
+        return exec(progArray, null, null);
+!!!379547.java!!!	exec(inout progArray : String, inout envp : String) : Process
+        return exec(progArray, envp, null);
+!!!379675.java!!!	exec(inout progArray : String, inout envp : String, inout directory : File) : Process
+        // ProcessManager is responsible for all argument checking.
+        return ProcessManager.getInstance().exec(progArray, envp, directory, false);
+!!!379803.java!!!	exec(inout prog : String) : Process
+        return exec(prog, null, null);
+!!!379931.java!!!	exec(inout prog : String, inout envp : String) : Process
+        return exec(prog, envp, null);
+!!!380059.java!!!	exec(inout prog : String, inout envp : String, inout directory : File) : Process
+        // Sanity checks
+        if (prog == null) {
+            throw new NullPointerException("prog == null");
+        } else if (prog.isEmpty()) {
+            throw new IllegalArgumentException("prog is empty");
+        }
+
+        // Break down into tokens, as described in Java docs
+        StringTokenizer tokenizer = new StringTokenizer(prog);
+        int length = tokenizer.countTokens();
+        String[] progArray = new String[length];
+        for (int i = 0; i < length; i++) {
+            progArray[i] = tokenizer.nextToken();
+        }
+
+        // Delegate
+        return exec(progArray, envp, directory);
+!!!380187.java!!!	exit(in code : int) : void
+        // Make sure we don't try this several times
+        synchronized(this) {
+            if (!shuttingDown) {
+                shuttingDown = true;
+
+                Thread[] hooks;
+                synchronized (shutdownHooks) {
+                    // create a copy of the hooks
+                    hooks = new Thread[shutdownHooks.size()];
+                    shutdownHooks.toArray(hooks);
+                }
+
+                // Start all shutdown hooks concurrently
+                for (Thread hook : hooks) {
+                    hook.start();
+                }
+
+                // Wait for all shutdown hooks to finish
+                for (Thread hook : hooks) {
+                    try {
+                        hook.join();
+                    } catch (InterruptedException ex) {
+                        // Ignore, since we are at VM shutdown.
+                    }
+                }
+
+                // Ensure finalization on exit, if requested
+                if (finalizeOnExit) {
+                    runFinalization();
+                }
+
+                // Get out of here finally...
+                nativeExit(code);
+            }
+        }
+!!!380443.java!!!	getRuntime() : Runtime
+        return mRuntime;
+!!!380571.java!!!	load(inout pathName : String) : void
+        load(pathName, VMStack.getCallingClassLoader());
+!!!380699.java!!!	load(inout pathName : String, inout loader : ClassLoader) : void
+        if (pathName == null) {
+            throw new NullPointerException("pathName == null");
+        }
+        String error = doLoad(pathName, loader);
+        if (error != null) {
+            throw new UnsatisfiedLinkError(error);
+        }
+!!!380827.java!!!	loadLibrary(inout libName : String) : void
+        loadLibrary(libName, VMStack.getCallingClassLoader());
+!!!380955.java!!!	loadLibrary(inout libraryName : String, inout loader : ClassLoader) : void
+        if (loader != null) {
+            String filename = loader.findLibrary(libraryName);
+            if (filename == null) {
+                throw new UnsatisfiedLinkError("Couldn't load " + libraryName +
+                                               " from loader " + loader +
+                                               ": findLibrary returned null");
+            }
+            String error = doLoad(filename, loader);
+            if (error != null) {
+                throw new UnsatisfiedLinkError(error);
+            }
+            return;
+        }
+
+        String filename = System.mapLibraryName(libraryName);
+        List<String> candidates = new ArrayList<String>();
+        String lastError = null;
+        for (String directory : mLibPaths) {
+            String candidate = directory + filename;
+            candidates.add(candidate);
+
+            if (IoUtils.canOpenReadOnly(candidate)) {
+                String error = doLoad(candidate, loader);
+                if (error == null) {
+                    return; // We successfully loaded the library. Job done.
+                }
+                lastError = error;
+            }
+        }
+
+        if (lastError != null) {
+            throw new UnsatisfiedLinkError(lastError);
+        }
+        throw new UnsatisfiedLinkError("Library " + libraryName + " not found; tried " + candidates);
+!!!381211.java!!!	doLoad(inout name : String, inout loader : ClassLoader) : String
+        // Android apps are forked from the zygote, so they can't have a custom LD_LIBRARY_PATH,
+        // which means that by default an app's shared library directory isn't on LD_LIBRARY_PATH.
+
+        // The PathClassLoader set up by frameworks/base knows the appropriate path, so we can load
+        // libraries with no dependencies just fine, but an app that has multiple libraries that
+        // depend on each other needed to load them in most-dependent-first order.
+
+        // We added API to Android's dynamic linker so we can update the library path used for
+        // the currently-running process. We pull the desired path out of the ClassLoader here
+        // and pass it to nativeLoad so that it can call the private dynamic linker API.
+
+        // We didn't just change frameworks/base to update the LD_LIBRARY_PATH once at the
+        // beginning because multiple apks can run in the same process and third party code can
+        // use its own BaseDexClassLoader.
+
+        // We didn't just add a dlopen_with_custom_LD_LIBRARY_PATH call because we wanted any
+        // dlopen(3) calls made from a .so's JNI_OnLoad to work too.
+
+        // So, find out what the native library search path is for the ClassLoader in question...
+        String ldLibraryPath = null;
+        if (loader != null && loader instanceof BaseDexClassLoader) {
+            ldLibraryPath = ((BaseDexClassLoader) loader).getLdLibraryPath();
+        }
+        // nativeLoad should be synchronized so there's only one LD_LIBRARY_PATH in use regardless
+        // of how many ClassLoaders are in the system, but dalvik doesn't support synchronized
+        // internal natives.
+        synchronized (this) {
+            return nativeLoad(name, loader, ldLibraryPath);
+        }
+!!!381467.java!!!	runFinalization() : void
+        try {
+            FinalizerReference.finalizeAllEnqueued();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+!!!381595.java!!!	runFinalizersOnExit(inout run : boolean) : void
+        finalizeOnExit = run;
+!!!381851.java!!!	traceMethodCalls(inout enable : boolean) : void
+        if (enable != tracingMethods) {
+            if (enable) {
+                VMDebug.startMethodTracing();
+            } else {
+                VMDebug.stopMethodTracing();
+            }
+            tracingMethods = enable;
+        }
+!!!381979.java!!!	getLocalizedInputStream(inout stream : InputStream) : InputStream
+        String encoding = System.getProperty("file.encoding", "UTF-8");
+        if (!encoding.equals("UTF-8")) {
+            throw new UnsupportedOperationException("Cannot localize " + encoding);
+        }
+        return stream;
+!!!382107.java!!!	getLocalizedOutputStream(inout stream : OutputStream) : OutputStream
+        String encoding = System.getProperty("file.encoding", "UTF-8");
+        if (!encoding.equals("UTF-8")) {
+            throw new UnsupportedOperationException("Cannot localize " + encoding);
+        }
+        return stream;
+!!!382235.java!!!	addShutdownHook(inout hook : Thread) : void
+        // Sanity checks
+        if (hook == null) {
+            throw new NullPointerException("hook == null");
+        }
+
+        if (shuttingDown) {
+            throw new IllegalStateException("VM already shutting down");
+        }
+
+        if (hook.hasBeenStarted) {
+            throw new IllegalArgumentException("Hook has already been started");
+        }
+
+        synchronized (shutdownHooks) {
+            if (shutdownHooks.contains(hook)) {
+                throw new IllegalArgumentException("Hook already registered.");
+            }
+
+            shutdownHooks.add(hook);
+        }
+!!!382363.java!!!	removeShutdownHook(inout hook : Thread) : boolean
+        // Sanity checks
+        if (hook == null) {
+            throw new NullPointerException("hook == null");
+        }
+
+        if (shuttingDown) {
+            throw new IllegalStateException("VM already shutting down");
+        }
+
+        synchronized (shutdownHooks) {
+            return shutdownHooks.remove(hook);
+        }
+!!!382491.java!!!	halt(in code : int) : void
+        // Get out of here...
+        nativeExit(code);
+!!!382619.java!!!	availableProcessors() : int
+        return (int) Libcore.os.sysconf(_SC_NPROCESSORS_CONF);

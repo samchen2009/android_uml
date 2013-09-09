@@ -1,0 +1,297 @@
+class DatagramChannelImpl
+!!!710939.java!!!	DatagramChannelImpl(inout selectorProvider : SelectorProvider)
+        super(selectorProvider);
+        fd = IoBridge.socket(false);
+!!!711067.java!!!	DatagramChannelImpl()
+        super(SelectorProvider.provider());
+        fd = new FileDescriptor();
+        connectAddress = new InetSocketAddress(0);
+!!!711195.java!!!	socket() : DatagramSocket
+        if (socket == null) {
+            socket = new DatagramSocketAdapter(new PlainDatagramSocketImpl(fd, localPort), this);
+        }
+        return socket;
+!!!711323.java!!!	getLocalAddress() : InetAddress
+        return IoBridge.getSocketLocalAddress(fd);
+!!!711451.java!!!	isConnected() : boolean
+        return connected;
+!!!711579.java!!!	connect(inout address : SocketAddress) : DatagramChannel
+        // must open
+        checkOpen();
+        // status must be un-connected.
+        if (connected) {
+            throw new IllegalStateException();
+        }
+
+        // check the address
+        InetSocketAddress inetSocketAddress = SocketChannelImpl.validateAddress(address);
+        try {
+            begin();
+            IoBridge.connect(fd, inetSocketAddress.getAddress(), inetSocketAddress.getPort());
+        } catch (ConnectException e) {
+            // ConnectException means connect fail, not exception
+        } finally {
+            end(true);
+        }
+
+        // set the connected address.
+        connectAddress = inetSocketAddress;
+        connected = true;
+        isBound = true;
+        return this;
+!!!711707.java!!!	disconnect() : DatagramChannel
+        if (!isConnected() || !isOpen()) {
+            return this;
+        }
+        connected = false;
+        connectAddress = null;
+        try {
+            Libcore.os.connect(fd, InetAddress.UNSPECIFIED, 0);
+        } catch (ErrnoException errnoException) {
+            throw errnoException.rethrowAsIOException();
+        }
+        if (socket != null) {
+            socket.disconnect();
+        }
+        return this;
+!!!711835.java!!!	receive(inout target : ByteBuffer) : SocketAddress
+        target.checkWritable();
+        checkOpen();
+
+        if (!isBound) {
+            return null;
+        }
+
+        SocketAddress retAddr = null;
+        try {
+            begin();
+
+            // receive real data packet, (not peek)
+            synchronized (readLock) {
+                boolean loop = isBlocking();
+                if (!target.isDirect()) {
+                    retAddr = receiveImpl(target, loop);
+                } else {
+                    retAddr = receiveDirectImpl(target, loop);
+                }
+            }
+        } catch (InterruptedIOException e) {
+            // this line used in Linux
+            return null;
+        } finally {
+            end(retAddr != null);
+        }
+        return retAddr;
+!!!711963.java!!!	receiveImpl(inout target : ByteBuffer, inout loop : boolean) : SocketAddress
+        SocketAddress retAddr = null;
+        DatagramPacket receivePacket;
+        int oldposition = target.position();
+        int received = 0;
+        // TODO: disallow mapped buffers and lose this conditional?
+        if (target.hasArray()) {
+            receivePacket = new DatagramPacket(target.array(), target.position() + target.arrayOffset(), target.remaining());
+        } else {
+            receivePacket = new DatagramPacket(new byte[target.remaining()], target.remaining());
+        }
+        do {
+            received = IoBridge.recvfrom(false, fd, receivePacket.getData(), receivePacket.getOffset(), receivePacket.getLength(), 0, receivePacket, isConnected());
+            if (receivePacket != null && receivePacket.getAddress() != null) {
+                if (received > 0) {
+                    if (target.hasArray()) {
+                        target.position(oldposition + received);
+                    } else {
+                        // copy the data of received packet
+                        target.put(receivePacket.getData(), 0, received);
+                    }
+                }
+                retAddr = receivePacket.getSocketAddress();
+                break;
+            }
+        } while (loop);
+        return retAddr;
+!!!712091.java!!!	receiveDirectImpl(inout target : ByteBuffer, inout loop : boolean) : SocketAddress
+        SocketAddress retAddr = null;
+        DatagramPacket receivePacket = new DatagramPacket(EmptyArray.BYTE, 0);
+        int oldposition = target.position();
+        int received = 0;
+        do {
+            received = IoBridge.recvfrom(false, fd, target, 0, receivePacket, isConnected());
+            if (receivePacket != null && receivePacket.getAddress() != null) {
+                // copy the data of received packet
+                if (received > 0) {
+                    target.position(oldposition + received);
+                }
+                retAddr = receivePacket.getSocketAddress();
+                break;
+            }
+        } while (loop);
+        return retAddr;
+!!!712219.java!!!	send(inout source : ByteBuffer, inout socketAddress : SocketAddress) : int
+        checkNotNull(source);
+        checkOpen();
+
+        InetSocketAddress isa = (InetSocketAddress) socketAddress;
+        if (isa.getAddress() == null) {
+            throw new IOException();
+        }
+
+        if (isConnected() && !connectAddress.equals(isa)) {
+            throw new IllegalArgumentException("Connected to " + connectAddress +
+                                               ", not " + socketAddress);
+        }
+
+        synchronized (writeLock) {
+            int sendCount = 0;
+            try {
+                begin();
+                int oldPosition = source.position();
+                sendCount = IoBridge.sendto(fd, source, 0, isa.getAddress(), isa.getPort());
+                if (sendCount > 0) {
+                    source.position(oldPosition + sendCount);
+                }
+            } finally {
+                end(sendCount >= 0);
+            }
+            return sendCount;
+        }
+!!!712347.java!!!	read(inout target : ByteBuffer) : int
+        target.checkWritable();
+        checkOpenConnected();
+
+        if (!target.hasRemaining()) {
+            return 0;
+        }
+
+        int readCount = 0;
+        if (target.isDirect() || target.hasArray()) {
+            readCount = readImpl(target);
+            if (readCount > 0) {
+                target.position(target.position() + readCount);
+            }
+
+        } else {
+            byte[] readArray = new byte[target.remaining()];
+            ByteBuffer readBuffer = ByteBuffer.wrap(readArray);
+            readCount = readImpl(readBuffer);
+            if (readCount > 0) {
+                target.put(readArray, 0, readCount);
+            }
+        }
+        return readCount;
+!!!712475.java!!!	read(inout targets : ByteBuffer, in offset : int, in length : int) : long
+        Arrays.checkOffsetAndCount(targets.length, offset, length);
+
+        // status must be open and connected
+        checkOpenConnected();
+        int totalCount = FileChannelImpl.calculateTotalRemaining(targets, offset, length, true);
+        if (totalCount == 0) {
+            return 0;
+        }
+
+        // read data to readBuffer, and then transfer data from readBuffer to
+        // targets.
+        ByteBuffer readBuffer = ByteBuffer.allocate(totalCount);
+        int readCount;
+        readCount = readImpl(readBuffer);
+        int left = readCount;
+        int index = offset;
+        // transfer data from readBuffer to targets
+        byte[] readArray = readBuffer.array();
+        while (left > 0) {
+            int putLength = Math.min(targets[index].remaining(), left);
+            targets[index].put(readArray, readCount - left, putLength);
+            index++;
+            left -= putLength;
+        }
+        return readCount;
+!!!712603.java!!!	readImpl(inout dst : ByteBuffer) : int
+        synchronized (readLock) {
+            int readCount = 0;
+            try {
+                begin();
+                readCount = IoBridge.recvfrom(false, fd, dst, 0, null, isConnected());
+            } catch (InterruptedIOException e) {
+                // InterruptedIOException will be thrown when timeout.
+                return 0;
+            } finally {
+                end(readCount > 0);
+            }
+            return readCount;
+        }
+!!!712731.java!!!	write(inout src : ByteBuffer) : int
+        checkNotNull(src);
+        checkOpenConnected();
+        if (!src.hasRemaining()) {
+            return 0;
+        }
+
+        int writeCount = writeImpl(src);
+        if (writeCount > 0) {
+            src.position(src.position() + writeCount);
+        }
+        return writeCount;
+!!!712859.java!!!	write(inout sources : ByteBuffer, in offset : int, in length : int) : long
+        Arrays.checkOffsetAndCount(sources.length, offset, length);
+
+        // status must be open and connected
+        checkOpenConnected();
+        int count = FileChannelImpl.calculateTotalRemaining(sources, offset, length, false);
+        if (count == 0) {
+            return 0;
+        }
+        ByteBuffer writeBuf = ByteBuffer.allocate(count);
+        for (int val = offset; val < length + offset; val++) {
+            ByteBuffer source = sources[val];
+            int oldPosition = source.position();
+            writeBuf.put(source);
+            source.position(oldPosition);
+        }
+        writeBuf.flip();
+        int result = writeImpl(writeBuf);
+        int val = offset;
+        int written = result;
+        while (result > 0) {
+            ByteBuffer source = sources[val];
+            int gap = Math.min(result, source.remaining());
+            source.position(source.position() + gap);
+            val++;
+            result -= gap;
+        }
+        return written;
+!!!712987.java!!!	writeImpl(inout buf : ByteBuffer) : int
+        synchronized (writeLock) {
+            int result = 0;
+            try {
+                begin();
+                result = IoBridge.sendto(fd, buf, 0, null, 0);
+            } finally {
+                end(result > 0);
+            }
+            return result;
+        }
+!!!713115.java!!!	implCloseSelectableChannel() : void
+        connected = false;
+        if (socket != null && !socket.isClosed()) {
+            socket.close();
+        } else {
+            IoBridge.closeSocket(fd);
+        }
+!!!713243.java!!!	implConfigureBlocking(inout blocking : boolean) : void
+        synchronized (blockingLock()) {
+            IoUtils.setBlocking(fd, blocking);
+        }
+!!!713371.java!!!	checkOpen() : void
+        if (!isOpen()) {
+            throw new ClosedChannelException();
+        }
+!!!713499.java!!!	checkOpenConnected() : void
+        checkOpen();
+        if (!isConnected()) {
+            throw new NotYetConnectedException();
+        }
+!!!713627.java!!!	checkNotNull(inout source : ByteBuffer) : void
+        if (source == null) {
+            throw new NullPointerException("source == null");
+        }
+!!!713755.java!!!	getFD() : FileDescriptor
+        return fd;

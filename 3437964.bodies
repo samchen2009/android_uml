@@ -1,0 +1,277 @@
+class BasicBlocker
+!!!14815116.java!!!	identifyBlocks(inout method : ConcreteMethod) : ByteBlockList
+        BasicBlocker bb = new BasicBlocker(method);
+
+        bb.doit();
+        return bb.getBlockList();
+!!!14815244.java!!!	BasicBlocker(inout method : ConcreteMethod)
+        if (method == null) {
+            throw new NullPointerException("method == null");
+        }
+
+        this.method = method;
+
+        /*
+         * The "+1" below is so the idx-past-end is also valid,
+         * avoiding a special case, but without preventing
+         * flow-of-control falling past the end of the method from
+         * getting properly reported.
+         */
+        int sz = method.getCode().size() + 1;
+
+        workSet = Bits.makeBitSet(sz);
+        liveSet = Bits.makeBitSet(sz);
+        blockSet = Bits.makeBitSet(sz);
+        targetLists = new IntList[sz];
+        catchLists = new ByteCatchList[sz];
+        previousOffset = -1;
+!!!14815372.java!!!	visitInvalid(in opcode : int, in offset : int, in length : int) : void
+        visitCommon(offset, length, true);
+!!!14815500.java!!!	visitNoArgs(in opcode : int, in offset : int, in length : int, inout type : Type) : void
+        switch (opcode) {
+            case ByteOps.IRETURN:
+            case ByteOps.RETURN: {
+                visitCommon(offset, length, false);
+                targetLists[offset] = IntList.EMPTY;
+                break;
+            }
+            case ByteOps.ATHROW: {
+                visitCommon(offset, length, false);
+                visitThrowing(offset, length, false);
+                break;
+            }
+            case ByteOps.IALOAD:
+            case ByteOps.LALOAD:
+            case ByteOps.FALOAD:
+            case ByteOps.DALOAD:
+            case ByteOps.AALOAD:
+            case ByteOps.BALOAD:
+            case ByteOps.CALOAD:
+            case ByteOps.SALOAD:
+            case ByteOps.IASTORE:
+            case ByteOps.LASTORE:
+            case ByteOps.FASTORE:
+            case ByteOps.DASTORE:
+            case ByteOps.AASTORE:
+            case ByteOps.BASTORE:
+            case ByteOps.CASTORE:
+            case ByteOps.SASTORE:
+            case ByteOps.ARRAYLENGTH:
+            case ByteOps.MONITORENTER:
+            case ByteOps.MONITOREXIT: {
+                /*
+                 * These instructions can all throw, so they have to end
+                 * the block they appear in (since throws are branches).
+                 */
+                visitCommon(offset, length, true);
+                visitThrowing(offset, length, true);
+                break;
+            }
+            case ByteOps.IDIV:
+            case ByteOps.IREM: {
+                /*
+                 * The int and long versions of division and remainder may
+                 * throw, but not the other types.
+                 */
+                visitCommon(offset, length, true);
+                if ((type == Type.INT) || (type == Type.LONG)) {
+                    visitThrowing(offset, length, true);
+                }
+                break;
+            }
+            default: {
+                visitCommon(offset, length, true);
+                break;
+            }
+        }
+!!!14815628.java!!!	visitLocal(in opcode : int, in offset : int, in length : int, in idx : int, inout type : Type, in value : int) : void
+        if (opcode == ByteOps.RET) {
+            visitCommon(offset, length, false);
+            targetLists[offset] = IntList.EMPTY;
+        } else {
+            visitCommon(offset, length, true);
+        }
+!!!14815756.java!!!	visitConstant(in opcode : int, in offset : int, in length : int, inout cst : Constant, in value : int) : void
+        visitCommon(offset, length, true);
+
+        if ((cst instanceof CstMemberRef) || (cst instanceof CstType) ||
+            (cst instanceof CstString)) {
+            /*
+             * Instructions with these sorts of constants have the
+             * possibility of throwing, so this instruction needs to
+             * end its block (since it can throw, and possible-throws
+             * are branch points).
+             */
+            visitThrowing(offset, length, true);
+        }
+!!!14815884.java!!!	visitBranch(in opcode : int, in offset : int, in length : int, in target : int) : void
+        switch (opcode) {
+            case ByteOps.GOTO: {
+                visitCommon(offset, length, false);
+                targetLists[offset] = IntList.makeImmutable(target);
+                break;
+            }
+            case ByteOps.JSR: {
+                /*
+                 * Each jsr is quarantined into a separate block (containing
+                 * only the jsr instruction) but is otherwise treated
+                 * as a conditional branch. (That is to say, both its
+                 * target and next instruction begin new blocks.)
+                 */
+                addWorkIfNecessary(offset, true);
+                // Fall through to next case...
+            }
+            default: {
+                int next = offset + length;
+                visitCommon(offset, length, true);
+                addWorkIfNecessary(next, true);
+                targetLists[offset] = IntList.makeImmutable(next, target);
+                break;
+            }
+        }
+
+        addWorkIfNecessary(target, true);
+!!!14816012.java!!!	visitSwitch(in opcode : int, in offset : int, in length : int, inout cases : SwitchList, in padding : int) : void
+        visitCommon(offset, length, false);
+        addWorkIfNecessary(cases.getDefaultTarget(), true);
+
+        int sz = cases.size();
+        for (int i = 0; i < sz; i++) {
+            addWorkIfNecessary(cases.getTarget(i), true);
+        }
+
+        targetLists[offset] = cases.getTargets();
+!!!14816140.java!!!	visitNewarray(in offset : int, in length : int, inout type : CstType, inout intVals : ArrayList<Constant>) : void
+        visitCommon(offset, length, true);
+        visitThrowing(offset, length, true);
+!!!14816268.java!!!	getBlockList() : ByteBlockList
+        BytecodeArray bytes = method.getCode();
+        ByteBlock[] bbs = new ByteBlock[bytes.size()];
+        int count = 0;
+
+        for (int at = 0, next; /*at*/; at = next) {
+            next = Bits.findFirst(blockSet, at + 1);
+            if (next < 0) {
+                break;
+            }
+
+            if (Bits.get(liveSet, at)) {
+                /*
+                 * Search backward for the branch or throwing
+                 * instruction at the end of this block, if any. If
+                 * there isn't any, then "next" is the sole target.
+                 */
+                IntList targets = null;
+                int targetsAt = -1;
+                ByteCatchList blockCatches;
+
+                for (int i = next - 1; i >= at; i--) {
+                    targets = targetLists[i];
+                    if (targets != null) {
+                        targetsAt = i;
+                        break;
+                    }
+                }
+
+                if (targets == null) {
+                    targets = IntList.makeImmutable(next);
+                    blockCatches = ByteCatchList.EMPTY;
+                } else {
+                    blockCatches = catchLists[targetsAt];
+                    if (blockCatches == null) {
+                        blockCatches = ByteCatchList.EMPTY;
+                    }
+                }
+
+                bbs[count] =
+                    new ByteBlock(at, at, next, targets, blockCatches);
+                count++;
+            }
+        }
+
+        ByteBlockList result = new ByteBlockList(count);
+        for (int i = 0; i < count; i++) {
+            result.set(i, bbs[i]);
+        }
+
+        return result;
+!!!14816396.java!!!	doit() : void
+        BytecodeArray bytes = method.getCode();
+        ByteCatchList catches = method.getCatches();
+        int catchSz = catches.size();
+
+        /*
+         * Start by setting offset 0 as the start of a block and in need
+         * of work...
+         */
+        Bits.set(workSet, 0);
+        Bits.set(blockSet, 0);
+
+        /*
+         * And then process the work set, add new work based on
+         * exception ranges that are active, and iterate until there's
+         * nothing left to work on.
+         */
+        while (!Bits.isEmpty(workSet)) {
+            try {
+                bytes.processWorkSet(workSet, this);
+            } catch (IllegalArgumentException ex) {
+                // Translate the exception.
+                throw new SimException("flow of control falls off " +
+                                       "end of method",
+                                       ex);
+            }
+
+            for (int i = 0; i < catchSz; i++) {
+                ByteCatchList.Item item = catches.get(i);
+                int start = item.getStartPc();
+                int end = item.getEndPc();
+                if (Bits.anyInRange(liveSet, start, end)) {
+                    Bits.set(blockSet, start);
+                    Bits.set(blockSet, end);
+                    addWorkIfNecessary(item.getHandlerPc(), true);
+                }
+            }
+        }
+!!!14816524.java!!!	addWorkIfNecessary(in offset : int, inout blockStart : boolean) : void
+        if (!Bits.get(liveSet, offset)) {
+            Bits.set(workSet, offset);
+        }
+
+        if (blockStart) {
+            Bits.set(blockSet, offset);
+        }
+!!!14816652.java!!!	visitCommon(in offset : int, in length : int, inout nextIsLive : boolean) : void
+        Bits.set(liveSet, offset);
+
+        if (nextIsLive) {
+            /*
+             * If the next instruction is flowed to by this one, just
+             * add it to the work set, and then a subsequent visit*()
+             * will deal with it as appropriate.
+             */
+            addWorkIfNecessary(offset + length, false);
+        } else {
+            /*
+             * If the next instruction isn't flowed to by this one,
+             * then mark it as a start of a block but *don't* add it
+             * to the work set, so that in the final phase we can know
+             * dead code blocks as those marked as blocks but not also marked
+             * live.
+             */
+            Bits.set(blockSet, offset + length);
+        }
+!!!14816780.java!!!	visitThrowing(in offset : int, in length : int, inout nextIsLive : boolean) : void
+        int next = offset + length;
+
+        if (nextIsLive) {
+            addWorkIfNecessary(next, true);
+        }
+
+        ByteCatchList catches = method.getCatches().listFor(offset);
+        catchLists[offset] = catches;
+        targetLists[offset] = catches.toTargetList(nextIsLive ? next : -1);
+!!!14816908.java!!!	setPreviousOffset(in offset : int) : void
+        previousOffset = offset;
+!!!14817036.java!!!	getPreviousOffset() : int
+        return previousOffset;

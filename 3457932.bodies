@@ -1,0 +1,309 @@
+class RopTranslator
+!!!14936844.java!!!	translate(inout method : RopMethod, in positionInfo : int, inout locals : LocalVariableInfo, in paramSize : int, inout dexOptions : DexOptions) : DalvCode
+        RopTranslator translator =
+            new RopTranslator(method, positionInfo, locals, paramSize, dexOptions);
+        return translator.translateAndGetResult();
+!!!14936972.java!!!	RopTranslator(inout method : RopMethod, in positionInfo : int, inout locals : LocalVariableInfo, in paramSize : int, inout dexOptions : DexOptions)
+        this.dexOptions = dexOptions;
+        this.method = method;
+        this.positionInfo = positionInfo;
+        this.locals = locals;
+        this.addresses = new BlockAddresses(method);
+        this.paramSize = paramSize;
+        this.order = null;
+        this.paramsAreInOrder = calculateParamsAreInOrder(method, paramSize);
+
+        BasicBlockList blocks = method.getBlocks();
+        int bsz = blocks.size();
+
+        /*
+         * Max possible instructions includes three code address
+         * objects per basic block (to the first and last instruction,
+         * and just past the end of the block), and the possibility of
+         * an extra goto at the end of each basic block.
+         */
+        int maxInsns = (bsz * 3) + blocks.getInstructionCount();
+
+        if (locals != null) {
+            /*
+             * If we're tracking locals, then there's could be another
+             * extra instruction per block (for the locals state at the
+             * start of the block) as well as one for each interblock
+             * local introduction.
+             */
+            maxInsns += bsz + locals.getAssignmentCount();
+        }
+
+        /*
+         * If params are not in order, we will need register space
+         * for them before this is all over...
+         */
+        this.regCount = blocks.getRegCount()
+                + (paramsAreInOrder ? 0 : this.paramSize);
+
+        this.output = new OutputCollector(dexOptions, maxInsns, bsz * 3, regCount);
+
+        if (locals != null) {
+            this.translationVisitor =
+                new LocalVariableAwareTranslationVisitor(output, locals);
+        } else {
+            this.translationVisitor = new TranslationVisitor(output);
+        }
+!!!14937100.java!!!	calculateParamsAreInOrder(inout method : RopMethod, in paramSize : int) : boolean
+        final boolean[] paramsAreInOrder = { true };
+        final int initialRegCount = method.getBlocks().getRegCount();
+
+        /*
+         * We almost could just check the first block here, but the
+         * {@code cf} layer will put in a second move-param in a
+         * subsequent block in the case of synchronized methods.
+         */
+        method.getBlocks().forEachInsn(new Insn.BaseVisitor() {
+            @Override
+            public void visitPlainCstInsn(PlainCstInsn insn) {
+                if (insn.getOpcode().getOpcode()== RegOps.MOVE_PARAM) {
+                    int param =
+                        ((CstInteger) insn.getConstant()).getValue();
+
+                    paramsAreInOrder[0] = paramsAreInOrder[0]
+                            && ((initialRegCount - paramSize + param)
+                                == insn.getResult().getReg());
+                }
+            }
+        });
+
+        return paramsAreInOrder[0];
+!!!14937228.java!!!	translateAndGetResult() : DalvCode
+        pickOrder();
+        outputInstructions();
+
+        StdCatchBuilder catches =
+            new StdCatchBuilder(method, order, addresses);
+
+        return new DalvCode(positionInfo, output.getFinisher(), catches);
+!!!14937356.java!!!	outputInstructions() : void
+        BasicBlockList blocks = method.getBlocks();
+        int[] order = this.order;
+        int len = order.length;
+
+        // Process the blocks in output order.
+        for (int i = 0; i < len; i++) {
+            int nextI = i + 1;
+            int nextLabel = (nextI == order.length) ? -1 : order[nextI];
+            outputBlock(blocks.labelToBlock(order[i]), nextLabel);
+        }
+!!!14937484.java!!!	outputBlock(inout block : BasicBlock, in nextLabel : int) : void
+        // Append the code address for this block.
+        CodeAddress startAddress = addresses.getStart(block);
+        output.add(startAddress);
+
+        // Append the local variable state for the block.
+        if (locals != null) {
+            RegisterSpecSet starts = locals.getStarts(block);
+            output.add(new LocalSnapshot(startAddress.getPosition(),
+                                         starts));
+        }
+
+        /*
+         * Choose and append an output instruction for each original
+         * instruction.
+         */
+        translationVisitor.setBlock(block, addresses.getLast(block));
+        block.getInsns().forEach(translationVisitor);
+
+        // Insert the block end code address.
+        output.add(addresses.getEnd(block));
+
+        // Set up for end-of-block activities.
+
+        int succ = block.getPrimarySuccessor();
+        Insn lastInsn = block.getLastInsn();
+
+        /*
+         * Check for (and possibly correct for) a non-optimal choice of
+         * which block will get output next.
+         */
+
+        if ((succ >= 0) && (succ != nextLabel)) {
+            /*
+             * The block has a "primary successor" and that primary
+             * successor isn't the next block to be output.
+             */
+            Rop lastRop = lastInsn.getOpcode();
+            if ((lastRop.getBranchingness() == Rop.BRANCH_IF) &&
+                    (block.getSecondarySuccessor() == nextLabel)) {
+                /*
+                 * The block ends with an "if" of some sort, and its
+                 * secondary successor (the "then") is in fact the
+                 * next block to output. So, reverse the sense of
+                 * the test, so that we can just emit the next block
+                 * without an interstitial goto.
+                 */
+                output.reverseBranch(1, addresses.getStart(succ));
+            } else {
+                /*
+                 * Our only recourse is to add a goto here to get the
+                 * flow to be correct.
+                 */
+                TargetInsn insn =
+                    new TargetInsn(Dops.GOTO, lastInsn.getPosition(),
+                            RegisterSpecList.EMPTY,
+                            addresses.getStart(succ));
+                output.add(insn);
+            }
+        }
+!!!14937612.java!!!	pickOrder() : void
+        BasicBlockList blocks = method.getBlocks();
+        int sz = blocks.size();
+        int maxLabel = blocks.getMaxLabel();
+        int[] workSet = Bits.makeBitSet(maxLabel);
+        int[] tracebackSet = Bits.makeBitSet(maxLabel);
+
+        for (int i = 0; i < sz; i++) {
+            BasicBlock one = blocks.get(i);
+            Bits.set(workSet, one.getLabel());
+        }
+
+        int[] order = new int[sz];
+        int at = 0;
+
+        /*
+         * Starting with the designated "first label" (that is, the
+         * first block of the method), add that label to the order,
+         * and then pick its first as-yet unordered successor to
+         * immediately follow it, giving top priority to the primary
+         * (aka default) successor (if any). Keep following successors
+         * until the trace runs out of possibilities. Then, continue
+         * by finding an unordered chain containing the first as-yet
+         * unordered block, and adding it to the order, and so on.
+         */
+        for (int label = method.getFirstLabel();
+             label != -1;
+             label = Bits.findFirst(workSet, 0)) {
+
+            /*
+             * Attempt to trace backward from the chosen block to an
+             * as-yet unordered predecessor which lists the chosen
+             * block as its primary successor, and so on, until we
+             * fail to find such an unordered predecessor. Start the
+             * trace with that block. Note that the first block in the
+             * method has no predecessors, so in that case this loop
+             * will simply terminate with zero iterations and without
+             * picking a new starter block.
+             */
+            traceBack:
+            for (;;) {
+                IntList preds = method.labelToPredecessors(label);
+                int psz = preds.size();
+
+                for (int i = 0; i < psz; i++) {
+                    int predLabel = preds.get(i);
+
+                    if (Bits.get(tracebackSet, predLabel)) {
+                        /*
+                         * We found a predecessor loop; stop tracing back
+                         * from here.
+                         */
+                        break;
+                    }
+
+                    if (!Bits.get(workSet, predLabel)) {
+                        // This one's already ordered.
+                        continue;
+                    }
+
+                    BasicBlock pred = blocks.labelToBlock(predLabel);
+                    if (pred.getPrimarySuccessor() == label) {
+                        // Found one!
+                        label = predLabel;
+                        Bits.set(tracebackSet, label);
+                        continue traceBack;
+                    }
+                }
+
+                // Failed to find a better block to start the trace.
+                break;
+            }
+
+            /*
+             * Trace a path from the chosen block to one of its
+             * unordered successors (hopefully the primary), and so
+             * on, until we run out of unordered successors.
+             */
+            while (label != -1) {
+                Bits.clear(workSet, label);
+                Bits.clear(tracebackSet, label);
+                order[at] = label;
+                at++;
+
+                BasicBlock one = blocks.labelToBlock(label);
+                BasicBlock preferredBlock = blocks.preferredSuccessorOf(one);
+
+                if (preferredBlock == null) {
+                    break;
+                }
+
+                int preferred = preferredBlock.getLabel();
+                int primary = one.getPrimarySuccessor();
+
+                if (Bits.get(workSet, preferred)) {
+                    /*
+                     * Order the current block's preferred successor
+                     * next, as it has yet to be scheduled.
+                     */
+                    label = preferred;
+                } else if ((primary != preferred) && (primary >= 0)
+                        && Bits.get(workSet, primary)) {
+                    /*
+                     * The primary is available, so use that.
+                     */
+                    label = primary;
+                } else {
+                    /*
+                     * There's no obvious candidate, so pick the first
+                     * one that's available, if any.
+                     */
+                    IntList successors = one.getSuccessors();
+                    int ssz = successors.size();
+                    label = -1;
+                    for (int i = 0; i < ssz; i++) {
+                        int candidate = successors.get(i);
+                        if (Bits.get(workSet, candidate)) {
+                            label = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (at != sz) {
+            // There was a duplicate block label.
+            throw new RuntimeException("shouldn't happen");
+        }
+
+        this.order = order;
+!!!14937740.java!!!	getRegs(inout insn : Insn) : RegisterSpecList
+        return getRegs(insn, insn.getResult());
+!!!14937868.java!!!	getRegs(inout insn : Insn, inout resultReg : RegisterSpec) : RegisterSpecList
+        RegisterSpecList regs = insn.getSources();
+
+        if (insn.getOpcode().isCommutative()
+                && (regs.size() == 2)
+                && (resultReg.getReg() == regs.get(1).getReg())) {
+
+            /*
+             * For commutative ops which have two register sources,
+             * if the second source is the same register as the result,
+             * swap the sources so that an opcode of form 12x can be selected
+             * instead of one of form 23x
+             */
+
+            regs = RegisterSpecList.make(regs.get(1), regs.get(0));
+        }
+
+        if (resultReg == null) {
+            return regs;
+        }
+
+        return regs.withFirst(resultReg);

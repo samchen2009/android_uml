@@ -1,0 +1,181 @@
+class NuPlayer::GenericSource
+!!!544012.cpp!!!	start() : void
+    ALOGI("start");
+
+    if (mAudioTrack.mSource != NULL) {
+        CHECK_EQ(mAudioTrack.mSource->start(), (status_t)OK);
+
+        mAudioTrack.mPackets =
+            new AnotherPacketSource(mAudioTrack.mSource->getFormat());
+
+        readBuffer(true /* audio */);
+    }
+
+    if (mVideoTrack.mSource != NULL) {
+        CHECK_EQ(mVideoTrack.mSource->start(), (status_t)OK);
+
+        mVideoTrack.mPackets =
+            new AnotherPacketSource(mVideoTrack.mSource->getFormat());
+
+        readBuffer(false /* audio */);
+    }
+!!!544140.cpp!!!	feedMoreTSData() : status_t
+    return OK;
+!!!544268.cpp!!!	dequeueAccessUnit(in audio : bool, inout accessUnit : sp<ABuffer>) : status_t
+    Track *track = audio ? &mAudioTrack : &mVideoTrack;
+
+    if (track->mSource == NULL) {
+        return -EWOULDBLOCK;
+    }
+
+    status_t finalResult;
+    if (!track->mPackets->hasBufferAvailable(&finalResult)) {
+        return finalResult == OK ? -EWOULDBLOCK : finalResult;
+    }
+
+    status_t result = track->mPackets->dequeueAccessUnit(accessUnit);
+
+    readBuffer(audio, -1ll);
+
+    return result;
+!!!544396.cpp!!!	getDuration(inout durationUs : int64_t) : status_t
+    *durationUs = mDurationUs;
+    return OK;
+!!!544524.cpp!!!	seekTo(in seekTimeUs : int64_t) : status_t
+    if (mVideoTrack.mSource != NULL) {
+        int64_t actualTimeUs;
+        readBuffer(false /* audio */, seekTimeUs, &actualTimeUs);
+
+        seekTimeUs = actualTimeUs;
+    }
+
+    if (mAudioTrack.mSource != NULL) {
+        readBuffer(true /* audio */, seekTimeUs);
+    }
+
+    return OK;
+!!!544652.cpp!!!	flags() : uint32_t
+    return FLAG_SEEKABLE;
+!!!544780.cpp!!!	getFormatMeta(in audio : bool) : sp<MetaData>
+    sp<MediaSource> source = audio ? mAudioTrack.mSource : mVideoTrack.mSource;
+
+    if (source == NULL) {
+        return NULL;
+    }
+
+    return source->getFormat();
+!!!544908.cpp!!!	initFromDataSource(in dataSource : sp<DataSource>) : void
+    sp<MediaExtractor> extractor = MediaExtractor::Create(dataSource);
+
+    CHECK(extractor != NULL);
+
+    for (size_t i = 0; i < extractor->countTracks(); ++i) {
+        sp<MetaData> meta = extractor->getTrackMetaData(i);
+
+        const char *mime;
+        CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+        sp<MediaSource> track;
+
+        if (!strncasecmp(mime, "audio/", 6)) {
+            if (mAudioTrack.mSource == NULL) {
+                mAudioTrack.mSource = track = extractor->getTrack(i);
+
+                if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_VORBIS)) {
+                    mAudioIsVorbis = true;
+                } else {
+                    mAudioIsVorbis = false;
+                }
+            }
+        } else if (!strncasecmp(mime, "video/", 6)) {
+            if (mVideoTrack.mSource == NULL) {
+                mVideoTrack.mSource = track = extractor->getTrack(i);
+            }
+        }
+
+        if (track != NULL) {
+            int64_t durationUs;
+            if (meta->findInt64(kKeyDuration, &durationUs)) {
+                if (durationUs > mDurationUs) {
+                    mDurationUs = durationUs;
+                }
+            }
+        }
+    }
+!!!545036.cpp!!!	readBuffer(in audio : bool, in seekTimeUs : int64_t = -1ll, inout actualTimeUs : int64_t = NULL) : void
+    Track *track = audio ? &mAudioTrack : &mVideoTrack;
+    CHECK(track->mSource != NULL);
+
+    if (actualTimeUs) {
+        *actualTimeUs = seekTimeUs;
+    }
+
+    MediaSource::ReadOptions options;
+
+    bool seeking = false;
+
+    if (seekTimeUs >= 0) {
+        options.setSeekTo(seekTimeUs);
+        seeking = true;
+    }
+
+    for (;;) {
+        MediaBuffer *mbuf;
+        status_t err = track->mSource->read(&mbuf, &options);
+
+        options.clearSeekTo();
+
+        if (err == OK) {
+            size_t outLength = mbuf->range_length();
+
+            if (audio && mAudioIsVorbis) {
+                outLength += sizeof(int32_t);
+            }
+
+            sp<ABuffer> buffer = new ABuffer(outLength);
+
+            memcpy(buffer->data(),
+                   (const uint8_t *)mbuf->data() + mbuf->range_offset(),
+                   mbuf->range_length());
+
+            if (audio && mAudioIsVorbis) {
+                int32_t numPageSamples;
+                if (!mbuf->meta_data()->findInt32(
+                            kKeyValidSamples, &numPageSamples)) {
+                    numPageSamples = -1;
+                }
+
+                memcpy(buffer->data() + mbuf->range_length(),
+                       &numPageSamples,
+                       sizeof(numPageSamples));
+            }
+
+            int64_t timeUs;
+            CHECK(mbuf->meta_data()->findInt64(kKeyTime, &timeUs));
+
+            buffer->meta()->setInt64("timeUs", timeUs);
+
+            if (actualTimeUs) {
+                *actualTimeUs = timeUs;
+            }
+
+            mbuf->release();
+            mbuf = NULL;
+
+            if (seeking) {
+                track->mPackets->queueDiscontinuity(
+                        ATSParser::DISCONTINUITY_SEEK, NULL);
+            }
+
+            track->mPackets->queueAccessUnit(buffer);
+            break;
+        } else if (err == INFO_FORMAT_CHANGED) {
+#if 0
+            track->mPackets->queueDiscontinuity(
+                    ATSParser::DISCONTINUITY_FORMATCHANGE, NULL);
+#endif
+        } else {
+            track->mPackets->signalEOS(err);
+            break;
+        }
+    }

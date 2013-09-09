@@ -1,0 +1,287 @@
+class SoundSettings
+!!!13880460.java!!!	onCreate(inout savedInstanceState : Bundle) : void
+        super.onCreate(savedInstanceState);
+        ContentResolver resolver = getContentResolver();
+        int activePhoneType = TelephonyManager.getDefault().getCurrentPhoneType();
+
+        mAudioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+
+        addPreferencesFromResource(R.xml.sound_settings);
+
+        if (TelephonyManager.PHONE_TYPE_CDMA != activePhoneType) {
+            // device is not CDMA, do not display CDMA emergency_tone
+            getPreferenceScreen().removePreference(findPreference(KEY_EMERGENCY_TONE));
+        }
+
+        if (!getResources().getBoolean(R.bool.has_silent_mode)) {
+            findPreference(KEY_RING_VOLUME).setDependency(null);
+        }
+
+        mVibrateWhenRinging = (CheckBoxPreference) findPreference(KEY_VIBRATE);
+        mVibrateWhenRinging.setPersistent(false);
+        mVibrateWhenRinging.setChecked(Settings.System.getInt(resolver,
+                Settings.System.VIBRATE_WHEN_RINGING, 0) != 0);
+
+        mDtmfTone = (CheckBoxPreference) findPreference(KEY_DTMF_TONE);
+        mDtmfTone.setPersistent(false);
+        mDtmfTone.setChecked(Settings.System.getInt(resolver,
+                Settings.System.DTMF_TONE_WHEN_DIALING, 1) != 0);
+        mSoundEffects = (CheckBoxPreference) findPreference(KEY_SOUND_EFFECTS);
+        mSoundEffects.setPersistent(false);
+        mSoundEffects.setChecked(Settings.System.getInt(resolver,
+                Settings.System.SOUND_EFFECTS_ENABLED, 1) != 0);
+        mHapticFeedback = (CheckBoxPreference) findPreference(KEY_HAPTIC_FEEDBACK);
+        mHapticFeedback.setPersistent(false);
+        mHapticFeedback.setChecked(Settings.System.getInt(resolver,
+                Settings.System.HAPTIC_FEEDBACK_ENABLED, 1) != 0);
+        mLockSounds = (CheckBoxPreference) findPreference(KEY_LOCK_SOUNDS);
+        mLockSounds.setPersistent(false);
+        mLockSounds.setChecked(Settings.System.getInt(resolver,
+                Settings.System.LOCKSCREEN_SOUNDS_ENABLED, 1) != 0);
+
+        mRingtonePreference = findPreference(KEY_RINGTONE);
+        mNotificationPreference = findPreference(KEY_NOTIFICATION_SOUND);
+
+        Vibrator vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+        if (vibrator == null || !vibrator.hasVibrator()) {
+            removePreference(KEY_VIBRATE);
+            removePreference(KEY_HAPTIC_FEEDBACK);
+        }
+        if (!Utils.isVoiceCapable(getActivity())) {
+            removePreference(KEY_VIBRATE);
+        }
+        if (!getActivity().getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_TOUCHSCREEN)) {
+            removePreference(KEY_SOUND_EFFECTS);
+        }
+
+        if (TelephonyManager.PHONE_TYPE_CDMA == activePhoneType) {
+            ListPreference emergencyTonePreference =
+                (ListPreference) findPreference(KEY_EMERGENCY_TONE);
+            emergencyTonePreference.setValue(String.valueOf(Settings.Global.getInt(
+                resolver, Settings.Global.EMERGENCY_TONE, FALLBACK_EMERGENCY_TONE_VALUE)));
+            emergencyTonePreference.setOnPreferenceChangeListener(this);
+        }
+
+        mSoundSettings = (PreferenceGroup) findPreference(KEY_SOUND_SETTINGS);
+
+        mMusicFx = mSoundSettings.findPreference(KEY_MUSICFX);
+        Intent i = new Intent(AudioEffect.ACTION_DISPLAY_AUDIO_EFFECT_CONTROL_PANEL);
+        PackageManager p = getPackageManager();
+        List<ResolveInfo> ris = p.queryIntentActivities(i, PackageManager.GET_DISABLED_COMPONENTS);
+        if (ris.size() <= 2) {
+            // no need to show the item if there is no choice for the user to make
+            // note: the built in musicfx panel has two activities (one being a
+            // compatibility shim that launches either the other activity, or a
+            // third party one), hence the check for <=2. If the implementation
+            // of the compatbility layer changes, this check may need to be updated.
+            mSoundSettings.removePreference(mMusicFx);
+        }
+
+        if (!Utils.isVoiceCapable(getActivity())) {
+            for (String prefKey : NEED_VOICE_CAPABILITY) {
+                Preference pref = findPreference(prefKey);
+                if (pref != null) {
+                    getPreferenceScreen().removePreference(pref);
+                }
+            }
+        }
+
+        mRingtoneLookupRunnable = new Runnable() {
+            public void run() {
+                if (mRingtonePreference != null) {
+                    updateRingtoneName(RingtoneManager.TYPE_RINGTONE, mRingtonePreference,
+                            MSG_UPDATE_RINGTONE_SUMMARY);
+                }
+                if (mNotificationPreference != null) {
+                    updateRingtoneName(RingtoneManager.TYPE_NOTIFICATION, mNotificationPreference,
+                            MSG_UPDATE_NOTIFICATION_SUMMARY);
+                }
+            }
+        };
+
+        initDockSettings();
+!!!13880588.java!!!	onResume() : void
+        super.onResume();
+
+        lookupRingtoneNames();
+
+        IntentFilter filter = new IntentFilter(Intent.ACTION_DOCK_EVENT);
+        getActivity().registerReceiver(mReceiver, filter);
+!!!13880716.java!!!	onPause() : void
+        super.onPause();
+
+        getActivity().unregisterReceiver(mReceiver);
+!!!13880844.java!!!	updateRingtoneName(in type : int, inout preference : Preference, in msg : int) : void
+        if (preference == null) return;
+        Context context = getActivity();
+        if (context == null) return;
+        Uri ringtoneUri = RingtoneManager.getActualDefaultRingtoneUri(context, type);
+        CharSequence summary = context.getString(com.android.internal.R.string.ringtone_unknown);
+        // Is it a silent ringtone?
+        if (ringtoneUri == null) {
+            summary = context.getString(com.android.internal.R.string.ringtone_silent);
+        } else {
+            // Fetch the ringtone title from the media provider
+            try {
+                Cursor cursor = context.getContentResolver().query(ringtoneUri,
+                        new String[] { MediaStore.Audio.Media.TITLE }, null, null, null);
+                if (cursor != null) {
+                    if (cursor.moveToFirst()) {
+                        summary = cursor.getString(0);
+                    }
+                    cursor.close();
+                }
+            } catch (SQLiteException sqle) {
+                // Unknown title for the ringtone
+            }
+        }
+        mHandler.sendMessage(mHandler.obtainMessage(msg, summary));
+!!!13880972.java!!!	lookupRingtoneNames() : void
+        new Thread(mRingtoneLookupRunnable).start();
+!!!13881100.java!!!	onPreferenceTreeClick(inout preferenceScreen : PreferenceScreen, inout preference : Preference) : boolean
+        if (preference == mVibrateWhenRinging) {
+            Settings.System.putInt(getContentResolver(), Settings.System.VIBRATE_WHEN_RINGING,
+                    mVibrateWhenRinging.isChecked() ? 1 : 0);
+        } else if (preference == mDtmfTone) {
+            Settings.System.putInt(getContentResolver(), Settings.System.DTMF_TONE_WHEN_DIALING,
+                    mDtmfTone.isChecked() ? 1 : 0);
+
+        } else if (preference == mSoundEffects) {
+            if (mSoundEffects.isChecked()) {
+                mAudioManager.loadSoundEffects();
+            } else {
+                mAudioManager.unloadSoundEffects();
+            }
+            Settings.System.putInt(getContentResolver(), Settings.System.SOUND_EFFECTS_ENABLED,
+                    mSoundEffects.isChecked() ? 1 : 0);
+
+        } else if (preference == mHapticFeedback) {
+            Settings.System.putInt(getContentResolver(), Settings.System.HAPTIC_FEEDBACK_ENABLED,
+                    mHapticFeedback.isChecked() ? 1 : 0);
+
+        } else if (preference == mLockSounds) {
+            Settings.System.putInt(getContentResolver(), Settings.System.LOCKSCREEN_SOUNDS_ENABLED,
+                    mLockSounds.isChecked() ? 1 : 0);
+
+        } else if (preference == mMusicFx) {
+            // let the framework fire off the intent
+            return false;
+        } else if (preference == mDockAudioSettings) {
+            int dockState = mDockIntent != null
+                    ? mDockIntent.getIntExtra(Intent.EXTRA_DOCK_STATE, 0)
+                    : Intent.EXTRA_DOCK_STATE_UNDOCKED;
+
+            if (dockState == Intent.EXTRA_DOCK_STATE_UNDOCKED) {
+                showDialog(DIALOG_NOT_DOCKED);
+            } else {
+                boolean isBluetooth = mDockIntent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) != null;
+
+                if (isBluetooth) {
+                    Intent i = new Intent(mDockIntent);
+                    i.setAction(DockEventReceiver.ACTION_DOCK_SHOW_UI);
+                    i.setClass(getActivity(), DockEventReceiver.class);
+                    getActivity().sendBroadcast(i);
+                } else {
+                    PreferenceScreen ps = (PreferenceScreen)mDockAudioSettings;
+                    Bundle extras = ps.getExtras();
+                    extras.putBoolean("checked",
+                            Settings.Global.getInt(getContentResolver(),
+                                    Settings.Global.DOCK_AUDIO_MEDIA_ENABLED, 0) == 1);
+                    super.onPreferenceTreeClick(ps, ps);
+                }
+            }
+        } else if (preference == mDockSounds) {
+            Settings.Global.putInt(getContentResolver(), Settings.Global.DOCK_SOUNDS_ENABLED,
+                    mDockSounds.isChecked() ? 1 : 0);
+        } else if (preference == mDockAudioMediaEnabled) {
+            Settings.Global.putInt(getContentResolver(), Settings.Global.DOCK_AUDIO_MEDIA_ENABLED,
+                    mDockAudioMediaEnabled.isChecked() ? 1 : 0);
+        }
+        return true;
+!!!13881228.java!!!	onPreferenceChange(inout preference : Preference, inout objValue : Object) : boolean
+        final String key = preference.getKey();
+        if (KEY_EMERGENCY_TONE.equals(key)) {
+            try {
+                int value = Integer.parseInt((String) objValue);
+                Settings.Global.putInt(getContentResolver(),
+                        Settings.Global.EMERGENCY_TONE, value);
+            } catch (NumberFormatException e) {
+                Log.e(TAG, "could not persist emergency tone setting", e);
+            }
+        }
+
+        return true;
+!!!13881356.java!!!	getHelpResource() : int
+        return R.string.help_url_sound;
+!!!13881484.java!!!	needsDockSettings() : boolean
+        return getResources().getBoolean(R.bool.has_dock_settings);
+!!!13881612.java!!!	initDockSettings() : void
+        ContentResolver resolver = getContentResolver();
+
+        if (needsDockSettings()) {
+            mDockSounds = (CheckBoxPreference) findPreference(KEY_DOCK_SOUNDS);
+            mDockSounds.setPersistent(false);
+            mDockSounds.setChecked(Settings.Global.getInt(resolver,
+                    Settings.Global.DOCK_SOUNDS_ENABLED, 0) != 0);
+            mDockAudioSettings = findPreference(KEY_DOCK_AUDIO_SETTINGS);
+            mDockAudioSettings.setEnabled(false);
+        } else {
+            getPreferenceScreen().removePreference(findPreference(KEY_DOCK_CATEGORY));
+            getPreferenceScreen().removePreference(findPreference(KEY_DOCK_AUDIO_SETTINGS));
+            getPreferenceScreen().removePreference(findPreference(KEY_DOCK_SOUNDS));
+            Settings.Global.putInt(resolver, Settings.Global.DOCK_AUDIO_MEDIA_ENABLED, 1);
+        }
+!!!13881740.java!!!	handleDockChange(inout intent : Intent) : void
+        if (mDockAudioSettings != null) {
+            int dockState = intent.getIntExtra(Intent.EXTRA_DOCK_STATE, 0);
+
+            boolean isBluetooth =
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) != null;
+
+            mDockIntent = intent;
+
+            if (dockState != Intent.EXTRA_DOCK_STATE_UNDOCKED) {
+                // remove undocked dialog if currently showing.
+                try {
+                    removeDialog(DIALOG_NOT_DOCKED);
+                } catch (IllegalArgumentException iae) {
+                    // Maybe it was already dismissed
+                }
+
+                if (isBluetooth) {
+                    mDockAudioSettings.setEnabled(true);
+                } else {
+                    if (dockState == Intent.EXTRA_DOCK_STATE_LE_DESK) {
+                        ContentResolver resolver = getContentResolver();
+                        mDockAudioSettings.setEnabled(true);
+                        if (Settings.Global.getInt(resolver,
+                                Settings.Global.DOCK_AUDIO_MEDIA_ENABLED, -1) == -1) {
+                            Settings.Global.putInt(resolver,
+                                    Settings.Global.DOCK_AUDIO_MEDIA_ENABLED, 0);
+                        }
+                        mDockAudioMediaEnabled =
+                                (CheckBoxPreference) findPreference(KEY_DOCK_AUDIO_MEDIA_ENABLED);
+                        mDockAudioMediaEnabled.setPersistent(false);
+                        mDockAudioMediaEnabled.setChecked(
+                                Settings.Global.getInt(resolver,
+                                        Settings.Global.DOCK_AUDIO_MEDIA_ENABLED, 0) != 0);
+                    } else {
+                        mDockAudioSettings.setEnabled(false);
+                    }
+                }
+            } else {
+                mDockAudioSettings.setEnabled(false);
+            }
+        }
+!!!13881868.java!!!	onCreateDialog(in id : int) : Dialog
+        if (id == DIALOG_NOT_DOCKED) {
+            return createUndockedMessage();
+        }
+        return null;
+!!!13881996.java!!!	createUndockedMessage() : Dialog
+        final AlertDialog.Builder ab = new AlertDialog.Builder(getActivity());
+        ab.setTitle(R.string.dock_not_found_title);
+        ab.setMessage(R.string.dock_not_found_text);
+        ab.setPositiveButton(android.R.string.ok, null);
+        return ab.create();

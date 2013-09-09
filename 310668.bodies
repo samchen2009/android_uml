@@ -1,0 +1,230 @@
+class SoftG711
+!!!576908.cpp!!!	SoftG711(in name : char, in callbacks : OMX_CALLBACKTYPE, in appData : OMX_PTR, inout component : OMX_COMPONENTTYPE)
+    if (!strcmp(name, "OMX.google.g711.alaw.decoder")) {
+        mIsMLaw = false;
+    } else {
+        CHECK(!strcmp(name, "OMX.google.g711.mlaw.decoder"));
+    }
+
+    initPorts();
+!!!577164.cpp!!!	internalGetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (pcmParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            pcmParams->eNumData = OMX_NumericalDataSigned;
+            pcmParams->eEndian = OMX_EndianBig;
+            pcmParams->bInterleaved = OMX_TRUE;
+            pcmParams->nBitPerSample = 16;
+            pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
+            pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
+
+            pcmParams->nChannels = mNumChannels;
+            pcmParams->nSamplingRate = 8000;
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalGetParameter(index, params);
+    }
+!!!577292.cpp!!!	internalSetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (pcmParams->nPortIndex != 0 && pcmParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (pcmParams->nChannels < 1 || pcmParams->nChannels > 2) {
+                return OMX_ErrorUndefined;
+            }
+
+            if(pcmParams->nPortIndex == 0) {
+                mNumChannels = pcmParams->nChannels;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamStandardComponentRole:
+        {
+            const OMX_PARAM_COMPONENTROLETYPE *roleParams =
+                (const OMX_PARAM_COMPONENTROLETYPE *)params;
+
+            if (mIsMLaw) {
+                if (strncmp((const char *)roleParams->cRole,
+                            "audio_decoder.g711mlaw",
+                            OMX_MAX_STRINGNAME_SIZE - 1)) {
+                    return OMX_ErrorUndefined;
+                }
+            } else {
+                if (strncmp((const char *)roleParams->cRole,
+                            "audio_decoder.g711alaw",
+                            OMX_MAX_STRINGNAME_SIZE - 1)) {
+                    return OMX_ErrorUndefined;
+                }
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalSetParameter(index, params);
+    }
+!!!577420.cpp!!!	onQueueFilled(in portIndex : OMX_U32) : void
+    if (mSignalledError) {
+        return;
+    }
+
+    List<BufferInfo *> &inQueue = getPortQueue(0);
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+
+    while (!inQueue.empty() && !outQueue.empty()) {
+        BufferInfo *inInfo = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+
+        BufferInfo *outInfo = *outQueue.begin();
+        OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            inQueue.erase(inQueue.begin());
+            inInfo->mOwnedByUs = false;
+            notifyEmptyBufferDone(inHeader);
+
+            outHeader->nFilledLen = 0;
+            outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+
+            outQueue.erase(outQueue.begin());
+            outInfo->mOwnedByUs = false;
+            notifyFillBufferDone(outHeader);
+            return;
+        }
+
+        if (inHeader->nFilledLen > kMaxNumSamplesPerFrame) {
+            ALOGE("input buffer too large (%ld).", inHeader->nFilledLen);
+
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+        }
+
+        const uint8_t *inputptr = inHeader->pBuffer + inHeader->nOffset;
+
+        if (mIsMLaw) {
+            DecodeMLaw(
+                    reinterpret_cast<int16_t *>(outHeader->pBuffer),
+                    inputptr, inHeader->nFilledLen);
+        } else {
+            DecodeALaw(
+                    reinterpret_cast<int16_t *>(outHeader->pBuffer),
+                    inputptr, inHeader->nFilledLen);
+        }
+
+        outHeader->nTimeStamp = inHeader->nTimeStamp;
+        outHeader->nOffset = 0;
+        outHeader->nFilledLen = inHeader->nFilledLen * sizeof(int16_t);
+        outHeader->nFlags = 0;
+
+        inInfo->mOwnedByUs = false;
+        inQueue.erase(inQueue.begin());
+        inInfo = NULL;
+        notifyEmptyBufferDone(inHeader);
+        inHeader = NULL;
+
+        outInfo->mOwnedByUs = false;
+        outQueue.erase(outQueue.begin());
+        outInfo = NULL;
+        notifyFillBufferDone(outHeader);
+        outHeader = NULL;
+    }
+!!!577548.cpp!!!	initPorts() : void
+    OMX_PARAM_PORTDEFINITIONTYPE def;
+    InitOMXParams(&def);
+
+    def.nPortIndex = 0;
+    def.eDir = OMX_DirInput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = 8192;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 1;
+
+    def.format.audio.cMIMEType =
+        const_cast<char *>(
+                mIsMLaw
+                    ? MEDIA_MIMETYPE_AUDIO_G711_MLAW
+                    : MEDIA_MIMETYPE_AUDIO_G711_ALAW);
+
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingG711;
+
+    addPort(def);
+
+    def.nPortIndex = 1;
+    def.eDir = OMX_DirOutput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = kMaxNumSamplesPerFrame * sizeof(int16_t);
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 2;
+
+    def.format.audio.cMIMEType = const_cast<char *>("audio/raw");
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingPCM;
+
+    addPort(def);
+!!!577676.cpp!!!	DecodeALaw(inout out : int16_t, in in : uint8_t, in inSize : size_t) : void
+    while (inSize-- > 0) {
+        int32_t x = *in++;
+
+        int32_t ix = x ^ 0x55;
+        ix &= 0x7f;
+
+        int32_t iexp = ix >> 4;
+        int32_t mant = ix & 0x0f;
+
+        if (iexp > 0) {
+            mant += 16;
+        }
+
+        mant = (mant << 4) + 8;
+
+        if (iexp > 1) {
+            mant = mant << (iexp - 1);
+        }
+
+        *out++ = (x > 127) ? mant : -mant;
+    }
+!!!577804.cpp!!!	DecodeMLaw(inout out : int16_t, in in : uint8_t, in inSize : size_t) : void
+    while (inSize-- > 0) {
+        int32_t x = *in++;
+
+        int32_t mantissa = ~x;
+        int32_t exponent = (mantissa >> 4) & 7;
+        int32_t segment = exponent + 1;
+        mantissa &= 0x0f;
+
+        int32_t step = 4 << segment;
+
+        int32_t abs = (0x80l << exponent) + step * mantissa + step / 2 - 4 * 33;
+
+        *out++ = (x < 0x80) ? -abs : abs;
+    }

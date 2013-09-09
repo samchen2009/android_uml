@@ -1,0 +1,133 @@
+class AVIExtractor::MP3Splitter
+!!!1854476.cpp!!!	clear() : void
+    mFindSync = true;
+    mBaseTimeUs = -1ll;
+    mNumSamplesRead = 0;
+
+    if (mBuffer != NULL) {
+        mBuffer->setRange(0, 0);
+    }
+!!!1854604.cpp!!!	append(inout buffer : MediaBuffer) : void
+    size_t prevCapacity = (mBuffer != NULL) ? mBuffer->capacity() : 0;
+
+    if (mBaseTimeUs < 0) {
+        CHECK(mBuffer == NULL || mBuffer->size() == 0);
+        CHECK(buffer->meta_data()->findInt64(kKeyTime, &mBaseTimeUs));
+        mNumSamplesRead = 0;
+    }
+
+    if (mBuffer != NULL && mBuffer->offset() > 0) {
+        memmove(mBuffer->base(), mBuffer->data(), mBuffer->size());
+        mBuffer->setRange(0, mBuffer->size());
+    }
+
+    if (mBuffer == NULL
+            || mBuffer->size() + buffer->range_length() > prevCapacity) {
+        size_t newCapacity =
+            (prevCapacity + buffer->range_length() + 1023) & ~1023;
+
+        sp<ABuffer> newBuffer = new ABuffer(newCapacity);
+        if (mBuffer != NULL) {
+            memcpy(newBuffer->data(), mBuffer->data(), mBuffer->size());
+            newBuffer->setRange(0, mBuffer->size());
+        } else {
+            newBuffer->setRange(0, 0);
+        }
+        mBuffer = newBuffer;
+    }
+
+    memcpy(mBuffer->data() + mBuffer->size(),
+           (const uint8_t *)buffer->data() + buffer->range_offset(),
+           buffer->range_length());
+
+    mBuffer->setRange(0, mBuffer->size() + buffer->range_length());
+!!!1854732.cpp!!!	read(inout out : MediaBuffer) : status_t
+    *out = NULL;
+
+    if (mFindSync) {
+        if (!resync()) {
+            return -EAGAIN;
+        }
+
+        mFindSync = false;
+    }
+
+    if (mBuffer->size() < 4) {
+        return -EAGAIN;
+    }
+
+    uint32_t header = U32_AT(mBuffer->data());
+    size_t frameSize;
+    int sampleRate;
+    int numSamples;
+    if (!GetMPEGAudioFrameSize(
+                header, &frameSize, &sampleRate, NULL, NULL, &numSamples)) {
+        return ERROR_MALFORMED;
+    }
+
+    if (mBuffer->size() < frameSize) {
+        return -EAGAIN;
+    }
+
+    MediaBuffer *mbuf = new MediaBuffer(frameSize);
+    memcpy(mbuf->data(), mBuffer->data(), frameSize);
+
+    int64_t timeUs = mBaseTimeUs + (mNumSamplesRead * 1000000ll) / sampleRate;
+    mNumSamplesRead += numSamples;
+
+    mbuf->meta_data()->setInt64(kKeyTime, timeUs);
+
+    mBuffer->setRange(
+            mBuffer->offset() + frameSize, mBuffer->size() - frameSize);
+
+    *out = mbuf;
+
+    return OK;
+!!!1854860.cpp!!!	resync() : bool
+    if (mBuffer == NULL) {
+        return false;
+    }
+
+    bool foundSync = false;
+    for (size_t offset = 0; offset + 3 < mBuffer->size(); ++offset) {
+        uint32_t firstHeader = U32_AT(mBuffer->data() + offset);
+
+        size_t frameSize;
+        if (!GetMPEGAudioFrameSize(firstHeader, &frameSize)) {
+            continue;
+        }
+
+        size_t subsequentOffset = offset + frameSize;
+        size_t i = 3;
+        while (i > 0) {
+            if (subsequentOffset + 3 >= mBuffer->size()) {
+                break;
+            }
+
+            static const uint32_t kMask = 0xfffe0c00;
+
+            uint32_t header = U32_AT(mBuffer->data() + subsequentOffset);
+            if ((header & kMask) != (firstHeader & kMask)) {
+                break;
+            }
+
+            if (!GetMPEGAudioFrameSize(header, &frameSize)) {
+                break;
+            }
+
+            subsequentOffset += frameSize;
+            --i;
+        }
+
+        if (i == 0) {
+            foundSync = true;
+            memmove(mBuffer->data(),
+                    mBuffer->data() + offset,
+                    mBuffer->size() - offset);
+
+            mBuffer->setRange(0, mBuffer->size() - offset);
+            break;
+        }
+    }
+
+    return foundSync;

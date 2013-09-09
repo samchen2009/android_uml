@@ -1,0 +1,707 @@
+class Layer
+!!!1746316.cpp!!!	Layer(inout flinger : SurfaceFlinger, in client : sp<Client>)
+    mCurrentCrop.makeInvalid();
+    glGenTextures(1, &mTextureName);
+!!!1746444.cpp!!!	~Layer()
+    sp<Client> c(mClientRef.promote());
+    if (c != 0) {
+        c->detachLayer(this);
+    }
+    mFlinger->deleteTextureAsync(mTextureName);
+!!!1746700.cpp!!!	setBuffers(in w : uint32_t, in h : uint32_t, in format : PixelFormat, in flags : uint32_t = 0) : status_t
+    // this surfaces pixel format
+    PixelFormatInfo info;
+    status_t err = getPixelFormatInfo(format, &info);
+    if (err) {
+        ALOGE("unsupported pixelformat %d", format);
+        return err;
+    }
+
+    uint32_t const maxSurfaceDims = min(
+            mFlinger->getMaxTextureSize(), mFlinger->getMaxViewportDims());
+
+    // never allow a surface larger than what our underlying GL implementation
+    // can handle.
+    if ((uint32_t(w)>maxSurfaceDims) || (uint32_t(h)>maxSurfaceDims)) {
+        ALOGE("dimensions too large %u x %u", uint32_t(w), uint32_t(h));
+        return BAD_VALUE;
+    }
+
+    mFormat = format;
+
+    mSecure = (flags & ISurfaceComposerClient::eSecure) ? true : false;
+    mProtectedByApp = (flags & ISurfaceComposerClient::eProtectedByApp) ? true : false;
+    mOpaqueLayer = (flags & ISurfaceComposerClient::eOpaque);
+    mCurrentOpacity = getOpacityForFormat(format);
+
+    mSurfaceFlingerConsumer->setDefaultBufferSize(w, h);
+    mSurfaceFlingerConsumer->setDefaultBufferFormat(format);
+    mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(0));
+
+    return NO_ERROR;
+!!!1746828.cpp!!!	isFixedSize() : bool
+    return mCurrentScalingMode != NATIVE_WINDOW_SCALING_MODE_FREEZE;
+!!!1746956.cpp!!!	setGeometry(in hw : sp<const DisplayDevice>, inout layer : HWCLayerInterface) : void
+    layer.setDefaultState();
+
+    // enable this layer
+    layer.setSkip(false);
+
+    if (isSecure() && !hw->isSecure()) {
+        layer.setSkip(true);
+    }
+
+    // this gives us only the "orientation" component of the transform
+    const State& s(drawingState());
+    if (!isOpaque() || s.alpha != 0xFF) {
+        layer.setBlending(mPremultipliedAlpha ?
+                HWC_BLENDING_PREMULT :
+                HWC_BLENDING_COVERAGE);
+    }
+
+    // apply the layer's transform, followed by the display's global transform
+    // here we're guaranteed that the layer's transform preserves rects
+    Rect frame(s.transform.transform(computeBounds()));
+    frame.intersect(hw->getViewport(), &frame);
+    const Transform& tr(hw->getTransform());
+    layer.setFrame(tr.transform(frame));
+    layer.setCrop(computeCrop(hw));
+    layer.setPlaneAlpha(s.alpha);
+
+    /*
+     * Transformations are applied in this order:
+     * 1) buffer orientation/flip/mirror
+     * 2) state transformation (window manager)
+     * 3) layer orientation (screen orientation)
+     * (NOTE: the matrices are multiplied in reverse order)
+     */
+
+    const Transform bufferOrientation(mCurrentTransform);
+    const Transform transform(tr * s.transform * bufferOrientation);
+
+    // this gives us only the "orientation" component of the transform
+    const uint32_t orientation = transform.getOrientation();
+    if (orientation & Transform::ROT_INVALID) {
+        // we can only handle simple transformation
+        layer.setSkip(true);
+    } else {
+        layer.setTransform(orientation);
+    }
+!!!1747084.cpp!!!	setPerFrameData(in hw : sp<const DisplayDevice>, inout layer : HWCLayerInterface) : void
+    // we have to set the visible region on every frame because
+    // we currently free it during onLayerDisplayed(), which is called
+    // after HWComposer::commit() -- every frame.
+    // Apply this display's projection's viewport to the visible region
+    // before giving it to the HWC HAL.
+    const Transform& tr = hw->getTransform();
+    Region visible = tr.transform(visibleRegion.intersect(hw->getViewport()));
+    layer.setVisibleRegionScreen(visible);
+
+    // NOTE: buffer can be NULL if the client never drew into this
+    // layer yet, or if we ran out of memory
+    layer.setBuffer(mActiveBuffer);
+!!!1747212.cpp!!!	setAcquireFence(in hw : sp<const DisplayDevice>, inout layer : HWCLayerInterface) : void
+    int fenceFd = -1;
+
+    // TODO: there is a possible optimization here: we only need to set the
+    // acquire fence the first time a new buffer is acquired on EACH display.
+
+    if (layer.getCompositionType() == HWC_OVERLAY) {
+        sp<Fence> fence = mSurfaceFlingerConsumer->getCurrentFence();
+        if (fence->isValid()) {
+            fenceFd = fence->dup();
+            if (fenceFd == -1) {
+                ALOGW("failed to dup layer fence, skipping sync: %d", errno);
+            }
+        }
+    }
+    layer.setAcquireFenceFd(fenceFd);
+!!!1747340.cpp!!!	onLayerDisplayed(in hw : sp<const DisplayDevice>, inout layer : HWCLayerInterface) : void
+    if (layer) {
+        layer->onDisplayed();
+        mSurfaceFlingerConsumer->setReleaseFence(layer->getAndResetReleaseFence());
+    }
+!!!1747468.cpp!!!	onPreComposition() : bool
+    mRefreshPending = false;
+    return mQueuedFrames > 0;
+!!!1747596.cpp!!!	onPostComposition() : void
+    if (mFrameLatencyNeeded) {
+        nsecs_t desiredPresentTime = mSurfaceFlingerConsumer->getTimestamp();
+        mFrameTracker.setDesiredPresentTime(desiredPresentTime);
+
+        sp<Fence> frameReadyFence = mSurfaceFlingerConsumer->getCurrentFence();
+        if (frameReadyFence->isValid()) {
+            mFrameTracker.setFrameReadyFence(frameReadyFence);
+        } else {
+            // There was no fence for this frame, so assume that it was ready
+            // to be presented at the desired present time.
+            mFrameTracker.setFrameReadyTime(desiredPresentTime);
+        }
+
+        const HWComposer& hwc = mFlinger->getHwComposer();
+        sp<Fence> presentFence = hwc.getDisplayFence(HWC_DISPLAY_PRIMARY);
+        if (presentFence->isValid()) {
+            mFrameTracker.setActualPresentFence(presentFence);
+        } else {
+            // The HWC doesn't support present fences, so use the refresh
+            // timestamp instead.
+            nsecs_t presentTime = hwc.getRefreshTimestamp(HWC_DISPLAY_PRIMARY);
+            mFrameTracker.setActualPresentTime(presentTime);
+        }
+
+        mFrameTracker.advanceFrame();
+        mFrameLatencyNeeded = false;
+    }
+!!!1747724.cpp!!!	onDraw(in hw : sp<const DisplayDevice>, in clip : Region) : void
+    ATRACE_CALL();
+
+    if (CC_UNLIKELY(mActiveBuffer == 0)) {
+        // the texture has not been created yet, this Layer has
+        // in fact never been drawn into. This happens frequently with
+        // SurfaceView because the WindowManager can't know when the client
+        // has drawn the first time.
+
+        // If there is nothing under us, we paint the screen in black, otherwise
+        // we just skip this update.
+
+        // figure out if there is something below us
+        Region under;
+        const SurfaceFlinger::LayerVector& drawingLayers(
+                mFlinger->mDrawingState.layersSortedByZ);
+        const size_t count = drawingLayers.size();
+        for (size_t i=0 ; i<count ; ++i) {
+            const sp<Layer>& layer(drawingLayers[i]);
+            if (layer.get() == static_cast<Layer const*>(this))
+                break;
+            under.orSelf( hw->getTransform().transform(layer->visibleRegion) );
+        }
+        // if not everything below us is covered, we plug the holes!
+        Region holes(clip.subtract(under));
+        if (!holes.isEmpty()) {
+            clearWithOpenGL(hw, holes, 0, 0, 0, 1);
+        }
+        return;
+    }
+
+    // Bind the current buffer to the GL texture, and wait for it to be
+    // ready for us to draw into.
+    status_t err = mSurfaceFlingerConsumer->bindTextureImage();
+    if (err != NO_ERROR) {
+        ALOGW("onDraw: bindTextureImage failed (err=%d)", err);
+        // Go ahead and draw the buffer anyway; no matter what we do the screen
+        // is probably going to have something visibly wrong.
+    }
+
+    bool blackOutLayer = isProtected() || (isSecure() && !hw->isSecure());
+
+    if (!blackOutLayer) {
+        // TODO: we could be more subtle with isFixedSize()
+        const bool useFiltering = getFiltering() || needsFiltering(hw) || isFixedSize();
+
+        // Query the texture matrix given our current filtering mode.
+        float textureMatrix[16];
+        mSurfaceFlingerConsumer->setFilteringEnabled(useFiltering);
+        mSurfaceFlingerConsumer->getTransformMatrix(textureMatrix);
+
+        // Set things up for texturing.
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, mTextureName);
+        GLenum filter = GL_NEAREST;
+        if (useFiltering) {
+            filter = GL_LINEAR;
+        }
+        glTexParameterx(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameterx(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, filter);
+        glMatrixMode(GL_TEXTURE);
+        glLoadMatrixf(textureMatrix);
+        glMatrixMode(GL_MODELVIEW);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_TEXTURE_EXTERNAL_OES);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, mFlinger->getProtectedTexName());
+        glMatrixMode(GL_TEXTURE);
+        glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW);
+        glDisable(GL_TEXTURE_EXTERNAL_OES);
+        glEnable(GL_TEXTURE_2D);
+    }
+
+    drawWithOpenGL(hw, clip);
+
+    glDisable(GL_TEXTURE_EXTERNAL_OES);
+    glDisable(GL_TEXTURE_2D);
+!!!1747852.cpp!!!	doTransaction(in flags : uint32_t) : uint32_t
+    ATRACE_CALL();
+
+    const Layer::State& front(drawingState());
+    const Layer::State& temp(currentState());
+
+    const bool sizeChanged = (temp.requested.w != front.requested.w) ||
+                             (temp.requested.h != front.requested.h);
+
+    if (sizeChanged) {
+        // the size changed, we need to ask our client to request a new buffer
+        ALOGD_IF(DEBUG_RESIZE,
+                "doTransaction: geometry (layer=%p '%s'), tr=%02x, scalingMode=%d\n"
+                "  current={ active   ={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }\n"
+                "            requested={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }}\n"
+                "  drawing={ active   ={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }\n"
+                "            requested={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }}\n",
+                this, (const char*) getName(), mCurrentTransform, mCurrentScalingMode,
+                temp.active.w, temp.active.h,
+                temp.active.crop.left,
+                temp.active.crop.top,
+                temp.active.crop.right,
+                temp.active.crop.bottom,
+                temp.active.crop.getWidth(),
+                temp.active.crop.getHeight(),
+                temp.requested.w, temp.requested.h,
+                temp.requested.crop.left,
+                temp.requested.crop.top,
+                temp.requested.crop.right,
+                temp.requested.crop.bottom,
+                temp.requested.crop.getWidth(),
+                temp.requested.crop.getHeight(),
+                front.active.w, front.active.h,
+                front.active.crop.left,
+                front.active.crop.top,
+                front.active.crop.right,
+                front.active.crop.bottom,
+                front.active.crop.getWidth(),
+                front.active.crop.getHeight(),
+                front.requested.w, front.requested.h,
+                front.requested.crop.left,
+                front.requested.crop.top,
+                front.requested.crop.right,
+                front.requested.crop.bottom,
+                front.requested.crop.getWidth(),
+                front.requested.crop.getHeight());
+
+        // record the new size, form this point on, when the client request
+        // a buffer, it'll get the new size.
+        mSurfaceFlingerConsumer->setDefaultBufferSize(
+                temp.requested.w, temp.requested.h);
+    }
+
+    if (!isFixedSize()) {
+
+        const bool resizePending = (temp.requested.w != temp.active.w) ||
+                                   (temp.requested.h != temp.active.h);
+
+        if (resizePending) {
+            // don't let Layer::doTransaction update the drawing state
+            // if we have a pending resize, unless we are in fixed-size mode.
+            // the drawing state will be updated only once we receive a buffer
+            // with the correct size.
+            //
+            // in particular, we want to make sure the clip (which is part
+            // of the geometry state) is latched together with the size but is
+            // latched immediately when no resizing is involved.
+
+            flags |= eDontUpdateGeometryState;
+        }
+    }
+
+    // always set active to requested, unless we're asked not to
+    // this is used by Layer, which special cases resizes.
+    if (flags & eDontUpdateGeometryState)  {
+    } else {
+        Layer::State& editTemp(currentState());
+        editTemp.active = temp.requested;
+    }
+
+    if (front.active != temp.active) {
+        // invalidate and recompute the visible regions if needed
+        flags |= Layer::eVisibleRegion;
+    }
+
+    if (temp.sequence != front.sequence) {
+        // invalidate and recompute the visible regions if needed
+        flags |= eVisibleRegion;
+        this->contentDirty = true;
+
+        // we may use linear filtering, if the matrix scales us
+        const uint8_t type = temp.transform.getType();
+        mNeedsFiltering = (!temp.transform.preserveRects() ||
+                (type >= Transform::SCALE));
+    }
+
+    // Commit the transaction
+    commitTransaction();
+    return flags;
+!!!1747980.cpp!!!	latchBuffer(inout recomputeVisibleRegions : bool) : Region
+    ATRACE_CALL();
+
+    Region outDirtyRegion;
+    if (mQueuedFrames > 0) {
+
+        // if we've already called updateTexImage() without going through
+        // a composition step, we have to skip this layer at this point
+        // because we cannot call updateTeximage() without a corresponding
+        // compositionComplete() call.
+        // we'll trigger an update in onPreComposition().
+        if (mRefreshPending) {
+            return outDirtyRegion;
+        }
+
+        // Capture the old state of the layer for comparisons later
+        const bool oldOpacity = isOpaque();
+        sp<GraphicBuffer> oldActiveBuffer = mActiveBuffer;
+
+        // signal another event if we have more frames pending
+        if (android_atomic_dec(&mQueuedFrames) > 1) {
+            mFlinger->signalLayerUpdate();
+        }
+
+        struct Reject : public SurfaceFlingerConsumer::BufferRejecter {
+            Layer::State& front;
+            Layer::State& current;
+            bool& recomputeVisibleRegions;
+            Reject(Layer::State& front, Layer::State& current,
+                    bool& recomputeVisibleRegions)
+                : front(front), current(current),
+                  recomputeVisibleRegions(recomputeVisibleRegions) {
+            }
+
+            virtual bool reject(const sp<GraphicBuffer>& buf,
+                    const BufferQueue::BufferItem& item) {
+                if (buf == NULL) {
+                    return false;
+                }
+
+                uint32_t bufWidth  = buf->getWidth();
+                uint32_t bufHeight = buf->getHeight();
+
+                // check that we received a buffer of the right size
+                // (Take the buffer's orientation into account)
+                if (item.mTransform & Transform::ROT_90) {
+                    swap(bufWidth, bufHeight);
+                }
+
+                bool isFixedSize = item.mScalingMode != NATIVE_WINDOW_SCALING_MODE_FREEZE;
+                if (front.active != front.requested) {
+
+                    if (isFixedSize ||
+                            (bufWidth == front.requested.w &&
+                             bufHeight == front.requested.h))
+                    {
+                        // Here we pretend the transaction happened by updating the
+                        // current and drawing states. Drawing state is only accessed
+                        // in this thread, no need to have it locked
+                        front.active = front.requested;
+
+                        // We also need to update the current state so that
+                        // we don't end-up overwriting the drawing state with
+                        // this stale current state during the next transaction
+                        //
+                        // NOTE: We don't need to hold the transaction lock here
+                        // because State::active is only accessed from this thread.
+                        current.active = front.active;
+
+                        // recompute visible region
+                        recomputeVisibleRegions = true;
+                    }
+
+                    ALOGD_IF(DEBUG_RESIZE,
+                            "latchBuffer/reject: buffer (%ux%u, tr=%02x), scalingMode=%d\n"
+                            "  drawing={ active   ={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }\n"
+                            "            requested={ wh={%4u,%4u} crop={%4d,%4d,%4d,%4d} (%4d,%4d) }}\n",
+                            bufWidth, bufHeight, item.mTransform, item.mScalingMode,
+                            front.active.w, front.active.h,
+                            front.active.crop.left,
+                            front.active.crop.top,
+                            front.active.crop.right,
+                            front.active.crop.bottom,
+                            front.active.crop.getWidth(),
+                            front.active.crop.getHeight(),
+                            front.requested.w, front.requested.h,
+                            front.requested.crop.left,
+                            front.requested.crop.top,
+                            front.requested.crop.right,
+                            front.requested.crop.bottom,
+                            front.requested.crop.getWidth(),
+                            front.requested.crop.getHeight());
+                }
+
+                if (!isFixedSize) {
+                    if (front.active.w != bufWidth ||
+                        front.active.h != bufHeight) {
+                        // reject this buffer
+                        return true;
+                    }
+                }
+
+                // if the transparent region has changed (this test is
+                // conservative, but that's fine, worst case we're doing
+                // a bit of extra work), we latch the new one and we
+                // trigger a visible-region recompute.
+                if (!front.activeTransparentRegion.isTriviallyEqual(
+                        front.requestedTransparentRegion)) {
+                    front.activeTransparentRegion = front.requestedTransparentRegion;
+
+                    // We also need to update the current state so that
+                    // we don't end-up overwriting the drawing state with
+                    // this stale current state during the next transaction
+                    //
+                    // NOTE: We don't need to hold the transaction lock here
+                    // because State::active is only accessed from this thread.
+                    current.activeTransparentRegion = front.activeTransparentRegion;
+
+                    // recompute visible region
+                    recomputeVisibleRegions = true;
+                }
+
+                return false;
+            }
+        };
+
+
+        Reject r(mDrawingState, currentState(), recomputeVisibleRegions);
+
+        if (mSurfaceFlingerConsumer->updateTexImage(&r) != NO_ERROR) {
+            // something happened!
+            recomputeVisibleRegions = true;
+            return outDirtyRegion;
+        }
+
+        // update the active buffer
+        mActiveBuffer = mSurfaceFlingerConsumer->getCurrentBuffer();
+        if (mActiveBuffer == NULL) {
+            // this can only happen if the very first buffer was rejected.
+            return outDirtyRegion;
+        }
+
+        mRefreshPending = true;
+        mFrameLatencyNeeded = true;
+        if (oldActiveBuffer == NULL) {
+             // the first time we receive a buffer, we need to trigger a
+             // geometry invalidation.
+            recomputeVisibleRegions = true;
+         }
+
+        Rect crop(mSurfaceFlingerConsumer->getCurrentCrop());
+        const uint32_t transform(mSurfaceFlingerConsumer->getCurrentTransform());
+        const uint32_t scalingMode(mSurfaceFlingerConsumer->getCurrentScalingMode());
+        if ((crop != mCurrentCrop) ||
+            (transform != mCurrentTransform) ||
+            (scalingMode != mCurrentScalingMode))
+        {
+            mCurrentCrop = crop;
+            mCurrentTransform = transform;
+            mCurrentScalingMode = scalingMode;
+            recomputeVisibleRegions = true;
+        }
+
+        if (oldActiveBuffer != NULL) {
+            uint32_t bufWidth  = mActiveBuffer->getWidth();
+            uint32_t bufHeight = mActiveBuffer->getHeight();
+            if (bufWidth != uint32_t(oldActiveBuffer->width) ||
+                bufHeight != uint32_t(oldActiveBuffer->height)) {
+                recomputeVisibleRegions = true;
+            }
+        }
+
+        mCurrentOpacity = getOpacityForFormat(mActiveBuffer->format);
+        if (oldOpacity != isOpaque()) {
+            recomputeVisibleRegions = true;
+        }
+
+        glTexParameterx(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameterx(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // FIXME: postedRegion should be dirty & bounds
+        const Layer::State& front(drawingState());
+        Region dirtyRegion(Rect(front.active.w, front.active.h));
+
+        // transform the dirty region to window-manager space
+        outDirtyRegion = (front.transform.transform(dirtyRegion));
+    }
+    return outDirtyRegion;
+!!!1748108.cpp!!!	isOpaque() : bool
+    // if we don't have a buffer yet, we're translucent regardless of the
+    // layer's opaque flag.
+    if (mActiveBuffer == 0) {
+        return false;
+    }
+
+    // if the layer has the opaque flag, then we're always opaque,
+    // otherwise we use the current buffer's format.
+    return mOpaqueLayer || mCurrentOpacity;
+!!!1748364.cpp!!!	isProtected() : bool
+    const sp<GraphicBuffer>& activeBuffer(mActiveBuffer);
+    return (activeBuffer != 0) &&
+            (activeBuffer->getUsage() & GRALLOC_USAGE_PROTECTED);
+!!!1748492.cpp!!!	onRemoved() : void
+    mSurfaceFlingerConsumer->abandon();
+!!!1748748.cpp!!!	setName(in name : String8) : void
+    LayerBase::setName(name);
+    mSurfaceTexture->setName(name);
+!!!1748876.cpp!!!	isVisible() : bool
+    const Layer::State& s(mDrawingState);
+    return !(s.flags & layer_state_t::eLayerHidden) && s.alpha
+            && (mActiveBuffer != NULL);
+!!!1749004.cpp!!!	getSurfaceTextureBinder() : wp<IBinder>
+    return mSurfaceTexture->getBufferQueue()->asBinder();
+!!!1749260.cpp!!!	updateTransformHint(in hw : sp<const DisplayDevice>) : void
+    uint32_t orientation = 0;
+    if (!mFlinger->mDebugDisableTransformHint) {
+        // The transform hint is used to improve performance, but we can
+        // only have a single transform hint, it cannot
+        // apply to all displays.
+        const Transform& planeTransform(hw->getTransform());
+        orientation = planeTransform.getOrientation();
+        if (orientation & Transform::ROT_INVALID) {
+            orientation = 0;
+        }
+    }
+    mSurfaceFlingerConsumer->setTransformHint(orientation);
+!!!1749388.cpp!!!	onFirstRef() : void
+    // Creates a custom BufferQueue for SurfaceFlingerConsumer to use
+    sp<BufferQueue> bq = new SurfaceTextureLayer(mFlinger);
+    mSurfaceFlingerConsumer = new SurfaceFlingerConsumer(mTextureName, true,
+            GL_TEXTURE_EXTERNAL_OES, false, bq);
+
+    mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(0));
+    mSurfaceFlingerConsumer->setFrameAvailableListener(this);
+    mSurfaceFlingerConsumer->setSynchronousMode(true);
+    mSurfaceFlingerConsumer->setName(mName);
+
+#ifdef TARGET_DISABLE_TRIPLE_BUFFERING
+#warning "disabling triple buffering"
+    mSurfaceFlingerConsumer->setDefaultMaxBufferCount(2);
+#else
+    mSurfaceFlingerConsumer->setDefaultMaxBufferCount(3);
+#endif
+
+    const sp<const DisplayDevice> hw(mFlinger->getDefaultDisplayDevice());
+    updateTransformHint(hw);
+!!!1749516.cpp!!!	dump(inout result : String8, inout buffer : char, in SIZE : size_t) : void
+    const Layer::State& s(drawingState());
+
+    snprintf(buffer, SIZE,
+            "+ %s %p (%s)\n",
+            getTypeId(), this, getName().string());
+    result.append(buffer);
+
+    s.activeTransparentRegion.dump(result, "transparentRegion");
+    visibleRegion.dump(result, "visibleRegion");
+    sp<Client> client(mClientRef.promote());
+
+    snprintf(buffer, SIZE,
+            "      "
+            "layerStack=%4d, z=%9d, pos=(%g,%g), size=(%4d,%4d), crop=(%4d,%4d,%4d,%4d), "
+            "isOpaque=%1d, invalidate=%1d, "
+            "alpha=0x%02x, flags=0x%08x, tr=[%.2f, %.2f][%.2f, %.2f]\n"
+            "      client=%p\n",
+            s.layerStack, s.z, s.transform.tx(), s.transform.ty(), s.active.w, s.active.h,
+            s.active.crop.left, s.active.crop.top,
+            s.active.crop.right, s.active.crop.bottom,
+            isOpaque(), contentDirty,
+            s.alpha, s.flags,
+            s.transform[0][0], s.transform[0][1],
+            s.transform[1][0], s.transform[1][1],
+            client.get());
+    result.append(buffer);
+
+    sp<const GraphicBuffer> buf0(mActiveBuffer);
+    uint32_t w0=0, h0=0, s0=0, f0=0;
+    if (buf0 != 0) {
+        w0 = buf0->getWidth();
+        h0 = buf0->getHeight();
+        s0 = buf0->getStride();
+        f0 = buf0->format;
+    }
+    snprintf(buffer, SIZE,
+            "      "
+            "format=%2d, activeBuffer=[%4ux%4u:%4u,%3X],"
+            " queued-frames=%d, mRefreshPending=%d\n",
+            mFormat, w0, h0, s0,f0,
+            mQueuedFrames, mRefreshPending);
+
+    result.append(buffer);
+
+    if (mSurfaceFlingerConsumer != 0) {
+        mSurfaceFlingerConsumer->dump(result, "            ", buffer, SIZE);
+    }
+!!!1749644.cpp!!!	dumpStats(inout result : String8, inout buffer : char, in SIZE : size_t) : void
+    mFrameTracker.dump(result);
+!!!1749772.cpp!!!	clearStats() : void
+    mFrameTracker.clear();
+!!!1749900.cpp!!!	onFrameQueued() : void
+    android_atomic_inc(&mQueuedFrames);
+    mFlinger->signalLayerUpdate();
+!!!1750028.cpp!!!	createSurface() : sp<ISurface>
+    class BSurface : public BnSurface, public LayerCleaner {
+        wp<const Layer> mOwner;
+        virtual sp<ISurfaceTexture> getSurfaceTexture() const {
+            sp<ISurfaceTexture> res;
+            sp<const Layer> that( mOwner.promote() );
+            if (that != NULL) {
+                res = that->mSurfaceTexture->getBufferQueue();
+            }
+            return res;
+        }
+    public:
+        BSurface(const sp<SurfaceFlinger>& flinger,
+                const sp<Layer>& layer)
+            : LayerCleaner(flinger, layer), mOwner(layer) { }
+    };
+    sp<ISurface> sur(new BSurface(mFlinger, this));
+    return sur;
+!!!1750156.cpp!!!	getEffectiveUsage(in usage : uint32_t) : uint32_t
+    // TODO: should we do something special if mSecure is set?
+    if (mProtectedByApp) {
+        // need a hardware-protected path to external video sink
+        usage |= GraphicBuffer::USAGE_PROTECTED;
+    }
+    usage |= GraphicBuffer::USAGE_HW_COMPOSER;
+    return usage;
+!!!1750284.cpp!!!	isCropped() : bool
+    return !mCurrentCrop.isEmpty();
+!!!1750412.cpp!!!	computeBufferCrop() : Rect
+    // Start with the SurfaceTexture's buffer crop...
+    Rect crop;
+    if (!mCurrentCrop.isEmpty()) {
+        crop = mCurrentCrop;
+    } else  if (mActiveBuffer != NULL){
+        crop = Rect(mActiveBuffer->getWidth(), mActiveBuffer->getHeight());
+    } else {
+        crop.makeInvalid();
+        return crop;
+    }
+
+    // ... then reduce that in the same proportions as the window crop reduces
+    // the window size.
+    const State& s(drawingState());
+    if (!s.active.crop.isEmpty()) {
+        // Transform the window crop to match the buffer coordinate system,
+        // which means using the inverse of the current transform set on the
+        // SurfaceTexture.
+        uint32_t invTransform = mCurrentTransform;
+        int winWidth = s.active.w;
+        int winHeight = s.active.h;
+        if (invTransform & NATIVE_WINDOW_TRANSFORM_ROT_90) {
+            invTransform ^= NATIVE_WINDOW_TRANSFORM_FLIP_V |
+                    NATIVE_WINDOW_TRANSFORM_FLIP_H;
+            winWidth = s.active.h;
+            winHeight = s.active.w;
+        }
+        Rect winCrop = s.active.crop.transform(invTransform,
+                s.active.w, s.active.h);
+
+        float xScale = float(crop.width()) / float(winWidth);
+        float yScale = float(crop.height()) / float(winHeight);
+        crop.left += int(ceilf(float(winCrop.left) * xScale));
+        crop.top += int(ceilf(float(winCrop.top) * yScale));
+        crop.right -= int(ceilf(float(winWidth - winCrop.right) * xScale));
+        crop.bottom -= int(ceilf(float(winHeight - winCrop.bottom) * yScale));
+    }
+
+    return crop;
+!!!1750540.cpp!!!	getOpacityForFormat(in format : uint32_t) : bool
+    if (HARDWARE_IS_DEVICE_FORMAT(format)) {
+        return true;
+    }
+    PixelFormatInfo info;
+    status_t err = getPixelFormatInfo(PixelFormat(format), &info);
+    // in case of error (unknown format), we assume no blending
+    return (err || info.h_alpha <= info.l_alpha);

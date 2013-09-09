@@ -1,0 +1,366 @@
+class RegisteredServicesCache
+!!!2355596.java!!!	findOrCreateUserLocked(in userId : int) : UserServices
+        UserServices<V> services = mUserServices.get(userId);
+        if (services == null) {
+            services = new UserServices<V>();
+            mUserServices.put(userId, services);
+        }
+        return services;
+!!!2355724.java!!!	RegisteredServicesCache(inout context : Context, in interfaceName : String, in metaDataName : String, in attributeName : String, inout serializerAndParser : XmlSerializerAndParser)
+        mContext = context;
+        mInterfaceName = interfaceName;
+        mMetaDataName = metaDataName;
+        mAttributesName = attributeName;
+        mSerializerAndParser = serializerAndParser;
+
+        File dataDir = Environment.getDataDirectory();
+        File systemDir = new File(dataDir, "system");
+        File syncDir = new File(systemDir, "registered_services");
+        mPersistentServicesFile = new AtomicFile(new File(syncDir, interfaceName + ".xml"));
+
+        // Load persisted services from disk
+        readPersistentServicesLocked();
+
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        intentFilter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        intentFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        intentFilter.addDataScheme("package");
+        mContext.registerReceiverAsUser(mPackageReceiver, UserHandle.ALL, intentFilter, null, null);
+
+        // Register for events related to sdcard installation.
+        IntentFilter sdFilter = new IntentFilter();
+        sdFilter.addAction(Intent.ACTION_EXTERNAL_APPLICATIONS_AVAILABLE);
+        sdFilter.addAction(Intent.ACTION_EXTERNAL_APPLICATIONS_UNAVAILABLE);
+        mContext.registerReceiver(mExternalReceiver, sdFilter);
+!!!2355852.java!!!	invalidateCache(in userId : int) : void
+        synchronized (mServicesLock) {
+            final UserServices<V> user = findOrCreateUserLocked(userId);
+            user.services = null;
+        }
+!!!2355980.java!!!	dump(inout fd : FileDescriptor, inout fout : PrintWriter, inout args : String, in userId : int) : void
+        synchronized (mServicesLock) {
+            final UserServices<V> user = findOrCreateUserLocked(userId);
+            if (user.services != null) {
+                fout.println("RegisteredServicesCache: " + user.services.size() + " services");
+                for (ServiceInfo<?> info : user.services.values()) {
+                    fout.println("  " + info);
+                }
+            } else {
+                fout.println("RegisteredServicesCache: services not loaded");
+            }
+        }
+!!!2356108.java!!!	getListener() : RegisteredServicesCacheListener
+        synchronized (this) {
+            return mListener;
+        }
+!!!2356236.java!!!	setListener(inout listener : RegisteredServicesCacheListener, inout handler : Handler) : void
+        if (handler == null) {
+            handler = new Handler(mContext.getMainLooper());
+        }
+        synchronized (this) {
+            mHandler = handler;
+            mListener = listener;
+        }
+!!!2356364.java!!!	notifyListener(in type : V, in userId : int, in removed : boolean) : void
+        if (DEBUG) {
+            Log.d(TAG, "notifyListener: " + type + " is " + (removed ? "removed" : "added"));
+        }
+        RegisteredServicesCacheListener<V> listener;
+        Handler handler; 
+        synchronized (this) {
+            listener = mListener;
+            handler = mHandler;
+        }
+        if (listener == null) {
+            return;
+        }
+        
+        final RegisteredServicesCacheListener<V> listener2 = listener;
+        handler.post(new Runnable() {
+            public void run() {
+                listener2.onServiceChanged(type, userId, removed);
+            }
+        });
+!!!2356748.java!!!	getServiceInfo(inout type : V, in userId : int) : ServiceInfo
+        synchronized (mServicesLock) {
+            // Find user and lazily populate cache
+            final UserServices<V> user = findOrCreateUserLocked(userId);
+            if (user.services == null) {
+                generateServicesMap(userId);
+            }
+            return user.services.get(type);
+        }
+!!!2356876.java!!!	getAllServices(in userId : int) : ServiceInfo
+        synchronized (mServicesLock) {
+            // Find user and lazily populate cache
+            final UserServices<V> user = findOrCreateUserLocked(userId);
+            if (user.services == null) {
+                generateServicesMap(userId);
+            }
+            return Collections.unmodifiableCollection(
+                    new ArrayList<ServiceInfo<V>>(user.services.values()));
+        }
+!!!2357004.java!!!	inSystemImage(in callerUid : int) : boolean
+        String[] packages = mContext.getPackageManager().getPackagesForUid(callerUid);
+        for (String name : packages) {
+            try {
+                PackageInfo packageInfo =
+                        mContext.getPackageManager().getPackageInfo(name, 0 /* flags */);
+                if ((packageInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
+                    return true;
+                }
+            } catch (PackageManager.NameNotFoundException e) {
+                return false;
+            }
+        }
+        return false;
+!!!2357132.java!!!	generateServicesMap(in userId : int) : void
+        if (DEBUG) {
+            Slog.d(TAG, "generateServicesMap() for " + userId);
+        }
+
+        final PackageManager pm = mContext.getPackageManager();
+        final ArrayList<ServiceInfo<V>> serviceInfos = new ArrayList<ServiceInfo<V>>();
+        final List<ResolveInfo> resolveInfos = pm.queryIntentServicesAsUser(
+                new Intent(mInterfaceName), PackageManager.GET_META_DATA, userId);
+        for (ResolveInfo resolveInfo : resolveInfos) {
+            try {
+                ServiceInfo<V> info = parseServiceInfo(resolveInfo);
+                if (info == null) {
+                    Log.w(TAG, "Unable to load service info " + resolveInfo.toString());
+                    continue;
+                }
+                serviceInfos.add(info);
+            } catch (XmlPullParserException e) {
+                Log.w(TAG, "Unable to load service info " + resolveInfo.toString(), e);
+            } catch (IOException e) {
+                Log.w(TAG, "Unable to load service info " + resolveInfo.toString(), e);
+            }
+        }
+
+        synchronized (mServicesLock) {
+            final UserServices<V> user = findOrCreateUserLocked(userId);
+            final boolean firstScan = user.services == null;
+            if (firstScan) {
+                user.services = Maps.newHashMap();
+            } else {
+                user.services.clear();
+            }
+
+            StringBuilder changes = new StringBuilder();
+            boolean changed = false;
+            for (ServiceInfo<V> info : serviceInfos) {
+                // four cases:
+                // - doesn't exist yet
+                //   - add, notify user that it was added
+                // - exists and the UID is the same
+                //   - replace, don't notify user
+                // - exists, the UID is different, and the new one is not a system package
+                //   - ignore
+                // - exists, the UID is different, and the new one is a system package
+                //   - add, notify user that it was added
+                Integer previousUid = user.persistentServices.get(info.type);
+                if (previousUid == null) {
+                    if (DEBUG) {
+                        changes.append("  New service added: ").append(info).append("\n");
+                    }
+                    changed = true;
+                    user.services.put(info.type, info);
+                    user.persistentServices.put(info.type, info.uid);
+                    if (!(mPersistentServicesFileDidNotExist && firstScan)) {
+                        notifyListener(info.type, userId, false /* removed */);
+                    }
+                } else if (previousUid == info.uid) {
+                    if (DEBUG) {
+                        changes.append("  Existing service (nop): ").append(info).append("\n");
+                    }
+                    user.services.put(info.type, info);
+                } else if (inSystemImage(info.uid)
+                        || !containsTypeAndUid(serviceInfos, info.type, previousUid)) {
+                    if (DEBUG) {
+                        if (inSystemImage(info.uid)) {
+                            changes.append("  System service replacing existing: ").append(info)
+                                    .append("\n");
+                        } else {
+                            changes.append("  Existing service replacing a removed service: ")
+                                    .append(info).append("\n");
+                        }
+                    }
+                    changed = true;
+                    user.services.put(info.type, info);
+                    user.persistentServices.put(info.type, info.uid);
+                    notifyListener(info.type, userId, false /* removed */);
+                } else {
+                    // ignore
+                    if (DEBUG) {
+                        changes.append("  Existing service with new uid ignored: ").append(info)
+                                .append("\n");
+                    }
+                }
+            }
+
+            ArrayList<V> toBeRemoved = Lists.newArrayList();
+            for (V v1 : user.persistentServices.keySet()) {
+                if (!containsType(serviceInfos, v1)) {
+                    toBeRemoved.add(v1);
+                }
+            }
+            for (V v1 : toBeRemoved) {
+                if (DEBUG) {
+                    changes.append("  Service removed: ").append(v1).append("\n");
+                }
+                changed = true;
+                user.persistentServices.remove(v1);
+                notifyListener(v1, userId, true /* removed */);
+            }
+            if (DEBUG) {
+                if (changes.length() > 0) {
+                    Log.d(TAG, "generateServicesMap(" + mInterfaceName + "): " +
+                            serviceInfos.size() + " services:\n" + changes);
+                } else {
+                    Log.d(TAG, "generateServicesMap(" + mInterfaceName + "): " +
+                            serviceInfos.size() + " services unchanged");
+                }
+            }
+            if (changed) {
+                writePersistentServicesLocked();
+            }
+        }
+!!!2357260.java!!!	containsType(inout serviceInfos : ArrayList<ServiceInfo<V>>, inout type : V) : boolean
+        for (int i = 0, N = serviceInfos.size(); i < N; i++) {
+            if (serviceInfos.get(i).type.equals(type)) {
+                return true;
+            }
+        }
+
+        return false;
+!!!2357388.java!!!	containsTypeAndUid(inout serviceInfos : ArrayList<ServiceInfo<V>>, inout type : V, in uid : int) : boolean
+        for (int i = 0, N = serviceInfos.size(); i < N; i++) {
+            final ServiceInfo<V> serviceInfo = serviceInfos.get(i);
+            if (serviceInfo.type.equals(type) && serviceInfo.uid == uid) {
+                return true;
+            }
+        }
+
+        return false;
+!!!2357516.java!!!	parseServiceInfo(inout service : ResolveInfo) : ServiceInfo
+        android.content.pm.ServiceInfo si = service.serviceInfo;
+        ComponentName componentName = new ComponentName(si.packageName, si.name);
+
+        PackageManager pm = mContext.getPackageManager();
+
+        XmlResourceParser parser = null;
+        try {
+            parser = si.loadXmlMetaData(pm, mMetaDataName);
+            if (parser == null) {
+                throw new XmlPullParserException("No " + mMetaDataName + " meta-data");
+            }
+
+            AttributeSet attrs = Xml.asAttributeSet(parser);
+
+            int type;
+            while ((type=parser.next()) != XmlPullParser.END_DOCUMENT
+                    && type != XmlPullParser.START_TAG) {
+            }
+
+            String nodeName = parser.getName();
+            if (!mAttributesName.equals(nodeName)) {
+                throw new XmlPullParserException(
+                        "Meta-data does not start with " + mAttributesName +  " tag");
+            }
+
+            V v = parseServiceAttributes(pm.getResourcesForApplication(si.applicationInfo),
+                    si.packageName, attrs);
+            if (v == null) {
+                return null;
+            }
+            final android.content.pm.ServiceInfo serviceInfo = service.serviceInfo;
+            final ApplicationInfo applicationInfo = serviceInfo.applicationInfo;
+            final int uid = applicationInfo.uid;
+            return new ServiceInfo<V>(v, componentName, uid);
+        } catch (NameNotFoundException e) {
+            throw new XmlPullParserException(
+                    "Unable to load resources for pacakge " + si.packageName);
+        } finally {
+            if (parser != null) parser.close();
+        }
+!!!2357644.java!!!	readPersistentServicesLocked() : void
+        mUserServices.clear();
+        if (mSerializerAndParser == null) {
+            return;
+        }
+        FileInputStream fis = null;
+        try {
+            mPersistentServicesFileDidNotExist = !mPersistentServicesFile.getBaseFile().exists();
+            if (mPersistentServicesFileDidNotExist) {
+                return;
+            }
+            fis = mPersistentServicesFile.openRead();
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setInput(fis, null);
+            int eventType = parser.getEventType();
+            while (eventType != XmlPullParser.START_TAG) {
+                eventType = parser.next();
+            }
+            String tagName = parser.getName();
+            if ("services".equals(tagName)) {
+                eventType = parser.next();
+                do {
+                    if (eventType == XmlPullParser.START_TAG && parser.getDepth() == 2) {
+                        tagName = parser.getName();
+                        if ("service".equals(tagName)) {
+                            V service = mSerializerAndParser.createFromXml(parser);
+                            if (service == null) {
+                                break;
+                            }
+                            String uidString = parser.getAttributeValue(null, "uid");
+                            final int uid = Integer.parseInt(uidString);
+                            final int userId = UserHandle.getUserId(uid);
+                            final UserServices<V> user = findOrCreateUserLocked(userId);
+                            user.persistentServices.put(service, uid);
+                        }
+                    }
+                    eventType = parser.next();
+                } while (eventType != XmlPullParser.END_DOCUMENT);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Error reading persistent services, starting from scratch", e);
+        } finally {
+            if (fis != null) {
+                try {
+                    fis.close();
+                } catch (java.io.IOException e1) {
+                }
+            }
+        }
+!!!2357772.java!!!	writePersistentServicesLocked() : void
+        if (mSerializerAndParser == null) {
+            return;
+        }
+        FileOutputStream fos = null;
+        try {
+            fos = mPersistentServicesFile.startWrite();
+            XmlSerializer out = new FastXmlSerializer();
+            out.setOutput(fos, "utf-8");
+            out.startDocument(null, true);
+            out.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true);
+            out.startTag(null, "services");
+            for (int i = 0; i < mUserServices.size(); i++) {
+                final UserServices<V> user = mUserServices.valueAt(i);
+                for (Map.Entry<V, Integer> service : user.persistentServices.entrySet()) {
+                    out.startTag(null, "service");
+                    out.attribute(null, "uid", Integer.toString(service.getValue()));
+                    mSerializerAndParser.writeAsXml(service.getKey(), out);
+                    out.endTag(null, "service");
+                }
+            }
+            out.endTag(null, "services");
+            out.endDocument();
+            mPersistentServicesFile.finishWrite(fos);
+        } catch (java.io.IOException e1) {
+            Log.w(TAG, "Error writing accounts", e1);
+            if (fos != null) {
+                mPersistentServicesFile.failWrite(fos);
+            }
+        }

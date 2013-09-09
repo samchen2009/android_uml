@@ -1,0 +1,247 @@
+class Choreographer
+!!!4446092.java!!!	Choreographer(inout looper : Looper)
+        mLooper = looper;
+        mHandler = new FrameHandler(looper);
+        mDisplayEventReceiver = USE_VSYNC ? new FrameDisplayEventReceiver(looper) : null;
+        mLastFrameTimeNanos = Long.MIN_VALUE;
+
+        mFrameIntervalNanos = (long)(1000000000 / getRefreshRate());
+
+        mCallbackQueues = new CallbackQueue[CALLBACK_LAST + 1];
+        for (int i = 0; i <= CALLBACK_LAST; i++) {
+            mCallbackQueues[i] = new CallbackQueue();
+        }
+!!!4446220.java!!!	getRefreshRate() : float
+        DisplayInfo di = DisplayManagerGlobal.getInstance().getDisplayInfo(
+                Display.DEFAULT_DISPLAY);
+        return di.refreshRate;
+!!!4446348.java!!!	getInstance() : Choreographer
+        return sThreadInstance.get();
+!!!4446476.java!!!	getFrameDelay() : long
+        return sFrameDelay;
+!!!4446604.java!!!	setFrameDelay(in frameDelay : long) : void
+        sFrameDelay = frameDelay;
+!!!4446732.java!!!	subtractFrameDelay(in delayMillis : long) : long
+        final long frameDelay = sFrameDelay;
+        return delayMillis <= frameDelay ? 0 : delayMillis - frameDelay;
+!!!4446860.java!!!	postCallback(in callbackType : int, inout action : Runnable, inout token : Object) : void
+        postCallbackDelayed(callbackType, action, token, 0);
+!!!4446988.java!!!	postCallbackDelayed(in callbackType : int, inout action : Runnable, inout token : Object, in delayMillis : long) : void
+        if (action == null) {
+            throw new IllegalArgumentException("action must not be null");
+        }
+        if (callbackType < 0 || callbackType > CALLBACK_LAST) {
+            throw new IllegalArgumentException("callbackType is invalid");
+        }
+
+        postCallbackDelayedInternal(callbackType, action, token, delayMillis);
+!!!4447116.java!!!	postCallbackDelayedInternal(in callbackType : int, inout action : Object, inout token : Object, in delayMillis : long) : void
+        if (DEBUG) {
+            Log.d(TAG, "PostCallback: type=" + callbackType
+                    + ", action=" + action + ", token=" + token
+                    + ", delayMillis=" + delayMillis);
+        }
+
+        synchronized (mLock) {
+            final long now = SystemClock.uptimeMillis();
+            final long dueTime = now + delayMillis;
+            mCallbackQueues[callbackType].addCallbackLocked(dueTime, action, token);
+
+            if (dueTime <= now) {
+                scheduleFrameLocked(now);
+            } else {
+                Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_CALLBACK, action);
+                msg.arg1 = callbackType;
+                msg.setAsynchronous(true);
+                mHandler.sendMessageAtTime(msg, dueTime);
+            }
+        }
+!!!4447244.java!!!	removeCallbacks(in callbackType : int, inout action : Runnable, inout token : Object) : void
+        if (callbackType < 0 || callbackType > CALLBACK_LAST) {
+            throw new IllegalArgumentException("callbackType is invalid");
+        }
+
+        removeCallbacksInternal(callbackType, action, token);
+!!!4447372.java!!!	removeCallbacksInternal(in callbackType : int, inout action : Object, inout token : Object) : void
+        if (DEBUG) {
+            Log.d(TAG, "RemoveCallbacks: type=" + callbackType
+                    + ", action=" + action + ", token=" + token);
+        }
+
+        synchronized (mLock) {
+            mCallbackQueues[callbackType].removeCallbacksLocked(action, token);
+            if (action != null && token == null) {
+                mHandler.removeMessages(MSG_DO_SCHEDULE_CALLBACK, action);
+            }
+        }
+!!!4447500.java!!!	postFrameCallback(inout callback : FrameCallback) : void
+        postFrameCallbackDelayed(callback, 0);
+!!!4447628.java!!!	postFrameCallbackDelayed(inout callback : FrameCallback, in delayMillis : long) : void
+        if (callback == null) {
+            throw new IllegalArgumentException("callback must not be null");
+        }
+
+        postCallbackDelayedInternal(CALLBACK_ANIMATION,
+                callback, FRAME_CALLBACK_TOKEN, delayMillis);
+!!!4447756.java!!!	removeFrameCallback(inout callback : FrameCallback) : void
+        if (callback == null) {
+            throw new IllegalArgumentException("callback must not be null");
+        }
+
+        removeCallbacksInternal(CALLBACK_ANIMATION, callback, FRAME_CALLBACK_TOKEN);
+!!!4447884.java!!!	getFrameTime() : long
+        return getFrameTimeNanos() / NANOS_PER_MS;
+!!!4448012.java!!!	getFrameTimeNanos() : long
+        synchronized (mLock) {
+            if (!mCallbacksRunning) {
+                throw new IllegalStateException("This method must only be called as "
+                        + "part of a callback while a frame is in progress.");
+            }
+            return USE_FRAME_TIME ? mLastFrameTimeNanos : System.nanoTime();
+        }
+!!!4448140.java!!!	scheduleFrameLocked(in now : long) : void
+        if (!mFrameScheduled) {
+            mFrameScheduled = true;
+            if (USE_VSYNC) {
+                if (DEBUG) {
+                    Log.d(TAG, "Scheduling next frame on vsync.");
+                }
+
+                // If running on the Looper thread, then schedule the vsync immediately,
+                // otherwise post a message to schedule the vsync from the UI thread
+                // as soon as possible.
+                if (isRunningOnLooperThreadLocked()) {
+                    scheduleVsyncLocked();
+                } else {
+                    Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_VSYNC);
+                    msg.setAsynchronous(true);
+                    mHandler.sendMessageAtFrontOfQueue(msg);
+                }
+            } else {
+                final long nextFrameTime = Math.max(
+                        mLastFrameTimeNanos / NANOS_PER_MS + sFrameDelay, now);
+                if (DEBUG) {
+                    Log.d(TAG, "Scheduling next frame in " + (nextFrameTime - now) + " ms.");
+                }
+                Message msg = mHandler.obtainMessage(MSG_DO_FRAME);
+                msg.setAsynchronous(true);
+                mHandler.sendMessageAtTime(msg, nextFrameTime);
+            }
+        }
+!!!4448268.java!!!	doFrame(in frameTimeNanos : long, in frame : int) : void
+        final long startNanos;
+        synchronized (mLock) {
+            if (!mFrameScheduled) {
+                return; // no work to do
+            }
+
+            startNanos = System.nanoTime();
+            final long jitterNanos = startNanos - frameTimeNanos;
+            if (jitterNanos >= mFrameIntervalNanos) {
+                final long skippedFrames = jitterNanos / mFrameIntervalNanos;
+                if (skippedFrames >= SKIPPED_FRAME_WARNING_LIMIT) {
+                    Log.i(TAG, "Skipped " + skippedFrames + " frames!  "
+                            + "The application may be doing too much work on its main thread.");
+                }
+                final long lastFrameOffset = jitterNanos % mFrameIntervalNanos;
+                if (DEBUG) {
+                    Log.d(TAG, "Missed vsync by " + (jitterNanos * 0.000001f) + " ms "
+                            + "which is more than the frame interval of "
+                            + (mFrameIntervalNanos * 0.000001f) + " ms!  "
+                            + "Skipping " + skippedFrames + " frames and setting frame "
+                            + "time to " + (lastFrameOffset * 0.000001f) + " ms in the past.");
+                }
+                frameTimeNanos = startNanos - lastFrameOffset;
+            }
+
+            if (frameTimeNanos < mLastFrameTimeNanos) {
+                if (DEBUG) {
+                    Log.d(TAG, "Frame time appears to be going backwards.  May be due to a "
+                            + "previously skipped frame.  Waiting for next vsync.");
+                }
+                scheduleVsyncLocked();
+                return;
+            }
+
+            mFrameScheduled = false;
+            mLastFrameTimeNanos = frameTimeNanos;
+        }
+
+        doCallbacks(Choreographer.CALLBACK_INPUT, frameTimeNanos);
+        doCallbacks(Choreographer.CALLBACK_ANIMATION, frameTimeNanos);
+        doCallbacks(Choreographer.CALLBACK_TRAVERSAL, frameTimeNanos);
+
+        if (DEBUG) {
+            final long endNanos = System.nanoTime();
+            Log.d(TAG, "Frame " + frame + ": Finished, took "
+                    + (endNanos - startNanos) * 0.000001f + " ms, latency "
+                    + (startNanos - frameTimeNanos) * 0.000001f + " ms.");
+        }
+!!!4448396.java!!!	doCallbacks(in callbackType : int, in frameTimeNanos : long) : void
+        CallbackRecord callbacks;
+        synchronized (mLock) {
+            // We use "now" to determine when callbacks become due because it's possible
+            // for earlier processing phases in a frame to post callbacks that should run
+            // in a following phase, such as an input event that causes an animation to start.
+            final long now = SystemClock.uptimeMillis();
+            callbacks = mCallbackQueues[callbackType].extractDueCallbacksLocked(now);
+            if (callbacks == null) {
+                return;
+            }
+            mCallbacksRunning = true;
+        }
+        try {
+            for (CallbackRecord c = callbacks; c != null; c = c.next) {
+                if (DEBUG) {
+                    Log.d(TAG, "RunCallback: type=" + callbackType
+                            + ", action=" + c.action + ", token=" + c.token
+                            + ", latencyMillis=" + (SystemClock.uptimeMillis() - c.dueTime));
+                }
+                c.run(frameTimeNanos);
+            }
+        } finally {
+            synchronized (mLock) {
+                mCallbacksRunning = false;
+                do {
+                    final CallbackRecord next = callbacks.next;
+                    recycleCallbackLocked(callbacks);
+                    callbacks = next;
+                } while (callbacks != null);
+            }
+        }
+!!!4448524.java!!!	doScheduleVsync() : void
+        synchronized (mLock) {
+            if (mFrameScheduled) {
+                scheduleVsyncLocked();
+            }
+        }
+!!!4448652.java!!!	doScheduleCallback(in callbackType : int) : void
+        synchronized (mLock) {
+            if (!mFrameScheduled) {
+                final long now = SystemClock.uptimeMillis();
+                if (mCallbackQueues[callbackType].hasDueCallbacksLocked(now)) {
+                    scheduleFrameLocked(now);
+                }
+            }
+        }
+!!!4448780.java!!!	scheduleVsyncLocked() : void
+        mDisplayEventReceiver.scheduleVsync();
+!!!4448908.java!!!	isRunningOnLooperThreadLocked() : boolean
+        return Looper.myLooper() == mLooper;
+!!!4449036.java!!!	obtainCallbackLocked(in dueTime : long, inout action : Object, inout token : Object) : CallbackRecord
+        CallbackRecord callback = mCallbackPool;
+        if (callback == null) {
+            callback = new CallbackRecord();
+        } else {
+            mCallbackPool = callback.next;
+            callback.next = null;
+        }
+        callback.dueTime = dueTime;
+        callback.action = action;
+        callback.token = token;
+        return callback;
+!!!4449164.java!!!	recycleCallbackLocked(inout callback : CallbackRecord) : void
+        callback.action = null;
+        callback.token = null;
+        callback.next = mCallbackPool;
+        mCallbackPool = callback;

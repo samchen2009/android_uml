@@ -1,0 +1,247 @@
+class GoogSatController
+!!!12743052.java!!!	GoogSatController(inout context : DeviceControllerContext, inout settings : MediaDeviceSettings, in deviceId : String)
+        super(context, settings, deviceId);
+        mLog.d("controller created");
+
+        mStreamList = new ArrayList<ChannelStream>();
+
+        ChannelListLoader loader = new ChannelListLoader(context.getApplicationContext());
+        List<ChannelEntry> entries = loader.load();
+
+        for (ChannelEntry entry : entries) {
+            mStreamList.add(new ChannelStream(entry.channelNumber, entry.callsign,
+                            entry.videoIds));
+        }
+
+        // Restore the currently tuned channel, and all the channel stream
+        // positions, from settings.
+        mCurrentChannelIndex = (int) getLongSetting(GoogSatConstants.KEY_LAST_TUNED_CHANNEL, 0);
+
+        String state = getStringSetting(GoogSatConstants.KEY_CHANNEL_STATES, null);
+        if (state != null) {
+            StringTokenizer st = new StringTokenizer(state, ",");
+            for (int n = 0; n < mStreamList.size() && st.hasMoreTokens(); ++n) {
+                ChannelStream stream = mStreamList.get(n);
+
+                StringTokenizer st2 = new StringTokenizer(st.nextToken(), "|");
+
+                int index = Integer.parseInt(st2.nextToken());
+                if ((index < 0) || (index >= stream.videos.size())) {
+                    stream.currentVideo = 0;
+                } else {
+                    stream.currentVideo = index;
+                }
+
+                stream.position = Integer.parseInt(st2.nextToken());
+            }
+        }
+!!!12743180.java!!!	performAction(inout event : ActionEvent) : void
+        mLog.d("performAction(): event=" + event);
+
+        if (event.getState() != ActionEvent.State.DOWN) return;
+
+        switch (event.getAction()) {
+            case CHANNEL_UP:
+                nextChannel();
+                break;
+
+            case CHANNEL_DOWN:
+                previousChannel();
+                break;
+
+            case INFO:
+                requestChannelBanner();
+                break;
+
+            case SKIP_FORWARD:
+                startVideo(+1, false);
+                // TODO(mlindner): Send a MediaStreamEvent notifying the client
+                // that playback has advanced to the next stream.
+                break;
+
+            case SKIP_BACK:
+                startVideo(-1, false);
+                // TODO(mlindner): Send a MediaStreamEvent notifying the client
+                // that playback has backed up to the previous stream.
+                break;
+
+            case PAUSE:
+                // TODO(mlindner): Send a MediaStreamEvent notifying the client
+                // that the stream is paused; and include stream duration and
+                // offset in case the client wants to display a stream progress
+                // bar.
+                pauseMediaStream();
+                break;
+
+            case PLAY:
+                // TODO(mlindner): Send a MediaStreamEvent notifying the client
+                // that the stream has resumed.
+                resumeMediaStream();
+                break;
+
+            default:
+                // ignore
+                break;
+        }
+!!!12743308.java!!!	tuneToChannel(inout channel : ChannelNumber) : void
+        mLog.d("tuneToChannel() channel=" + channel);
+        int index = findStreamByChannelNumber(channel);
+        if (index < 0) {
+            mLog.w("Request to tune to unknown channel " + channel);
+            return;
+        }
+
+        setCurrentChannel(index);
+        startVideo(0, true);
+!!!12743436.java!!!	tuneToCurrentChannel() : void
+        mLog.d("tuneToCurrentChannel(); is playing? " + mIsPlaying);
+        if (!mIsPlaying) {
+            startVideo(0, true);
+        }
+!!!12743564.java!!!	onMediaStreamStarted(in duration : int) : void
+        mIsPlaying = true;
+        mLog.d("onMediaStreamStarted; duration=" + duration);
+
+        // Queue the next video in line.
+        final ChannelStream stream = mStreamList.get(mCurrentChannelIndex);
+        final String nextVideo = stream.getNextVideo();
+
+        YouTubeStreamFinderTask task = new YouTubeStreamFinderTask() {
+                @Override
+                protected void onPostExecute(final Uri uri) {
+                    stream.hasQueuedVideo = true;
+                    mLog.d("queueMediaStreamUri with uri: " + uri);
+                    if (uri != null) {
+                        queueMediaStreamUri(uri);
+                    } else {
+                        // TODO(mlindner): Need an API to indicate an error
+                        // condition to the MDS.
+                    }
+                }
+            };
+        task.execute(stream.getNextVideo());
+!!!12743692.java!!!	onMediaStreamStopped(in position : int) : void
+        mIsPlaying = false;
+        mLog.d("onMediaStreamStopped; position=" + position);
+
+        final ChannelStream stream = mStreamList.get(mCurrentChannelIndex);
+        stream.position = position;
+!!!12743820.java!!!	onMediaStreamEnded() : void
+        mLog.d("onMediaStreamEnded; currentChannelIndex=" + mCurrentChannelIndex);
+        final ChannelStream stream = mStreamList.get(mCurrentChannelIndex);
+
+        if (stream.hasQueuedVideo) {
+            stream.advance();
+            stream.hasQueuedVideo = false;
+            return;
+        }
+
+        mIsPlaying = false;
+        startVideo(+1, false);
+!!!12743948.java!!!	nextChannel() : void
+        // TODO(mlindner): Skip over disabled channels
+        setCurrentChannel(mCurrentChannelIndex < mStreamList.size() - 1
+                ? mCurrentChannelIndex + 1 : 0);
+        startVideo(0, true);
+!!!12744076.java!!!	previousChannel() : void
+        // TODO(mlindner): Skip over disabled channels
+        setCurrentChannel(mCurrentChannelIndex > 0 ? mCurrentChannelIndex - 1
+                : mStreamList.size() - 1);
+        startVideo(0, true);
+!!!12744204.java!!!	startVideo(in offset : int, in resume : boolean) : void
+        getHandler().post(new Runnable() {
+                @Override
+                public void run() {
+                    final ChannelStream stream = mStreamList.get(mCurrentChannelIndex);
+                    if (offset != 0) {
+                        stream.seekToVideo(offset);
+                    }
+                    final int streamPosition = (offset == 0) ? (resume ? stream.position : 0) : 0;
+
+                    YouTubeStreamFinderTask task = new YouTubeStreamFinderTask() {
+                            @Override
+                            protected void onPostExecute(final Uri uri) {
+                                mLog.d("setMediaStreamUri with uri: " + uri + " and position "
+                                    + streamPosition);
+                                if (uri != null) {
+                                    setMediaStreamUri(uri, streamPosition);
+                                    playMediaStream();
+                                } else {
+                                    // TODO(mlindner): need an API to indicate an error
+                                    // condition to the MDS
+                                }
+                            }
+                        };
+                    task.execute(stream.getCurrentVideo());
+                }
+            });
+!!!12744332.java!!!	onMediaStreamError(in errorCode : int) : boolean
+        mIsPlaying = false;
+        // TODO(mlindner): Implement; for now, just eat the error.
+        return true;
+!!!12744460.java!!!	destroy() : void
+        mLog.d("destroy");
+
+        StringBuilder sb = new StringBuilder(100);
+        for (ChannelStream stream : mStreamList) {
+            sb.append(stream.currentVideo);
+            sb.append('|');
+            sb.append(stream.position);
+            sb.append(",");
+        }
+
+        setStringSetting(GoogSatConstants.KEY_CHANNEL_STATES, sb.toString());
+
+        super.destroy();
+!!!12745228.java!!!	findStreamByChannelNumber(inout channelNumber : ChannelNumber) : int
+        int count = mStreamList.size();
+        for (int i = 0; i < count; ++i) {
+            ChannelStream stream =  mStreamList.get(i);
+            if (stream.channelNumber.equals(channelNumber)) {
+                return i;
+            }
+        }
+        return -1;
+!!!12745356.java!!!	setCurrentChannel(in index : int) : void
+        if ((mCurrentChannelIndex == index) && mIsPlaying) {
+            mLog.d("Already on channel " + index + " and playing");
+            // We're already on the desired channel and we're playing, so do
+            // nothing.
+            return;
+        }
+
+        final ChannelStream oldStream = mStreamList.get(mCurrentChannelIndex);
+        oldStream.position = getMediaStreamPosition();
+        mLog.d("saving stream position of " + oldStream.position);
+
+        mCurrentChannelIndex = index;
+        final ChannelStream stream = mStreamList.get(index);
+        mLog.d("Switched to channel " + stream.callsign);
+        final Uri mediaUri = TvUriUtils.getChannelTvUri(getDeviceId(), stream.callsign);
+
+        MediaStreamEvent event = new MediaStreamEvent.Builder(
+                MediaStreamEvent.Action.MEDIA_URI_CHANGED)
+                .setUri(mediaUri)
+                .setStreamPosition(stream.position)
+                .setFlags(buildEventFlags())
+                .setSource(MediaStreamEvent.Source.USER)
+                .build();
+
+        notifyStreamEvent(event);
+        setLongSetting(GoogSatConstants.KEY_LAST_TUNED_CHANNEL, mCurrentChannelIndex);
+!!!12745484.java!!!	buildEventFlags() : int
+        boolean showChannelBanner = getBooleanSetting(
+                GoogSatConstants.KEY_SHOW_CHANNEL_BANNER, true);
+
+        int flags = 0;
+        if (showChannelBanner) {
+            flags |= MediaStreamEvent.FLAG_SHOW_CHANNEL_BANNER;
+        }
+
+        return flags;
+!!!12745612.java!!!	requestChannelBanner() : void
+        final ChannelStream stream = mStreamList.get(mCurrentChannelIndex);
+        final Uri mediaUri = TvUriUtils.getChannelTvUri(getDeviceId(), stream.callsign);
+
+        notifyStreamEvent(new MediaStreamEvent(MediaStreamEvent.Action.MEDIA_URI,
+                        mediaUri, buildEventFlags(), MediaStreamEvent.Source.USER));

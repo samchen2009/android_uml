@@ -1,0 +1,440 @@
+class Track
+!!!809356.cpp!!!	Track(inout thread : PlaybackThread, in client : sp<Client>, in streamType : audio_stream_type_t, in sampleRate : uint32_t, in format : audio_format_t, in channelMask : audio_channel_mask_t, in frameCount : int, in sharedBuffer : sp<IMemory>, in sessionId : int, in flags : track_flags_t)
+    if (mCblk != NULL) {
+        // NOTE: audio_track_cblk_t::frameSize for 8 bit PCM data is based on a sample size of
+        // 16 bit because data is converted to 16 bit before being stored in buffer by AudioTrack
+        mCblk->frameSize = audio_is_linear_pcm(format) ? mChannelCount * sizeof(int16_t) : sizeof(uint8_t);
+        // to avoid leaking a track name, do not allocate one unless there is an mCblk
+        mName = thread->getTrackName_l(channelMask, sessionId);
+        mCblk->mName = mName;
+        if (mName < 0) {
+            ALOGE("no more track names available");
+            return;
+        }
+        // only allocate a fast track index if we were able to allocate a normal track name
+        if (flags & IAudioFlinger::TRACK_FAST) {
+            mCblk->flags |= CBLK_FAST;  // atomic op not needed yet
+            ALOG_ASSERT(thread->mFastTrackAvailMask != 0);
+            int i = __builtin_ctz(thread->mFastTrackAvailMask);
+            ALOG_ASSERT(0 < i && i < (int)FastMixerState::kMaxFastTracks);
+            // FIXME This is too eager.  We allocate a fast track index before the
+            //       fast track becomes active.  Since fast tracks are a scarce resource,
+            //       this means we are potentially denying other more important fast tracks from
+            //       being created.  It would be better to allocate the index dynamically.
+            mFastIndex = i;
+            mCblk->mName = i;
+            // Read the initial underruns because this field is never cleared by the fast mixer
+            mObservedUnderruns = thread->getFastTrackUnderruns(i);
+            thread->mFastTrackAvailMask &= ~(1 << i);
+        }
+    }
+    ALOGV("Track constructor name %d, calling pid %d", mName, IPCThreadState::self()->getCallingPid());
+!!!809484.cpp!!!	~Track()
+    ALOGV("PlaybackThread::Track destructor");
+!!!809612.cpp!!!	appendDumpHeader(inout result : String8) : void
+    result.append("   Name Client Type Fmt Chn mask   Session mFrCnt fCount S M F SRate  L dB  R dB  "
+                  "  Server      User     Main buf    Aux Buf  Flags Underruns\n");
+!!!809740.cpp!!!	dump(inout buffer : char, in size : size_t) : void
+    uint32_t vlr = mCblk->getVolumeLR();
+    if (isFastTrack()) {
+        sprintf(buffer, "   F %2d", mFastIndex);
+    } else {
+        sprintf(buffer, "   %4d", mName - AudioMixer::TRACK0);
+    }
+    track_state state = mState;
+    char stateChar;
+    switch (state) {
+    case IDLE:
+        stateChar = 'I';
+        break;
+    case TERMINATED:
+        stateChar = 'T';
+        break;
+    case STOPPING_1:
+        stateChar = 's';
+        break;
+    case STOPPING_2:
+        stateChar = '5';
+        break;
+    case STOPPED:
+        stateChar = 'S';
+        break;
+    case RESUMING:
+        stateChar = 'R';
+        break;
+    case ACTIVE:
+        stateChar = 'A';
+        break;
+    case PAUSING:
+        stateChar = 'p';
+        break;
+    case PAUSED:
+        stateChar = 'P';
+        break;
+    case FLUSHED:
+        stateChar = 'F';
+        break;
+    default:
+        stateChar = '?';
+        break;
+    }
+    char nowInUnderrun;
+    switch (mObservedUnderruns.mBitFields.mMostRecent) {
+    case UNDERRUN_FULL:
+        nowInUnderrun = ' ';
+        break;
+    case UNDERRUN_PARTIAL:
+        nowInUnderrun = '<';
+        break;
+    case UNDERRUN_EMPTY:
+        nowInUnderrun = '*';
+        break;
+    default:
+        nowInUnderrun = '?';
+        break;
+    }
+    snprintf(&buffer[7], size-7, " %6d %4u %3u 0x%08x %7u %6u %6u %1c %1d %1d %5u %5.2g %5.2g  "
+            "0x%08x 0x%08x 0x%08x 0x%08x %#5x %9u%c\n",
+            (mClient == 0) ? getpid_cached : mClient->pid(),
+            mStreamType,
+            mFormat,
+            mChannelMask,
+            mSessionId,
+            mFrameCount,
+            mCblk->frameCount,
+            stateChar,
+            mMute,
+            mFillingUpStatus,
+            mCblk->sampleRate,
+            20.0 * log10((vlr & 0xFFFF) / 4096.0),
+            20.0 * log10((vlr >> 16) / 4096.0),
+            mCblk->server,
+            mCblk->user,
+            (int)mMainBuffer,
+            (int)mAuxBuffer,
+            mCblk->flags,
+            mUnderrunCount,
+            nowInUnderrun);
+!!!809868.cpp!!!	start(in event : sync_event_t = AudioSystem::SYNC_EVENT_NONE, in triggerSession : int = 0) : status_t
+    status_t status = NO_ERROR;
+    ALOGV("start(%d), calling pid %d session %d",
+            mName, IPCThreadState::self()->getCallingPid(), mSessionId);
+
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        Mutex::Autolock _l(thread->mLock);
+        track_state state = mState;
+        // here the track could be either new, or restarted
+        // in both cases "unstop" the track
+        if (mState == PAUSED) {
+            mState = TrackBase::RESUMING;
+            ALOGV("PAUSED => RESUMING (%d) on thread %p", mName, this);
+        } else {
+            mState = TrackBase::ACTIVE;
+            ALOGV("? => ACTIVE (%d) on thread %p", mName, this);
+        }
+
+        if (!isOutputTrack() && state != ACTIVE && state != RESUMING) {
+            thread->mLock.unlock();
+            status = AudioSystem::startOutput(thread->id(), mStreamType, mSessionId);
+            thread->mLock.lock();
+
+#ifdef ADD_BATTERY_DATA
+            // to track the speaker usage
+            if (status == NO_ERROR) {
+                addBatteryData(IMediaPlayerService::kBatteryDataAudioFlingerStart);
+            }
+#endif
+        }
+        if (status == NO_ERROR) {
+            PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
+            playbackThread->addTrack_l(this);
+        } else {
+            mState = state;
+            triggerEvents(AudioSystem::SYNC_EVENT_PRESENTATION_COMPLETE);
+        }
+    } else {
+        status = BAD_VALUE;
+    }
+    return status;
+!!!809996.cpp!!!	stop() : void
+    ALOGV("stop(%d), calling pid %d", mName, IPCThreadState::self()->getCallingPid());
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        Mutex::Autolock _l(thread->mLock);
+        track_state state = mState;
+        if (state == RESUMING || state == ACTIVE || state == PAUSING || state == PAUSED) {
+            // If the track is not active (PAUSED and buffers full), flush buffers
+            PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
+            if (playbackThread->mActiveTracks.indexOf(this) < 0) {
+                reset();
+                mState = STOPPED;
+            } else if (!isFastTrack()) {
+                mState = STOPPED;
+            } else {
+                // prepareTracks_l() will set state to STOPPING_2 after next underrun,
+                // and then to STOPPED and reset() when presentation is complete
+                mState = STOPPING_1;
+            }
+            ALOGV("not stopping/stopped => stopping/stopped (%d) on thread %p", mName, playbackThread);
+        }
+        if (!isOutputTrack() && (state == ACTIVE || state == RESUMING)) {
+            thread->mLock.unlock();
+            AudioSystem::stopOutput(thread->id(), mStreamType, mSessionId);
+            thread->mLock.lock();
+
+#ifdef ADD_BATTERY_DATA
+            // to track the speaker usage
+            addBatteryData(IMediaPlayerService::kBatteryDataAudioFlingerStop);
+#endif
+        }
+    }
+!!!810124.cpp!!!	pause() : void
+    ALOGV("pause(%d), calling pid %d", mName, IPCThreadState::self()->getCallingPid());
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        Mutex::Autolock _l(thread->mLock);
+        if (mState == ACTIVE || mState == RESUMING) {
+            mState = PAUSING;
+            ALOGV("ACTIVE/RESUMING => PAUSING (%d) on thread %p", mName, thread.get());
+            if (!isOutputTrack()) {
+                thread->mLock.unlock();
+                AudioSystem::stopOutput(thread->id(), mStreamType, mSessionId);
+                thread->mLock.lock();
+
+#ifdef ADD_BATTERY_DATA
+                // to track the speaker usage
+                addBatteryData(IMediaPlayerService::kBatteryDataAudioFlingerStop);
+#endif
+            }
+        }
+    }
+!!!810252.cpp!!!	flush() : void
+    ALOGV("flush(%d)", mName);
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        Mutex::Autolock _l(thread->mLock);
+        if (mState != STOPPING_1 && mState != STOPPING_2 && mState != STOPPED && mState != PAUSED &&
+                mState != PAUSING && mState != IDLE && mState != FLUSHED) {
+            return;
+        }
+        // No point remaining in PAUSED state after a flush => go to
+        // FLUSHED state
+        mState = FLUSHED;
+        // do not reset the track if it is still in the process of being stopped or paused.
+        // this will be done by prepareTracks_l() when the track is stopped.
+        // prepareTracks_l() will see mState == FLUSHED, then
+        // remove from active track list, reset(), and trigger presentation complete
+        PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
+        if (playbackThread->mActiveTracks.indexOf(this) < 0) {
+            reset();
+        }
+    }
+!!!810380.cpp!!!	destroy() : void
+    // NOTE: destroyTrack_l() can remove a strong reference to this Track
+    // by removing it from mTracks vector, so there is a risk that this Tracks's
+    // destructor is called. As the destructor needs to lock mLock,
+    // we must acquire a strong reference on this Track before locking mLock
+    // here so that the destructor is called only when exiting this function.
+    // On the other hand, as long as Track::destroy() is only called by
+    // TrackHandle destructor, the TrackHandle still holds a strong ref on
+    // this Track with its member mTrack.
+    sp<Track> keep(this);
+    { // scope for mLock
+        sp<ThreadBase> thread = mThread.promote();
+        if (thread != 0) {
+            if (!isOutputTrack()) {
+                if (mState == ACTIVE || mState == RESUMING) {
+                    AudioSystem::stopOutput(thread->id(), mStreamType, mSessionId);
+
+#ifdef ADD_BATTERY_DATA
+                    // to track the speaker usage
+                    addBatteryData(IMediaPlayerService::kBatteryDataAudioFlingerStop);
+#endif
+                }
+                AudioSystem::releaseOutput(thread->id());
+            }
+            Mutex::Autolock _l(thread->mLock);
+            PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
+            playbackThread->destroyTrack_l(this);
+        }
+    }
+!!!810508.cpp!!!	mute(in muted : bool) : void
+    mMute = muted;
+!!!810892.cpp!!!	attachAuxEffect(in EffectId : int) : status_t
+    status_t status = DEAD_OBJECT;
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
+        sp<AudioFlinger> af = mClient->audioFlinger();
+
+        Mutex::Autolock _l(af->mLock);
+
+        sp<PlaybackThread> srcThread = af->getEffectThread_l(AUDIO_SESSION_OUTPUT_MIX, EffectId);
+
+        if (EffectId != 0 && srcThread != 0 && playbackThread != srcThread.get()) {
+            Mutex::Autolock _dl(playbackThread->mLock);
+            Mutex::Autolock _sl(srcThread->mLock);
+            sp<EffectChain> chain = srcThread->getEffectChain_l(AUDIO_SESSION_OUTPUT_MIX);
+            if (chain == 0) {
+                return INVALID_OPERATION;
+            }
+
+            sp<EffectModule> effect = chain->getEffectFromId_l(EffectId);
+            if (effect == 0) {
+                return INVALID_OPERATION;
+            }
+            srcThread->removeEffect_l(effect);
+            playbackThread->addEffect_l(effect);
+            // removeEffect_l() has stopped the effect if it was active so it must be restarted
+            if (effect->state() == EffectModule::ACTIVE ||
+                    effect->state() == EffectModule::STOPPING) {
+                effect->start();
+            }
+
+            sp<EffectChain> dstChain = effect->chain().promote();
+            if (dstChain == 0) {
+                srcThread->addEffect_l(effect);
+                return INVALID_OPERATION;
+            }
+            AudioSystem::unregisterEffect(effect->id());
+            AudioSystem::registerEffect(&effect->desc(),
+                                        srcThread->id(),
+                                        dstChain->strategy(),
+                                        AUDIO_SESSION_OUTPUT_MIX,
+                                        effect->id());
+        }
+        status = playbackThread->attachAuxEffect(this, EffectId);
+    }
+    return status;
+!!!811020.cpp!!!	setAuxBuffer(in EffectId : int, inout buffer : int32_t) : void
+    mAuxEffectId = EffectId;
+    mAuxBuffer = buffer;
+!!!811660.cpp!!!	getVolumeLR() : uint32_t
+    // called by FastMixer, so not allowed to take any locks, block, or do I/O including logs
+    ALOG_ASSERT(isFastTrack() && (mCblk != NULL));
+    uint32_t vlr = mCblk->getVolumeLR();
+    uint32_t vl = vlr & 0xFFFF;
+    uint32_t vr = vlr >> 16;
+    // track volumes come from shared memory, so can't be trusted and must be clamped
+    if (vl > MAX_GAIN_INT) {
+        vl = MAX_GAIN_INT;
+    }
+    if (vr > MAX_GAIN_INT) {
+        vr = MAX_GAIN_INT;
+    }
+    // now apply the cached master volume and stream type volume;
+    // this is trusted but lacks any synchronization or barrier so may be stale
+    float v = mCachedVolume;
+    vl *= v;
+    vr *= v;
+    // re-combine into U4.16
+    vlr = (vr << 16) | (vl & 0xFFFF);
+    // FIXME look at mute, pause, and stop flags
+    return vlr;
+!!!811788.cpp!!!	setSyncEvent(in event : sp<SyncEvent>) : status_t
+    if (mState == TERMINATED || mState == PAUSED ||
+            ((framesReady() == 0) && ((mSharedBuffer != 0) ||
+                                      (mState == STOPPED)))) {
+        ALOGW("Track::setSyncEvent() in invalid state %d on session %d %s mode, framesReady %d ",
+              mState, mSessionId, (mSharedBuffer != 0) ? "static" : "stream", framesReady());
+        event->cancel();
+        return INVALID_OPERATION;
+    }
+    (void) TrackBase::setSyncEvent(event);
+    return NO_ERROR;
+!!!812172.cpp!!!	getNextBuffer(inout buffer : Buffer, in pts : int64_t = kInvalidPTS) : status_t
+    audio_track_cblk_t* cblk = this->cblk();
+    uint32_t framesReady;
+    uint32_t framesReq = buffer->frameCount;
+
+    // Check if last stepServer failed, try to step now
+    if (mStepServerFailed) {
+        // FIXME When called by fast mixer, this takes a mutex with tryLock().
+        //       Since the fast mixer is higher priority than client callback thread,
+        //       it does not result in priority inversion for client.
+        //       But a non-blocking solution would be preferable to avoid
+        //       fast mixer being unable to tryLock(), and
+        //       to avoid the extra context switches if the client wakes up,
+        //       discovers the mutex is locked, then has to wait for fast mixer to unlock.
+        if (!step())  goto getNextBuffer_exit;
+        ALOGV("stepServer recovered");
+        mStepServerFailed = false;
+    }
+
+    // FIXME Same as above
+    framesReady = cblk->framesReady();
+
+    if (CC_LIKELY(framesReady)) {
+        uint32_t s = cblk->server;
+        uint32_t bufferEnd = cblk->serverBase + cblk->frameCount;
+
+        bufferEnd = (cblk->loopEnd < bufferEnd) ? cblk->loopEnd : bufferEnd;
+        if (framesReq > framesReady) {
+            framesReq = framesReady;
+        }
+        if (framesReq > bufferEnd - s) {
+            framesReq = bufferEnd - s;
+        }
+
+        buffer->raw = getBuffer(s, framesReq);
+        buffer->frameCount = framesReq;
+        return NO_ERROR;
+    }
+
+getNextBuffer_exit:
+    buffer->raw = NULL;
+    buffer->frameCount = 0;
+    ALOGV("getNextBuffer() no more data for track %d on thread %p", mName, mThread.unsafe_get());
+    return NOT_ENOUGH_DATA;
+!!!812300.cpp!!!	framesReady() : size_t
+    return mCblk->framesReady();
+!!!812940.cpp!!!	isReady() : bool
+    if (mFillingUpStatus != FS_FILLING || isStopped() || isPausing()) return true;
+
+    if (framesReady() >= mCblk->frameCount ||
+            (mCblk->flags & CBLK_FORCEREADY_MSK)) {
+        mFillingUpStatus = FS_FILLED;
+        android_atomic_and(~CBLK_FORCEREADY_MSK, &mCblk->flags);
+        return true;
+    }
+    return false;
+!!!813196.cpp!!!	reset() : void
+    // Do not reset twice to avoid discarding data written just after a flush and before
+    // the audioflinger thread detects the track is stopped.
+    if (!mResetDone) {
+        TrackBase::reset();
+        // Force underrun condition to avoid false underrun callback until first data is
+        // written to buffer
+        android_atomic_and(~CBLK_FORCEREADY_MSK, &mCblk->flags);
+        android_atomic_or(CBLK_UNDERRUN_ON, &mCblk->flags);
+        mFillingUpStatus = FS_FILLING;
+        mResetDone = true;
+        if (mState == FLUSHED) {
+            mState = IDLE;
+        }
+    }
+!!!813580.cpp!!!	presentationComplete(in framesWritten : size_t, in audioHalFrames : size_t) : bool
+    // a track is considered presented when the total number of frames written to audio HAL
+    // corresponds to the number of frames written when presentationComplete() is called for the
+    // first time (mPresentationCompleteFrames == 0) plus the buffer filling status at that time.
+    if (mPresentationCompleteFrames == 0) {
+        mPresentationCompleteFrames = framesWritten + audioHalFrames;
+        ALOGV("presentationComplete() reset: mPresentationCompleteFrames %d audioHalFrames %d",
+                  mPresentationCompleteFrames, audioHalFrames);
+    }
+    if (framesWritten >= mPresentationCompleteFrames) {
+        ALOGV("presentationComplete() session %d complete: framesWritten %d",
+                  mSessionId, framesWritten);
+        triggerEvents(AudioSystem::SYNC_EVENT_PRESENTATION_COMPLETE);
+        return true;
+    }
+    return false;
+!!!813708.cpp!!!	triggerEvents(in type : sync_event_t) : void
+    for (int i = 0; i < (int)mSyncEvents.size(); i++) {
+        if (mSyncEvents[i]->type() == type) {
+            mSyncEvents[i]->trigger();
+            mSyncEvents.removeAt(i);
+            i--;
+        }
+    }

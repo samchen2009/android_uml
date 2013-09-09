@@ -1,0 +1,404 @@
+class LauncherDataProvider
+!!!13457292.java!!!	LauncherDataProvider(inout context : Context)
+        this(context, true /* register for updates */);
+!!!13457420.java!!!	LauncherDataProvider(inout context : Context, inout registerForUpdates : boolean)
+        mContext = context;
+        mContentResolver = context.getContentResolver();
+        mLauncherItems = Collections.synchronizedMap(new HashMap<String, LauncherItemInfo>());
+        mHandlerThread = new HandlerThread("launcher_data_provider");
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper()) {
+
+            @Override
+            public void handleMessage(Message msg) {
+                if (msg.what == MSG_RELOAD_LAUNCHER_ITEMS) {
+                    mLauncherItems.clear();
+                    ensureLauncherItemsExist();
+                    notifyChange(false);
+                } else if (msg.what == MSG_REFRESH_DEFAULT_SHORTCUTS_DATABASE) {
+                    refreshDefaultShortcutsDatabase();
+                }
+            }
+        };
+        if (registerForUpdates) {
+            setupBroadcastReceiver();
+            setupContentObserver();
+        }
+!!!13457548.java!!!	setupBroadcastReceiver() : void
+        mBroadcastReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (Intent.ACTION_LOCALE_CHANGED.equals(intent.getAction())) {
+                    queueRefreshDefaultShortcutsDatabase();
+                }
+                queueReloadLauncherItems();
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        filter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        filter.addDataScheme("package");
+        mContext.registerReceiver(mBroadcastReceiver, filter);
+        filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_EXTERNAL_APPLICATIONS_AVAILABLE);
+        filter.addAction(Intent.ACTION_EXTERNAL_APPLICATIONS_UNAVAILABLE);
+        filter.addAction(Intent.ACTION_LOCALE_CHANGED);
+        mContext.registerReceiver(mBroadcastReceiver, filter);
+!!!13457676.java!!!	setupContentObserver() : void
+        if (mContentObserver == null) {
+            mContentObserver = new ContentObserver(mHandler) {
+
+                @Override
+                public void onChange(boolean selfChange) {
+                    super.onChange(selfChange);
+                    queueReloadLauncherItems();
+                }
+
+            };
+            mContext.getContentResolver().registerContentObserver(ShortcutColumns.CONTENT_URI, true,
+                    mContentObserver);
+        }
+!!!13457804.java!!!	destroy() : void
+        if (mBroadcastReceiver != null) {
+            mContext.unregisterReceiver(mBroadcastReceiver);
+            mBroadcastReceiver = null;
+        }
+        if (mContentObserver != null) {
+            mContext.getContentResolver().unregisterContentObserver(mContentObserver);
+            mContentObserver = null;
+        }
+        mHandlerThread.quit();
+!!!13457932.java!!!	getMoreItems() : LauncherItemInfo
+        ensureLauncherItemsExist();
+        ArrayList<LauncherItemInfo> returnList = new ArrayList<LauncherItemInfo>();
+        returnList.addAll(mLauncherItems.values());
+        Collections.sort(returnList);
+        return returnList;
+!!!13458060.java!!!	getQuickListItems(in quickListId : int) : LauncherItemInfo
+        ensureLauncherItemsExist();
+        ArrayList<LauncherItemInfo> returnList = new ArrayList<LauncherItemInfo>();
+        Cursor c = null;
+        try {
+            c = mContentResolver.query(QuickListContentsColumns.CONTENT_URI,
+                    Settings.QUICKLIST_PROJECTION,
+                    QuickListContentsColumns.QUICKLIST_ID + " = ?",
+                    new String[] { String.valueOf(quickListId) },
+                    QuickListContentsColumns.QUICKLIST_INDEX + " ASC");
+            while (c != null && c.moveToNext()) {
+                int index = c.getInt(Settings.QUICKLIST_PROJECTION_ITEM_INDEX_INDEX);
+                LauncherItemInfo info = null;
+                String itemId = c.getString(Settings.QUICKLIST_PROJECTION_ITEM_ID_INDEX);
+                info = mLauncherItems.get(itemId);
+                while (returnList.size() < index) {
+                    returnList.add(null);
+                }
+                // If the info cannot be found in the list of launcher items, try the fallback item
+                // id if present.
+                if (info == null) {
+                    itemId = c.getString(Settings.QUICKLIST_PROJECTION_ITEM_FALLBACK_ID_INDEX);
+                    info = mLauncherItems.get(itemId);
+                }
+                returnList.add(index, info);
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return returnList;
+!!!13458188.java!!!	setQuickListItem(in quickListId : int, in index : int, inout info : LauncherItemInfo) : void
+        String selection = QuickListContentsColumns.QUICKLIST_ID + " = ? AND " +
+                QuickListContentsColumns.QUICKLIST_INDEX + " = ?";
+        String[] selectionArgs = new String[] {
+                String.valueOf(quickListId),
+                String.valueOf(index)
+        };
+        if (info == null) {
+            // This is a delete.
+            mContentResolver.delete(QuickListContentsColumns.CONTENT_URI, selection, selectionArgs);
+            return;
+        }
+        // Otherwise, check if there's already an item at that index.
+        boolean found;
+        Cursor c = null;
+        try {
+            c = mContentResolver.query(QuickListContentsColumns.CONTENT_URI,
+                    new String[] { QuickListContentsColumns._ID },
+                    selection, selectionArgs, null);
+            found = c.moveToNext();
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        ContentValues values = new ContentValues();
+        values.put(QuickListContentsColumns.QUICKLIST_ID, quickListId);
+        values.put(QuickListContentsColumns.ITEM_TYPE, info.getItemTypeDbValue());
+        values.put(QuickListContentsColumns.ITEM_ID, info.getLauncherId());
+        values.put(QuickListContentsColumns.QUICKLIST_INDEX, index);
+        if (found) {
+            // If there is an item, update row.
+            mContentResolver.update(QuickListContentsColumns.CONTENT_URI,
+                    values, selection, selectionArgs);
+        } else {
+            // If not, insert row.
+            mContentResolver.insert(QuickListContentsColumns.CONTENT_URI, values);
+        }
+        // Don't bother notifying the UI since it was probably the one that caused the change.
+!!!13458316.java!!!	setQuickListItems(in quickListId : int, inout infos : List<LauncherItemInfo>) : void
+        String selection = QuickListContentsColumns.QUICKLIST_ID + " = ?";
+        String[] selectionArgs = new String[] {
+                String.valueOf(quickListId)
+        };
+        mContentResolver.delete(QuickListContentsColumns.CONTENT_URI, selection, selectionArgs);
+        int index = 0;
+        for (LauncherItemInfo info : infos) {
+            if (info != null) {
+                // Might have nulls due to apps being uninstalled.
+                ContentValues values = new ContentValues();
+                values.put(QuickListContentsColumns.QUICKLIST_ID, quickListId);
+                values.put(QuickListContentsColumns.ITEM_TYPE, info.getItemTypeDbValue());
+                values.put(QuickListContentsColumns.ITEM_ID, info.getLauncherId());
+                values.put(QuickListContentsColumns.QUICKLIST_INDEX, index);
+                mContentResolver.insert(QuickListContentsColumns.CONTENT_URI, values);
+            }
+            index++;
+        }
+!!!13458444.java!!!	addShortcut(inout info : ShortcutInfo) : void
+        if (isAppDuplicate(info)) {
+            // Don't add a duplicate shortcut if an app icon exists.
+            return;
+        }
+        ContentValues values = new ContentValues();
+        info.setContentValues(values);
+        Uri contentUri = mContentResolver.insert(ShortcutColumns.CONTENT_URI, values);
+        // Update the ID of the input item when inserted.
+        info.setId(ContentUris.parseId(contentUri));
+        // Add to map.
+        mLauncherItems.put(info.getLauncherId(), info);
+        notifyChange(false);
+!!!13458572.java!!!	removeShortcut(inout info : ShortcutInfo) : void
+        long id = info.getId();
+        // Remove from map.
+        mLauncherItems.remove(ShortcutInfo.createLauncherId(id));
+        deleteShortcutFromDatabase(id);
+        notifyChange(false);
+!!!13458700.java!!!	deleteShortcutFromDatabase(in shortcutId : long) : void
+        String[] selectionArgs = new String[] { String.valueOf(shortcutId) };
+        // Delete from shortcuts table.
+        mContentResolver.delete(ShortcutColumns.CONTENT_URI,
+                ShortcutColumns._ID + " = ?",
+                selectionArgs);
+        // Delete any quicklist items which reference this shortcut.
+        mContentResolver.delete(QuickListContentsColumns.CONTENT_URI,
+                QuickListContentsColumns.ITEM_TYPE + " = " + QuickListContentsColumns.TYPE_SHORTCUT
+                + " AND " + QuickListContentsColumns.ITEM_ID + " = ?",
+                selectionArgs);
+!!!13458828.java!!!	shortcutExists(inout shortcut : ShortcutInfo) : boolean
+        ensureLauncherItemsExist();
+        synchronized (mLauncherItems) {
+            for (LauncherItemInfo info : mLauncherItems.values()) {
+                if (!(info instanceof ShortcutInfo)) {
+                    continue;
+                }
+                if (((ShortcutInfo) info).getIntent().filterEquals(shortcut.getIntent())
+                        && info.getTitle().equals(shortcut.getTitle())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+!!!13458956.java!!!	getCanvasItems(in canvasId : int) : CanvasItemInfo
+        ArrayList<CanvasItemInfo> returnList = new ArrayList<CanvasItemInfo>();
+        Cursor c = null;
+        try {
+            c = mContentResolver.query(CanvasContentsColumns.CONTENT_URI,
+                    Settings.CANVAS_CONTENTS_PROJECTION,
+                    CanvasContentsColumns.CANVAS_ID + " = ?",
+                    new String[] { String.valueOf(canvasId) },
+                    null);
+            while (c.moveToNext()) {
+                // TODO(justinkoh): create factory class for this. Not worth it for now since there
+                // is only one type of item.
+                WidgetInfo info = WidgetInfo.readFromCursor(c);
+                if (info != null) {
+                    returnList.add(info);
+                }
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return returnList;
+!!!13459084.java!!!	addCanvasItem(in canvasId : int, inout info : CanvasItemInfo) : void
+        ContentValues values = new ContentValues();
+        info.setContentValues(values);
+        values.put(CanvasContentsColumns.CANVAS_ID, canvasId);
+        Uri contentUri = mContentResolver.insert(CanvasContentsColumns.CONTENT_URI, values);
+        long id = ContentUris.parseId(contentUri);
+        info.setDatabaseId(id);
+!!!13459212.java!!!	removeCanvasItem(inout info : CanvasItemInfo) : void
+        String selection = CanvasContentsColumns._ID + " = ?";
+        String[] selectionArgs = new String[] { String.valueOf(info.getDatabaseId()) };
+        mContentResolver.delete(CanvasContentsColumns.CONTENT_URI, selection, selectionArgs);
+!!!13459340.java!!!	updateCanvasItem(inout info : CanvasItemInfo) : void
+        String selection = CanvasContentsColumns._ID + " = ?";
+        String[] selectionArgs = new String[] { String.valueOf(info.getDatabaseId()) };
+        ContentValues values = new ContentValues();
+        info.setContentValues(values);
+        mContentResolver.update(CanvasContentsColumns.CONTENT_URI, values, selection,
+                selectionArgs);
+!!!13459468.java!!!	ensureLauncherItemsExist() : void
+        if (mLauncherItems.size() == 0) {
+            addApps(mLauncherItems);
+            addShortcuts(mLauncherItems);
+        }
+!!!13459596.java!!!	addApps(inout itemMap : Map<String, LauncherItemInfo>) : void
+        PackageManager manager = mContext.getPackageManager();
+        Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
+        mainIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> activities = manager.queryIntentActivities(mainIntent, 0);
+        int activityCount = (activities == null) ? 0: activities.size();
+        for (int index = 0; index < activityCount; ++index) {
+            ResolveInfo info = activities.get(index);
+            CharSequence title = info.loadLabel(manager);
+            ShortcutIconResource iconResource = new ShortcutIconResource();
+            boolean isDownloaded = false;
+            boolean isUpdatedSystemApp = false;
+            try {
+                Resources resources = manager.getResourcesForApplication(
+                        info.activityInfo.applicationInfo);
+                iconResource.packageName = info.activityInfo.packageName;
+                int iconResourceId = info.getIconResource();
+                if (iconResourceId != 0) {
+                    iconResource.resourceName = resources.getResourceName(iconResourceId);
+                } else {
+                    iconResource = null;
+                }
+                int appFlags = manager.getApplicationInfo(info.activityInfo.packageName, 0).flags;
+                isDownloaded = (appFlags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0;
+                isUpdatedSystemApp = (appFlags &
+                        android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0;
+            } catch (PackageManager.NameNotFoundException e) {
+                iconResource = null;
+            }
+            Drawable drawable = null;
+            if (iconResource != null) {
+                drawable = Views.loadRemoteDrawable(mContext, iconResource);
+            }
+            Intent intent = new Intent(Intent.ACTION_MAIN);
+            intent.setClassName(info.activityInfo.packageName, info.activityInfo.name);
+            ApplicationInfo appInfo = new ApplicationInfo(title, drawable, intent, isDownloaded,
+                    isUpdatedSystemApp);
+            itemMap.put(appInfo.getLauncherId(), appInfo);
+        }
+!!!13459724.java!!!	refreshDefaultShortcutsDatabase() : void
+        List<ShortcutInfo> defaults = new DefaultItemProvider(mContext).getAllDefaultShortcuts(true);
+        for (ShortcutInfo shortcut : defaults) {
+            ContentValues values = new ContentValues();
+            shortcut.setContentValues(values);
+            String selection = ShortcutColumns.INTENT + " = ?";
+            String[] selectionArgs = new String[] { values.getAsString(ShortcutColumns.INTENT) };
+            mContentResolver.update(ShortcutColumns.CONTENT_URI, values, selection, selectionArgs);
+        }
+!!!13459852.java!!!	addShortcuts(inout itemMap : Map<String, LauncherItemInfo>) : void
+        Cursor c = null;
+        try {
+            c = mContentResolver.query(ShortcutColumns.CONTENT_URI, Settings.SHORTCUT_PROJECTION,
+                    null, null, null);
+            while (c != null && c.moveToNext()) {
+                ShortcutInfo info = new ShortcutInfo();
+                info.setId(c.getLong(Settings.SHORTCUT_PROJECTION_ID_INDEX));
+                info.setTitle(c.getString(Settings.SHORTCUT_PROJECTION_TITLE_INDEX));
+                if (!c.isNull(Settings.SHORTCUT_PROJECTION_ICON_BITMAP_INDEX)) {
+                    byte[] iconBitmapBytes = c.getBlob(
+                            Settings.SHORTCUT_PROJECTION_ICON_BITMAP_INDEX);
+                    info.setIconBitmap(BitmapFactory.decodeByteArray(iconBitmapBytes, 0,
+                            iconBitmapBytes.length));
+                }
+                if (!c.isNull(Settings.SHORTCUT_PROJECTION_ICON_PACKAGE_INDEX) &&
+                        !c.isNull(Settings.SHORTCUT_PROJECTION_ICON_RESOURCE_INDEX)) {
+                    ShortcutIconResource iconResource = new ShortcutIconResource();
+                    iconResource.packageName = c.getString(
+                            Settings.SHORTCUT_PROJECTION_ICON_PACKAGE_INDEX);
+                    iconResource.resourceName = c.getString(
+                            Settings.SHORTCUT_PROJECTION_ICON_RESOURCE_INDEX);
+                    info.setIconResource(iconResource);
+
+                    // Check that package and icon exists.
+                    try {
+                        Resources resources = mContext.getPackageManager()
+                                .getResourcesForApplication(iconResource.packageName);
+                        int id = resources.getIdentifier(iconResource.resourceName, null, null);
+                        resources.getDrawable(id);
+                    } catch (PackageManager.NameNotFoundException ex) {
+                        // Can not find an icon for shortcut. Most likely the app was uninstalled.
+                        // Delete it from database.
+                        deleteShortcutFromDatabase(info.getId());
+                        // And do not add it to output;
+                        continue;
+                    } catch (Resources.NotFoundException ex) {
+                        // Can not find an icon for shortcut. Most likely the app was uninstalled.
+                        // Delete it from database.
+                        deleteShortcutFromDatabase(info.getId());
+                        // And do not add it to output;
+                        continue;
+                    }
+                }
+                try {
+                    info.setIntent(Intent.parseUri(
+                            c.getString(Settings.SHORTCUT_PROJECTION_INTENT_INDEX),
+                            Intent.URI_INTENT_SCHEME));
+                } catch (URISyntaxException e) {
+                    // Bad data.
+                    info = null;
+                }
+                if (info != null) {
+                    // Don't add a duplicate shortcut if an app icon exists.
+                    if (!isAppDuplicate(info)) {
+                        itemMap.put(info.getLauncherId(), info);
+                    }
+                }
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+!!!13459980.java!!!	queueRefreshDefaultShortcutsDatabase() : void
+        mHandler.removeMessages(MSG_REFRESH_DEFAULT_SHORTCUTS_DATABASE);
+        mHandler.sendEmptyMessageDelayed(MSG_REFRESH_DEFAULT_SHORTCUTS_DATABASE, RELOAD_LAUNCHER_ITEMS_DELAY_MS);
+!!!13460108.java!!!	queueReloadLauncherItems() : void
+        mHandler.removeMessages(MSG_RELOAD_LAUNCHER_ITEMS);
+        mHandler.sendEmptyMessageDelayed(MSG_RELOAD_LAUNCHER_ITEMS, RELOAD_LAUNCHER_ITEMS_DELAY_MS);
+!!!13460236.java!!!	isAppDuplicate(inout shortcut : ShortcutInfo) : boolean
+        synchronized (mLauncherItems) {
+            for (LauncherItemInfo info : mLauncherItems.values()) {
+                if (!(info instanceof ApplicationInfo)) {
+                    continue;
+                }
+                if (detectDuplicate(shortcut, (ApplicationInfo) info)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+!!!13460364.java!!!	detectDuplicate(inout shortcut : ShortcutInfo, inout app : ApplicationInfo) : boolean
+        Intent intent1 = shortcut.getIntent();
+        Intent intent2 = app.getIntent();
+
+        if (!equalsHelper(intent1.getAction(), intent2.getAction())) {
+            return false;
+        }
+
+        return equalsHelper(intent1.getComponent(), intent2.getComponent());
+!!!13460492.java!!!	equalsHelper(inout o1 : Object, inout o2 : Object) : boolean
+        if (o1 == null && o2 == null) {
+            return true;
+        }
+        if (o1 == null || o2 == null) {
+            return false;
+        }
+        return o1.equals(o2);

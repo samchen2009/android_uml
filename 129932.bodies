@@ -1,0 +1,132 @@
+class ALooper
+!!!430604.cpp!!!	setName(in name : char) : void
+    mName = name;
+!!!430732.cpp!!!	registerHandler(in handler : sp<AHandler>) : handler_id
+    return gLooperRoster.registerHandler(this, handler);
+!!!430860.cpp!!!	unregisterHandler(in handlerID : handler_id) : void
+    gLooperRoster.unregisterHandler(handlerID);
+!!!430988.cpp!!!	start(in runOnCallingThread : bool = false, in canCallJava : bool = false, in priority : int32_t = PRIORITY_DEFAULT) : status_t
+    if (runOnCallingThread) {
+        {
+            Mutex::Autolock autoLock(mLock);
+
+            if (mThread != NULL || mRunningLocally) {
+                return INVALID_OPERATION;
+            }
+
+            mRunningLocally = true;
+        }
+
+        do {
+        } while (loop());
+
+        return OK;
+    }
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (mThread != NULL || mRunningLocally) {
+        return INVALID_OPERATION;
+    }
+
+    mThread = new LooperThread(this, canCallJava);
+
+    status_t err = mThread->run(
+            mName.empty() ? "ALooper" : mName.c_str(), priority);
+    if (err != OK) {
+        mThread.clear();
+    }
+
+    return err;
+!!!431116.cpp!!!	stop() : status_t
+    sp<LooperThread> thread;
+    bool runningLocally;
+
+    {
+        Mutex::Autolock autoLock(mLock);
+
+        thread = mThread;
+        runningLocally = mRunningLocally;
+        mThread.clear();
+        mRunningLocally = false;
+    }
+
+    if (thread == NULL && !runningLocally) {
+        return INVALID_OPERATION;
+    }
+
+    if (thread != NULL) {
+        thread->requestExit();
+    }
+
+    mQueueChangedCondition.signal();
+
+    if (!runningLocally && !thread->isCurrentThread()) {
+        // If not running locally and this thread _is_ the looper thread,
+        // the loop() function will return and never be called again.
+        thread->requestExitAndWait();
+    }
+
+    return OK;
+!!!431244.cpp!!!	GetNowUs() : int64_t
+    return systemTime(SYSTEM_TIME_MONOTONIC) / 1000ll;
+!!!431372.cpp!!!	~ALooper()
+    stop();
+!!!431500.cpp!!!	post(in msg : sp<AMessage>, in delayUs : int64_t) : void
+    Mutex::Autolock autoLock(mLock);
+
+    int64_t whenUs;
+    if (delayUs > 0) {
+        whenUs = GetNowUs() + delayUs;
+    } else {
+        whenUs = GetNowUs();
+    }
+
+    List<Event>::iterator it = mEventQueue.begin();
+    while (it != mEventQueue.end() && (*it).mWhenUs <= whenUs) {
+        ++it;
+    }
+
+    Event event;
+    event.mWhenUs = whenUs;
+    event.mMessage = msg;
+
+    if (it == mEventQueue.begin()) {
+        mQueueChangedCondition.signal();
+    }
+
+    mEventQueue.insert(it, event);
+!!!431628.cpp!!!	loop() : bool
+    Event event;
+
+    {
+        Mutex::Autolock autoLock(mLock);
+        if (mThread == NULL && !mRunningLocally) {
+            return false;
+        }
+        if (mEventQueue.empty()) {
+            mQueueChangedCondition.wait(mLock);
+            return true;
+        }
+        int64_t whenUs = (*mEventQueue.begin()).mWhenUs;
+        int64_t nowUs = GetNowUs();
+
+        if (whenUs > nowUs) {
+            int64_t delayUs = whenUs - nowUs;
+            mQueueChangedCondition.waitRelative(mLock, delayUs * 1000ll);
+
+            return true;
+        }
+
+        event = *mEventQueue.begin();
+        mEventQueue.erase(mEventQueue.begin());
+    }
+
+    gLooperRoster.deliverMessage(event.mMessage);
+
+    // NOTE: It's important to note that at this point our "ALooper" object
+    // may no longer exist (its final reference may have gone away while
+    // delivering the message). We have made sure, however, that loop()
+    // won't be called again.
+
+    return true;

@@ -1,0 +1,436 @@
+class ContentService
+!!!3073932.java!!!	getSyncManager() : SyncManager
+        synchronized(mSyncManagerLock) {
+            try {
+                // Try to create the SyncManager, return null if it fails (e.g. the disk is full).
+                if (mSyncManager == null) mSyncManager = new SyncManager(mContext, mFactoryTest);
+            } catch (SQLiteException e) {
+                Log.e(TAG, "Can't create SyncManager", e);
+            }
+            return mSyncManager;
+        }
+!!!3074060.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.DUMP,
+                "caller doesn't have the DUMP permission");
+
+        // This makes it so that future permission checks will be in the context of this
+        // process rather than the caller's process. We will restore this before returning.
+        long identityToken = clearCallingIdentity();
+        try {
+            if (mSyncManager == null) {
+                pw.println("No SyncManager created!  (Disk full?)");
+            } else {
+                mSyncManager.dump(fd, pw);
+            }
+            pw.println();
+            pw.println("Observer tree:");
+            synchronized (mRootNode) {
+                int[] counts = new int[2];
+                final SparseIntArray pidCounts = new SparseIntArray();
+                mRootNode.dumpLocked(fd, pw, args, "", "  ", counts, pidCounts);
+                pw.println();
+                ArrayList<Integer> sorted = new ArrayList<Integer>();
+                for (int i=0; i<pidCounts.size(); i++) {
+                    sorted.add(pidCounts.keyAt(i));
+                }
+                Collections.sort(sorted, new Comparator<Integer>() {
+                    @Override
+                    public int compare(Integer lhs, Integer rhs) {
+                        int lc = pidCounts.get(lhs);
+                        int rc = pidCounts.get(rhs);
+                        if (lc < rc) {
+                            return 1;
+                        } else if (lc > rc) {
+                            return -1;
+                        }
+                        return 0;
+                    }
+
+                });
+                for (int i=0; i<sorted.size(); i++) {
+                    int pid = sorted.get(i);
+                    pw.print("  pid "); pw.print(pid); pw.print(": ");
+                            pw.print(pidCounts.get(pid)); pw.println(" observers");
+                }
+                pw.println();
+                pw.print(" Total number of nodes: "); pw.println(counts[0]);
+                pw.print(" Total number of observers: "); pw.println(counts[1]);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3074188.java!!!	onTransact(in code : int, inout data : Parcel, inout reply : Parcel, in flags : int) : boolean
+        try {
+            return super.onTransact(code, data, reply, flags);
+        } catch (RuntimeException e) {
+            // The content service only throws security exceptions, so let's
+            // log all others.
+            if (!(e instanceof SecurityException)) {
+                Log.e(TAG, "Content Service Crash", e);
+            }
+            throw e;
+        }
+!!!3074316.java!!!	ContentService(inout context : Context, inout factoryTest : boolean)
+        mContext = context;
+        mFactoryTest = factoryTest;
+!!!3074444.java!!!	systemReady() : void
+        getSyncManager();
+!!!3074572.java!!!	registerContentObserver(inout uri : Uri, inout notifyForDescendants : boolean, inout observer : IContentObserver, in userHandle : int) : void
+        if (observer == null || uri == null) {
+            throw new IllegalArgumentException("You must pass a valid uri and observer");
+        }
+
+        final int callingUser = UserHandle.getCallingUserId();
+        if (callingUser != userHandle) {
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.INTERACT_ACROSS_USERS_FULL,
+                    "no permission to observe other users' provider view");
+        }
+
+        if (userHandle < 0) {
+            if (userHandle == UserHandle.USER_CURRENT) {
+                userHandle = ActivityManager.getCurrentUser();
+            } else if (userHandle != UserHandle.USER_ALL) {
+                throw new InvalidParameterException("Bad user handle for registerContentObserver: "
+                        + userHandle);
+            }
+        }
+
+        synchronized (mRootNode) {
+            mRootNode.addObserverLocked(uri, observer, notifyForDescendants, mRootNode,
+                    Binder.getCallingUid(), Binder.getCallingPid(), userHandle);
+            if (false) Log.v(TAG, "Registered observer " + observer + " at " + uri +
+                    " with notifyForDescendants " + notifyForDescendants);
+        }
+!!!3074700.java!!!	registerContentObserver(inout uri : Uri, inout notifyForDescendants : boolean, inout observer : IContentObserver) : void
+        registerContentObserver(uri, notifyForDescendants, observer,
+                UserHandle.getCallingUserId());
+!!!3074828.java!!!	unregisterContentObserver(inout observer : IContentObserver) : void
+        if (observer == null) {
+            throw new IllegalArgumentException("You must pass a valid observer");
+        }
+        synchronized (mRootNode) {
+            mRootNode.removeObserverLocked(observer);
+            if (false) Log.v(TAG, "Unregistered observer " + observer);
+        }
+!!!3074956.java!!!	notifyChange(inout uri : Uri, inout observer : IContentObserver, inout observerWantsSelfNotifications : boolean, inout syncToNetwork : boolean, in userHandle : int) : void
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+            Log.v(TAG, "Notifying update of " + uri + " for user " + userHandle
+                    + " from observer " + observer + ", syncToNetwork " + syncToNetwork);
+        }
+
+        // Notify for any user other than the caller's own requires permission.
+        final int callingUserHandle = UserHandle.getCallingUserId();
+        if (userHandle != callingUserHandle) {
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.INTERACT_ACROSS_USERS_FULL,
+                    "no permission to notify other users");
+        }
+
+        // We passed the permission check; resolve pseudouser targets as appropriate
+        if (userHandle < 0) {
+            if (userHandle == UserHandle.USER_CURRENT) {
+                userHandle = ActivityManager.getCurrentUser();
+            } else if (userHandle != UserHandle.USER_ALL) {
+                throw new InvalidParameterException("Bad user handle for notifyChange: "
+                        + userHandle);
+            }
+        }
+
+        // This makes it so that future permission checks will be in the context of this
+        // process rather than the caller's process. We will restore this before returning.
+        long identityToken = clearCallingIdentity();
+        try {
+            ArrayList<ObserverCall> calls = new ArrayList<ObserverCall>();
+            synchronized (mRootNode) {
+                mRootNode.collectObserversLocked(uri, 0, observer, observerWantsSelfNotifications,
+                        userHandle, calls);
+            }
+            final int numCalls = calls.size();
+            for (int i=0; i<numCalls; i++) {
+                ObserverCall oc = calls.get(i);
+                try {
+                    oc.mObserver.onChange(oc.mSelfChange, uri);
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Notified " + oc.mObserver + " of " + "update at " + uri);
+                    }
+                } catch (RemoteException ex) {
+                    synchronized (mRootNode) {
+                        Log.w(TAG, "Found dead observer, removing");
+                        IBinder binder = oc.mObserver.asBinder();
+                        final ArrayList<ObserverNode.ObserverEntry> list
+                                = oc.mNode.mObservers;
+                        int numList = list.size();
+                        for (int j=0; j<numList; j++) {
+                            ObserverNode.ObserverEntry oe = list.get(j);
+                            if (oe.observer.asBinder() == binder) {
+                                list.remove(j);
+                                j--;
+                                numList--;
+                            }
+                        }
+                    }
+                }
+            }
+            if (syncToNetwork) {
+                SyncManager syncManager = getSyncManager();
+                if (syncManager != null) {
+                    syncManager.scheduleLocalSync(null /* all accounts */, callingUserHandle,
+                            uri.getAuthority());
+                }
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3075084.java!!!	notifyChange(inout uri : Uri, inout observer : IContentObserver, inout observerWantsSelfNotifications : boolean, inout syncToNetwork : boolean) : void
+        notifyChange(uri, observer, observerWantsSelfNotifications, syncToNetwork,
+                UserHandle.getCallingUserId());
+!!!3075340.java!!!	requestSync(inout account : Account, in authority : String, inout extras : Bundle) : void
+        ContentResolver.validateSyncExtrasBundle(extras);
+        int userId = UserHandle.getCallingUserId();
+
+        // This makes it so that future permission checks will be in the context of this
+        // process rather than the caller's process. We will restore this before returning.
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                syncManager.scheduleSync(account, userId, authority, extras, 0 /* no delay */,
+                        false /* onlyThoseWithUnkownSyncableState */);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3075468.java!!!	cancelSync(inout account : Account, in authority : String) : void
+        int userId = UserHandle.getCallingUserId();
+
+        // This makes it so that future permission checks will be in the context of this
+        // process rather than the caller's process. We will restore this before returning.
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                syncManager.clearScheduledSyncOperations(account, userId, authority);
+                syncManager.cancelActiveSync(account, userId, authority);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3075596.java!!!	getSyncAdapterTypes() : SyncAdapterType
+        // This makes it so that future permission checks will be in the context of this
+        // process rather than the caller's process. We will restore this before returning.
+        final int userId = UserHandle.getCallingUserId();
+        final long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            return syncManager.getSyncAdapterTypes(userId);
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3075724.java!!!	getSyncAutomatically(inout account : Account, in providerName : String) : boolean
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_SETTINGS,
+                "no permission to read the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                return syncManager.getSyncStorageEngine().getSyncAutomatically(
+                        account, userId, providerName);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+        return false;
+!!!3075852.java!!!	setSyncAutomatically(inout account : Account, in providerName : String, inout sync : boolean) : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.WRITE_SYNC_SETTINGS,
+                "no permission to write the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                syncManager.getSyncStorageEngine().setSyncAutomatically(
+                        account, userId, providerName, sync);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3075980.java!!!	addPeriodicSync(inout account : Account, in authority : String, inout extras : Bundle, in pollFrequency : long) : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.WRITE_SYNC_SETTINGS,
+                "no permission to write the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            getSyncManager().getSyncStorageEngine().addPeriodicSync(
+                    account, userId, authority, extras, pollFrequency);
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3076108.java!!!	removePeriodicSync(inout account : Account, in authority : String, inout extras : Bundle) : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.WRITE_SYNC_SETTINGS,
+                "no permission to write the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            getSyncManager().getSyncStorageEngine().removePeriodicSync(account, userId, authority,
+                    extras);
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3076236.java!!!	getPeriodicSyncs(inout account : Account, in providerName : String) : PeriodicSync
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_SETTINGS,
+                "no permission to read the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            return getSyncManager().getSyncStorageEngine().getPeriodicSyncs(
+                    account, userId, providerName);
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3076364.java!!!	getIsSyncable(inout account : Account, in providerName : String) : int
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_SETTINGS,
+                "no permission to read the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                return syncManager.getSyncStorageEngine().getIsSyncable(
+                        account, userId, providerName);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+        return -1;
+!!!3076492.java!!!	setIsSyncable(inout account : Account, in providerName : String, in syncable : int) : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.WRITE_SYNC_SETTINGS,
+                "no permission to write the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                syncManager.getSyncStorageEngine().setIsSyncable(
+                        account, userId, providerName, syncable);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3076620.java!!!	getMasterSyncAutomatically() : boolean
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_SETTINGS,
+                "no permission to read the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                return syncManager.getSyncStorageEngine().getMasterSyncAutomatically(userId);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+        return false;
+!!!3076748.java!!!	setMasterSyncAutomatically(inout flag : boolean) : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.WRITE_SYNC_SETTINGS,
+                "no permission to write the sync settings");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                syncManager.getSyncStorageEngine().setMasterSyncAutomatically(flag, userId);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3076876.java!!!	isSyncActive(inout account : Account, in authority : String) : boolean
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_STATS,
+                "no permission to read the sync stats");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                return syncManager.getSyncStorageEngine().isSyncActive(
+                        account, userId, authority);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+        return false;
+!!!3077004.java!!!	getCurrentSyncs() : SyncInfo
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_STATS,
+                "no permission to read the sync stats");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            return getSyncManager().getSyncStorageEngine().getCurrentSyncs(userId);
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3077132.java!!!	getSyncStatus(inout account : Account, in authority : String) : SyncStatusInfo
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_STATS,
+                "no permission to read the sync stats");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                return syncManager.getSyncStorageEngine().getStatusByAccountAndAuthority(
+                        account, userId, authority);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+        return null;
+!!!3077260.java!!!	isSyncPending(inout account : Account, in authority : String) : boolean
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.READ_SYNC_STATS,
+                "no permission to read the sync stats");
+        int userId = UserHandle.getCallingUserId();
+
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null) {
+                return syncManager.getSyncStorageEngine().isSyncPending(account, userId, authority);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+        return false;
+!!!3077388.java!!!	addStatusChangeListener(in mask : int, inout callback : ISyncStatusObserver) : void
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null && callback != null) {
+                syncManager.getSyncStorageEngine().addStatusChangeListener(mask, callback);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3077516.java!!!	removeStatusChangeListener(inout callback : ISyncStatusObserver) : void
+        long identityToken = clearCallingIdentity();
+        try {
+            SyncManager syncManager = getSyncManager();
+            if (syncManager != null && callback != null) {
+                syncManager.getSyncStorageEngine().removeStatusChangeListener(callback);
+            }
+        } finally {
+            restoreCallingIdentity(identityToken);
+        }
+!!!3077644.java!!!	main(inout context : Context, inout factoryTest : boolean) : ContentService
+        ContentService service = new ContentService(context, factoryTest);
+        ServiceManager.addService(ContentResolver.CONTENT_SERVICE_NAME, service);
+        return service;

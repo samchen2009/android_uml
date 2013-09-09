@@ -1,0 +1,352 @@
+class MessageQueue
+!!!2549132.java!!!	addIdleHandler(inout handler : IdleHandler) : void
+        if (handler == null) {
+            throw new NullPointerException("Can't add a null IdleHandler");
+        }
+        synchronized (this) {
+            mIdleHandlers.add(handler);
+        }
+!!!2549260.java!!!	removeIdleHandler(inout handler : IdleHandler) : void
+        synchronized (this) {
+            mIdleHandlers.remove(handler);
+        }
+!!!2549388.java!!!	MessageQueue(inout quitAllowed : boolean)
+        mQuitAllowed = quitAllowed;
+        nativeInit();
+!!!2549516.java!!!	finalize() : void
+        try {
+            nativeDestroy();
+        } finally {
+            super.finalize();
+        }
+!!!2549644.java!!!	next() : Message
+        int pendingIdleHandlerCount = -1; // -1 only during first iteration
+        int nextPollTimeoutMillis = 0;
+
+        for (;;) {
+            if (nextPollTimeoutMillis != 0) {
+                Binder.flushPendingCommands();
+            }
+            nativePollOnce(mPtr, nextPollTimeoutMillis);
+
+            synchronized (this) {
+                if (mQuiting) {
+                    return null;
+                }
+
+                // Try to retrieve the next message.  Return if found.
+                final long now = SystemClock.uptimeMillis();
+                Message prevMsg = null;
+                Message msg = mMessages;
+                if (msg != null && msg.target == null) {
+                    // Stalled by a barrier.  Find the next asynchronous message in the queue.
+                    do {
+                        prevMsg = msg;
+                        msg = msg.next;
+                    } while (msg != null && !msg.isAsynchronous());
+                }
+                if (msg != null) {
+                    if (now < msg.when) {
+                        // Next message is not ready.  Set a timeout to wake up when it is ready.
+                        nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.MAX_VALUE);
+                    } else {
+                        // Got a message.
+                        mBlocked = false;
+                        if (prevMsg != null) {
+                            prevMsg.next = msg.next;
+                        } else {
+                            mMessages = msg.next;
+                        }
+                        msg.next = null;
+                        if (false) Log.v("MessageQueue", "Returning message: " + msg);
+                        msg.markInUse();
+                        return msg;
+                    }
+                } else {
+                    // No more messages.
+                    nextPollTimeoutMillis = -1;
+                }
+
+                // If first time idle, then get the number of idlers to run.
+                // Idle handles only run if the queue is empty or if the first message
+                // in the queue (possibly a barrier) is due to be handled in the future.
+                if (pendingIdleHandlerCount < 0
+                        && (mMessages == null || now < mMessages.when)) {
+                    pendingIdleHandlerCount = mIdleHandlers.size();
+                }
+                if (pendingIdleHandlerCount <= 0) {
+                    // No idle handlers to run.  Loop and wait some more.
+                    mBlocked = true;
+                    continue;
+                }
+
+                if (mPendingIdleHandlers == null) {
+                    mPendingIdleHandlers = new IdleHandler[Math.max(pendingIdleHandlerCount, 4)];
+                }
+                mPendingIdleHandlers = mIdleHandlers.toArray(mPendingIdleHandlers);
+            }
+
+            // Run the idle handlers.
+            // We only ever reach this code block during the first iteration.
+            for (int i = 0; i < pendingIdleHandlerCount; i++) {
+                final IdleHandler idler = mPendingIdleHandlers[i];
+                mPendingIdleHandlers[i] = null; // release the reference to the handler
+
+                boolean keep = false;
+                try {
+                    keep = idler.queueIdle();
+                } catch (Throwable t) {
+                    Log.wtf("MessageQueue", "IdleHandler threw exception", t);
+                }
+
+                if (!keep) {
+                    synchronized (this) {
+                        mIdleHandlers.remove(idler);
+                    }
+                }
+            }
+
+            // Reset the idle handler count to 0 so we do not run them again.
+            pendingIdleHandlerCount = 0;
+
+            // While calling an idle handler, a new message could have been delivered
+            // so go back and look again for a pending message without waiting.
+            nextPollTimeoutMillis = 0;
+        }
+!!!2549772.java!!!	quit() : void
+        if (!mQuitAllowed) {
+            throw new RuntimeException("Main thread not allowed to quit.");
+        }
+
+        synchronized (this) {
+            if (mQuiting) {
+                return;
+            }
+            mQuiting = true;
+        }
+        nativeWake(mPtr);
+!!!2549900.java!!!	enqueueSyncBarrier(in when : long) : int
+        // Enqueue a new sync barrier token.
+        // We don't need to wake the queue because the purpose of a barrier is to stall it.
+        synchronized (this) {
+            final int token = mNextBarrierToken++;
+            final Message msg = Message.obtain();
+            msg.arg1 = token;
+
+            Message prev = null;
+            Message p = mMessages;
+            if (when != 0) {
+                while (p != null && p.when <= when) {
+                    prev = p;
+                    p = p.next;
+                }
+            }
+            if (prev != null) { // invariant: p == prev.next
+                msg.next = p;
+                prev.next = msg;
+            } else {
+                msg.next = p;
+                mMessages = msg;
+            }
+            return token;
+        }
+!!!2550028.java!!!	removeSyncBarrier(in token : int) : void
+        // Remove a sync barrier token from the queue.
+        // If the queue is no longer stalled by a barrier then wake it.
+        final boolean needWake;
+        synchronized (this) {
+            Message prev = null;
+            Message p = mMessages;
+            while (p != null && (p.target != null || p.arg1 != token)) {
+                prev = p;
+                p = p.next;
+            }
+            if (p == null) {
+                throw new IllegalStateException("The specified message queue synchronization "
+                        + " barrier token has not been posted or has already been removed.");
+            }
+            if (prev != null) {
+                prev.next = p.next;
+                needWake = false;
+            } else {
+                mMessages = p.next;
+                needWake = mMessages == null || mMessages.target != null;
+            }
+            p.recycle();
+        }
+        if (needWake) {
+            nativeWake(mPtr);
+        }
+!!!2550156.java!!!	enqueueMessage(inout msg : Message, in when : long) : boolean
+        if (msg.isInUse()) {
+            throw new AndroidRuntimeException(msg + " This message is already in use.");
+        }
+        if (msg.target == null) {
+            throw new AndroidRuntimeException("Message must have a target.");
+        }
+
+        boolean needWake;
+        synchronized (this) {
+            if (mQuiting) {
+                RuntimeException e = new RuntimeException(
+                        msg.target + " sending message to a Handler on a dead thread");
+                Log.w("MessageQueue", e.getMessage(), e);
+                return false;
+            }
+
+            msg.when = when;
+            Message p = mMessages;
+            if (p == null || when == 0 || when < p.when) {
+                // New head, wake up the event queue if blocked.
+                msg.next = p;
+                mMessages = msg;
+                needWake = mBlocked;
+            } else {
+                // Inserted within the middle of the queue.  Usually we don't have to wake
+                // up the event queue unless there is a barrier at the head of the queue
+                // and the message is the earliest asynchronous message in the queue.
+                needWake = mBlocked && p.target == null && msg.isAsynchronous();
+                Message prev;
+                for (;;) {
+                    prev = p;
+                    p = p.next;
+                    if (p == null || when < p.when) {
+                        break;
+                    }
+                    if (needWake && p.isAsynchronous()) {
+                        needWake = false;
+                    }
+                }
+                msg.next = p; // invariant: p == prev.next
+                prev.next = msg;
+            }
+        }
+        if (needWake) {
+            nativeWake(mPtr);
+        }
+        return true;
+!!!2550284.java!!!	hasMessages(inout h : Handler, in what : int, inout object : Object) : boolean
+        if (h == null) {
+            return false;
+        }
+
+        synchronized (this) {
+            Message p = mMessages;
+            while (p != null) {
+                if (p.target == h && p.what == what && (object == null || p.obj == object)) {
+                    return true;
+                }
+                p = p.next;
+            }
+            return false;
+        }
+!!!2550412.java!!!	hasMessages(inout h : Handler, inout r : Runnable, inout object : Object) : boolean
+        if (h == null) {
+            return false;
+        }
+
+        synchronized (this) {
+            Message p = mMessages;
+            while (p != null) {
+                if (p.target == h && p.callback == r && (object == null || p.obj == object)) {
+                    return true;
+                }
+                p = p.next;
+            }
+            return false;
+        }
+!!!2550540.java!!!	removeMessages(inout h : Handler, in what : int, inout object : Object) : void
+        if (h == null) {
+            return;
+        }
+
+        synchronized (this) {
+            Message p = mMessages;
+
+            // Remove all messages at front.
+            while (p != null && p.target == h && p.what == what
+                   && (object == null || p.obj == object)) {
+                Message n = p.next;
+                mMessages = n;
+                p.recycle();
+                p = n;
+            }
+
+            // Remove all messages after front.
+            while (p != null) {
+                Message n = p.next;
+                if (n != null) {
+                    if (n.target == h && n.what == what
+                        && (object == null || n.obj == object)) {
+                        Message nn = n.next;
+                        n.recycle();
+                        p.next = nn;
+                        continue;
+                    }
+                }
+                p = n;
+            }
+        }
+!!!2550668.java!!!	removeMessages(inout h : Handler, inout r : Runnable, inout object : Object) : void
+        if (h == null || r == null) {
+            return;
+        }
+
+        synchronized (this) {
+            Message p = mMessages;
+
+            // Remove all messages at front.
+            while (p != null && p.target == h && p.callback == r
+                   && (object == null || p.obj == object)) {
+                Message n = p.next;
+                mMessages = n;
+                p.recycle();
+                p = n;
+            }
+
+            // Remove all messages after front.
+            while (p != null) {
+                Message n = p.next;
+                if (n != null) {
+                    if (n.target == h && n.callback == r
+                        && (object == null || n.obj == object)) {
+                        Message nn = n.next;
+                        n.recycle();
+                        p.next = nn;
+                        continue;
+                    }
+                }
+                p = n;
+            }
+        }
+!!!2550796.java!!!	removeCallbacksAndMessages(inout h : Handler, inout object : Object) : void
+        if (h == null) {
+            return;
+        }
+
+        synchronized (this) {
+            Message p = mMessages;
+
+            // Remove all messages at front.
+            while (p != null && p.target == h
+                    && (object == null || p.obj == object)) {
+                Message n = p.next;
+                mMessages = n;
+                p.recycle();
+                p = n;
+            }
+
+            // Remove all messages after front.
+            while (p != null) {
+                Message n = p.next;
+                if (n != null) {
+                    if (n.target == h && (object == null || n.obj == object)) {
+                        Message nn = n.next;
+                        n.recycle();
+                        p.next = nn;
+                        continue;
+                    }
+                }
+                p = n;
+            }
+        }

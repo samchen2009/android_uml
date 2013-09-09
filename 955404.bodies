@@ -1,0 +1,206 @@
+class ScaleGestureDetector
+!!!4581644.java!!!	ScaleGestureDetector(inout context : Context, inout listener : OnScaleGestureListener)
+        mContext = context;
+        mListener = listener;
+        mSpanSlop = ViewConfiguration.get(context).getScaledTouchSlop() * 2;
+
+        final Resources res = context.getResources();
+        mTouchMinMajor = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.config_minScalingTouchMajor);
+        mMinSpan = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.config_minScalingSpan);
+!!!4581772.java!!!	addTouchHistory(inout ev : MotionEvent) : void
+        final long currentTime = SystemClock.uptimeMillis();
+        final int count = ev.getPointerCount();
+        boolean accept = currentTime - mTouchHistoryLastAcceptedTime >= TOUCH_STABILIZE_TIME;
+        float total = 0;
+        int sampleCount = 0;
+        for (int i = 0; i < count; i++) {
+            final boolean hasLastAccepted = !Float.isNaN(mTouchHistoryLastAccepted);
+            final int historySize = ev.getHistorySize();
+            final int pointerSampleCount = historySize + 1;
+            for (int h = 0; h < pointerSampleCount; h++) {
+                float major;
+                if (h < historySize) {
+                    major = ev.getHistoricalTouchMajor(i, h);
+                } else {
+                    major = ev.getTouchMajor(i);
+                }
+                if (major < mTouchMinMajor) major = mTouchMinMajor;
+                total += major;
+
+                if (Float.isNaN(mTouchUpper) || major > mTouchUpper) {
+                    mTouchUpper = major;
+                }
+                if (Float.isNaN(mTouchLower) || major < mTouchLower) {
+                    mTouchLower = major;
+                }
+
+                if (hasLastAccepted) {
+                    final int directionSig = (int) Math.signum(major - mTouchHistoryLastAccepted);
+                    if (directionSig != mTouchHistoryDirection ||
+                            (directionSig == 0 && mTouchHistoryDirection == 0)) {
+                        mTouchHistoryDirection = directionSig;
+                        final long time = h < historySize ? ev.getHistoricalEventTime(h)
+                                : ev.getEventTime();
+                        mTouchHistoryLastAcceptedTime = time;
+                        accept = false;
+                    }
+                }
+            }
+            sampleCount += pointerSampleCount;
+        }
+
+        final float avg = total / sampleCount;
+
+        if (accept) {
+            float newAccepted = (mTouchUpper + mTouchLower + avg) / 3;
+            mTouchUpper = (mTouchUpper + newAccepted) / 2;
+            mTouchLower = (mTouchLower + newAccepted) / 2;
+            mTouchHistoryLastAccepted = newAccepted;
+            mTouchHistoryDirection = 0;
+            mTouchHistoryLastAcceptedTime = ev.getEventTime();
+        }
+!!!4581900.java!!!	clearTouchHistory() : void
+        mTouchUpper = Float.NaN;
+        mTouchLower = Float.NaN;
+        mTouchHistoryLastAccepted = Float.NaN;
+        mTouchHistoryDirection = 0;
+        mTouchHistoryLastAcceptedTime = 0;
+!!!4582028.java!!!	onTouchEvent(inout event : MotionEvent) : boolean
+        if (mInputEventConsistencyVerifier != null) {
+            mInputEventConsistencyVerifier.onTouchEvent(event, 0);
+        }
+
+        mCurrTime = event.getEventTime();
+
+        final int action = event.getActionMasked();
+
+        final boolean streamComplete = action == MotionEvent.ACTION_UP ||
+                action == MotionEvent.ACTION_CANCEL;
+        if (action == MotionEvent.ACTION_DOWN || streamComplete) {
+            // Reset any scale in progress with the listener.
+            // If it's an ACTION_DOWN we're beginning a new event stream.
+            // This means the app probably didn't give us all the events. Shame on it.
+            if (mInProgress) {
+                mListener.onScaleEnd(this);
+                mInProgress = false;
+                mInitialSpan = 0;
+            }
+
+            if (streamComplete) {
+                clearTouchHistory();
+                return true;
+            }
+        }
+
+        final boolean configChanged = action == MotionEvent.ACTION_DOWN ||
+                action == MotionEvent.ACTION_POINTER_UP ||
+                action == MotionEvent.ACTION_POINTER_DOWN;
+        final boolean pointerUp = action == MotionEvent.ACTION_POINTER_UP;
+        final int skipIndex = pointerUp ? event.getActionIndex() : -1;
+
+        // Determine focal point
+        float sumX = 0, sumY = 0;
+        final int count = event.getPointerCount();
+        for (int i = 0; i < count; i++) {
+            if (skipIndex == i) continue;
+            sumX += event.getX(i);
+            sumY += event.getY(i);
+        }
+        final int div = pointerUp ? count - 1 : count;
+        final float focusX = sumX / div;
+        final float focusY = sumY / div;
+
+
+        addTouchHistory(event);
+
+        // Determine average deviation from focal point
+        float devSumX = 0, devSumY = 0;
+        for (int i = 0; i < count; i++) {
+            if (skipIndex == i) continue;
+
+            // Convert the resulting diameter into a radius.
+            final float touchSize = mTouchHistoryLastAccepted / 2;
+            devSumX += Math.abs(event.getX(i) - focusX) + touchSize;
+            devSumY += Math.abs(event.getY(i) - focusY) + touchSize;
+        }
+        final float devX = devSumX / div;
+        final float devY = devSumY / div;
+
+        // Span is the average distance between touch points through the focal point;
+        // i.e. the diameter of the circle with a radius of the average deviation from
+        // the focal point.
+        final float spanX = devX * 2;
+        final float spanY = devY * 2;
+        final float span = FloatMath.sqrt(spanX * spanX + spanY * spanY);
+
+        // Dispatch begin/end events as needed.
+        // If the configuration changes, notify the app to reset its current state by beginning
+        // a fresh scale event stream.
+        final boolean wasInProgress = mInProgress;
+        mFocusX = focusX;
+        mFocusY = focusY;
+        if (mInProgress && (span < mMinSpan || configChanged)) {
+            mListener.onScaleEnd(this);
+            mInProgress = false;
+            mInitialSpan = span;
+        }
+        if (configChanged) {
+            mPrevSpanX = mCurrSpanX = spanX;
+            mPrevSpanY = mCurrSpanY = spanY;
+            mInitialSpan = mPrevSpan = mCurrSpan = span;
+        }
+        if (!mInProgress && span >= mMinSpan &&
+                (wasInProgress || Math.abs(span - mInitialSpan) > mSpanSlop)) {
+            mPrevSpanX = mCurrSpanX = spanX;
+            mPrevSpanY = mCurrSpanY = spanY;
+            mPrevSpan = mCurrSpan = span;
+            mPrevTime = mCurrTime;
+            mInProgress = mListener.onScaleBegin(this);
+        }
+
+        // Handle motion; focal point and span/scale factor are changing.
+        if (action == MotionEvent.ACTION_MOVE) {
+            mCurrSpanX = spanX;
+            mCurrSpanY = spanY;
+            mCurrSpan = span;
+
+            boolean updatePrev = true;
+            if (mInProgress) {
+                updatePrev = mListener.onScale(this);
+            }
+
+            if (updatePrev) {
+                mPrevSpanX = mCurrSpanX;
+                mPrevSpanY = mCurrSpanY;
+                mPrevSpan = mCurrSpan;
+                mPrevTime = mCurrTime;
+            }
+        }
+
+        return true;
+!!!4582156.java!!!	isInProgress() : boolean
+        return mInProgress;
+!!!4582284.java!!!	getFocusX() : float
+        return mFocusX;
+!!!4582412.java!!!	getFocusY() : float
+        return mFocusY;
+!!!4582540.java!!!	getCurrentSpan() : float
+        return mCurrSpan;
+!!!4582668.java!!!	getCurrentSpanX() : float
+        return mCurrSpanX;
+!!!4582796.java!!!	getCurrentSpanY() : float
+        return mCurrSpanY;
+!!!4582924.java!!!	getPreviousSpan() : float
+        return mPrevSpan;
+!!!4583052.java!!!	getPreviousSpanX() : float
+        return mPrevSpanX;
+!!!4583180.java!!!	getPreviousSpanY() : float
+        return mPrevSpanY;
+!!!4583308.java!!!	getScaleFactor() : float
+        return mPrevSpan > 0 ? mCurrSpan / mPrevSpan : 1;
+!!!4583436.java!!!	getTimeDelta() : long
+        return mCurrTime - mPrevTime;
+!!!4583564.java!!!	getEventTime() : long
+        return mCurrTime;

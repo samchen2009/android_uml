@@ -1,0 +1,242 @@
+class TranslationVisitor
+!!!14574348.java!!!	TranslationVisitor(inout output : OutputCollector)
+            this.output = output;
+!!!14574476.java!!!	setBlock(inout block : BasicBlock, inout lastAddress : CodeAddress) : void
+            this.block = block;
+            this.lastAddress = lastAddress;
+!!!14574604.java!!!	visitPlainInsn(inout insn : PlainInsn) : void
+            Rop rop = insn.getOpcode();
+            if (rop.getOpcode() == RegOps.MARK_LOCAL) {
+                /*
+                 * Ignore these. They're dealt with by
+                 * the LocalVariableAwareTranslationVisitor
+                 */
+                return;
+            }
+            if (rop.getOpcode() == RegOps.MOVE_RESULT_PSEUDO) {
+                // These get skipped
+                return;
+            }
+
+            SourcePosition pos = insn.getPosition();
+            Dop opcode = RopToDop.dopFor(insn);
+            DalvInsn di;
+
+            switch (rop.getBranchingness()) {
+                case Rop.BRANCH_NONE:
+                case Rop.BRANCH_RETURN:
+                case Rop.BRANCH_THROW: {
+                    di = new SimpleInsn(opcode, pos, getRegs(insn));
+                    break;
+                }
+                case Rop.BRANCH_GOTO: {
+                    /*
+                     * Code in the main translation loop will emit a
+                     * goto if necessary (if the branch isn't to the
+                     * immediately subsequent block).
+                     */
+                    return;
+                }
+                case Rop.BRANCH_IF: {
+                    int target = block.getSuccessors().get(1);
+                    di = new TargetInsn(opcode, pos, getRegs(insn),
+                                        addresses.getStart(target));
+                    break;
+                }
+                default: {
+                    throw new RuntimeException("shouldn't happen");
+                }
+            }
+
+            addOutput(di);
+!!!14574732.java!!!	visitPlainCstInsn(inout insn : PlainCstInsn) : void
+            SourcePosition pos = insn.getPosition();
+            Dop opcode = RopToDop.dopFor(insn);
+            Rop rop = insn.getOpcode();
+            int ropOpcode = rop.getOpcode();
+            DalvInsn di;
+
+            if (rop.getBranchingness() != Rop.BRANCH_NONE) {
+                throw new RuntimeException("shouldn't happen");
+            }
+
+            if (ropOpcode == RegOps.MOVE_PARAM) {
+                if (!paramsAreInOrder) {
+                    /*
+                     * Parameters are not in order at the top of the reg space.
+                     * We need to add moves.
+                     */
+
+                    RegisterSpec dest = insn.getResult();
+                    int param =
+                        ((CstInteger) insn.getConstant()).getValue();
+                    RegisterSpec source =
+                        RegisterSpec.make(regCount - paramSize + param,
+                                dest.getType());
+                    di = new SimpleInsn(opcode, pos,
+                                        RegisterSpecList.make(dest, source));
+                    addOutput(di);
+                }
+            } else {
+                // No moves required for the parameters
+                RegisterSpecList regs = getRegs(insn);
+                di = new CstInsn(opcode, pos, regs, insn.getConstant());
+                addOutput(di);
+            }
+!!!14574860.java!!!	visitSwitchInsn(inout insn : SwitchInsn) : void
+            SourcePosition pos = insn.getPosition();
+            IntList cases = insn.getCases();
+            IntList successors = block.getSuccessors();
+            int casesSz = cases.size();
+            int succSz = successors.size();
+            int primarySuccessor = block.getPrimarySuccessor();
+
+            /*
+             * Check the assumptions that the number of cases is one
+             * less than the number of successors and that the last
+             * successor in the list is the primary (in this case, the
+             * default). This test is here to guard against forgetting
+             * to change this code if the way switch instructions are
+             * constructed also gets changed.
+             */
+            if ((casesSz != (succSz - 1)) ||
+                (primarySuccessor != successors.get(casesSz))) {
+                throw new RuntimeException("shouldn't happen");
+            }
+
+            CodeAddress[] switchTargets = new CodeAddress[casesSz];
+
+            for (int i = 0; i < casesSz; i++) {
+                int label = successors.get(i);
+                switchTargets[i] = addresses.getStart(label);
+            }
+
+            CodeAddress dataAddress = new CodeAddress(pos);
+            SwitchData dataInsn =
+                new SwitchData(pos, lastAddress, cases, switchTargets);
+            Dop opcode = dataInsn.isPacked() ?
+                Dops.PACKED_SWITCH : Dops.SPARSE_SWITCH;
+            TargetInsn switchInsn =
+                new TargetInsn(opcode, pos, getRegs(insn), dataAddress);
+
+            addOutput(lastAddress);
+            addOutput(switchInsn);
+
+            addOutputSuffix(new OddSpacer(pos));
+            addOutputSuffix(dataAddress);
+            addOutputSuffix(dataInsn);
+!!!14574988.java!!!	getNextMoveResultPseudo() : RegisterSpec
+            int label = block.getPrimarySuccessor();
+
+            if (label < 0) {
+                return null;
+            }
+
+            Insn insn
+                    = method.getBlocks().labelToBlock(label).getInsns().get(0);
+
+            if (insn.getOpcode().getOpcode() != RegOps.MOVE_RESULT_PSEUDO) {
+                return null;
+            } else {
+                return insn.getResult();
+            }
+!!!14575116.java!!!	visitThrowingCstInsn(inout insn : ThrowingCstInsn) : void
+            SourcePosition pos = insn.getPosition();
+            Dop opcode = RopToDop.dopFor(insn);
+            Rop rop = insn.getOpcode();
+            Constant cst = insn.getConstant();
+
+            if (rop.getBranchingness() != Rop.BRANCH_THROW) {
+                throw new RuntimeException("shouldn't happen");
+            }
+
+            addOutput(lastAddress);
+
+            if (rop.isCallLike()) {
+                RegisterSpecList regs = insn.getSources();
+                DalvInsn di = new CstInsn(opcode, pos, regs, cst);
+
+                addOutput(di);
+            } else {
+                RegisterSpec realResult = getNextMoveResultPseudo();
+
+                RegisterSpecList regs = getRegs(insn, realResult);
+                DalvInsn di;
+
+                boolean hasResult = opcode.hasResult()
+                        || (rop.getOpcode() == RegOps.CHECK_CAST);
+
+                if (hasResult != (realResult != null)) {
+                    throw new RuntimeException(
+                            "Insn with result/move-result-pseudo mismatch " +
+                            insn);
+                }
+
+                if ((rop.getOpcode() == RegOps.NEW_ARRAY) &&
+                    (opcode.getOpcode() != DalvOps.NEW_ARRAY)) {
+                    /*
+                     * It's a type-specific new-array-<primitive>, and
+                     * so it should be turned into a SimpleInsn (no
+                     * constant ref as it's implicit).
+                     */
+                    di = new SimpleInsn(opcode, pos, regs);
+                } else {
+                    /*
+                     * This is the general case for constant-bearing
+                     * instructions.
+                     */
+                    di = new CstInsn(opcode, pos, regs, cst);
+                }
+
+                addOutput(di);
+            }
+!!!14575244.java!!!	visitThrowingInsn(inout insn : ThrowingInsn) : void
+            SourcePosition pos = insn.getPosition();
+            Dop opcode = RopToDop.dopFor(insn);
+            Rop rop = insn.getOpcode();
+            RegisterSpec realResult;
+
+            if (rop.getBranchingness() != Rop.BRANCH_THROW) {
+                throw new RuntimeException("shouldn't happen");
+            }
+
+            realResult = getNextMoveResultPseudo();
+
+            if (opcode.hasResult() != (realResult != null)) {
+                throw new RuntimeException(
+                        "Insn with result/move-result-pseudo mismatch" + insn);
+            }
+
+            addOutput(lastAddress);
+
+            DalvInsn di = new SimpleInsn(opcode, pos,
+                    getRegs(insn, realResult));
+
+            addOutput(di);
+!!!14575372.java!!!	visitFillArrayDataInsn(inout insn : FillArrayDataInsn) : void
+            SourcePosition pos = insn.getPosition();
+            Constant cst = insn.getConstant();
+            ArrayList<Constant> values = insn.getInitValues();
+            Rop rop = insn.getOpcode();
+
+            if (rop.getBranchingness() != Rop.BRANCH_NONE) {
+                throw new RuntimeException("shouldn't happen");
+            }
+            CodeAddress dataAddress = new CodeAddress(pos);
+            ArrayData dataInsn =
+                new ArrayData(pos, lastAddress, values, cst);
+
+            TargetInsn fillArrayDataInsn =
+                new TargetInsn(Dops.FILL_ARRAY_DATA, pos, getRegs(insn),
+                        dataAddress);
+
+            addOutput(lastAddress);
+            addOutput(fillArrayDataInsn);
+
+            addOutputSuffix(new OddSpacer(pos));
+            addOutputSuffix(dataAddress);
+            addOutputSuffix(dataInsn);
+!!!14575500.java!!!	addOutput(inout insn : DalvInsn) : void
+            output.add(insn);
+!!!14575628.java!!!	addOutputSuffix(inout insn : DalvInsn) : void
+            output.addSuffix(insn);

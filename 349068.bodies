@@ -1,0 +1,458 @@
+class NuCachedSource2
+!!!640268.cpp!!!	NuCachedSource2(in source : sp<DataSource>, in cacheConfig : char = NULL, in disconnectAtHighwatermark : bool = false)
+    // We are NOT going to support disconnect-at-highwatermark indefinitely
+    // and we are not guaranteeing support for client-specified cache
+    // parameters. Both of these are temporary measures to solve a specific
+    // problem that will be solved in a better way going forward.
+
+    updateCacheParamsFromSystemProperty();
+
+    if (cacheConfig != NULL) {
+        updateCacheParamsFromString(cacheConfig);
+    }
+
+    if (mDisconnectAtHighwatermark) {
+        // Makes no sense to disconnect and do keep-alives...
+        mKeepAliveIntervalUs = 0;
+    }
+
+    mLooper->setName("NuCachedSource2");
+    mLooper->registerHandler(mReflector);
+    mLooper->start();
+
+    Mutex::Autolock autoLock(mLock);
+    (new AMessage(kWhatFetchMore, mReflector->id()))->post();
+!!!640396.cpp!!!	initCheck() : status_t
+    return mSource->initCheck();
+!!!640524.cpp!!!	readAt(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    Mutex::Autolock autoSerializer(mSerializer);
+
+    ALOGV("readAt offset %lld, size %d", offset, size);
+
+    Mutex::Autolock autoLock(mLock);
+
+    // If the request can be completely satisfied from the cache, do so.
+
+    if (offset >= mCacheOffset
+            && offset + size <= mCacheOffset + mCache->totalSize()) {
+        size_t delta = offset - mCacheOffset;
+        mCache->copy(delta, data, size);
+
+        mLastAccessPos = offset + size;
+
+        return size;
+    }
+
+    sp<AMessage> msg = new AMessage(kWhatRead, mReflector->id());
+    msg->setInt64("offset", offset);
+    msg->setPointer("data", data);
+    msg->setSize("size", size);
+
+    CHECK(mAsyncResult == NULL);
+    msg->post();
+
+    while (mAsyncResult == NULL) {
+        mCondition.wait(mLock);
+    }
+
+    int32_t result;
+    CHECK(mAsyncResult->findInt32("result", &result));
+
+    mAsyncResult.clear();
+
+    if (result > 0) {
+        mLastAccessPos = offset + result;
+    }
+
+    return (ssize_t)result;
+!!!640652.cpp!!!	getSize(inout size : off64_t) : status_t
+    return mSource->getSize(size);
+!!!640780.cpp!!!	flags() : uint32_t
+    // Remove HTTP related flags since NuCachedSource2 is not HTTP-based.
+    uint32_t flags = mSource->flags() & ~(kWantsPrefetching | kIsHTTPBasedSource);
+    return (flags | kIsCachingDataSource);
+!!!640908.cpp!!!	DrmInitialization(in mime : char) : sp<DecryptHandle>
+    return mSource->DrmInitialization(mime);
+!!!641036.cpp!!!	getDrmInfo(inout handle : sp<DecryptHandle>, inout client : DrmManagerClient) : void
+    mSource->getDrmInfo(handle, client);
+!!!641164.cpp!!!	getUri() : String8
+    return mSource->getUri();
+!!!641292.cpp!!!	getMIMEType() : String8
+    return mSource->getMIMEType();
+!!!641420.cpp!!!	cachedSize() : size_t
+    Mutex::Autolock autoLock(mLock);
+    return mCacheOffset + mCache->totalSize();
+!!!641548.cpp!!!	approxDataRemaining(inout finalStatus : status_t) : size_t
+    Mutex::Autolock autoLock(mLock);
+    return approxDataRemaining_l(finalStatus);
+!!!641676.cpp!!!	resumeFetchingIfNecessary() : void
+    Mutex::Autolock autoLock(mLock);
+
+    restartPrefetcherIfNecessary_l(true /* ignore low water threshold */);
+!!!641804.cpp!!!	getEstimatedBandwidthKbps(inout kbps : int32_t) : status_t
+    if (mSource->flags() & kIsHTTPBasedSource) {
+        HTTPBase* source = static_cast<HTTPBase *>(mSource.get());
+        return source->getEstimatedBandwidthKbps(kbps);
+    }
+    return ERROR_UNSUPPORTED;
+!!!641932.cpp!!!	setCacheStatCollectFreq(in freqMs : int32_t) : status_t
+    if (mSource->flags() & kIsHTTPBasedSource) {
+        HTTPBase *source = static_cast<HTTPBase *>(mSource.get());
+        return source->setBandwidthStatCollectFreq(freqMs);
+    }
+    return ERROR_UNSUPPORTED;
+!!!642060.cpp!!!	RemoveCacheSpecificHeaders(inout headers : KeyedVector<String8, String8>, inout cacheConfig : String8, inout disconnectAtHighwatermark : bool) : void
+    *cacheConfig = String8();
+    *disconnectAtHighwatermark = false;
+
+    if (headers == NULL) {
+        return;
+    }
+
+    ssize_t index;
+    if ((index = headers->indexOfKey(String8("x-cache-config"))) >= 0) {
+        *cacheConfig = headers->valueAt(index);
+
+        headers->removeItemsAt(index);
+
+        ALOGV("Using special cache config '%s'", cacheConfig->string());
+    }
+
+    if ((index = headers->indexOfKey(
+                    String8("x-disconnect-at-highwatermark"))) >= 0) {
+        *disconnectAtHighwatermark = true;
+        headers->removeItemsAt(index);
+
+        ALOGV("Client requested disconnection at highwater mark");
+    }
+!!!642188.cpp!!!	~NuCachedSource2()
+    mLooper->stop();
+    mLooper->unregisterHandler(mReflector->id());
+
+    delete mCache;
+    mCache = NULL;
+!!!642316.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatFetchMore:
+        {
+            onFetch();
+            break;
+        }
+
+        case kWhatRead:
+        {
+            onRead(msg);
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!642444.cpp!!!	onFetch() : void
+    ALOGV("onFetch");
+
+    if (mFinalStatus != OK && mNumRetriesLeft == 0) {
+        ALOGV("EOS reached, done prefetching for now");
+        mFetching = false;
+    }
+
+    bool keepAlive =
+        !mFetching
+            && mFinalStatus == OK
+            && mKeepAliveIntervalUs > 0
+            && ALooper::GetNowUs() >= mLastFetchTimeUs + mKeepAliveIntervalUs;
+
+    if (mFetching || keepAlive) {
+        if (keepAlive) {
+            ALOGI("Keep alive");
+        }
+
+        fetchInternal();
+
+        mLastFetchTimeUs = ALooper::GetNowUs();
+
+        if (mFetching && mCache->totalSize() >= mHighwaterThresholdBytes) {
+            ALOGI("Cache full, done prefetching for now");
+            mFetching = false;
+
+            if (mDisconnectAtHighwatermark
+                    && (mSource->flags() & DataSource::kIsHTTPBasedSource)) {
+                ALOGV("Disconnecting at high watermark");
+                static_cast<HTTPBase *>(mSource.get())->disconnect();
+                mFinalStatus = -EAGAIN;
+            }
+        }
+    } else {
+        Mutex::Autolock autoLock(mLock);
+        restartPrefetcherIfNecessary_l();
+    }
+
+    int64_t delayUs;
+    if (mFetching) {
+        if (mFinalStatus != OK && mNumRetriesLeft > 0) {
+            // We failed this time and will try again in 3 seconds.
+            delayUs = 3000000ll;
+        } else {
+            delayUs = 0;
+        }
+    } else {
+        delayUs = 100000ll;
+    }
+
+    (new AMessage(kWhatFetchMore, mReflector->id()))->post(delayUs);
+!!!642572.cpp!!!	onRead(in msg : sp<AMessage>) : void
+    ALOGV("onRead");
+
+    int64_t offset;
+    CHECK(msg->findInt64("offset", &offset));
+
+    void *data;
+    CHECK(msg->findPointer("data", &data));
+
+    size_t size;
+    CHECK(msg->findSize("size", &size));
+
+    ssize_t result = readInternal(offset, data, size);
+
+    if (result == -EAGAIN) {
+        msg->post(50000);
+        return;
+    }
+
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK(mAsyncResult == NULL);
+
+    mAsyncResult = new AMessage;
+    mAsyncResult->setInt32("result", result);
+
+    mCondition.signal();
+!!!642700.cpp!!!	fetchInternal() : void
+    ALOGV("fetchInternal");
+
+    bool reconnect = false;
+
+    {
+        Mutex::Autolock autoLock(mLock);
+        CHECK(mFinalStatus == OK || mNumRetriesLeft > 0);
+
+        if (mFinalStatus != OK) {
+            --mNumRetriesLeft;
+
+            reconnect = true;
+        }
+    }
+
+    if (reconnect) {
+        status_t err =
+            mSource->reconnectAtOffset(mCacheOffset + mCache->totalSize());
+
+        Mutex::Autolock autoLock(mLock);
+
+        if (err == ERROR_UNSUPPORTED || err == -EPIPE) {
+            // These are errors that are not likely to go away even if we
+            // retry, i.e. the server doesn't support range requests or similar.
+            mNumRetriesLeft = 0;
+            return;
+        } else if (err != OK) {
+            ALOGI("The attempt to reconnect failed, %d retries remaining",
+                 mNumRetriesLeft);
+
+            return;
+        }
+    }
+
+    PageCache::Page *page = mCache->acquirePage();
+
+    ssize_t n = mSource->readAt(
+            mCacheOffset + mCache->totalSize(), page->mData, kPageSize);
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (n < 0) {
+        mFinalStatus = n;
+        if (n == ERROR_UNSUPPORTED || n == -EPIPE) {
+            // These are errors that are not likely to go away even if we
+            // retry, i.e. the server doesn't support range requests or similar.
+            mNumRetriesLeft = 0;
+        }
+
+        ALOGE("source returned error %ld, %d retries left", n, mNumRetriesLeft);
+        mCache->releasePage(page);
+    } else if (n == 0) {
+        ALOGI("ERROR_END_OF_STREAM");
+
+        mNumRetriesLeft = 0;
+        mFinalStatus = ERROR_END_OF_STREAM;
+
+        mCache->releasePage(page);
+    } else {
+        if (mFinalStatus != OK) {
+            ALOGI("retrying a previously failed read succeeded.");
+        }
+        mNumRetriesLeft = kMaxNumRetries;
+        mFinalStatus = OK;
+
+        page->mSize = n;
+        mCache->appendPage(page);
+    }
+!!!642828.cpp!!!	readInternal(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    CHECK_LE(size, (size_t)mHighwaterThresholdBytes);
+
+    ALOGV("readInternal offset %lld size %d", offset, size);
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (!mFetching) {
+        mLastAccessPos = offset;
+        restartPrefetcherIfNecessary_l(
+                false, // ignoreLowWaterThreshold
+                true); // force
+    }
+
+    if (offset < mCacheOffset
+            || offset >= (off64_t)(mCacheOffset + mCache->totalSize())) {
+        static const off64_t kPadding = 256 * 1024;
+
+        // In the presence of multiple decoded streams, once of them will
+        // trigger this seek request, the other one will request data "nearby"
+        // soon, adjust the seek position so that that subsequent request
+        // does not trigger another seek.
+        off64_t seekOffset = (offset > kPadding) ? offset - kPadding : 0;
+
+        seekInternal_l(seekOffset);
+    }
+
+    size_t delta = offset - mCacheOffset;
+
+    if (mFinalStatus != OK && mNumRetriesLeft == 0) {
+        if (delta >= mCache->totalSize()) {
+            return mFinalStatus;
+        }
+
+        size_t avail = mCache->totalSize() - delta;
+
+        if (avail > size) {
+            avail = size;
+        }
+
+        mCache->copy(delta, data, avail);
+
+        return avail;
+    }
+
+    if (offset + size <= mCacheOffset + mCache->totalSize()) {
+        mCache->copy(delta, data, size);
+
+        return size;
+    }
+
+    ALOGV("deferring read");
+
+    return -EAGAIN;
+!!!642956.cpp!!!	seekInternal_l(in offset : off64_t) : status_t
+    mLastAccessPos = offset;
+
+    if (offset >= mCacheOffset
+            && offset <= (off64_t)(mCacheOffset + mCache->totalSize())) {
+        return OK;
+    }
+
+    ALOGI("new range: offset= %lld", offset);
+
+    mCacheOffset = offset;
+
+    size_t totalSize = mCache->totalSize();
+    CHECK_EQ(mCache->releaseFromStart(totalSize), totalSize);
+
+    mNumRetriesLeft = kMaxNumRetries;
+    mFetching = true;
+
+    return OK;
+!!!643084.cpp!!!	approxDataRemaining_l(inout finalStatus : status_t) : size_t
+    *finalStatus = mFinalStatus;
+
+    if (mFinalStatus != OK && mNumRetriesLeft > 0) {
+        // Pretend that everything is fine until we're out of retries.
+        *finalStatus = OK;
+    }
+
+    off64_t lastBytePosCached = mCacheOffset + mCache->totalSize();
+    if (mLastAccessPos < lastBytePosCached) {
+        return lastBytePosCached - mLastAccessPos;
+    }
+    return 0;
+!!!643212.cpp!!!	restartPrefetcherIfNecessary_l(in ignoreLowWaterThreshold : bool = false, in force : bool = false) : void
+    static const size_t kGrayArea = 1024 * 1024;
+
+    if (mFetching || (mFinalStatus != OK && mNumRetriesLeft == 0)) {
+        return;
+    }
+
+    if (!ignoreLowWaterThreshold && !force
+            && mCacheOffset + mCache->totalSize() - mLastAccessPos
+                >= mLowwaterThresholdBytes) {
+        return;
+    }
+
+    size_t maxBytes = mLastAccessPos - mCacheOffset;
+
+    if (!force) {
+        if (maxBytes < kGrayArea) {
+            return;
+        }
+
+        maxBytes -= kGrayArea;
+    }
+
+    size_t actualBytes = mCache->releaseFromStart(maxBytes);
+    mCacheOffset += actualBytes;
+
+    ALOGI("restarting prefetcher, totalSize = %d", mCache->totalSize());
+    mFetching = true;
+!!!643340.cpp!!!	updateCacheParamsFromSystemProperty() : void
+    char value[PROPERTY_VALUE_MAX];
+    if (!property_get("media.stagefright.cache-params", value, NULL)) {
+        return;
+    }
+
+    updateCacheParamsFromString(value);
+!!!643468.cpp!!!	updateCacheParamsFromString(in s : char) : void
+    ssize_t lowwaterMarkKb, highwaterMarkKb;
+    int keepAliveSecs;
+
+    if (sscanf(s, "%ld/%ld/%d",
+               &lowwaterMarkKb, &highwaterMarkKb, &keepAliveSecs) != 3) {
+        ALOGE("Failed to parse cache parameters from '%s'.", s);
+        return;
+    }
+
+    if (lowwaterMarkKb >= 0) {
+        mLowwaterThresholdBytes = lowwaterMarkKb * 1024;
+    } else {
+        mLowwaterThresholdBytes = kDefaultLowWaterThreshold;
+    }
+
+    if (highwaterMarkKb >= 0) {
+        mHighwaterThresholdBytes = highwaterMarkKb * 1024;
+    } else {
+        mHighwaterThresholdBytes = kDefaultHighWaterThreshold;
+    }
+
+    if (mLowwaterThresholdBytes >= mHighwaterThresholdBytes) {
+        ALOGE("Illegal low/highwater marks specified, reverting to defaults.");
+
+        mLowwaterThresholdBytes = kDefaultLowWaterThreshold;
+        mHighwaterThresholdBytes = kDefaultHighWaterThreshold;
+    }
+
+    if (keepAliveSecs >= 0) {
+        mKeepAliveIntervalUs = keepAliveSecs * 1000000ll;
+    } else {
+        mKeepAliveIntervalUs = kDefaultKeepAliveIntervalUs;
+    }
+
+    ALOGV("lowwater = %d bytes, highwater = %d bytes, keepalive = %lld us",
+         mLowwaterThresholdBytes,
+         mHighwaterThresholdBytes,
+         mKeepAliveIntervalUs);

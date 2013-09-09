@@ -1,0 +1,296 @@
+class DocumentBuilderImpl
+!!!2328091.java!!!	reset() : void
+        coalescing = false;
+        entityResolver = null;
+        errorHandler = null;
+        ignoreComments = false;
+        ignoreElementContentWhitespace = false;
+        namespaceAware = false;
+!!!2328219.java!!!	getDOMImplementation() : DOMImplementation
+        return dom;
+!!!2328347.java!!!	isNamespaceAware() : boolean
+        return namespaceAware;
+!!!2328475.java!!!	isValidating() : boolean
+        return false;
+!!!2328603.java!!!	newDocument() : Document
+        return dom.createDocument(null, null, null);
+!!!2328731.java!!!	parse(inout source : InputSource) : Document
+        if (source == null) {
+            throw new IllegalArgumentException("source == null");
+        }
+
+        String namespaceURI = null;
+        String qualifiedName = null;
+        DocumentType doctype = null;
+        String inputEncoding = source.getEncoding();
+        String systemId = source.getSystemId();
+        DocumentImpl document = new DocumentImpl(
+                dom, namespaceURI, qualifiedName, doctype, inputEncoding);
+        document.setDocumentURI(systemId);
+
+        KXmlParser parser = new KXmlParser();
+        try {
+            parser.keepNamespaceAttributes();
+            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, namespaceAware);
+
+            if (source.getByteStream() != null) {
+                parser.setInput(source.getByteStream(), inputEncoding);
+            } else if (source.getCharacterStream() != null) {
+                parser.setInput(source.getCharacterStream());
+            } else if (systemId != null) {
+                URL url = new URL(systemId);
+                URLConnection urlConnection = url.openConnection();
+                urlConnection.connect();
+                // TODO: if null, extract the inputEncoding from the Content-Type header?
+                parser.setInput(urlConnection.getInputStream(), inputEncoding);
+            } else {
+                throw new SAXParseException("InputSource needs a stream, reader or URI", null);
+            }
+
+            if (parser.nextToken() == XmlPullParser.END_DOCUMENT) {
+                throw new SAXParseException("Unexpected end of document", null);
+            }
+
+            parse(parser, document, document, XmlPullParser.END_DOCUMENT);
+
+            parser.require(XmlPullParser.END_DOCUMENT, null, null);
+        } catch (XmlPullParserException ex) {
+            if (ex.getDetail() instanceof IOException) {
+                throw (IOException) ex.getDetail();
+            }
+            if (ex.getDetail() instanceof RuntimeException) {
+                throw (RuntimeException) ex.getDetail();
+            }
+
+            LocatorImpl locator = new LocatorImpl();
+
+            locator.setPublicId(source.getPublicId());
+            locator.setSystemId(systemId);
+            locator.setLineNumber(ex.getLineNumber());
+            locator.setColumnNumber(ex.getColumnNumber());
+
+            SAXParseException newEx = new SAXParseException(ex.getMessage(), locator);
+
+            if (errorHandler != null) {
+                errorHandler.error(newEx);
+            }
+
+            throw newEx;
+        } finally {
+            IoUtils.closeQuietly(parser);
+        }
+
+        return document;
+!!!2328859.java!!!	parse(inout parser : KXmlParser, inout document : DocumentImpl, inout node : Node, in endToken : int) : void
+
+        int token = parser.getEventType();
+
+        /*
+         * The main parsing loop. The precondition is that we are already on the
+         * token to be processed. This holds for each iteration of the loop, so
+         * the inner statements have to ensure that (in particular the recursive
+         * call).
+         */
+        while (token != endToken && token != XmlPullParser.END_DOCUMENT) {
+            if (token == XmlPullParser.PROCESSING_INSTRUCTION) {
+                /*
+                 * Found a processing instructions. We need to split the token
+                 * text at the first whitespace character.
+                 */
+                String text = parser.getText();
+
+                int dot = text.indexOf(' ');
+
+                String target = (dot != -1 ? text.substring(0, dot) : text);
+                String data = (dot != -1 ? text.substring(dot + 1) : "");
+
+                node.appendChild(document.createProcessingInstruction(target,
+                        data));
+            } else if (token == XmlPullParser.DOCDECL) {
+                String name = parser.getRootElementName();
+                String publicId = parser.getPublicId();
+                String systemId = parser.getSystemId();
+                document.appendChild(new DocumentTypeImpl(document, name, publicId, systemId));
+
+            } else if (token == XmlPullParser.COMMENT) {
+                /*
+                 * Found a comment. We simply take the token text, but we only
+                 * create a node if the client wants to see comments at all.
+                 */
+                if (!ignoreComments) {
+                    node.appendChild(document.createComment(parser.getText()));
+                }
+            } else if (token == XmlPullParser.IGNORABLE_WHITESPACE) {
+                /*
+                 * Found some ignorable whitespace. We only add it if the client
+                 * wants to see whitespace. Whitespace before and after the
+                 * document element is always ignored.
+                 */
+                if (!ignoreElementContentWhitespace && document != node) {
+                    appendText(document, node, token, parser.getText());
+                }
+            } else if (token == XmlPullParser.TEXT || token == XmlPullParser.CDSECT) {
+                /*
+                 * Found a piece of text (possibly encoded as a CDATA section).
+                 * That's the easiest case. We simply take it and create a new text node,
+                 * or merge with an adjacent text node.
+                 */
+                appendText(document, node, token, parser.getText());
+            } else if (token == XmlPullParser.ENTITY_REF) {
+                /*
+                 * Found an entity reference. If an entity resolver is
+                 * installed, we replace it by text (if possible). Otherwise we
+                 * add an entity reference node.
+                 */
+                String entity = parser.getName();
+
+                if (entityResolver != null) {
+                    // TODO Implement this...
+                }
+
+                String resolved = resolvePredefinedOrCharacterEntity(entity);
+                if (resolved != null) {
+                    appendText(document, node, token, resolved);
+                } else {
+                    node.appendChild(document.createEntityReference(entity));
+                }
+            } else if (token == XmlPullParser.START_TAG) {
+                /*
+                 * Found an element start tag. We create an element node with
+                 * the proper info and attributes. We then invoke parse()
+                 * recursively to handle the next level of nesting. When we
+                 * return from this call, we check that we are on the proper
+                 * element end tag. The whole handling differs somewhat
+                 * depending on whether the parser is namespace-aware or not.
+                 */
+                if (namespaceAware) {
+                    // Collect info for element node
+                    String namespace = parser.getNamespace();
+                    String name = parser.getName();
+                    String prefix = parser.getPrefix();
+
+                    if ("".equals(namespace)) {
+                        namespace = null;
+                    }
+
+                    // Create element node and wire it correctly
+                    Element element = document.createElementNS(namespace, name);
+                    element.setPrefix(prefix);
+                    node.appendChild(element);
+
+                    for (int i = 0; i < parser.getAttributeCount(); i++) {
+                        // Collect info for a single attribute node
+                        String attrNamespace = parser.getAttributeNamespace(i);
+                        String attrPrefix = parser.getAttributePrefix(i);
+                        String attrName = parser.getAttributeName(i);
+                        String attrValue = parser.getAttributeValue(i);
+
+                        if ("".equals(attrNamespace)) {
+                            attrNamespace = null;
+                        }
+
+                        // Create attribute node and wire it correctly
+                        Attr attr = document.createAttributeNS(attrNamespace, attrName);
+                        attr.setPrefix(attrPrefix);
+                        attr.setValue(attrValue);
+                        element.setAttributeNodeNS(attr);
+                    }
+
+                    // Recursive descent
+                    token = parser.nextToken();
+                    parse(parser, document, element, XmlPullParser.END_TAG);
+
+                    // Expect the element's end tag here
+                    parser.require(XmlPullParser.END_TAG, namespace, name);
+
+                } else {
+                    // Collect info for element node
+                    String name = parser.getName();
+
+                    // Create element node and wire it correctly
+                    Element element = document.createElement(name);
+                    node.appendChild(element);
+
+                    for (int i = 0; i < parser.getAttributeCount(); i++) {
+                        // Collect info for a single attribute node
+                        String attrName = parser.getAttributeName(i);
+                        String attrValue = parser.getAttributeValue(i);
+
+                        // Create attribute node and wire it correctly
+                        Attr attr = document.createAttribute(attrName);
+                        attr.setValue(attrValue);
+                        element.setAttributeNode(attr);
+                    }
+
+                    // Recursive descent
+                    token = parser.nextToken();
+                    parse(parser, document, element, XmlPullParser.END_TAG);
+
+                    // Expect the element's end tag here
+                    parser.require(XmlPullParser.END_TAG, "", name);
+                }
+            }
+
+            token = parser.nextToken();
+        }
+!!!2328987.java!!!	appendText(inout document : DocumentImpl, inout parent : Node, in token : int, inout text : String) : void
+        // Ignore empty runs.
+        if (text.isEmpty()) {
+            return;
+        }
+        // Merge with any previous text node if possible.
+        if (coalescing || token != XmlPullParser.CDSECT) {
+            Node lastChild = parent.getLastChild();
+            if (lastChild != null && lastChild.getNodeType() == Node.TEXT_NODE) {
+                Text textNode = (Text) lastChild;
+                textNode.appendData(text);
+                return;
+            }
+        }
+        // Okay, we really do need a new text node
+        parent.appendChild(token == XmlPullParser.CDSECT
+                ? new CDATASectionImpl(document, text)
+                : new TextImpl(document, text));
+!!!2329115.java!!!	setEntityResolver(inout resolver : EntityResolver) : void
+        entityResolver = resolver;
+!!!2329243.java!!!	setErrorHandler(inout handler : ErrorHandler) : void
+        errorHandler = handler;
+!!!2329371.java!!!	setIgnoreComments(inout value : boolean) : void
+        ignoreComments = value;
+!!!2329499.java!!!	setCoalescing(inout value : boolean) : void
+        coalescing = value;
+!!!2329627.java!!!	setIgnoreElementContentWhitespace(inout value : boolean) : void
+        ignoreElementContentWhitespace = value;
+!!!2329755.java!!!	setNamespaceAware(inout value : boolean) : void
+        namespaceAware = value;
+!!!2329883.java!!!	resolvePredefinedOrCharacterEntity(inout entityName : String) : String
+        // Character references, section 4.1 of the XML specification.
+        if (entityName.startsWith("#x")) {
+            return resolveCharacterReference(entityName.substring(2), 16);
+        } else if (entityName.startsWith("#")) {
+            return resolveCharacterReference(entityName.substring(1), 10);
+        }
+        // Predefined entities, section 4.6 of the XML specification.
+        if ("lt".equals(entityName)) {
+            return "<";
+        } else if ("gt".equals(entityName)) {
+            return ">";
+        } else if ("amp".equals(entityName)) {
+            return "&";
+        } else if ("apos".equals(entityName)) {
+            return "'";
+        } else if ("quot".equals(entityName)) {
+            return "\"";
+        } else {
+            return null;
+        }
+!!!2330011.java!!!	resolveCharacterReference(inout value : String, in base : int) : String
+        try {
+            int ch = Integer.parseInt(value, base);
+            if (ch < 0 || ch > Character.MAX_VALUE) {
+                return null;
+            }
+            return String.valueOf((char) ch);
+        } catch (NumberFormatException ex) {
+            return null;
+        }

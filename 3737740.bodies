@@ -1,0 +1,204 @@
+class Session
+!!!15929868.java!!!	Session(inout accounts : UserAccounts, inout response : IAccountManagerResponse, inout accountType : String, inout expectActivityLaunch : boolean, inout stripAuthTokenFromResult : boolean)
+            super();
+            //if (response == null) throw new IllegalArgumentException("response is null");
+            if (accountType == null) throw new IllegalArgumentException("accountType is null");
+            mAccounts = accounts;
+            mStripAuthTokenFromResult = stripAuthTokenFromResult;
+            mResponse = response;
+            mAccountType = accountType;
+            mExpectActivityLaunch = expectActivityLaunch;
+            mCreationTime = SystemClock.elapsedRealtime();
+            synchronized (mSessions) {
+                mSessions.put(toString(), this);
+            }
+            if (response != null) {
+                try {
+                    response.asBinder().linkToDeath(this, 0 /* flags */);
+                } catch (RemoteException e) {
+                    mResponse = null;
+                    binderDied();
+                }
+            }
+!!!15929996.java!!!	getResponseAndClose() : IAccountManagerResponse
+            if (mResponse == null) {
+                // this session has already been closed
+                return null;
+            }
+            IAccountManagerResponse response = mResponse;
+            close(); // this clears mResponse so we need to save the response before this call
+            return response;
+!!!15930124.java!!!	close() : void
+            synchronized (mSessions) {
+                if (mSessions.remove(toString()) == null) {
+                    // the session was already closed, so bail out now
+                    return;
+                }
+            }
+            if (mResponse != null) {
+                // stop listening for response deaths
+                mResponse.asBinder().unlinkToDeath(this, 0 /* flags */);
+
+                // clear this so that we don't accidentally send any further results
+                mResponse = null;
+            }
+            cancelTimeout();
+            unbind();
+!!!15930252.java!!!	binderDied() : void
+            mResponse = null;
+            close();
+!!!15930380.java!!!	toDebugString() : String
+            return toDebugString(SystemClock.elapsedRealtime());
+!!!15930508.java!!!	toDebugString(in now : long) : String
+            return "Session: expectLaunch " + mExpectActivityLaunch
+                    + ", connected " + (mAuthenticator != null)
+                    + ", stats (" + mNumResults + "/" + mNumRequestContinued
+                    + "/" + mNumErrors + ")"
+                    + ", lifetime " + ((now - mCreationTime) / 1000.0);
+!!!15930636.java!!!	bind() : void
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "initiating bind to authenticator type " + mAccountType);
+            }
+            if (!bindToAuthenticator(mAccountType)) {
+                Log.d(TAG, "bind attempt failed for " + toDebugString());
+                onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION, "bind failure");
+            }
+!!!15930764.java!!!	unbind() : void
+            if (mAuthenticator != null) {
+                mAuthenticator = null;
+                mContext.unbindService(this);
+            }
+!!!15930892.java!!!	scheduleTimeout() : void
+            mMessageHandler.sendMessageDelayed(
+                    mMessageHandler.obtainMessage(MESSAGE_TIMED_OUT, this), TIMEOUT_DELAY_MS);
+!!!15931020.java!!!	cancelTimeout() : void
+            mMessageHandler.removeMessages(MESSAGE_TIMED_OUT, this);
+!!!15931148.java!!!	onServiceConnected(inout name : ComponentName, inout service : IBinder) : void
+            mAuthenticator = IAccountAuthenticator.Stub.asInterface(service);
+            try {
+                run();
+            } catch (RemoteException e) {
+                onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                        "remote exception");
+            }
+!!!15931276.java!!!	onServiceDisconnected(inout name : ComponentName) : void
+            mAuthenticator = null;
+            IAccountManagerResponse response = getResponseAndClose();
+            if (response != null) {
+                try {
+                    response.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                            "disconnected");
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Session.onServiceDisconnected: "
+                                + "caught RemoteException while responding", e);
+                    }
+                }
+            }
+!!!15931532.java!!!	onTimedOut() : void
+            IAccountManagerResponse response = getResponseAndClose();
+            if (response != null) {
+                try {
+                    response.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                            "timeout");
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Session.onTimedOut: caught RemoteException while responding",
+                                e);
+                    }
+                }
+            }
+!!!15931660.java!!!	onResult(inout result : Bundle) : void
+            mNumResults++;
+            if (result != null && !TextUtils.isEmpty(result.getString(AccountManager.KEY_AUTHTOKEN))) {
+                String accountName = result.getString(AccountManager.KEY_ACCOUNT_NAME);
+                String accountType = result.getString(AccountManager.KEY_ACCOUNT_TYPE);
+                if (!TextUtils.isEmpty(accountName) && !TextUtils.isEmpty(accountType)) {
+                    Account account = new Account(accountName, accountType);
+                    cancelNotification(getSigninRequiredNotificationId(mAccounts, account),
+                            new UserHandle(mAccounts.userId));
+                }
+            }
+            IAccountManagerResponse response;
+            if (mExpectActivityLaunch && result != null
+                    && result.containsKey(AccountManager.KEY_INTENT)) {
+                response = mResponse;
+            } else {
+                response = getResponseAndClose();
+            }
+            if (response != null) {
+                try {
+                    if (result == null) {
+                        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                            Log.v(TAG, getClass().getSimpleName()
+                                    + " calling onError() on response " + response);
+                        }
+                        response.onError(AccountManager.ERROR_CODE_INVALID_RESPONSE,
+                                "null bundle returned");
+                    } else {
+                        if (mStripAuthTokenFromResult) {
+                            result.remove(AccountManager.KEY_AUTHTOKEN);
+                        }
+                        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                            Log.v(TAG, getClass().getSimpleName()
+                                    + " calling onResult() on response " + response);
+                        }
+                        response.onResult(result);
+                    }
+                } catch (RemoteException e) {
+                    // if the caller is dead then there is no one to care about remote exceptions
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "failure while notifying response", e);
+                    }
+                }
+            }
+!!!15931788.java!!!	onRequestContinued() : void
+            mNumRequestContinued++;
+!!!15931916.java!!!	onError(in errorCode : int, inout errorMessage : String) : void
+            mNumErrors++;
+            IAccountManagerResponse response = getResponseAndClose();
+            if (response != null) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, getClass().getSimpleName()
+                            + " calling onError() on response " + response);
+                }
+                try {
+                    response.onError(errorCode, errorMessage);
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Session.onError: caught RemoteException while responding", e);
+                    }
+                }
+            } else {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "Session.onError: already closed");
+                }
+            }
+!!!15932044.java!!!	bindToAuthenticator(inout authenticatorType : String) : boolean
+            final AccountAuthenticatorCache.ServiceInfo<AuthenticatorDescription> authenticatorInfo;
+            authenticatorInfo = mAuthenticatorCache.getServiceInfo(
+                    AuthenticatorDescription.newKey(authenticatorType), mAccounts.userId);
+            if (authenticatorInfo == null) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "there is no authenticator for " + authenticatorType
+                            + ", bailing out");
+                }
+                return false;
+            }
+
+            Intent intent = new Intent();
+            intent.setAction(AccountManager.ACTION_AUTHENTICATOR_INTENT);
+            intent.setComponent(authenticatorInfo.componentName);
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "performing bindService to " + authenticatorInfo.componentName);
+            }
+            if (!mContext.bindServiceAsUser(intent, this, Context.BIND_AUTO_CREATE,
+                    new UserHandle(mAccounts.userId))) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "bindService to " + authenticatorInfo.componentName + " failed");
+                }
+                return false;
+            }
+
+
+            return true;

@@ -1,0 +1,115 @@
+class WorkQueue
+!!!1664652.cpp!!!	~WorkQueue()
+    if (!cancel()) {
+        finish();
+    }
+!!!1664780.cpp!!!	schedule(inout workUnit : WorkUnit, in backlog : size_t = 2) : status_t
+    AutoMutex _l(mLock);
+
+    if (mFinished || mCanceled) {
+        return INVALID_OPERATION;
+    }
+
+    if (mWorkThreads.size() < mMaxThreads
+            && mIdleThreads < mWorkUnits.size() + 1) {
+        sp<WorkThread> workThread = new WorkThread(this, mCanCallJava);
+        status_t status = workThread->run("WorkQueue::WorkThread");
+        if (status) {
+            return status;
+        }
+        mWorkThreads.add(workThread);
+        mIdleThreads += 1;
+    } else if (backlog) {
+        while (mWorkUnits.size() >= mMaxThreads * backlog) {
+            mWorkDequeuedCondition.wait(mLock);
+            if (mFinished || mCanceled) {
+                return INVALID_OPERATION;
+            }
+        }
+    }
+
+    mWorkUnits.add(workUnit);
+    mWorkChangedCondition.broadcast();
+    return OK;
+!!!1664908.cpp!!!	cancel() : status_t
+    AutoMutex _l(mLock);
+
+    return cancelLocked();
+!!!1665036.cpp!!!	finish() : status_t
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        if (mFinished) {
+            return INVALID_OPERATION;
+        }
+
+        mFinished = true;
+        mWorkChangedCondition.broadcast();
+    } // release lock
+
+    // It is not possible for the list of work threads to change once the mFinished
+    // flag has been set, so we can access mWorkThreads outside of the lock here.
+    size_t count = mWorkThreads.size();
+    for (size_t i = 0; i < count; i++) {
+        mWorkThreads.itemAt(i)->join();
+    }
+    mWorkThreads.clear();
+    return OK;
+!!!1665548.cpp!!!	cancelLocked() : status_t
+    if (mFinished) {
+        return INVALID_OPERATION;
+    }
+
+    if (!mCanceled) {
+        mCanceled = true;
+
+        size_t count = mWorkUnits.size();
+        for (size_t i = 0; i < count; i++) {
+            delete mWorkUnits.itemAt(i);
+        }
+        mWorkUnits.clear();
+        mWorkChangedCondition.broadcast();
+        mWorkDequeuedCondition.broadcast();
+    }
+    return OK;
+!!!1665676.cpp!!!	threadLoop() : bool
+    WorkUnit* workUnit;
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        for (;;) {
+            if (mCanceled) {
+                return false;
+            }
+
+            if (!mWorkUnits.isEmpty()) {
+                workUnit = mWorkUnits.itemAt(0);
+                mWorkUnits.removeAt(0);
+                mIdleThreads -= 1;
+                mWorkDequeuedCondition.broadcast();
+                break;
+            }
+
+            if (mFinished) {
+                return false;
+            }
+
+            mWorkChangedCondition.wait(mLock);
+        }
+    } // release lock
+
+    bool shouldContinue = workUnit->run();
+    delete workUnit;
+
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        mIdleThreads += 1;
+
+        if (!shouldContinue) {
+            cancelLocked();
+            return false;
+        }
+    } // release lock
+
+    return true;

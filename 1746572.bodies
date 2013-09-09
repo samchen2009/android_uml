@@ -1,0 +1,208 @@
+class StreamAdapter
+!!!10039180.cpp!!!	StreamAdapter(in consumer : sp<ISurfaceTexture>)
+    mConsumerInterface = new SurfaceTextureClient(consumer);
+    camera2_stream_ops::dequeue_buffer = dequeue_buffer;
+    camera2_stream_ops::enqueue_buffer = enqueue_buffer;
+    camera2_stream_ops::cancel_buffer = cancel_buffer;
+    camera2_stream_ops::set_crop = set_crop;
+!!!10039308.cpp!!!	~StreamAdapter()
+    disconnect();
+!!!10039436.cpp!!!	connectToDevice(inout d : camera2_device_t, in width : uint32_t, in height : uint32_t, in format : int) : status_t
+    if (mState != UNINITIALIZED) return INVALID_OPERATION;
+    if (d == NULL) {
+        ALOGE("%s: Null device passed to stream adapter", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    status_t res;
+
+    mWidth = width;
+    mHeight = height;
+    mFormat = format;
+
+    // Allocate device-side stream interface
+
+    uint32_t id;
+    uint32_t formatActual; // ignored
+    uint32_t usage;
+    uint32_t maxBuffers = 2;
+    res = d->ops->allocate_stream(d,
+            mWidth, mHeight, mFormat, getStreamOps(),
+            &id, &formatActual, &usage, &maxBuffers);
+    if (res != OK) {
+        ALOGE("%s: Device stream allocation failed: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        mState = UNINITIALIZED;
+        return res;
+    }
+    mDevice = d;
+
+    mId = id;
+    mUsage = usage;
+    mMaxProducerBuffers = maxBuffers;
+
+    // Configure consumer-side ANativeWindow interface
+
+    res = native_window_api_connect(mConsumerInterface.get(),
+            NATIVE_WINDOW_API_CAMERA);
+    if (res != OK) {
+        ALOGE("%s: Unable to connect to native window for stream %d",
+                __FUNCTION__, mId);
+        mState = ALLOCATED;
+        return res;
+    }
+
+    res = native_window_set_usage(mConsumerInterface.get(), mUsage);
+    if (res != OK) {
+        ALOGE("%s: Unable to configure usage %08x for stream %d",
+                __FUNCTION__, mUsage, mId);
+        mState = CONNECTED;
+        return res;
+    }
+
+    res = native_window_set_buffers_geometry(mConsumerInterface.get(),
+            mWidth, mHeight, mFormat);
+    if (res != OK) {
+        ALOGE("%s: Unable to configure buffer geometry"
+                " %d x %d, format 0x%x for stream %d",
+                __FUNCTION__, mWidth, mHeight, mFormat, mId);
+        mState = CONNECTED;
+        return res;
+    }
+
+    int maxConsumerBuffers;
+    res = mConsumerInterface->query(mConsumerInterface.get(),
+            NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &maxConsumerBuffers);
+    if (res != OK) {
+        ALOGE("%s: Unable to query consumer undequeued"
+                " buffer count for stream %d", __FUNCTION__, mId);
+        mState = CONNECTED;
+        return res;
+    }
+    mMaxConsumerBuffers = maxConsumerBuffers;
+
+    ALOGV("%s: Producer wants %d buffers, consumer wants %d", __FUNCTION__,
+            mMaxProducerBuffers, mMaxConsumerBuffers);
+
+    int totalBuffers = mMaxConsumerBuffers + mMaxProducerBuffers;
+
+    res = native_window_set_buffer_count(mConsumerInterface.get(),
+            totalBuffers);
+    if (res != OK) {
+        ALOGE("%s: Unable to set buffer count for stream %d",
+                __FUNCTION__, mId);
+        mState = CONNECTED;
+        return res;
+    }
+
+    // Register allocated buffers with HAL device
+    buffer_handle_t *buffers = new buffer_handle_t[totalBuffers];
+    ANativeWindowBuffer **anwBuffers = new ANativeWindowBuffer*[totalBuffers];
+    int bufferIdx = 0;
+    for (; bufferIdx < totalBuffers; bufferIdx++) {
+        res = native_window_dequeue_buffer_and_wait(mConsumerInterface.get(),
+                &anwBuffers[bufferIdx]);
+        if (res != OK) {
+            ALOGE("%s: Unable to dequeue buffer %d for initial registration for"
+                    "stream %d", __FUNCTION__, bufferIdx, mId);
+            mState = CONNECTED;
+            goto cleanUpBuffers;
+        }
+        buffers[bufferIdx] = anwBuffers[bufferIdx]->handle;
+    }
+
+    res = mDevice->ops->register_stream_buffers(mDevice,
+            mId,
+            totalBuffers,
+            buffers);
+    if (res != OK) {
+        ALOGE("%s: Unable to register buffers with HAL device for stream %d",
+                __FUNCTION__, mId);
+        mState = CONNECTED;
+    } else {
+        mState = ACTIVE;
+    }
+
+cleanUpBuffers:
+    for (int i = 0; i < bufferIdx; i++) {
+        res = mConsumerInterface->cancelBuffer(mConsumerInterface.get(),
+                anwBuffers[i], -1);
+    }
+    delete anwBuffers;
+    delete buffers;
+
+    return res;
+!!!10039564.cpp!!!	disconnect() : status_t
+    status_t res;
+    if (mState >= ALLOCATED) {
+        res = mDevice->ops->release_stream(mDevice, mId);
+        if (res != OK) {
+            ALOGE("%s: Unable to release stream %d",
+                    __FUNCTION__, mId);
+            return res;
+        }
+    }
+    if (mState >= CONNECTED) {
+        res = native_window_api_disconnect(mConsumerInterface.get(),
+                NATIVE_WINDOW_API_CAMERA);
+        if (res != OK) {
+            ALOGE("%s: Unable to disconnect stream %d from native window",
+                    __FUNCTION__, mId);
+            return res;
+        }
+    }
+    mId = -1;
+    mState = DISCONNECTED;
+    return OK;
+!!!10039692.cpp!!!	getId() : int
+    return mId;
+!!!10039820.cpp!!!	getStreamOps() : camera2_stream_ops
+    return static_cast<camera2_stream_ops *>(this);
+!!!10039948.cpp!!!	toANW(in w : camera2_stream_ops_t) : ANativeWindow
+    return static_cast<const StreamAdapter*>(w)->mConsumerInterface.get();
+!!!10040076.cpp!!!	dequeue_buffer(in w : camera2_stream_ops_t, inout buffer : buffer_handle_t) : int
+    int res;
+    int state = static_cast<const StreamAdapter*>(w)->mState;
+    if (state != ACTIVE) {
+        ALOGE("%s: Called when in bad state: %d", __FUNCTION__, state);
+        return INVALID_OPERATION;
+    }
+
+    ANativeWindow *a = toANW(w);
+    ANativeWindowBuffer* anb;
+    res = native_window_dequeue_buffer_and_wait(a, &anb);
+    if (res != OK) return res;
+
+    *buffer = &(anb->handle);
+
+    return res;
+!!!10040204.cpp!!!	enqueue_buffer(in w : camera2_stream_ops_t, in timestamp : int64_t, inout buffer : buffer_handle_t) : int
+    int state = static_cast<const StreamAdapter*>(w)->mState;
+    if (state != ACTIVE) {
+        ALOGE("%s: Called when in bad state: %d", __FUNCTION__, state);
+        return INVALID_OPERATION;
+    }
+    ANativeWindow *a = toANW(w);
+    status_t err;
+    err = native_window_set_buffers_timestamp(a, timestamp);
+    if (err != OK) return err;
+    return a->queueBuffer(a,
+            container_of(buffer, ANativeWindowBuffer, handle), -1);
+!!!10040332.cpp!!!	cancel_buffer(in w : camera2_stream_ops_t, inout buffer : buffer_handle_t) : int
+    int state = static_cast<const StreamAdapter*>(w)->mState;
+    if (state != ACTIVE) {
+        ALOGE("%s: Called when in bad state: %d", __FUNCTION__, state);
+        return INVALID_OPERATION;
+    }
+    ANativeWindow *a = toANW(w);
+    return a->cancelBuffer(a,
+            container_of(buffer, ANativeWindowBuffer, handle), -1);
+!!!10040460.cpp!!!	set_crop(in w : camera2_stream_ops_t, in left : int, in top : int, in right : int, in bottom : int) : int
+    int state = static_cast<const StreamAdapter*>(w)->mState;
+    if (state != ACTIVE) {
+        ALOGE("%s: Called when in bad state: %d", __FUNCTION__, state);
+        return INVALID_OPERATION;
+    }
+    ANativeWindow *a = toANW(w);
+    android_native_rect_t crop = { left, top, right, bottom };
+    return native_window_set_crop(a, &crop);

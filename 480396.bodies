@@ -1,0 +1,616 @@
+class AaptAssets
+!!!1346060.cpp!!!	getGroupEntries() : SortedVector<AaptGroupEntry>
+    if (mChanged) {
+    }
+    return mGroupEntries;
+!!!1346188.cpp!!!	addFile(in name : String8, in file : sp<AaptGroup>) : status_t
+    mChanged = true;
+    return AaptDir::addFile(name, file);
+!!!1346316.cpp!!!	addFile(in filePath : String8, in entry : AaptGroupEntry, in srcDir : String8, inout outGroup : sp<AaptGroup>, in resType : String8) : sp<AaptFile>
+    sp<AaptDir> dir = this;
+    sp<AaptGroup> group;
+    sp<AaptFile> file;
+    String8 root, remain(filePath), partialPath;
+    while (remain.length() > 0) {
+        root = remain.walkPath(&remain);
+        partialPath.appendPath(root);
+
+        const String8 rootStr(root);
+
+        if (remain.length() == 0) {
+            ssize_t i = dir->getFiles().indexOfKey(rootStr);
+            if (i >= 0) {
+                group = dir->getFiles().valueAt(i);
+            } else {
+                group = new AaptGroup(rootStr, filePath);
+                status_t res = dir->addFile(rootStr, group);
+                if (res != NO_ERROR) {
+                    return NULL;
+                }
+            }
+            file = new AaptFile(srcDir.appendPathCopy(filePath), entry, resType);
+            status_t res = group->addFile(file);
+            if (res != NO_ERROR) {
+                return NULL;
+            }
+            break;
+
+        } else {
+            ssize_t i = dir->getDirs().indexOfKey(rootStr);
+            if (i >= 0) {
+                dir = dir->getDirs().valueAt(i);
+            } else {
+                sp<AaptDir> subdir = new AaptDir(rootStr, partialPath);
+                status_t res = dir->addDir(rootStr, subdir);
+                if (res != NO_ERROR) {
+                    return NULL;
+                }
+                dir = subdir;
+            }
+        }
+    }
+
+    mGroupEntries.add(entry);
+    if (outGroup) *outGroup = group;
+    return file;
+!!!1346444.cpp!!!	addResource(in leafName : String8, in path : String8, in file : sp<AaptFile>, in resType : String8) : void
+    sp<AaptDir> res = AaptDir::makeDir(kResString);
+    String8 dirname = file->getGroupEntry().toDirName(resType);
+    sp<AaptDir> subdir = res->makeDir(dirname);
+    sp<AaptGroup> grr = new AaptGroup(leafName, path);
+    grr->addFile(file);
+
+    subdir->addFile(leafName, grr);
+!!!1346700.cpp!!!	slurpFromArgs(inout bundle : Bundle) : ssize_t
+    int count;
+    int totalCount = 0;
+    FileType type;
+    const Vector<const char *>& resDirs = bundle->getResourceSourceDirs();
+    const size_t dirCount =resDirs.size();
+    sp<AaptAssets> current = this;
+
+    const int N = bundle->getFileSpecCount();
+
+    /*
+     * If a package manifest was specified, include that first.
+     */
+    if (bundle->getAndroidManifestFile() != NULL) {
+        // place at root of zip.
+        String8 srcFile(bundle->getAndroidManifestFile());
+        addFile(srcFile.getPathLeaf(), AaptGroupEntry(), srcFile.getPathDir(),
+                NULL, String8());
+        totalCount++;
+    }
+
+    /*
+     * If a directory of custom assets was supplied, slurp 'em up.
+     */
+    if (bundle->getAssetSourceDir()) {
+        const char* assetDir = bundle->getAssetSourceDir();
+
+        FileType type = getFileType(assetDir);
+        if (type == kFileTypeNonexistent) {
+            fprintf(stderr, "ERROR: asset directory '%s' does not exist\n", assetDir);
+            return UNKNOWN_ERROR;
+        }
+        if (type != kFileTypeDirectory) {
+            fprintf(stderr, "ERROR: '%s' is not a directory\n", assetDir);
+            return UNKNOWN_ERROR;
+        }
+
+        String8 assetRoot(assetDir);
+        sp<AaptDir> assetAaptDir = makeDir(String8(kAssetDir));
+        AaptGroupEntry group;
+        count = assetAaptDir->slurpFullTree(bundle, assetRoot, group,
+                                            String8(), mFullAssetPaths);
+        if (count < 0) {
+            totalCount = count;
+            goto bail;
+        }
+        if (count > 0) {
+            mGroupEntries.add(group);
+        }
+        totalCount += count;
+
+        if (bundle->getVerbose())
+            printf("Found %d custom asset file%s in %s\n",
+                   count, (count==1) ? "" : "s", assetDir);
+    }
+
+    /*
+     * If a directory of resource-specific assets was supplied, slurp 'em up.
+     */
+    for (size_t i=0; i<dirCount; i++) {
+        const char *res = resDirs[i];
+        if (res) {
+            type = getFileType(res);
+            if (type == kFileTypeNonexistent) {
+                fprintf(stderr, "ERROR: resource directory '%s' does not exist\n", res);
+                return UNKNOWN_ERROR;
+            }
+            if (type == kFileTypeDirectory) {
+                if (i>0) {
+                    sp<AaptAssets> nextOverlay = new AaptAssets();
+                    current->setOverlay(nextOverlay);
+                    current = nextOverlay;
+                    current->setFullResPaths(mFullResPaths);
+                }
+                count = current->slurpResourceTree(bundle, String8(res));
+
+                if (count < 0) {
+                    totalCount = count;
+                    goto bail;
+                }
+                totalCount += count;
+            }
+            else {
+                fprintf(stderr, "ERROR: '%s' is not a directory\n", res);
+                return UNKNOWN_ERROR;
+            }
+        }
+        
+    }
+    /*
+     * Now do any additional raw files.
+     */
+    for (int arg=0; arg<N; arg++) {
+        const char* assetDir = bundle->getFileSpecEntry(arg);
+
+        FileType type = getFileType(assetDir);
+        if (type == kFileTypeNonexistent) {
+            fprintf(stderr, "ERROR: input directory '%s' does not exist\n", assetDir);
+            return UNKNOWN_ERROR;
+        }
+        if (type != kFileTypeDirectory) {
+            fprintf(stderr, "ERROR: '%s' is not a directory\n", assetDir);
+            return UNKNOWN_ERROR;
+        }
+
+        String8 assetRoot(assetDir);
+
+        if (bundle->getVerbose())
+            printf("Processing raw dir '%s'\n", (const char*) assetDir);
+
+        /*
+         * Do a recursive traversal of subdir tree.  We don't make any
+         * guarantees about ordering, so we're okay with an inorder search
+         * using whatever order the OS happens to hand back to us.
+         */
+        count = slurpFullTree(bundle, assetRoot, AaptGroupEntry(), String8(), mFullAssetPaths);
+        if (count < 0) {
+            /* failure; report error and remove archive */
+            totalCount = count;
+            goto bail;
+        }
+        totalCount += count;
+
+        if (bundle->getVerbose())
+            printf("Found %d asset file%s in %s\n",
+                   count, (count==1) ? "" : "s", assetDir);
+    }
+
+    count = validate();
+    if (count != NO_ERROR) {
+        totalCount = count;
+        goto bail;
+    }
+
+    count = filter(bundle);
+    if (count != NO_ERROR) {
+        totalCount = count;
+        goto bail;
+    }
+
+bail:
+    return totalCount;
+!!!1346828.cpp!!!	getSymbolsFor(in name : String8) : sp<AaptSymbols>
+    sp<AaptSymbols> sym = mSymbols.valueFor(name);
+    if (sym == NULL) {
+        sym = new AaptSymbols();
+        mSymbols.add(name, sym);
+    }
+    return sym;
+!!!1346956.cpp!!!	getJavaSymbolsFor(in name : String8) : sp<AaptSymbols>
+    sp<AaptSymbols> sym = mJavaSymbols.valueFor(name);
+    if (sym == NULL) {
+        sym = new AaptSymbols();
+        mJavaSymbols.add(name, sym);
+    }
+    return sym;
+!!!1347084.cpp!!!	applyJavaSymbols() : status_t
+    size_t N = mJavaSymbols.size();
+    for (size_t i=0; i<N; i++) {
+        const String8& name = mJavaSymbols.keyAt(i);
+        const sp<AaptSymbols>& symbols = mJavaSymbols.valueAt(i);
+        ssize_t pos = mSymbols.indexOfKey(name);
+        if (pos < 0) {
+            SourcePos pos;
+            pos.error("Java symbol dir %s not defined\n", name.string());
+            return UNKNOWN_ERROR;
+        }
+        //printf("**** applying java symbols in dir %s\n", name.string());
+        status_t err = mSymbols.valueAt(pos)->applyJavaSymbols(symbols);
+        if (err != NO_ERROR) {
+            return err;
+        }
+    }
+
+    return NO_ERROR;
+!!!1347724.cpp!!!	isJavaSymbol(in sym : AaptSymbolEntry, in includePrivate : bool) : bool
+    //printf("isJavaSymbol %s: public=%d, includePrivate=%d, isJavaSymbol=%d\n",
+    //        sym.name.string(), sym.isPublic ? 1 : 0, includePrivate ? 1 : 0,
+    //        sym.isJavaSymbol ? 1 : 0);
+    if (!mHavePrivateSymbols) return true;
+    if (sym.isPublic) return true;
+    if (includePrivate && sym.isJavaSymbol) return true;
+    return false;
+!!!1347852.cpp!!!	buildIncludedResources(inout bundle : Bundle) : status_t
+    if (!mHaveIncludedAssets) {
+        // Add in all includes.
+        const Vector<const char*>& incl = bundle->getPackageIncludes();
+        const size_t N=incl.size();
+        for (size_t i=0; i<N; i++) {
+            if (bundle->getVerbose())
+                printf("Including resources from package: %s\n", incl[i]);
+            if (!mIncludedAssets.addAssetPath(String8(incl[i]), NULL)) {
+                fprintf(stderr, "ERROR: Asset package include '%s' not found.\n",
+                        incl[i]);
+                return UNKNOWN_ERROR;
+            }
+        }
+        mHaveIncludedAssets = true;
+    }
+
+    return NO_ERROR;
+!!!1347980.cpp!!!	addIncludedResources(in file : sp<AaptFile>) : status_t
+    const ResTable& res = getIncludedResources();
+    // XXX dirty!
+    return const_cast<ResTable&>(res).add(file->getData(), file->getSize(), NULL);
+!!!1348108.cpp!!!	getIncludedResources() : ResTable
+    return mIncludedAssets.getResources(false);
+!!!1348236.cpp!!!	print(in prefix : String8) : void
+    String8 innerPrefix(prefix);
+    innerPrefix.append("  ");
+    String8 innerInnerPrefix(innerPrefix);
+    innerInnerPrefix.append("  ");
+    printf("%sConfigurations:\n", prefix.string());
+    const size_t N=mGroupEntries.size();
+    for (size_t i=0; i<N; i++) {
+        String8 cname = mGroupEntries.itemAt(i).toDirName(String8());
+        printf("%s %s\n", prefix.string(),
+                cname != "" ? cname.string() : "(default)");
+    }
+
+    printf("\n%sFiles:\n", prefix.string());
+    AaptDir::print(innerPrefix);
+
+    printf("\n%sResource Dirs:\n", prefix.string());
+    const Vector<sp<AaptDir> >& resdirs = mResDirs;
+    const size_t NR = resdirs.size();
+    for (size_t i=0; i<NR; i++) {
+        const sp<AaptDir>& d = resdirs.itemAt(i);
+        printf("%s  Type %s\n", prefix.string(), d->getLeaf().string());
+        d->print(innerInnerPrefix);
+    }
+!!!1348492.cpp!!!	resDir(in name : String8) : sp<AaptDir>
+    const Vector<sp<AaptDir> >& resdirs = mResDirs;
+    const size_t N = resdirs.size();
+    for (size_t i=0; i<N; i++) {
+        const sp<AaptDir>& d = resdirs.itemAt(i);
+        if (d->getLeaf() == name) {
+            return d;
+        }
+    }
+    return NULL;
+!!!1349644.cpp!!!	slurpFullTree(inout bundle : Bundle, in srcDir : String8, in kind : AaptGroupEntry, in resType : String8, inout fullResPaths : sp<FilePathStore>) : ssize_t
+    ssize_t res = AaptDir::slurpFullTree(bundle, srcDir, kind, resType, fullResPaths);
+    if (res > 0) {
+        mGroupEntries.add(kind);
+    }
+
+    return res;
+!!!1349772.cpp!!!	slurpResourceTree(inout bundle : Bundle, in srcDir : String8) : ssize_t
+    ssize_t err = 0;
+
+    DIR* dir = opendir(srcDir.string());
+    if (dir == NULL) {
+        fprintf(stderr, "ERROR: opendir(%s): %s\n", srcDir.string(), strerror(errno));
+        return UNKNOWN_ERROR;
+    }
+
+    status_t count = 0;
+
+    /*
+     * Run through the directory, looking for dirs that match the
+     * expected pattern.
+     */
+    while (1) {
+        struct dirent* entry = readdir(dir);
+        if (entry == NULL) {
+            break;
+        }
+
+        if (isHidden(srcDir.string(), entry->d_name)) {
+            continue;
+        }
+
+        String8 subdirName(srcDir);
+        subdirName.appendPath(entry->d_name);
+
+        AaptGroupEntry group;
+        String8 resType;
+        bool b = group.initFromDirName(entry->d_name, &resType);
+        if (!b) {
+            fprintf(stderr, "invalid resource directory name: %s/%s\n", srcDir.string(),
+                    entry->d_name);
+            err = -1;
+            continue;
+        }
+
+        if (bundle->getMaxResVersion() != NULL && group.getVersionString().length() != 0) {
+            int maxResInt = atoi(bundle->getMaxResVersion());
+            const char *verString = group.getVersionString().string();
+            int dirVersionInt = atoi(verString + 1); // skip 'v' in version name
+            if (dirVersionInt > maxResInt) {
+              fprintf(stderr, "max res %d, skipping %s\n", maxResInt, entry->d_name);
+              continue;
+            }
+        }
+
+        FileType type = getFileType(subdirName.string());
+
+        if (type == kFileTypeDirectory) {
+            sp<AaptDir> dir = makeDir(resType);
+            ssize_t res = dir->slurpFullTree(bundle, subdirName, group,
+                                                resType, mFullResPaths);
+            if (res < 0) {
+                count = res;
+                goto bail;
+            }
+            if (res > 0) {
+                mGroupEntries.add(group);
+                count += res;
+            }
+
+            // Only add this directory if we don't already have a resource dir
+            // for the current type.  This ensures that we only add the dir once
+            // for all configs.
+            sp<AaptDir> rdir = resDir(resType);
+            if (rdir == NULL) {
+                mResDirs.add(dir);
+            }
+        } else {
+            if (bundle->getVerbose()) {
+                fprintf(stderr, "   (ignoring file '%s')\n", subdirName.string());
+            }
+        }
+    }
+
+bail:
+    closedir(dir);
+    dir = NULL;
+
+    if (err != 0) {
+        return err;
+    }
+    return count;
+!!!1349900.cpp!!!	slurpResourceZip(inout bundle : Bundle, in filename : char) : ssize_t
+    int count = 0;
+    SortedVector<AaptGroupEntry> entries;
+
+    ZipFile* zip = new ZipFile;
+    status_t err = zip->open(filename, ZipFile::kOpenReadOnly);
+    if (err != NO_ERROR) {
+        fprintf(stderr, "error opening zip file %s\n", filename);
+        count = err;
+        delete zip;
+        return -1;
+    }
+
+    const int N = zip->getNumEntries();
+    for (int i=0; i<N; i++) {
+        ZipEntry* entry = zip->getEntryByIndex(i);
+        if (entry->getDeleted()) {
+            continue;
+        }
+
+        String8 entryName(entry->getFileName());
+
+        String8 dirName = entryName.getPathDir();
+        sp<AaptDir> dir = dirName == "" ? this : makeDir(dirName);
+
+        String8 resType;
+        AaptGroupEntry kind;
+
+        String8 remain;
+        if (entryName.walkPath(&remain) == kResourceDir) {
+            // these are the resources, pull their type out of the directory name
+            kind.initFromDirName(remain.walkPath().string(), &resType);
+        } else {
+            // these are untyped and don't have an AaptGroupEntry
+        }
+        if (entries.indexOf(kind) < 0) {
+            entries.add(kind);
+            mGroupEntries.add(kind);
+        }
+
+        // use the one from the zip file if they both exist.
+        dir->removeFile(entryName.getPathLeaf());
+
+        sp<AaptFile> file = new AaptFile(entryName, kind, resType);
+        status_t err = dir->addLeafFile(entryName.getPathLeaf(), file);
+        if (err != NO_ERROR) {
+            fprintf(stderr, "err=%s entryName=%s\n", strerror(err), entryName.string());
+            count = err;
+            goto bail;
+        }
+        file->setCompressionMethod(entry->getCompressionMethod());
+
+#if 0
+        if (entryName == "AndroidManifest.xml") {
+            printf("AndroidManifest.xml\n");
+        }
+        printf("\n\nfile: %s\n", entryName.string());
+#endif
+
+        size_t len = entry->getUncompressedLen();
+        void* data = zip->uncompress(entry);
+        void* buf = file->editData(len);
+        memcpy(buf, data, len);
+
+#if 0
+        const int OFF = 0;
+        const unsigned char* p = (unsigned char*)data;
+        const unsigned char* end = p+len;
+        p += OFF;
+        for (int i=0; i<32 && p < end; i++) {
+            printf("0x%03x ", i*0x10 + OFF);
+            for (int j=0; j<0x10 && p < end; j++) {
+                printf(" %02x", *p);
+                p++;
+            }
+            printf("\n");
+        }
+#endif
+
+        free(data);
+
+        count++;
+    }
+
+bail:
+    delete zip;
+    return count;
+!!!1350028.cpp!!!	filter(inout bundle : Bundle) : status_t
+    ResourceFilter reqFilter;
+    status_t err = reqFilter.parse(bundle->getConfigurations());
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    ResourceFilter prefFilter;
+    err = prefFilter.parse(bundle->getPreferredConfigurations());
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    if (reqFilter.isEmpty() && prefFilter.isEmpty()) {
+        return NO_ERROR;
+    }
+
+    if (bundle->getVerbose()) {
+        if (!reqFilter.isEmpty()) {
+            printf("Applying required filter: %s\n",
+                    bundle->getConfigurations());
+        }
+        if (!prefFilter.isEmpty()) {
+            printf("Applying preferred filter: %s\n",
+                    bundle->getPreferredConfigurations());
+        }
+    }
+
+    const Vector<sp<AaptDir> >& resdirs = mResDirs;
+    const size_t ND = resdirs.size();
+    for (size_t i=0; i<ND; i++) {
+        const sp<AaptDir>& dir = resdirs.itemAt(i);
+        if (dir->getLeaf() == kValuesDir) {
+            // The "value" dir is special since a single file defines
+            // multiple resources, so we can not do filtering on the
+            // files themselves.
+            continue;
+        }
+        if (dir->getLeaf() == kMipmapDir) {
+            // We also skip the "mipmap" directory, since the point of this
+            // is to include all densities without stripping.  If you put
+            // other configurations in here as well they won't be stripped
+            // either...  So don't do that.  Seriously.  What is wrong with you?
+            continue;
+        }
+
+        const size_t NG = dir->getFiles().size();
+        for (size_t j=0; j<NG; j++) {
+            sp<AaptGroup> grp = dir->getFiles().valueAt(j);
+
+            // First remove any configurations we know we don't need.
+            for (size_t k=0; k<grp->getFiles().size(); k++) {
+                sp<AaptFile> file = grp->getFiles().valueAt(k);
+                if (k == 0 && grp->getFiles().size() == 1) {
+                    // If this is the only file left, we need to keep it.
+                    // Otherwise the resource IDs we are using will be inconsistent
+                    // with what we get when not stripping.  Sucky, but at least
+                    // for now we can rely on the back-end doing another filtering
+                    // pass to take this out and leave us with this resource name
+                    // containing no entries.
+                    continue;
+                }
+                if (file->getPath().getPathExtension() == ".xml") {
+                    // We can't remove .xml files at this point, because when
+                    // we parse them they may add identifier resources, so
+                    // removing them can cause our resource identifiers to
+                    // become inconsistent.
+                    continue;
+                }
+                const ResTable_config& config(file->getGroupEntry().toParams());
+                if (!reqFilter.match(config)) {
+                    if (bundle->getVerbose()) {
+                        printf("Pruning unneeded resource: %s\n",
+                                file->getPrintableSource().string());
+                    }
+                    grp->removeFile(k);
+                    k--;
+                }
+            }
+
+            // Quick check: no preferred filters, nothing more to do.
+            if (prefFilter.isEmpty()) {
+                continue;
+            }
+
+            // Now deal with preferred configurations.
+            for (int axis=AXIS_START; axis<=AXIS_END; axis++) {
+                for (size_t k=0; k<grp->getFiles().size(); k++) {
+                    sp<AaptFile> file = grp->getFiles().valueAt(k);
+                    if (k == 0 && grp->getFiles().size() == 1) {
+                        // If this is the only file left, we need to keep it.
+                        // Otherwise the resource IDs we are using will be inconsistent
+                        // with what we get when not stripping.  Sucky, but at least
+                        // for now we can rely on the back-end doing another filtering
+                        // pass to take this out and leave us with this resource name
+                        // containing no entries.
+                        continue;
+                    }
+                    if (file->getPath().getPathExtension() == ".xml") {
+                        // We can't remove .xml files at this point, because when
+                        // we parse them they may add identifier resources, so
+                        // removing them can cause our resource identifiers to
+                        // become inconsistent.
+                        continue;
+                    }
+                    const ResTable_config& config(file->getGroupEntry().toParams());
+                    if (!prefFilter.match(axis, config)) {
+                        // This is a resource we would prefer not to have.  Check
+                        // to see if have a similar variation that we would like
+                        // to have and, if so, we can drop it.
+                        for (size_t m=0; m<grp->getFiles().size(); m++) {
+                            if (m == k) continue;
+                            sp<AaptFile> mfile = grp->getFiles().valueAt(m);
+                            const ResTable_config& mconfig(mfile->getGroupEntry().toParams());
+                            if (AaptGroupEntry::configSameExcept(config, mconfig, axis)) {
+                                if (prefFilter.match(axis, mconfig)) {
+                                    if (bundle->getVerbose()) {
+                                        printf("Pruning unneeded resource: %s\n",
+                                                file->getPrintableSource().string());
+                                    }
+                                    grp->removeFile(k);
+                                    k--;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return NO_ERROR;

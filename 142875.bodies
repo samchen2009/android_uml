@@ -1,0 +1,242 @@
+class CharsetEncoder
+!!!794779.java!!!	CharsetEncoder(inout cs : Charset, in averageBytesPerChar : float, in maxBytesPerChar : float)
+        this(cs, averageBytesPerChar, maxBytesPerChar, new byte[] { (byte) '?' });
+!!!794907.java!!!	CharsetEncoder(inout cs : Charset, in averageBytesPerChar : float, in maxBytesPerChar : float, inout replacement : byte)
+        this(cs, averageBytesPerChar, maxBytesPerChar, replacement, false);
+!!!795035.java!!!	CharsetEncoder(inout cs : Charset, in averageBytesPerChar : float, in maxBytesPerChar : float, inout replacement : byte, inout trusted : boolean)
+        if (averageBytesPerChar <= 0 || maxBytesPerChar <= 0) {
+            throw new IllegalArgumentException("averageBytesPerChar and maxBytesPerChar must both be positive");
+        }
+        if (averageBytesPerChar > maxBytesPerChar) {
+            throw new IllegalArgumentException("averageBytesPerChar is greater than maxBytesPerChar");
+        }
+        this.cs = cs;
+        this.averageBytesPerChar = averageBytesPerChar;
+        this.maxBytesPerChar = maxBytesPerChar;
+        status = INIT;
+        malformedInputAction = CodingErrorAction.REPORT;
+        unmappableCharacterAction = CodingErrorAction.REPORT;
+        if (trusted) {
+            // The RI enforces unnecessary restrictions on the replacement bytes. We trust ICU to
+            // know what it's doing. Doing so lets us support ICU's EUC-JP, SCSU, and Shift_JIS.
+            this.replacementBytes = replacement;
+        } else {
+            replaceWith(replacement);
+        }
+!!!795163.java!!!	averageBytesPerChar() : float
+        return averageBytesPerChar;
+!!!795291.java!!!	canEncode(in c : char) : boolean
+        return implCanEncode(CharBuffer.wrap(new char[] { c }));
+!!!795419.java!!!	implCanEncode(inout cb : CharBuffer) : boolean
+        if (status == FLUSH || status == INIT) {
+            status = READY;
+        }
+        if (status != READY) {
+            throw new IllegalStateException("encoding already in progress");
+        }
+        CodingErrorAction malformBak = malformedInputAction;
+        CodingErrorAction unmapBak = unmappableCharacterAction;
+        onMalformedInput(CodingErrorAction.REPORT);
+        onUnmappableCharacter(CodingErrorAction.REPORT);
+        boolean result = true;
+        try {
+            this.encode(cb);
+        } catch (CharacterCodingException e) {
+            result = false;
+        }
+        onMalformedInput(malformBak);
+        onUnmappableCharacter(unmapBak);
+        reset();
+        return result;
+!!!795547.java!!!	canEncode(inout sequence : CharSequence) : boolean
+        CharBuffer cb;
+        if (sequence instanceof CharBuffer) {
+            cb = ((CharBuffer) sequence).duplicate();
+        } else {
+            cb = CharBuffer.wrap(sequence);
+        }
+        return implCanEncode(cb);
+!!!795675.java!!!	charset() : Charset
+        return cs;
+!!!795803.java!!!	encode(inout in : CharBuffer) : ByteBuffer
+        if (in.remaining() == 0) {
+            return ByteBuffer.allocate(0);
+        }
+        reset();
+        int length = (int) (in.remaining() * averageBytesPerChar);
+        ByteBuffer output = ByteBuffer.allocate(length);
+        CoderResult result = null;
+        while (true) {
+            result = encode(in, output, false);
+            if (result==CoderResult.UNDERFLOW) {
+                break;
+            } else if (result==CoderResult.OVERFLOW) {
+                output = allocateMore(output);
+                continue;
+            }
+            checkCoderResult(result);
+        }
+        result = encode(in, output, true);
+        checkCoderResult(result);
+
+        while (true) {
+            result = flush(output);
+            if (result==CoderResult.UNDERFLOW) {
+                output.flip();
+                break;
+            } else if (result==CoderResult.OVERFLOW) {
+                output = allocateMore(output);
+                continue;
+            }
+            checkCoderResult(result);
+            output.flip();
+            if (result.isMalformed()) {
+                throw new MalformedInputException(result.length());
+            } else if (result.isUnmappable()) {
+                throw new UnmappableCharacterException(result.length());
+            }
+            break;
+        }
+        status = READY;
+        finished = true;
+        return output;
+!!!795931.java!!!	checkCoderResult(inout result : CoderResult) : void
+        if (malformedInputAction == CodingErrorAction.REPORT && result.isMalformed() ) {
+            throw new MalformedInputException(result.length());
+        } else if (unmappableCharacterAction == CodingErrorAction.REPORT && result.isUnmappable()) {
+            throw new UnmappableCharacterException(result.length());
+        }
+!!!796059.java!!!	allocateMore(inout output : ByteBuffer) : ByteBuffer
+        if (output.capacity() == 0) {
+            return ByteBuffer.allocate(1);
+        }
+        ByteBuffer result = ByteBuffer.allocate(output.capacity() * 2);
+        output.flip();
+        result.put(output);
+        return result;
+!!!796187.java!!!	encode(inout in : CharBuffer, inout out : ByteBuffer, inout endOfInput : boolean) : CoderResult
+        // If the previous step is encode(CharBuffer), then no more input is needed
+        // thus endOfInput should not be false
+        if (status == READY && finished && !endOfInput) {
+            throw new IllegalStateException();
+        }
+        if ((status == FLUSH) || (!endOfInput && status == END)) {
+            throw new IllegalStateException();
+        }
+
+        CoderResult result;
+        while (true) {
+            try {
+                result = encodeLoop(in, out);
+            } catch (BufferOverflowException e) {
+                throw new CoderMalfunctionError(e);
+            } catch (BufferUnderflowException e) {
+                throw new CoderMalfunctionError(e);
+            }
+            if (result==CoderResult.UNDERFLOW) {
+                status = endOfInput ? END : ONGOING;
+                if (endOfInput) {
+                    int remaining = in.remaining();
+                    if (remaining > 0) {
+                        result = CoderResult.malformedForLength(remaining);
+                    } else {
+                        return result;
+                    }
+                } else {
+                    return result;
+                }
+            } else if (result==CoderResult.OVERFLOW) {
+                status = endOfInput ? END : ONGOING;
+                return result;
+            }
+            CodingErrorAction action = malformedInputAction;
+            if (result.isUnmappable()) {
+                action = unmappableCharacterAction;
+            }
+            // If the action is IGNORE or REPLACE, we should continue
+            // encoding.
+            if (action == CodingErrorAction.REPLACE) {
+                if (out.remaining() < replacementBytes.length) {
+                    return CoderResult.OVERFLOW;
+                }
+                out.put(replacementBytes);
+            } else {
+                if (action != CodingErrorAction.IGNORE) {
+                    return result;
+                }
+            }
+            in.position(in.position() + result.length());
+        }
+!!!796443.java!!!	flush(inout out : ByteBuffer) : CoderResult
+        if (status != END && status != READY) {
+            throw new IllegalStateException();
+        }
+        CoderResult result = implFlush(out);
+        if (result == CoderResult.UNDERFLOW) {
+            status = FLUSH;
+        }
+        return result;
+!!!796571.java!!!	implFlush(inout out : ByteBuffer) : CoderResult
+        return CoderResult.UNDERFLOW;
+!!!796699.java!!!	implOnMalformedInput(inout newAction : CodingErrorAction) : void
+        // default implementation is empty
+!!!796827.java!!!	implOnUnmappableCharacter(inout newAction : CodingErrorAction) : void
+        // default implementation is empty
+!!!796955.java!!!	implReplaceWith(inout newReplacement : byte) : void
+        // default implementation is empty
+!!!797083.java!!!	implReset() : void
+        // default implementation is empty
+!!!797211.java!!!	isLegalReplacement(inout replacement : byte) : boolean
+        if (decoder == null) {
+            decoder = cs.newDecoder();
+            decoder.onMalformedInput(CodingErrorAction.REPORT);
+            decoder.onUnmappableCharacter(CodingErrorAction.REPORT);
+        }
+        ByteBuffer in = ByteBuffer.wrap(replacement);
+        CharBuffer out = CharBuffer.allocate((int) (replacement.length * decoder.maxCharsPerByte()));
+        CoderResult result = decoder.decode(in, out, true);
+        return !result.isError();
+!!!797339.java!!!	malformedInputAction() : CodingErrorAction
+        return malformedInputAction;
+!!!797467.java!!!	maxBytesPerChar() : float
+        return maxBytesPerChar;
+!!!797595.java!!!	onMalformedInput(inout newAction : CodingErrorAction) : CharsetEncoder
+        if (newAction == null) {
+            throw new IllegalArgumentException("newAction == null");
+        }
+        malformedInputAction = newAction;
+        implOnMalformedInput(newAction);
+        return this;
+!!!797723.java!!!	onUnmappableCharacter(inout newAction : CodingErrorAction) : CharsetEncoder
+        if (newAction == null) {
+            throw new IllegalArgumentException("newAction == null");
+        }
+        unmappableCharacterAction = newAction;
+        implOnUnmappableCharacter(newAction);
+        return this;
+!!!797851.java!!!	replacement() : byte
+        return replacementBytes;
+!!!797979.java!!!	replaceWith(inout replacement : byte) : CharsetEncoder
+        if (replacement == null) {
+            throw new IllegalArgumentException("replacement == null");
+        }
+        if (replacement.length == 0) {
+            throw new IllegalArgumentException("replacement.length == 0");
+        }
+        if (replacement.length > maxBytesPerChar()) {
+            throw new IllegalArgumentException("replacement.length > maxBytesPerChar: " +
+                    replacement.length + " > " + maxBytesPerChar());
+        }
+        if (!isLegalReplacement(replacement)) {
+            throw new IllegalArgumentException("Bad replacement: " + Arrays.toString(replacement));
+        }
+        // It seems like a bug, but the RI doesn't clone, and we have tests that check we don't.
+        this.replacementBytes = replacement;
+        implReplaceWith(replacementBytes);
+        return this;
+!!!798107.java!!!	reset() : CharsetEncoder
+        status = INIT;
+        implReset();
+        return this;
+!!!798235.java!!!	unmappableCharacterAction() : CodingErrorAction
+        return unmappableCharacterAction;

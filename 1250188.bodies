@@ -1,0 +1,312 @@
+class MediaSource
+!!!7118860.java!!!	MediaSource(in name : String)
+        super(name);
+        mNewFrameAvailable = false;
+
+        mLogVerbose = Log.isLoggable(TAG, Log.VERBOSE);
+!!!7118988.java!!!	setupPorts() : void
+        // Add input port
+        addOutputPort("video", ImageFormat.create(ImageFormat.COLORSPACE_RGBA,
+                                                  FrameFormat.TARGET_GPU));
+!!!7119116.java!!!	createFormats() : void
+        mOutputFormat = ImageFormat.create(ImageFormat.COLORSPACE_RGBA,
+                                           FrameFormat.TARGET_GPU);
+!!!7119244.java!!!	prepare(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Preparing MediaSource");
+
+        mFrameExtractor = new ShaderProgram(context, mFrameShader);
+        // SurfaceTexture defines (0,0) to be bottom-left. The filter framework
+        // defines (0,0) as top-left, so do the flip here.
+        mFrameExtractor.setSourceRect(0, 1, 1, -1);
+
+        createFormats();
+!!!7119372.java!!!	open(inout context : FilterContext) : void
+        if (mLogVerbose) {
+            Log.v(TAG, "Opening MediaSource");
+            if (mSelectedIsUrl) {
+                Log.v(TAG, "Current URL is " + mSourceUrl);
+            } else {
+                Log.v(TAG, "Current source is Asset!");
+            }
+        }
+
+        mMediaFrame = (GLFrame)context.getFrameManager().newBoundFrame(
+                mOutputFormat,
+                GLFrame.EXTERNAL_TEXTURE,
+                0);
+
+        mSurfaceTexture = new SurfaceTexture(mMediaFrame.getTextureId());
+
+        if (!setupMediaPlayer(mSelectedIsUrl)) {
+          throw new RuntimeException("Error setting up MediaPlayer!");
+        }
+!!!7119500.java!!!	process(inout context : FilterContext) : void
+        // Note: process is synchronized by its caller in the Filter base class
+        if (mLogVerbose) Log.v(TAG, "Processing new frame");
+
+        if (mMediaPlayer == null) {
+            // Something went wrong in initialization or parameter updates
+            throw new NullPointerException("Unexpected null media player!");
+        }
+
+        if (mCompleted) {
+            // Video playback is done, so close us down
+            closeOutputPort("video");
+            return;
+        }
+
+        if (!mPlaying) {
+            int waitCount = 0;
+            if (mLogVerbose) Log.v(TAG, "Waiting for preparation to complete");
+            while (!mGotSize || !mPrepared) {
+                try {
+                    this.wait(PREP_TIMEOUT);
+                } catch (InterruptedException e) {
+                    // ignoring
+                }
+                if (mCompleted) {
+                    // Video playback is done, so close us down
+                    closeOutputPort("video");
+                    return;
+                }
+                waitCount++;
+                if (waitCount == PREP_TIMEOUT_REPEAT) {
+                    mMediaPlayer.release();
+                    throw new RuntimeException("MediaPlayer timed out while preparing!");
+                }
+            }
+            if (mLogVerbose) Log.v(TAG, "Starting playback");
+            mMediaPlayer.start();
+        }
+
+        // Use last frame if paused, unless just starting playback, in which case
+        // we want at least one valid frame before pausing
+        if (!mPaused || !mPlaying) {
+            if (mWaitForNewFrame) {
+                if (mLogVerbose) Log.v(TAG, "Waiting for new frame");
+
+                int waitCount = 0;
+                while (!mNewFrameAvailable) {
+                    if (waitCount == NEWFRAME_TIMEOUT_REPEAT) {
+                        if (mCompleted) {
+                            // Video playback is done, so close us down
+                            closeOutputPort("video");
+                            return;
+                        } else {
+                            throw new RuntimeException("Timeout waiting for new frame!");
+                        }
+                    }
+                    try {
+                        this.wait(NEWFRAME_TIMEOUT);
+                    } catch (InterruptedException e) {
+                        if (mLogVerbose) Log.v(TAG, "interrupted");
+                        // ignoring
+                    }
+                    waitCount++;
+                }
+                mNewFrameAvailable = false;
+                if (mLogVerbose) Log.v(TAG, "Got new frame");
+            }
+
+            mSurfaceTexture.updateTexImage();
+            mOrientationUpdated = true;
+        }
+        if (mOrientationUpdated) {
+            float[] surfaceTransform = new float[16];
+            mSurfaceTexture.getTransformMatrix(surfaceTransform);
+
+            float[] sourceCoords = new float[16];
+            switch (mOrientation) {
+                default:
+                case 0:
+                    Matrix.multiplyMM(sourceCoords, 0,
+                                      surfaceTransform, 0,
+                                      mSourceCoords_0, 0);
+                    break;
+                case 90:
+                    Matrix.multiplyMM(sourceCoords, 0,
+                                      surfaceTransform, 0,
+                                      mSourceCoords_90, 0);
+                    break;
+                case 180:
+                    Matrix.multiplyMM(sourceCoords, 0,
+                                      surfaceTransform, 0,
+                                      mSourceCoords_180, 0);
+                    break;
+                case 270:
+                    Matrix.multiplyMM(sourceCoords, 0,
+                                      surfaceTransform, 0,
+                                      mSourceCoords_270, 0);
+                    break;
+            }
+            if (mLogVerbose) {
+                Log.v(TAG, "OrientationHint = " + mOrientation);
+                String temp = String.format("SetSourceRegion: %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f",
+                        sourceCoords[4], sourceCoords[5],sourceCoords[0], sourceCoords[1],
+                        sourceCoords[12], sourceCoords[13],sourceCoords[8], sourceCoords[9]);
+                Log.v(TAG, temp);
+            }
+            mFrameExtractor.setSourceRegion(sourceCoords[4], sourceCoords[5],
+                    sourceCoords[0], sourceCoords[1],
+                    sourceCoords[12], sourceCoords[13],
+                    sourceCoords[8], sourceCoords[9]);
+            mOrientationUpdated = false;
+        }
+
+        Frame output = context.getFrameManager().newFrame(mOutputFormat);
+        mFrameExtractor.process(mMediaFrame, output);
+
+        long timestamp = mSurfaceTexture.getTimestamp();
+        if (mLogVerbose) Log.v(TAG, "Timestamp: " + (timestamp / 1000000000.0) + " s");
+        output.setTimestamp(timestamp);
+
+        pushOutput("video", output);
+        output.release();
+
+        mPlaying = true;
+!!!7119628.java!!!	close(inout context : FilterContext) : void
+        if (mMediaPlayer.isPlaying()) {
+            mMediaPlayer.stop();
+        }
+        mPrepared = false;
+        mGotSize = false;
+        mPlaying = false;
+        mPaused = false;
+        mCompleted = false;
+        mNewFrameAvailable = false;
+
+        mMediaPlayer.release();
+        mMediaPlayer = null;
+        mSurfaceTexture.release();
+        mSurfaceTexture = null;
+        if (mLogVerbose) Log.v(TAG, "MediaSource closed");
+!!!7119756.java!!!	tearDown(inout context : FilterContext) : void
+        if (mMediaFrame != null) {
+            mMediaFrame.release();
+        }
+!!!7119884.java!!!	fieldPortValueUpdated(in name : String, inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Parameter update");
+        if (name.equals("sourceUrl")) {
+           if (isOpen()) {
+                if (mLogVerbose) Log.v(TAG, "Opening new source URL");
+                if (mSelectedIsUrl) {
+                    setupMediaPlayer(mSelectedIsUrl);
+                }
+            }
+        } else if (name.equals("sourceAsset") ) {
+            if (isOpen()) {
+                if (mLogVerbose) Log.v(TAG, "Opening new source FD");
+                if (!mSelectedIsUrl) {
+                    setupMediaPlayer(mSelectedIsUrl);
+                }
+            }
+        } else if (name.equals("loop")) {
+            if (isOpen()) {
+                mMediaPlayer.setLooping(mLooping);
+            }
+        } else if (name.equals("sourceIsUrl")) {
+            if (isOpen()){
+                if (mSelectedIsUrl){
+                    if (mLogVerbose) Log.v(TAG, "Opening new source URL");
+                } else {
+                    if (mLogVerbose) Log.v(TAG, "Opening new source Asset");
+                }
+                setupMediaPlayer(mSelectedIsUrl);
+            }
+        } else if (name.equals("volume")) {
+            if (isOpen()) {
+                mMediaPlayer.setVolume(mVolume, mVolume);
+            }
+        } else if (name.equals("orientation") && mGotSize) {
+            if (mOrientation == 0 || mOrientation == 180) {
+                mOutputFormat.setDimensions(mWidth, mHeight);
+            } else {
+                mOutputFormat.setDimensions(mHeight, mWidth);
+            }
+            mOrientationUpdated = true;
+        }
+!!!7120012.java!!!	pauseVideo(inout pauseState : boolean) : void
+        if (isOpen()) {
+            if (pauseState && !mPaused) {
+                mMediaPlayer.pause();
+            } else if (!pauseState && mPaused) {
+                mMediaPlayer.start();
+            }
+        }
+        mPaused = pauseState;
+!!!7120140.java!!!	setupMediaPlayer(inout useUrl : boolean) : boolean
+        mPrepared = false;
+        mGotSize = false;
+        mPlaying = false;
+        mPaused = false;
+        mCompleted = false;
+        mNewFrameAvailable = false;
+
+        if (mLogVerbose) Log.v(TAG, "Setting up playback.");
+
+        if (mMediaPlayer != null) {
+            // Clean up existing media players
+            if (mLogVerbose) Log.v(TAG, "Resetting existing MediaPlayer.");
+            mMediaPlayer.reset();
+        } else {
+            // Create new media player
+            if (mLogVerbose) Log.v(TAG, "Creating new MediaPlayer.");
+            mMediaPlayer = new MediaPlayer();
+        }
+
+        if (mMediaPlayer == null) {
+            throw new RuntimeException("Unable to create a MediaPlayer!");
+        }
+
+        // Set up data sources, etc
+        try {
+            if (useUrl) {
+                if (mLogVerbose) Log.v(TAG, "Setting MediaPlayer source to URI " + mSourceUrl);
+                if (mContext == null) {
+                    mMediaPlayer.setDataSource(mSourceUrl);
+                } else {
+                    mMediaPlayer.setDataSource(mContext, Uri.parse(mSourceUrl.toString()));
+                }
+            } else {
+                if (mLogVerbose) Log.v(TAG, "Setting MediaPlayer source to asset " + mSourceAsset);
+                mMediaPlayer.setDataSource(mSourceAsset.getFileDescriptor(), mSourceAsset.getStartOffset(), mSourceAsset.getLength());
+            }
+        } catch(IOException e) {
+            mMediaPlayer.release();
+            mMediaPlayer = null;
+            if (useUrl) {
+                throw new RuntimeException(String.format("Unable to set MediaPlayer to URL %s!", mSourceUrl), e);
+            } else {
+                throw new RuntimeException(String.format("Unable to set MediaPlayer to asset %s!", mSourceAsset), e);
+            }
+        } catch(IllegalArgumentException e) {
+            mMediaPlayer.release();
+            mMediaPlayer = null;
+            if (useUrl) {
+                throw new RuntimeException(String.format("Unable to set MediaPlayer to URL %s!", mSourceUrl), e);
+            } else {
+                throw new RuntimeException(String.format("Unable to set MediaPlayer to asset %s!", mSourceAsset), e);
+            }
+        }
+
+        mMediaPlayer.setLooping(mLooping);
+        mMediaPlayer.setVolume(mVolume, mVolume);
+
+        // Bind it to our media frame
+        Surface surface = new Surface(mSurfaceTexture);
+        mMediaPlayer.setSurface(surface);
+        surface.release();
+
+        // Connect Media Player to callbacks
+
+        mMediaPlayer.setOnVideoSizeChangedListener(onVideoSizeChangedListener);
+        mMediaPlayer.setOnPreparedListener(onPreparedListener);
+        mMediaPlayer.setOnCompletionListener(onCompletionListener);
+
+        // Connect SurfaceTexture to callback
+        mSurfaceTexture.setOnFrameAvailableListener(onMediaFrameAvailableListener);
+
+        if (mLogVerbose) Log.v(TAG, "Preparing MediaPlayer.");
+        mMediaPlayer.prepareAsync();
+
+        return true;

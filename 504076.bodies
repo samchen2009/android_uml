@@ -1,0 +1,208 @@
+class BpBinder
+!!!1445644.cpp!!!	BpBinder(in handle : int32_t)
+    ALOGV("Creating BpBinder %p handle %d\n", this, mHandle);
+
+    extendObjectLifetime(OBJECT_LIFETIME_WEAK);
+    IPCThreadState::self()->incWeakHandle(handle);
+!!!1445900.cpp!!!	getInterfaceDescriptor() : String16
+    if (isDescriptorCached() == false) {
+        Parcel send, reply;
+        // do the IPC without a lock held.
+        status_t err = const_cast<BpBinder*>(this)->transact(
+                INTERFACE_TRANSACTION, send, &reply);
+        if (err == NO_ERROR) {
+            String16 res(reply.readString16());
+            Mutex::Autolock _l(mLock);
+            // mDescriptorCache could have been assigned while the lock was
+            // released.
+            if (mDescriptorCache.size() == 0)
+                mDescriptorCache = res;
+        }
+    }
+    
+    // we're returning a reference to a non-static object here. Usually this
+    // is not something smart to do, however, with binder objects it is 
+    // (usually) safe because they are reference-counted.
+    
+    return mDescriptorCache;
+!!!1446028.cpp!!!	isBinderAlive() : bool
+    return mAlive != 0;
+!!!1446156.cpp!!!	pingBinder() : status_t
+    Parcel send;
+    Parcel reply;
+    status_t err = transact(PING_TRANSACTION, send, &reply);
+    if (err != NO_ERROR) return err;
+    if (reply.dataSize() < sizeof(status_t)) return NOT_ENOUGH_DATA;
+    return (status_t)reply.readInt32();
+!!!1446284.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    Parcel send;
+    Parcel reply;
+    send.writeFileDescriptor(fd);
+    const size_t numArgs = args.size();
+    send.writeInt32(numArgs);
+    for (size_t i = 0; i < numArgs; i++) {
+        send.writeString16(args[i]);
+    }
+    status_t err = transact(DUMP_TRANSACTION, send, &reply);
+    return err;
+!!!1446412.cpp!!!	transact(in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t = 0) : status_t
+    // Once a binder has died, it will never come back to life.
+    if (mAlive) {
+        status_t status = IPCThreadState::self()->transact(
+            mHandle, code, data, reply, flags);
+        if (status == DEAD_OBJECT) mAlive = 0;
+        return status;
+    }
+
+    return DEAD_OBJECT;
+!!!1446540.cpp!!!	linkToDeath(in recipient : sp<DeathRecipient>, inout cookie : void = NULL, in flags : uint32_t = 0) : status_t
+    Obituary ob;
+    ob.recipient = recipient;
+    ob.cookie = cookie;
+    ob.flags = flags;
+
+    LOG_ALWAYS_FATAL_IF(recipient == NULL,
+                        "linkToDeath(): recipient must be non-NULL");
+
+    {
+        AutoMutex _l(mLock);
+
+        if (!mObitsSent) {
+            if (!mObituaries) {
+                mObituaries = new Vector<Obituary>;
+                if (!mObituaries) {
+                    return NO_MEMORY;
+                }
+                ALOGV("Requesting death notification: %p handle %d\n", this, mHandle);
+                getWeakRefs()->incWeak(this);
+                IPCThreadState* self = IPCThreadState::self();
+                self->requestDeathNotification(mHandle, this);
+                self->flushCommands();
+            }
+            ssize_t res = mObituaries->add(ob);
+            return res >= (ssize_t)NO_ERROR ? (status_t)NO_ERROR : res;
+        }
+    }
+
+    return DEAD_OBJECT;
+!!!1446668.cpp!!!	unlinkToDeath(in recipient : wp<DeathRecipient>, inout cookie : void = NULL, in flags : uint32_t = 0, inout outRecipient : wp<DeathRecipient> = NULL) : status_t
+    AutoMutex _l(mLock);
+
+    if (mObitsSent) {
+        return DEAD_OBJECT;
+    }
+
+    const size_t N = mObituaries ? mObituaries->size() : 0;
+    for (size_t i=0; i<N; i++) {
+        const Obituary& obit = mObituaries->itemAt(i);
+        if ((obit.recipient == recipient
+                    || (recipient == NULL && obit.cookie == cookie))
+                && obit.flags == flags) {
+            const uint32_t allFlags = obit.flags|flags;
+            if (outRecipient != NULL) {
+                *outRecipient = mObituaries->itemAt(i).recipient;
+            }
+            mObituaries->removeAt(i);
+            if (mObituaries->size() == 0) {
+                ALOGV("Clearing death notification: %p handle %d\n", this, mHandle);
+                IPCThreadState* self = IPCThreadState::self();
+                self->clearDeathNotification(mHandle, this);
+                self->flushCommands();
+                delete mObituaries;
+                mObituaries = NULL;
+            }
+            return NO_ERROR;
+        }
+    }
+
+    return NAME_NOT_FOUND;
+!!!1446796.cpp!!!	attachObject(in objectID : void, inout object : void, inout cleanupCookie : void, in func : object_cleanup_func) : void
+    AutoMutex _l(mLock);
+    ALOGV("Attaching object %p to binder %p (manager=%p)", object, this, &mObjects);
+    mObjects.attach(objectID, object, cleanupCookie, func);
+!!!1446924.cpp!!!	findObject(in objectID : void) : void
+    AutoMutex _l(mLock);
+    return mObjects.find(objectID);
+!!!1447052.cpp!!!	detachObject(in objectID : void) : void
+    AutoMutex _l(mLock);
+    mObjects.detach(objectID);
+!!!1447180.cpp!!!	remoteBinder() : BpBinder
+    return this;
+!!!1447436.cpp!!!	sendObituary() : void
+    ALOGV("Sending obituary for proxy %p handle %d, mObitsSent=%s\n",
+        this, mHandle, mObitsSent ? "true" : "false");
+
+    mAlive = 0;
+    if (mObitsSent) return;
+
+    mLock.lock();
+    Vector<Obituary>* obits = mObituaries;
+    if(obits != NULL) {
+        ALOGV("Clearing sent death notification: %p handle %d\n", this, mHandle);
+        IPCThreadState* self = IPCThreadState::self();
+        self->clearDeathNotification(mHandle, this);
+        self->flushCommands();
+        mObituaries = NULL;
+    }
+    mObitsSent = 1;
+    mLock.unlock();
+
+    ALOGV("Reporting death of proxy %p for %d recipients\n",
+        this, obits ? obits->size() : 0);
+
+    if (obits != NULL) {
+        const size_t N = obits->size();
+        for (size_t i=0; i<N; i++) {
+            reportOneDeath(obits->itemAt(i));
+        }
+
+        delete obits;
+    }
+!!!1448588.cpp!!!	~BpBinder()
+    ALOGV("Destroying BpBinder %p handle %d\n", this, mHandle);
+
+    IPCThreadState* ipc = IPCThreadState::self();
+
+    mLock.lock();
+    Vector<Obituary>* obits = mObituaries;
+    if(obits != NULL) {
+        if (ipc) ipc->clearDeathNotification(mHandle, this);
+        mObituaries = NULL;
+    }
+    mLock.unlock();
+
+    if (obits != NULL) {
+        // XXX Should we tell any remaining DeathRecipient
+        // objects that the last strong ref has gone away, so they
+        // are no longer linked?
+        delete obits;
+    }
+
+    if (ipc) {
+        ipc->expungeHandle(mHandle, this);
+        ipc->decWeakHandle(mHandle);
+    }
+!!!1448716.cpp!!!	onFirstRef() : void
+    ALOGV("onFirstRef BpBinder %p handle %d\n", this, mHandle);
+    IPCThreadState* ipc = IPCThreadState::self();
+    if (ipc) ipc->incStrongHandle(mHandle);
+!!!1448844.cpp!!!	onLastStrongRef(in id : void) : void
+    ALOGV("onLastStrongRef BpBinder %p handle %d\n", this, mHandle);
+    IF_ALOGV() {
+        printRefs();
+    }
+    IPCThreadState* ipc = IPCThreadState::self();
+    if (ipc) ipc->decStrongHandle(mHandle);
+!!!1448972.cpp!!!	onIncStrongAttempted(in flags : uint32_t, in id : void) : bool
+    ALOGV("onIncStrongAttempted BpBinder %p handle %d\n", this, mHandle);
+    IPCThreadState* ipc = IPCThreadState::self();
+    return ipc ? ipc->attemptIncStrongHandle(mHandle) == NO_ERROR : false;
+!!!1449100.cpp!!!	reportOneDeath(in obit : Obituary) : void
+    sp<DeathRecipient> recipient = obit.recipient.promote();
+    ALOGV("Reporting death to recipient: %p\n", recipient.get());
+    if (recipient == NULL) return;
+
+    recipient->binderDied(this);
+!!!1449228.cpp!!!	isDescriptorCached() : bool
+    Mutex::Autolock _l(mLock);
+    return mDescriptorCache.size() ? true : false;

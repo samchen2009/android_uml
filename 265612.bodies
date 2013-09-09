@@ -1,0 +1,181 @@
+class AudioBiquadFilter
+!!!485516.cpp!!!	AudioBiquadFilter(in nChannels : int, in sampleRate : int)
+    configure(nChannels, sampleRate);
+    reset();
+!!!485644.cpp!!!	configure(in nChannels : int, in sampleRate : int) : void
+    assert(nChannels > 0 && nChannels <= MAX_CHANNELS);
+    assert(sampleRate > 0);
+    mNumChannels  = nChannels;
+    mMaxDelta = static_cast<int64_t>(MAX_DELTA_PER_SEC)
+                * AUDIO_COEF_ONE
+                / sampleRate;
+    clear();
+!!!485772.cpp!!!	reset() : void
+    memcpy(mCoefs, IDENTITY_COEFS, sizeof(mCoefs));
+    mCoefDirtyBits = 0;
+    setState(STATE_BYPASS);
+!!!485900.cpp!!!	clear() : void
+    memset(mDelays, 0, sizeof(mDelays));
+!!!486028.cpp!!!	setCoefs(in coefs : audio_coef_t, in immediate : bool = false) : void
+    memcpy(mTargetCoefs, coefs, sizeof(mTargetCoefs));
+    if (mState & STATE_ENABLED_MASK) {
+        if (CC_UNLIKELY(immediate)) {
+            memcpy(mCoefs, coefs, sizeof(mCoefs));
+            setState(STATE_NORMAL);
+        } else {
+            setState(STATE_TRANSITION_TO_NORMAL);
+        }
+    }
+!!!486156.cpp!!!	process(in in : audio_sample_t, in out : audio_sample_t, in frameCount : int) : void
+    (this->*mCurProcessFunc)(in, out, frameCount);
+!!!486284.cpp!!!	enable(in immediate : bool = false) : void
+    if (CC_UNLIKELY(immediate)) {
+        memcpy(mCoefs, mTargetCoefs, sizeof(mCoefs));
+        setState(STATE_NORMAL);
+    } else {
+        setState(STATE_TRANSITION_TO_NORMAL);
+    }
+!!!486412.cpp!!!	disable(in immediate : bool = false) : void
+    if (CC_UNLIKELY(immediate)) {
+        memcpy(mCoefs, IDENTITY_COEFS, sizeof(mCoefs));
+        setState(STATE_BYPASS);
+    } else {
+        setState(STATE_TRANSITION_TO_BYPASS);
+    }
+!!!486540.cpp!!!	setState(in state : state_t) : void
+    switch (state) {
+    case STATE_BYPASS:
+      mCurProcessFunc = &AudioBiquadFilter::process_bypass;
+      break;
+    case STATE_TRANSITION_TO_BYPASS:
+      if (mNumChannels == 1) {
+        mCurProcessFunc = &AudioBiquadFilter::process_transition_bypass_mono;
+      } else {
+        mCurProcessFunc = &AudioBiquadFilter::process_transition_bypass_multi;
+      }
+      mCoefDirtyBits = (1 << NUM_COEFS) - 1;
+      break;
+    case STATE_TRANSITION_TO_NORMAL:
+      if (mNumChannels == 1) {
+        mCurProcessFunc = &AudioBiquadFilter::process_transition_normal_mono;
+      } else {
+        mCurProcessFunc = &AudioBiquadFilter::process_transition_normal_multi;
+      }
+      mCoefDirtyBits = (1 << NUM_COEFS) - 1;
+      break;
+    case STATE_NORMAL:
+      if (mNumChannels == 1) {
+        mCurProcessFunc = &AudioBiquadFilter::process_normal_mono;
+      } else {
+        mCurProcessFunc = &AudioBiquadFilter::process_normal_multi;
+      }
+      break;
+    }
+    mState = state;
+!!!486668.cpp!!!	updateCoefs(in coefs : audio_coef_t, in frameCount : int) : bool
+    int64_t maxDelta = mMaxDelta * frameCount;
+    for (int i = 0; i < NUM_COEFS; ++i) {
+        if (mCoefDirtyBits & (1<<i)) {
+            audio_coef_t diff = coefs[i] - mCoefs[i];
+            if (diff > maxDelta) {
+                mCoefs[i] += maxDelta;
+            } else if (diff < -maxDelta) {
+                mCoefs[i] -= maxDelta;
+            } else {
+                mCoefs[i] = coefs[i];
+                mCoefDirtyBits ^= (1<<i);
+            }
+        }
+    }
+    return mCoefDirtyBits == 0;
+!!!486796.cpp!!!	process_bypass(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+    // The common case is in-place processing, because this is what the EQ does.
+    if (CC_UNLIKELY(in != out)) {
+        memcpy(out, in, frameCount * mNumChannels * sizeof(audio_sample_t));
+    }
+!!!486924.cpp!!!	process_normal_mono(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+    size_t nFrames = frameCount;
+    audio_sample_t x1 = mDelays[0][0];
+    audio_sample_t x2 = mDelays[0][1];
+    audio_sample_t y1 = mDelays[0][2];
+    audio_sample_t y2 = mDelays[0][3];
+    const audio_coef_t b0 = mCoefs[0];
+    const audio_coef_t b1 = mCoefs[1];
+    const audio_coef_t b2 = mCoefs[2];
+    const audio_coef_t a1 = mCoefs[3];
+    const audio_coef_t a2 = mCoefs[4];
+    while (nFrames-- > 0) {
+        audio_sample_t x0 = *(in++);
+        audio_coef_sample_acc_t acc;
+        acc = mul_coef_sample(b0, x0);
+        acc = mac_coef_sample(b1, x1, acc);
+        acc = mac_coef_sample(b2, x2, acc);
+        acc = mac_coef_sample(a1, y1, acc);
+        acc = mac_coef_sample(a2, y2, acc);
+        audio_sample_t y0 = coef_sample_acc_to_sample(acc);
+        y2 = y1;
+        y1 = y0;
+        x2 = x1;
+        x1 = x0;
+        (*out++) = y0;
+    }
+    mDelays[0][0] = x1;
+    mDelays[0][1] = x2;
+    mDelays[0][2] = y1;
+    mDelays[0][3] = y2;
+!!!487052.cpp!!!	process_transition_normal_mono(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+    if (updateCoefs(mTargetCoefs, frameCount)) {
+        setState(STATE_NORMAL);
+    }
+    process_normal_mono(in, out, frameCount);
+!!!487180.cpp!!!	process_transition_bypass_mono(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+  if (updateCoefs(IDENTITY_COEFS, frameCount)) {
+      setState(STATE_NORMAL);
+  }
+  process_normal_mono(in, out, frameCount);
+!!!487308.cpp!!!	process_normal_multi(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+    const audio_coef_t b0 = mCoefs[0];
+    const audio_coef_t b1 = mCoefs[1];
+    const audio_coef_t b2 = mCoefs[2];
+    const audio_coef_t a1 = mCoefs[3];
+    const audio_coef_t a2 = mCoefs[4];
+    for (int ch = 0; ch < mNumChannels; ++ch) {
+        size_t nFrames = frameCount;
+        audio_sample_t x1 = mDelays[ch][0];
+        audio_sample_t x2 = mDelays[ch][1];
+        audio_sample_t y1 = mDelays[ch][2];
+        audio_sample_t y2 = mDelays[ch][3];
+        while (nFrames-- > 0) {
+            audio_sample_t x0 = *in;
+            audio_coef_sample_acc_t acc;
+            acc = mul_coef_sample(b0, x0);
+            acc = mac_coef_sample(b1, x1, acc);
+            acc = mac_coef_sample(b2, x2, acc);
+            acc = mac_coef_sample(a1, y1, acc);
+            acc = mac_coef_sample(a2, y2, acc);
+            audio_sample_t y0 = coef_sample_acc_to_sample(acc);
+            y2 = y1;
+            y1 = y0;
+            x2 = x1;
+            x1 = x0;
+            *out = y0;
+            in += mNumChannels;
+            out += mNumChannels;
+        }
+        mDelays[ch][0] = x1;
+        mDelays[ch][1] = x2;
+        mDelays[ch][2] = y1;
+        mDelays[ch][3] = y2;
+        in -= frameCount * mNumChannels - 1;
+        out -= frameCount * mNumChannels - 1;
+    }
+!!!487436.cpp!!!	process_transition_normal_multi(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+    if (updateCoefs(mTargetCoefs, frameCount)) {
+        setState(STATE_NORMAL);
+    }
+    process_normal_multi(in, out, frameCount);
+!!!487564.cpp!!!	process_transition_bypass_multi(in in : audio_sample_t, inout out : audio_sample_t, in frameCount : int) : void
+    if (updateCoefs(IDENTITY_COEFS, frameCount)) {
+        setState(STATE_NORMAL);
+    }
+    process_normal_multi(in, out, frameCount);

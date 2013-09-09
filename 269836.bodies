@@ -1,0 +1,329 @@
+class AudioOutput
+!!!501516.cpp!!!	AudioOutput(in sessionId : int)
+    ALOGV("AudioOutput(%d)", sessionId);
+    mTrack = 0;
+    mRecycledTrack = 0;
+    mStreamType = AUDIO_STREAM_MUSIC;
+    mLeftVolume = 1.0;
+    mRightVolume = 1.0;
+    mPlaybackRatePermille = 1000;
+    mSampleRateHz = 0;
+    mMsecsPerFrame = 0;
+    mAuxEffectId = 0;
+    mSendLevel = 0.0;
+    setMinBufferCount();
+!!!501644.cpp!!!	~AudioOutput()
+    close();
+    delete mRecycledTrack;
+    delete mCallbackData;
+!!!502028.cpp!!!	bufferSize() : ssize_t
+    if (mTrack == 0) return NO_INIT;
+    return mTrack->frameCount() * frameSize();
+!!!502156.cpp!!!	frameCount() : ssize_t
+    if (mTrack == 0) return NO_INIT;
+    return mTrack->frameCount();
+!!!502284.cpp!!!	channelCount() : ssize_t
+    if (mTrack == 0) return NO_INIT;
+    return mTrack->channelCount();
+!!!502412.cpp!!!	frameSize() : ssize_t
+    if (mTrack == 0) return NO_INIT;
+    return mTrack->frameSize();
+!!!502540.cpp!!!	latency() : uint32_t
+    if (mTrack == 0) return 0;
+    return mTrack->latency();
+!!!502668.cpp!!!	msecsPerFrame() : float
+    return mMsecsPerFrame;
+!!!502796.cpp!!!	getPosition(inout position : uint32_t) : status_t
+    if (mTrack == 0) return NO_INIT;
+    return mTrack->getPosition(position);
+!!!502924.cpp!!!	getFramesWritten(inout frameswritten : uint32_t) : status_t
+    if (mTrack == 0) return NO_INIT;
+    *frameswritten = mBytesWritten / frameSize();
+    return OK;
+!!!503052.cpp!!!	getSessionId() : int
+    return mSessionId;
+!!!503180.cpp!!!	open(in sampleRate : uint32_t, in channelCount : int, in channelMask : audio_channel_mask_t, in format : audio_format_t, in bufferCount : int, in cb : AudioCallback, inout cookie : void, in flags : audio_output_flags_t = AUDIO_OUTPUT_FLAG_NONE) : status_t
+    mCallback = cb;
+    mCallbackCookie = cookie;
+
+    // Check argument "bufferCount" against the mininum buffer count
+    if (bufferCount < mMinBufferCount) {
+        ALOGD("bufferCount (%d) is too small and increased to %d", bufferCount, mMinBufferCount);
+        bufferCount = mMinBufferCount;
+
+    }
+    ALOGV("open(%u, %d, 0x%x, %d, %d, %d)", sampleRate, channelCount, channelMask,
+            format, bufferCount, mSessionId);
+    int afSampleRate;
+    int afFrameCount;
+    uint32_t frameCount;
+
+    if (AudioSystem::getOutputFrameCount(&afFrameCount, mStreamType) != NO_ERROR) {
+        return NO_INIT;
+    }
+    if (AudioSystem::getOutputSamplingRate(&afSampleRate, mStreamType) != NO_ERROR) {
+        return NO_INIT;
+    }
+
+    frameCount = (sampleRate*afFrameCount*bufferCount)/afSampleRate;
+
+    if (channelMask == CHANNEL_MASK_USE_CHANNEL_ORDER) {
+        channelMask = audio_channel_out_mask_from_count(channelCount);
+        if (0 == channelMask) {
+            ALOGE("open() error, can\'t derive mask for %d audio channels", channelCount);
+            return NO_INIT;
+        }
+    }
+
+    AudioTrack *t;
+    CallbackData *newcbd = NULL;
+    if (mCallback != NULL) {
+        newcbd = new CallbackData(this);
+        t = new AudioTrack(
+                mStreamType,
+                sampleRate,
+                format,
+                channelMask,
+                frameCount,
+                flags,
+                CallbackWrapper,
+                newcbd,
+                0,  // notification frames
+                mSessionId);
+    } else {
+        t = new AudioTrack(
+                mStreamType,
+                sampleRate,
+                format,
+                channelMask,
+                frameCount,
+                flags,
+                NULL,
+                NULL,
+                0,
+                mSessionId);
+    }
+
+    if ((t == 0) || (t->initCheck() != NO_ERROR)) {
+        ALOGE("Unable to create audio track");
+        delete t;
+        delete newcbd;
+        return NO_INIT;
+    }
+
+
+    if (mRecycledTrack) {
+        // check if the existing track can be reused as-is, or if a new track needs to be created.
+
+        bool reuse = true;
+        if ((mCallbackData == NULL && mCallback != NULL) ||
+                (mCallbackData != NULL && mCallback == NULL)) {
+            // recycled track uses callbacks but the caller wants to use writes, or vice versa
+            ALOGV("can't chain callback and write");
+            reuse = false;
+        } else if ((mRecycledTrack->getSampleRate() != sampleRate) ||
+                (mRecycledTrack->channelCount() != channelCount) ||
+                (mRecycledTrack->frameCount() != t->frameCount())) {
+            ALOGV("samplerate, channelcount or framecount differ: %d/%d Hz, %d/%d ch, %d/%d frames",
+                  mRecycledTrack->getSampleRate(), sampleRate,
+                  mRecycledTrack->channelCount(), channelCount,
+                  mRecycledTrack->frameCount(), t->frameCount());
+            reuse = false;
+        } else if (flags != mFlags) {
+            ALOGV("output flags differ %08x/%08x", flags, mFlags);
+            reuse = false;
+        }
+        if (reuse) {
+            ALOGV("chaining to next output");
+            close();
+            mTrack = mRecycledTrack;
+            mRecycledTrack = NULL;
+            if (mCallbackData != NULL) {
+                mCallbackData->setOutput(this);
+            }
+            delete t;
+            delete newcbd;
+            return OK;
+        }
+
+        // if we're not going to reuse the track, unblock and flush it
+        if (mCallbackData != NULL) {
+            mCallbackData->setOutput(NULL);
+            mCallbackData->endTrackSwitch();
+        }
+        mRecycledTrack->flush();
+        delete mRecycledTrack;
+        mRecycledTrack = NULL;
+        delete mCallbackData;
+        mCallbackData = NULL;
+        close();
+    }
+
+    mCallbackData = newcbd;
+    ALOGV("setVolume");
+    t->setVolume(mLeftVolume, mRightVolume);
+
+    mSampleRateHz = sampleRate;
+    mFlags = flags;
+    mMsecsPerFrame = mPlaybackRatePermille / (float) sampleRate;
+    uint32_t pos;
+    if (t->getPosition(&pos) == OK) {
+        mBytesWritten = uint64_t(pos) * t->frameSize();
+    }
+    mTrack = t;
+
+    status_t res = t->setSampleRate(mPlaybackRatePermille * mSampleRateHz / 1000);
+    if (res != NO_ERROR) {
+        return res;
+    }
+    t->setAuxEffectSendLevel(mSendLevel);
+    return t->attachAuxEffect(mAuxEffectId);;
+!!!503308.cpp!!!	start() : void
+    ALOGV("start");
+    if (mCallbackData != NULL) {
+        mCallbackData->endTrackSwitch();
+    }
+    if (mTrack) {
+        mTrack->setVolume(mLeftVolume, mRightVolume);
+        mTrack->setAuxEffectSendLevel(mSendLevel);
+        mTrack->start();
+    }
+!!!503436.cpp!!!	write(in buffer : void, in size : size_t) : ssize_t
+    LOG_FATAL_IF(mCallback != NULL, "Don't call write if supplying a callback.");
+
+    //ALOGV("write(%p, %u)", buffer, size);
+    if (mTrack) {
+        ssize_t ret = mTrack->write(buffer, size);
+        mBytesWritten += ret;
+        return ret;
+    }
+    return NO_INIT;
+!!!503564.cpp!!!	stop() : void
+    ALOGV("stop");
+    if (mTrack) mTrack->stop();
+!!!503692.cpp!!!	flush() : void
+    ALOGV("flush");
+    if (mTrack) mTrack->flush();
+!!!503820.cpp!!!	pause() : void
+    ALOGV("pause");
+    if (mTrack) mTrack->pause();
+!!!503948.cpp!!!	close() : void
+    ALOGV("close");
+    delete mTrack;
+    mTrack = 0;
+!!!504204.cpp!!!	setVolume(in left : float, in right : float) : void
+    ALOGV("setVolume(%f, %f)", left, right);
+    mLeftVolume = left;
+    mRightVolume = right;
+    if (mTrack) {
+        mTrack->setVolume(left, right);
+    }
+!!!504332.cpp!!!	setPlaybackRatePermille(in ratePermille : int32_t) : status_t
+    ALOGV("setPlaybackRatePermille(%d)", ratePermille);
+    status_t res = NO_ERROR;
+    if (mTrack) {
+        res = mTrack->setSampleRate(ratePermille * mSampleRateHz / 1000);
+    } else {
+        res = NO_INIT;
+    }
+    mPlaybackRatePermille = ratePermille;
+    if (mSampleRateHz != 0) {
+        mMsecsPerFrame = mPlaybackRatePermille / (float) mSampleRateHz;
+    }
+    return res;
+!!!504460.cpp!!!	setAuxEffectSendLevel(in level : float) : status_t
+    ALOGV("setAuxEffectSendLevel(%f)", level);
+    mSendLevel = level;
+    if (mTrack) {
+        return mTrack->setAuxEffectSendLevel(level);
+    }
+    return NO_ERROR;
+!!!504588.cpp!!!	attachAuxEffect(in effectId : int) : status_t
+    ALOGV("attachAuxEffect(%d)", effectId);
+    mAuxEffectId = effectId;
+    if (mTrack) {
+        return mTrack->attachAuxEffect(effectId);
+    }
+    return NO_ERROR;
+!!!504716.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    result.append(" AudioOutput\n");
+    snprintf(buffer, 255, "  stream type(%d), left - right volume(%f, %f)\n",
+            mStreamType, mLeftVolume, mRightVolume);
+    result.append(buffer);
+    snprintf(buffer, 255, "  msec per frame(%f), latency (%d)\n",
+            mMsecsPerFrame, (mTrack != 0) ? mTrack->latency() : -1);
+    result.append(buffer);
+    snprintf(buffer, 255, "  aux effect id(%d), send level (%f)\n",
+            mAuxEffectId, mSendLevel);
+    result.append(buffer);
+
+    ::write(fd, result.string(), result.size());
+    if (mTrack != 0) {
+        mTrack->dump(fd, args);
+    }
+    return NO_ERROR;
+!!!504844.cpp!!!	isOnEmulator() : bool
+    setMinBufferCount();
+    return mIsOnEmulator;
+!!!504972.cpp!!!	getMinBufferCount() : int
+    setMinBufferCount();
+    return mMinBufferCount;
+!!!505100.cpp!!!	setNextOutput(in nextOutput : sp<AudioOutput>) : void
+    mNextOutput = nextOutput;
+!!!505228.cpp!!!	switchToNextOutput() : void
+    ALOGV("switchToNextOutput");
+    if (mNextOutput != NULL) {
+        if (mCallbackData != NULL) {
+            mCallbackData->beginTrackSwitch();
+        }
+        delete mNextOutput->mCallbackData;
+        mNextOutput->mCallbackData = mCallbackData;
+        mCallbackData = NULL;
+        mNextOutput->mRecycledTrack = mTrack;
+        mTrack = NULL;
+        mNextOutput->mSampleRateHz = mSampleRateHz;
+        mNextOutput->mMsecsPerFrame = mMsecsPerFrame;
+        mNextOutput->mBytesWritten = mBytesWritten;
+        mNextOutput->mFlags = mFlags;
+    }
+!!!505484.cpp!!!	setMinBufferCount() : void
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("ro.kernel.qemu", value, 0)) {
+        mIsOnEmulator = true;
+        mMinBufferCount = 12;  // to prevent systematic buffer underrun for emulator
+    }
+!!!505612.cpp!!!	CallbackWrapper(in event : int, inout cookie : void, inout info : void) : void
+    //ALOGV("callbackwrapper");
+    if (event != AudioTrack::EVENT_MORE_DATA) {
+        return;
+    }
+
+    CallbackData *data = (CallbackData*)cookie;
+    data->lock();
+    AudioOutput *me = data->getOutput();
+    AudioTrack::Buffer *buffer = (AudioTrack::Buffer *)info;
+    if (me == NULL) {
+        // no output set, likely because the track was scheduled to be reused
+        // by another player, but the format turned out to be incompatible.
+        data->unlock();
+        buffer->size = 0;
+        return;
+    }
+
+    size_t actualSize = (*me->mCallback)(
+            me, buffer->raw, buffer->size, me->mCallbackCookie);
+
+    if (actualSize == 0 && buffer->size > 0 && me->mNextOutput == NULL) {
+        // We've reached EOS but the audio track is not stopped yet,
+        // keep playing silence.
+
+        memset(buffer->raw, 0, buffer->size);
+        actualSize = buffer->size;
+    }
+
+    buffer->size = actualSize;
+    data->unlock();

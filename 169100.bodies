@@ -1,0 +1,318 @@
+class SoundPool
+!!!320268.cpp!!!	SoundPool(in maxChannels : int, in streamType : audio_stream_type_t, in srcQuality : int)
+    ALOGV("SoundPool constructor: maxChannels=%d, streamType=%d, srcQuality=%d",
+            maxChannels, streamType, srcQuality);
+
+    // check limits
+    mMaxChannels = maxChannels;
+    if (mMaxChannels < 1) {
+        mMaxChannels = 1;
+    }
+    else if (mMaxChannels > 32) {
+        mMaxChannels = 32;
+    }
+    ALOGW_IF(maxChannels != mMaxChannels, "App requested %d channels", maxChannels);
+
+    mQuit = false;
+    mDecodeThread = 0;
+    mStreamType = streamType;
+    mSrcQuality = srcQuality;
+    mAllocated = 0;
+    mNextSampleID = 0;
+    mNextChannelID = 0;
+
+    mCallback = 0;
+    mUserData = 0;
+
+    mChannelPool = new SoundChannel[mMaxChannels];
+    for (int i = 0; i < mMaxChannels; ++i) {
+        mChannelPool[i].init(this);
+        mChannels.push_back(&mChannelPool[i]);
+    }
+
+    // start decode thread
+    startThreads();
+!!!320396.cpp!!!	~SoundPool()
+    ALOGV("SoundPool destructor");
+    mDecodeThread->quit();
+    quit();
+
+    Mutex::Autolock lock(&mLock);
+
+    mChannels.clear();
+    if (mChannelPool)
+        delete [] mChannelPool;
+    // clean up samples
+    ALOGV("clear samples");
+    mSamples.clear();
+
+    if (mDecodeThread)
+        delete mDecodeThread;
+!!!320524.cpp!!!	load(in path : char, in priority : int) : int
+    ALOGV("load: path=%s, priority=%d", path, priority);
+    Mutex::Autolock lock(&mLock);
+    sp<Sample> sample = new Sample(++mNextSampleID, path);
+    mSamples.add(sample->sampleID(), sample);
+    doLoad(sample);
+    return sample->sampleID();
+!!!320652.cpp!!!	load(in fd : int, in offset : int64_t, in length : int64_t, in priority : int) : int
+    ALOGV("load: fd=%d, offset=%lld, length=%lld, priority=%d",
+            fd, offset, length, priority);
+    Mutex::Autolock lock(&mLock);
+    sp<Sample> sample = new Sample(++mNextSampleID, fd, offset, length);
+    mSamples.add(sample->sampleID(), sample);
+    doLoad(sample);
+    return sample->sampleID();
+!!!320780.cpp!!!	unload(in sampleID : int) : bool
+    ALOGV("unload: sampleID=%d", sampleID);
+    Mutex::Autolock lock(&mLock);
+    return mSamples.removeItem(sampleID);
+!!!320908.cpp!!!	play(in sampleID : int, in leftVolume : float, in rightVolume : float, in priority : int, in loop : int, in rate : float) : int
+    ALOGV("play sampleID=%d, leftVolume=%f, rightVolume=%f, priority=%d, loop=%d, rate=%f",
+            sampleID, leftVolume, rightVolume, priority, loop, rate);
+    sp<Sample> sample;
+    SoundChannel* channel;
+    int channelID;
+
+    Mutex::Autolock lock(&mLock);
+
+    if (mQuit) {
+        return 0;
+    }
+    // is sample ready?
+    sample = findSample(sampleID);
+    if ((sample == 0) || (sample->state() != Sample::READY)) {
+        ALOGW("  sample %d not READY", sampleID);
+        return 0;
+    }
+
+    dump();
+
+    // allocate a channel
+    channel = allocateChannel_l(priority);
+
+    // no channel allocated - return 0
+    if (!channel) {
+        ALOGV("No channel allocated");
+        return 0;
+    }
+
+    channelID = ++mNextChannelID;
+
+    ALOGV("play channel %p state = %d", channel, channel->state());
+    channel->play(sample, channelID, leftVolume, rightVolume, priority, loop, rate);
+    return channelID;
+!!!321036.cpp!!!	pause(in channelID : int) : void
+    ALOGV("pause(%d)", channelID);
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->pause();
+    }
+!!!321164.cpp!!!	autoPause() : void
+    ALOGV("autoPause()");
+    Mutex::Autolock lock(&mLock);
+    for (int i = 0; i < mMaxChannels; ++i) {
+        SoundChannel* channel = &mChannelPool[i];
+        channel->autoPause();
+    }
+!!!321292.cpp!!!	resume(in channelID : int) : void
+    ALOGV("resume(%d)", channelID);
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->resume();
+    }
+!!!321420.cpp!!!	autoResume() : void
+    ALOGV("autoResume()");
+    Mutex::Autolock lock(&mLock);
+    for (int i = 0; i < mMaxChannels; ++i) {
+        SoundChannel* channel = &mChannelPool[i];
+        channel->autoResume();
+    }
+!!!321548.cpp!!!	stop(in channelID : int) : void
+    ALOGV("stop(%d)", channelID);
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->stop();
+    } else {
+        channel = findNextChannel(channelID);
+        if (channel)
+            channel->clearNextEvent();
+    }
+!!!321676.cpp!!!	setVolume(in channelID : int, in leftVolume : float, in rightVolume : float) : void
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->setVolume(leftVolume, rightVolume);
+    }
+!!!321804.cpp!!!	setPriority(in channelID : int, in priority : int) : void
+    ALOGV("setPriority(%d, %d)", channelID, priority);
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->setPriority(priority);
+    }
+!!!321932.cpp!!!	setLoop(in channelID : int, in loop : int) : void
+    ALOGV("setLoop(%d, %d)", channelID, loop);
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->setLoop(loop);
+    }
+!!!322060.cpp!!!	setRate(in channelID : int, in rate : float) : void
+    ALOGV("setRate(%d, %f)", channelID, rate);
+    Mutex::Autolock lock(&mLock);
+    SoundChannel* channel = findChannel(channelID);
+    if (channel) {
+        channel->setRate(rate);
+    }
+!!!322572.cpp!!!	done_l(inout channel : SoundChannel) : void
+    ALOGV("done_l(%d)", channel->channelID());
+    // if "stolen", play next event
+    if (channel->nextChannelID() != 0) {
+        ALOGV("add to restart list");
+        addToRestartList(channel);
+    }
+
+    // return to idle state
+    else {
+        ALOGV("move to front");
+        moveToFront_l(channel);
+    }
+!!!322700.cpp!!!	setCallback(inout callback : SoundPoolCallback, inout user : void) : void
+    Mutex::Autolock lock(&mCallbackLock);
+    mCallback = callback;
+    mUserData = user;
+!!!323084.cpp!!!	startThreads() : bool
+    createThreadEtc(beginThread, this, "SoundPool");
+    if (mDecodeThread == NULL)
+        mDecodeThread = new SoundPoolThread(this);
+    return mDecodeThread != NULL;
+!!!323212.cpp!!!	doLoad(inout sample : sp<Sample>) : void
+    ALOGV("doLoad: loading sample sampleID=%d", sample->sampleID());
+    sample->startLoad();
+    mDecodeThread->loadSample(sample->sampleID());
+!!!323468.cpp!!!	findChannel(in channelID : int) : SoundChannel
+    for (int i = 0; i < mMaxChannels; ++i) {
+        if (mChannelPool[i].channelID() == channelID) {
+            return &mChannelPool[i];
+        }
+    }
+    return NULL;
+!!!323596.cpp!!!	findNextChannel(in channelID : int) : SoundChannel
+    for (int i = 0; i < mMaxChannels; ++i) {
+        if (mChannelPool[i].nextChannelID() == channelID) {
+            return &mChannelPool[i];
+        }
+    }
+    return NULL;
+!!!323724.cpp!!!	allocateChannel_l(in priority : int) : SoundChannel
+    List<SoundChannel*>::iterator iter;
+    SoundChannel* channel = NULL;
+
+    // allocate a channel
+    if (!mChannels.empty()) {
+        iter = mChannels.begin();
+        if (priority >= (*iter)->priority()) {
+            channel = *iter;
+            mChannels.erase(iter);
+            ALOGV("Allocated active channel");
+        }
+    }
+
+    // update priority and put it back in the list
+    if (channel) {
+        channel->setPriority(priority);
+        for (iter = mChannels.begin(); iter != mChannels.end(); ++iter) {
+            if (priority < (*iter)->priority()) {
+                break;
+            }
+        }
+        mChannels.insert(iter, channel);
+    }
+    return channel;
+!!!323852.cpp!!!	moveToFront_l(inout channel : SoundChannel) : void
+    for (List<SoundChannel*>::iterator iter = mChannels.begin(); iter != mChannels.end(); ++iter) {
+        if (*iter == channel) {
+            mChannels.erase(iter);
+            mChannels.push_front(channel);
+            break;
+        }
+    }
+!!!323980.cpp!!!	notify(in event : SoundPoolEvent) : void
+    Mutex::Autolock lock(&mCallbackLock);
+    if (mCallback != NULL) {
+        mCallback(event, this, mUserData);
+    }
+!!!324108.cpp!!!	dump() : void
+    for (int i = 0; i < mMaxChannels; ++i) {
+        mChannelPool[i].dump();
+    }
+!!!324236.cpp!!!	addToRestartList(inout channel : SoundChannel) : void
+    Mutex::Autolock lock(&mRestartLock);
+    if (!mQuit) {
+        mRestart.push_back(channel);
+        mCondition.signal();
+    }
+!!!324364.cpp!!!	addToStopList(inout channel : SoundChannel) : void
+    Mutex::Autolock lock(&mRestartLock);
+    if (!mQuit) {
+        mStop.push_back(channel);
+        mCondition.signal();
+    }
+!!!324492.cpp!!!	beginThread(inout arg : void) : int
+    SoundPool* p = (SoundPool*)arg;
+    return p->run();
+!!!324620.cpp!!!	run() : int
+    mRestartLock.lock();
+    while (!mQuit) {
+        mCondition.wait(mRestartLock);
+        ALOGV("awake");
+        if (mQuit) break;
+
+        while (!mStop.empty()) {
+            SoundChannel* channel;
+            ALOGV("Getting channel from stop list");
+            List<SoundChannel* >::iterator iter = mStop.begin();
+            channel = *iter;
+            mStop.erase(iter);
+            mRestartLock.unlock();
+            if (channel != 0) {
+                Mutex::Autolock lock(&mLock);
+                channel->stop();
+            }
+            mRestartLock.lock();
+            if (mQuit) break;
+        }
+
+        while (!mRestart.empty()) {
+            SoundChannel* channel;
+            ALOGV("Getting channel from list");
+            List<SoundChannel*>::iterator iter = mRestart.begin();
+            channel = *iter;
+            mRestart.erase(iter);
+            mRestartLock.unlock();
+            if (channel != 0) {
+                Mutex::Autolock lock(&mLock);
+                channel->nextEvent();
+            }
+            mRestartLock.lock();
+            if (mQuit) break;
+        }
+    }
+
+    mStop.clear();
+    mRestart.clear();
+    mCondition.signal();
+    mRestartLock.unlock();
+    ALOGV("goodbye");
+    return 0;
+!!!324748.cpp!!!	quit() : void
+    mRestartLock.lock();
+    mQuit = true;
+    mCondition.signal();
+    mCondition.wait(mRestartLock);
+    ALOGV("return from quit");
+    mRestartLock.unlock();

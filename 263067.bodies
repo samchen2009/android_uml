@@ -1,0 +1,160 @@
+class Exchanger
+!!!1527835.java!!!	doExchange(inout item : Object, inout timed : boolean, in nanos : long) : Object
+        Node me = new Node(item);                 // Create in case occupying
+        int index = hashIndex();                  // Index of current slot
+        int fails = 0;                            // Number of CAS failures
+
+        for (;;) {
+            Object y;                             // Contents of current slot
+            Slot slot = arena[index];
+            if (slot == null)                     // Lazily initialize slots
+                createSlot(index);                // Continue loop to reread
+            else if ((y = slot.get()) != null &&  // Try to fulfill
+                     slot.compareAndSet(y, null)) {
+                Node you = (Node)y;               // Transfer item
+                if (you.compareAndSet(null, item)) {
+                    LockSupport.unpark(you.waiter);
+                    return you.item;
+                }                                 // Else cancelled; continue
+            }
+            else if (y == null &&                 // Try to occupy
+                     slot.compareAndSet(null, me)) {
+                if (index == 0)                   // Blocking wait for slot 0
+                    return timed ?
+                        awaitNanos(me, slot, nanos) :
+                        await(me, slot);
+                Object v = spinWait(me, slot);    // Spin wait for non-0
+                if (v != CANCEL)
+                    return v;
+                me = new Node(item);              // Throw away cancelled node
+                int m = max.get();
+                if (m > (index >>>= 1))           // Decrease index
+                    max.compareAndSet(m, m - 1);  // Maybe shrink table
+            }
+            else if (++fails > 1) {               // Allow 2 fails on 1st slot
+                int m = max.get();
+                if (fails > 3 && m < FULL && max.compareAndSet(m, m + 1))
+                    index = m + 1;                // Grow on 3rd failed slot
+                else if (--index < 0)
+                    index = m;                    // Circularly traverse
+            }
+        }
+!!!1527963.java!!!	hashIndex() : int
+        long id = Thread.currentThread().getId();
+        int hash = (((int)(id ^ (id >>> 32))) ^ 0x811c9dc5) * 0x01000193;
+
+        int m = max.get();
+        int nbits = (((0xfffffc00  >> m) & 4) | // Compute ceil(log2(m+1))
+                     ((0x000001f8 >>> m) & 2) | // The constants hold
+                     ((0xffff00f2 >>> m) & 1)); // a lookup table
+        int index;
+        while ((index = hash & ((1 << nbits) - 1)) > m)       // May retry on
+            hash = (hash >>> nbits) | (hash << (33 - nbits)); // non-power-2 m
+        return index;
+!!!1528091.java!!!	createSlot(in index : int) : void
+        // Create slot outside of lock to narrow sync region
+        Slot newSlot = new Slot();
+        Slot[] a = arena;
+        synchronized (a) {
+            if (a[index] == null)
+                a[index] = newSlot;
+        }
+!!!1528219.java!!!	tryCancel(inout node : Node, inout slot : Slot) : boolean
+        if (!node.compareAndSet(null, CANCEL))
+            return false;
+        if (slot.get() == node) // pre-check to minimize contention
+            slot.compareAndSet(node, null);
+        return true;
+!!!1528347.java!!!	spinWait(inout node : Node, inout slot : Slot) : Object
+        int spins = SPINS;
+        for (;;) {
+            Object v = node.get();
+            if (v != null)
+                return v;
+            else if (spins > 0)
+                --spins;
+            else
+                tryCancel(node, slot);
+        }
+!!!1528475.java!!!	await(inout node : Node, inout slot : Slot) : Object
+        Thread w = Thread.currentThread();
+        int spins = SPINS;
+        for (;;) {
+            Object v = node.get();
+            if (v != null)
+                return v;
+            else if (spins > 0)                 // Spin-wait phase
+                --spins;
+            else if (node.waiter == null)       // Set up to block next
+                node.waiter = w;
+            else if (w.isInterrupted())         // Abort on interrupt
+                tryCancel(node, slot);
+            else                                // Block
+                LockSupport.park(node);
+        }
+!!!1528603.java!!!	awaitNanos(inout node : Node, inout slot : Slot, in nanos : long) : Object
+        int spins = TIMED_SPINS;
+        long lastTime = 0;
+        Thread w = null;
+        for (;;) {
+            Object v = node.get();
+            if (v != null)
+                return v;
+            long now = System.nanoTime();
+            if (w == null)
+                w = Thread.currentThread();
+            else
+                nanos -= now - lastTime;
+            lastTime = now;
+            if (nanos > 0) {
+                if (spins > 0)
+                    --spins;
+                else if (node.waiter == null)
+                    node.waiter = w;
+                else if (w.isInterrupted())
+                    tryCancel(node, slot);
+                else
+                    LockSupport.parkNanos(node, nanos);
+            }
+            else if (tryCancel(node, slot) && !w.isInterrupted())
+                return scanOnTimeout(node);
+        }
+!!!1528731.java!!!	scanOnTimeout(inout node : Node) : Object
+        Object y;
+        for (int j = arena.length - 1; j >= 0; --j) {
+            Slot slot = arena[j];
+            if (slot != null) {
+                while ((y = slot.get()) != null) {
+                    if (slot.compareAndSet(y, null)) {
+                        Node you = (Node)y;
+                        if (you.compareAndSet(null, node.item)) {
+                            LockSupport.unpark(you.waiter);
+                            return you.item;
+                        }
+                    }
+                }
+            }
+        }
+        return CANCEL;
+!!!1528987.java!!!	exchange(inout x : V) : V
+        if (!Thread.interrupted()) {
+            Object v = doExchange((x == null) ? NULL_ITEM : x, false, 0);
+            if (v == NULL_ITEM)
+                return null;
+            if (v != CANCEL)
+                return (V)v;
+            Thread.interrupted(); // Clear interrupt status on IE throw
+        }
+        throw new InterruptedException();
+!!!1529115.java!!!	exchange(inout x : V, in timeout : long, inout unit : TimeUnit) : V
+        if (!Thread.interrupted()) {
+            Object v = doExchange((x == null) ? NULL_ITEM : x,
+                                  true, unit.toNanos(timeout));
+            if (v == NULL_ITEM)
+                return null;
+            if (v != CANCEL)
+                return (V)v;
+            if (!Thread.interrupted())
+                throw new TimeoutException();
+        }
+        throw new InterruptedException();

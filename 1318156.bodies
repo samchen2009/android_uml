@@ -1,0 +1,230 @@
+class FaceUnlock
+!!!7827596.java!!!	FaceUnlock(inout context : Context)
+        mContext = context;
+        mLockPatternUtils = new LockPatternUtils(context);
+        mHandler = new Handler(this);
+!!!7827724.java!!!	setKeyguardCallback(inout keyguardScreenCallback : KeyguardSecurityCallback) : void
+        mKeyguardScreenCallback = keyguardScreenCallback;
+!!!7827852.java!!!	initializeView(inout biometricUnlockView : View) : void
+        Log.d(TAG, "initializeView()");
+        mFaceUnlockView = biometricUnlockView;
+!!!7827980.java!!!	isRunning() : boolean
+        return mIsRunning;
+!!!7828108.java!!!	stopAndShowBackup() : void
+        if (DEBUG) Log.d(TAG, "stopAndShowBackup()");
+        mHandler.sendEmptyMessage(MSG_CANCEL);
+!!!7828236.java!!!	start() : boolean
+        if (DEBUG) Log.d(TAG, "start()");
+        if (mHandler.getLooper() != Looper.myLooper()) {
+            Log.e(TAG, "start() called off of the UI thread");
+        }
+
+        if (mIsRunning) {
+            Log.w(TAG, "start() called when already running");
+        }
+
+        if (!mBoundToService) {
+            Log.d(TAG, "Binding to Face Unlock service for user="
+                    + mLockPatternUtils.getCurrentUser());
+            mContext.bindService(new Intent(IFaceLockInterface.class.getName()),
+                    mConnection,
+                    Context.BIND_AUTO_CREATE,
+                    mLockPatternUtils.getCurrentUser());
+            mBoundToService = true;
+        } else {
+            Log.w(TAG, "Attempt to bind to Face Unlock when already bound");
+        }
+
+        mIsRunning = true;
+        return true;
+!!!7828364.java!!!	stop() : boolean
+        if (DEBUG) Log.d(TAG, "stop()");
+        if (mHandler.getLooper() != Looper.myLooper()) {
+            Log.e(TAG, "stop() called from non-UI thread");
+        }
+
+        // Clearing any old service connected messages.
+        mHandler.removeMessages(MSG_SERVICE_CONNECTED);
+
+        boolean mWasRunning = mIsRunning;
+
+        stopUi();
+
+        if (mBoundToService) {
+            if (mService != null) {
+                try {
+                    mService.unregisterCallback(mFaceUnlockCallback);
+                } catch (RemoteException e) {
+                    // Not much we can do
+                }
+            }
+            Log.d(TAG, "Unbinding from Face Unlock service");
+            mContext.unbindService(mConnection);
+            mBoundToService = false;
+        } else {
+            // This is usually not an error when this happens.  Sometimes we will tell it to
+            // unbind multiple times because it's called from both onWindowFocusChanged and
+            // onDetachedFromWindow.
+            if (DEBUG) Log.d(TAG, "Attempt to unbind from Face Unlock when not bound");
+        }
+        mIsRunning = false;
+        return mWasRunning;
+!!!7828492.java!!!	cleanUp() : void
+        if (DEBUG) Log.d(TAG, "cleanUp()");
+        if (mService != null) {
+            try {
+                mService.unregisterCallback(mFaceUnlockCallback);
+            } catch (RemoteException e) {
+                // Not much we can do
+            }
+            stopUi();
+            mService = null;
+        }
+!!!7828620.java!!!	getQuality() : int
+        return DevicePolicyManager.PASSWORD_QUALITY_BIOMETRIC_WEAK;
+!!!7828748.java!!!	handleMessage(inout msg : Message) : boolean
+        switch (msg.what) {
+            case MSG_SERVICE_CONNECTED:
+                handleServiceConnected();
+                break;
+            case MSG_SERVICE_DISCONNECTED:
+                handleServiceDisconnected();
+                break;
+            case MSG_UNLOCK:
+                handleUnlock(msg.arg1);
+                break;
+            case MSG_CANCEL:
+                handleCancel();
+                break;
+            case MSG_REPORT_FAILED_ATTEMPT:
+                handleReportFailedAttempt();
+                break;
+            case MSG_POKE_WAKELOCK:
+                handlePokeWakelock(msg.arg1);
+                break;
+            default:
+                Log.e(TAG, "Unhandled message");
+                return false;
+        }
+        return true;
+!!!7828876.java!!!	handleServiceConnected() : void
+        Log.d(TAG, "handleServiceConnected()");
+
+        // It is possible that an unbind has occurred in the time between the bind and when this
+        // function is reached.  If an unbind has already occurred, proceeding on to call startUi()
+        // can result in a fatal error.  Note that the onServiceConnected() callback is
+        // asynchronous, so this possibility would still exist if we executed this directly in
+        // onServiceConnected() rather than using a handler.
+        if (!mBoundToService) {
+            Log.d(TAG, "Dropping startUi() in handleServiceConnected() because no longer bound");
+            return;
+        }
+
+        try {
+            mService.registerCallback(mFaceUnlockCallback);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Caught exception connecting to Face Unlock: " + e.toString());
+            mService = null;
+            mBoundToService = false;
+            mIsRunning = false;
+            return;
+        }
+
+        if (mFaceUnlockView != null) {
+            IBinder windowToken = mFaceUnlockView.getWindowToken();
+            if (windowToken != null) {
+                // When switching between portrait and landscape view while Face Unlock is running,
+                // the screen will eventually go dark unless we poke the wakelock when Face Unlock
+                // is restarted.
+                mKeyguardScreenCallback.userActivity(0);
+
+                int[] position;
+                position = new int[2];
+                mFaceUnlockView.getLocationInWindow(position);
+                startUi(windowToken, position[0], position[1], mFaceUnlockView.getWidth(),
+                        mFaceUnlockView.getHeight());
+            } else {
+                Log.e(TAG, "windowToken is null in handleServiceConnected()");
+            }
+        }
+!!!7829004.java!!!	handleServiceDisconnected() : void
+        Log.e(TAG, "handleServiceDisconnected()");
+        // TODO: this lock may no longer be needed now that everything is being called from a
+        // handler
+        synchronized (mServiceRunningLock) {
+            mService = null;
+            mServiceRunning = false;
+        }
+        mBoundToService = false;
+        mIsRunning = false;
+!!!7829132.java!!!	handleUnlock(in authenticatedUserId : int) : void
+        if (DEBUG) Log.d(TAG, "handleUnlock()");
+        stop();
+        int currentUserId = mLockPatternUtils.getCurrentUser();
+        if (authenticatedUserId == currentUserId) {
+            if (DEBUG) Log.d(TAG, "Unlocking for user " + authenticatedUserId);
+            mKeyguardScreenCallback.reportSuccessfulUnlockAttempt();
+            mKeyguardScreenCallback.dismiss(true);
+        } else {
+            Log.d(TAG, "Ignoring unlock for authenticated user (" + authenticatedUserId +
+                    ") because the current user is " + currentUserId);
+        }
+!!!7829260.java!!!	handleCancel() : void
+        if (DEBUG) Log.d(TAG, "handleCancel()");
+        // We are going to the backup method, so we don't want to see Face Unlock again until the
+        // next time the user visits keyguard.
+        KeyguardUpdateMonitor.getInstance(mContext).setAlternateUnlockEnabled(false);
+
+        mKeyguardScreenCallback.showBackupSecurity();
+        stop();
+        mKeyguardScreenCallback.userActivity(BACKUP_LOCK_TIMEOUT);
+!!!7829388.java!!!	handleReportFailedAttempt() : void
+        if (DEBUG) Log.d(TAG, "handleReportFailedAttempt()");
+        // We are going to the backup method, so we don't want to see Face Unlock again until the
+        // next time the user visits keyguard.
+        KeyguardUpdateMonitor.getInstance(mContext).setAlternateUnlockEnabled(false);
+
+        mKeyguardScreenCallback.reportFailedUnlockAttempt();
+!!!7829516.java!!!	handlePokeWakelock(in millis : int) : void
+      PowerManager powerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+      if (powerManager.isScreenOn()) {
+        mKeyguardScreenCallback.userActivity(millis);
+      }
+!!!7829644.java!!!	startUi(inout windowToken : IBinder, in x : int, in y : int, in w : int, in h : int) : void
+        if (DEBUG) Log.d(TAG, "startUi()");
+        synchronized (mServiceRunningLock) {
+            if (!mServiceRunning) {
+                Log.d(TAG, "Starting Face Unlock");
+                try {
+                    mService.startUi(windowToken, x, y, w, h,
+                            mLockPatternUtils.isBiometricWeakLivelinessEnabled());
+                } catch (RemoteException e) {
+                    Log.e(TAG, "Caught exception starting Face Unlock: " + e.toString());
+                    return;
+                }
+                mServiceRunning = true;
+            } else {
+                Log.w(TAG, "startUi() attempted while running");
+            }
+        }
+!!!7829772.java!!!	stopUi() : void
+        if (DEBUG) Log.d(TAG, "stopUi()");
+        // Note that attempting to stop Face Unlock when it's not running is not an issue.
+        // Face Unlock can return, which stops it and then we try to stop it when the
+        // screen is turned off.  That's why we check.
+        synchronized (mServiceRunningLock) {
+            if (mServiceRunning) {
+                Log.d(TAG, "Stopping Face Unlock");
+                try {
+                    mService.stopUi();
+                } catch (RemoteException e) {
+                    Log.e(TAG, "Caught exception stopping Face Unlock: " + e.toString());
+                }
+                mServiceRunning = false;
+            } else {
+                // This is usually not an error when this happens.  Sometimes we will tell it to
+                // stop multiple times because it's called from both onWindowFocusChanged and
+                // onDetachedFromWindow.
+                if (DEBUG) Log.d(TAG, "stopUi() attempted while not running");
+            }
+        }

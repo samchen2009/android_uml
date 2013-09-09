@@ -1,0 +1,2902 @@
+class GGLAssembler
+!!!9897612.cpp!!!	reset(in opt_level : int) : void
+    ARMAssemblerProxy::reset();
+    RegisterAllocator::reset();
+    mOptLevel = opt_level;
+!!!9897740.cpp!!!	prolog() : void
+    ARMAssemblerProxy::prolog();
+!!!9897868.cpp!!!	epilog(in touched : uint32_t) : void
+    ARMAssemblerProxy::epilog(touched);
+!!!9897996.cpp!!!	scanline(in needs : needs_t, in c : context_t) : int
+    int err = 0;
+    int opt_level = mOptLevel;
+    while (opt_level >= 0) {
+        reset(opt_level);
+        err = scanline_core(needs, c);
+        if (err == 0)
+            break;
+        opt_level--;
+    }
+    
+    // XXX: in theory, pcForLabel is not valid before generate()
+    uint32_t* fragment_start_pc = pcForLabel("fragment_loop");
+    uint32_t* fragment_end_pc = pcForLabel("epilog");
+    const int per_fragment_ops = int(fragment_end_pc - fragment_start_pc);
+    
+    // build a name for our pipeline
+    char name[64];    
+    sprintf(name,
+            "scanline__%08X:%08X_%08X_%08X [%3d ipp]",
+            needs.p, needs.n, needs.t[0], needs.t[1], per_fragment_ops);
+
+    if (err) {
+        ALOGE("Error while generating ""%s""\n", name);
+        disassemble(name);
+        return -1;
+    }
+
+    return generate(name);
+!!!9898124.cpp!!!	scanline_core(in needs : needs_t, in c : context_t) : int
+    int64_t duration = ggl_system_time();
+
+    mBlendFactorCached = 0;
+    mBlending = 0;
+    mMasking = 0;
+    mAA        = GGL_READ_NEEDS(P_AA, needs.p);
+    mDithering = GGL_READ_NEEDS(P_DITHER, needs.p);
+    mAlphaTest = GGL_READ_NEEDS(P_ALPHA_TEST, needs.p) + GGL_NEVER;
+    mDepthTest = GGL_READ_NEEDS(P_DEPTH_TEST, needs.p) + GGL_NEVER;
+    mFog       = GGL_READ_NEEDS(P_FOG, needs.p) != 0;
+    mSmooth    = GGL_READ_NEEDS(SHADE, needs.n) != 0;
+    mBuilderContext.needs = needs;
+    mBuilderContext.c = c;
+    mBuilderContext.Rctx = reserveReg(R0); // context always in R0
+    mCbFormat = c->formats[ GGL_READ_NEEDS(CB_FORMAT, needs.n) ];
+
+    // ------------------------------------------------------------------------
+
+    decodeLogicOpNeeds(needs);
+
+    decodeTMUNeeds(needs, c);
+
+    mBlendSrc  = ggl_needs_to_blendfactor(GGL_READ_NEEDS(BLEND_SRC, needs.n));
+    mBlendDst  = ggl_needs_to_blendfactor(GGL_READ_NEEDS(BLEND_DST, needs.n));
+    mBlendSrcA = ggl_needs_to_blendfactor(GGL_READ_NEEDS(BLEND_SRCA, needs.n));
+    mBlendDstA = ggl_needs_to_blendfactor(GGL_READ_NEEDS(BLEND_DSTA, needs.n));
+
+    if (!mCbFormat.c[GGLFormat::ALPHA].h) {
+        if ((mBlendSrc == GGL_ONE_MINUS_DST_ALPHA) ||
+            (mBlendSrc == GGL_DST_ALPHA)) {
+            mBlendSrc = GGL_ONE;
+        }
+        if ((mBlendSrcA == GGL_ONE_MINUS_DST_ALPHA) ||
+            (mBlendSrcA == GGL_DST_ALPHA)) {
+            mBlendSrcA = GGL_ONE;
+        }
+        if ((mBlendDst == GGL_ONE_MINUS_DST_ALPHA) ||
+            (mBlendDst == GGL_DST_ALPHA)) {
+            mBlendDst = GGL_ONE;
+        }
+        if ((mBlendDstA == GGL_ONE_MINUS_DST_ALPHA) ||
+            (mBlendDstA == GGL_DST_ALPHA)) {
+            mBlendDstA = GGL_ONE;
+        }
+    }
+
+    // if we need the framebuffer, read it now
+    const int blending =    blending_codes(mBlendSrc, mBlendDst) |
+                            blending_codes(mBlendSrcA, mBlendDstA);
+
+    // XXX: handle special cases, destination not modified...
+    if ((mBlendSrc==GGL_ZERO) && (mBlendSrcA==GGL_ZERO) &&
+        (mBlendDst==GGL_ONE) && (mBlendDstA==GGL_ONE)) {
+        // Destination unmodified (beware of logic ops)
+    } else if ((mBlendSrc==GGL_ZERO) && (mBlendSrcA==GGL_ZERO) &&
+        (mBlendDst==GGL_ZERO) && (mBlendDstA==GGL_ZERO)) {
+        // Destination is zero (beware of logic ops)
+    }
+    
+    int fbComponents = 0;
+    const int masking = GGL_READ_NEEDS(MASK_ARGB, needs.n);
+    for (int i=0 ; i<4 ; i++) {
+        const int mask = 1<<i;
+        component_info_t& info = mInfo[i];
+        int fs = i==GGLFormat::ALPHA ? mBlendSrcA : mBlendSrc;
+        int fd = i==GGLFormat::ALPHA ? mBlendDstA : mBlendDst;
+        if (fs==GGL_SRC_ALPHA_SATURATE && i==GGLFormat::ALPHA)
+            fs = GGL_ONE;
+        info.masked =   !!(masking & mask);
+        info.inDest =   !info.masked && mCbFormat.c[i].h && 
+                        ((mLogicOp & LOGIC_OP_SRC) || (!mLogicOp));
+        if (mCbFormat.components >= GGL_LUMINANCE &&
+                (i==GGLFormat::GREEN || i==GGLFormat::BLUE)) {
+            info.inDest = false;
+        }
+        info.needed =   (i==GGLFormat::ALPHA) && 
+                        (isAlphaSourceNeeded() || mAlphaTest != GGL_ALWAYS);
+        info.replaced = !!(mTextureMachine.replaced & mask);
+        info.iterated = (!info.replaced && (info.inDest || info.needed)); 
+        info.smooth =   mSmooth && info.iterated;
+        info.fog =      mFog && info.inDest && (i != GGLFormat::ALPHA);
+        info.blend =    (fs != int(GGL_ONE)) || (fd > int(GGL_ZERO));
+
+        mBlending |= (info.blend ? mask : 0);
+        mMasking |= (mCbFormat.c[i].h && info.masked) ? mask : 0;
+        fbComponents |= mCbFormat.c[i].h ? mask : 0;
+    }
+
+    mAllMasked = (mMasking == fbComponents);
+    if (mAllMasked) {
+        mDithering = 0;
+    }
+    
+    fragment_parts_t parts;
+
+    // ------------------------------------------------------------------------
+    prolog();
+    // ------------------------------------------------------------------------
+
+    build_scanline_prolog(parts, needs);
+
+    if (registerFile().status())
+        return registerFile().status();
+
+    // ------------------------------------------------------------------------
+    label("fragment_loop");
+    // ------------------------------------------------------------------------
+    {
+        Scratch regs(registerFile());
+
+        if (mDithering) {
+            // update the dither index.
+            MOV(AL, 0, parts.count.reg,
+                    reg_imm(parts.count.reg, ROR, GGL_DITHER_ORDER_SHIFT));
+            ADD(AL, 0, parts.count.reg, parts.count.reg,
+                    imm( 1 << (32 - GGL_DITHER_ORDER_SHIFT)));
+            MOV(AL, 0, parts.count.reg,
+                    reg_imm(parts.count.reg, ROR, 32 - GGL_DITHER_ORDER_SHIFT));
+        }
+
+        // XXX: could we do an early alpha-test here in some cases?
+        // It would probaly be used only with smooth-alpha and no texture
+        // (or no alpha component in the texture).
+
+        // Early z-test
+        if (mAlphaTest==GGL_ALWAYS) {
+            build_depth_test(parts, Z_TEST|Z_WRITE);
+        } else {
+            // we cannot do the z-write here, because
+            // it might be killed by the alpha-test later
+            build_depth_test(parts, Z_TEST);
+        }
+
+        { // texture coordinates
+            Scratch scratches(registerFile());
+
+            // texel generation
+            build_textures(parts, regs);
+            if (registerFile().status())
+                return registerFile().status();
+        }
+
+        if ((blending & (FACTOR_DST|BLEND_DST)) || 
+                (mMasking && !mAllMasked) ||
+                (mLogicOp & LOGIC_OP_DST)) 
+        {
+            // blending / logic_op / masking need the framebuffer
+            mDstPixel.setTo(regs.obtain(), &mCbFormat);
+
+            // load the framebuffer pixel
+            comment("fetch color-buffer");
+            load(parts.cbPtr, mDstPixel);
+        }
+
+        if (registerFile().status())
+            return registerFile().status();
+
+        pixel_t pixel;
+        int directTex = mTextureMachine.directTexture;
+        if (directTex | parts.packed) {
+            // note: we can't have both here
+            // iterated color or direct texture
+            pixel = directTex ? parts.texel[directTex-1] : parts.iterated;
+            pixel.flags &= ~CORRUPTIBLE;
+        } else {
+            if (mDithering) {
+                const int ctxtReg = mBuilderContext.Rctx;
+                const int mask = GGL_DITHER_SIZE-1;
+                parts.dither = reg_t(regs.obtain());
+                AND(AL, 0, parts.dither.reg, parts.count.reg, imm(mask));
+                ADD(AL, 0, parts.dither.reg, parts.dither.reg, ctxtReg);
+                LDRB(AL, parts.dither.reg, parts.dither.reg,
+                        immed12_pre(GGL_OFFSETOF(ditherMatrix)));
+            }
+        
+            // allocate a register for the resulting pixel
+            pixel.setTo(regs.obtain(), &mCbFormat, FIRST);
+
+            build_component(pixel, parts, GGLFormat::ALPHA,    regs);
+
+            if (mAlphaTest!=GGL_ALWAYS) {
+                // only handle the z-write part here. We know z-test
+                // was successful, as well as alpha-test.
+                build_depth_test(parts, Z_WRITE);
+            }
+
+            build_component(pixel, parts, GGLFormat::RED,      regs);
+            build_component(pixel, parts, GGLFormat::GREEN,    regs);
+            build_component(pixel, parts, GGLFormat::BLUE,     regs);
+
+            pixel.flags |= CORRUPTIBLE;
+        }
+
+        if (registerFile().status())
+            return registerFile().status();
+        
+        if (pixel.reg == -1) {
+            // be defensive here. if we're here it's probably
+            // that this whole fragment is a no-op.
+            pixel = mDstPixel;
+        }
+        
+        if (!mAllMasked) {
+            // logic operation
+            build_logic_op(pixel, regs);
+    
+            // masking
+            build_masking(pixel, regs); 
+    
+            comment("store");
+            store(parts.cbPtr, pixel, WRITE_BACK);
+        }
+    }
+
+    if (registerFile().status())
+        return registerFile().status();
+
+    // update the iterated color...
+    if (parts.reload != 3) {
+        build_smooth_shade(parts);
+    }
+
+    // update iterated z
+    build_iterate_z(parts);
+
+    // update iterated fog
+    build_iterate_f(parts);
+
+    SUB(AL, S, parts.count.reg, parts.count.reg, imm(1<<16));
+    B(PL, "fragment_loop");
+    label("epilog");
+    epilog(registerFile().touched());
+
+    if ((mAlphaTest!=GGL_ALWAYS) || (mDepthTest!=GGL_ALWAYS)) {
+        if (mDepthTest!=GGL_ALWAYS) {
+            label("discard_before_textures");
+            build_iterate_texture_coordinates(parts);
+        }
+        label("discard_after_textures");
+        build_smooth_shade(parts);
+        build_iterate_z(parts);
+        build_iterate_f(parts);
+        if (!mAllMasked) {
+            ADD(AL, 0, parts.cbPtr.reg, parts.cbPtr.reg, imm(parts.cbPtr.size>>3));
+        }
+        SUB(AL, S, parts.count.reg, parts.count.reg, imm(1<<16));
+        B(PL, "fragment_loop");
+        epilog(registerFile().touched());
+    }
+
+    return registerFile().status();
+!!!9901708.cpp!!!	base_offset(in d : pointer_t, in b : pointer_t, in o : reg_t) : void
+    switch (b.size) {
+    case 32:
+        ADD(AL, 0, d.reg, b.reg, reg_imm(o.reg, LSL, 2));
+        break;
+    case 24:
+        if (d.reg == b.reg) {
+            ADD(AL, 0, d.reg, b.reg, reg_imm(o.reg, LSL, 1));
+            ADD(AL, 0, d.reg, d.reg, o.reg);
+        } else {
+            ADD(AL, 0, d.reg, o.reg, reg_imm(o.reg, LSL, 1));
+            ADD(AL, 0, d.reg, d.reg, b.reg);
+        }
+        break;
+    case 16:
+        ADD(AL, 0, d.reg, b.reg, reg_imm(o.reg, LSL, 1));
+        break;
+    case 8:
+        ADD(AL, 0, d.reg, b.reg, o.reg);
+        break;
+    }
+!!!9901836.cpp!!!	modulate(inout dest : component_t, in incoming : component_t, in incomingTexel : pixel_t, in component : int) : void
+    Scratch locals(registerFile());
+    integer_t texel(locals.obtain(), 32, CORRUPTIBLE);            
+    extract(texel, incomingTexel, component);
+
+    const int Nt = texel.size();
+        // Nt should always be less than 10 bits because it comes
+        // from the TMU.
+
+    int Ni = incoming.size();
+        // Ni could be big because it comes from previous MODULATEs
+
+    if (Nt == 1) {
+        // texel acts as a bit-mask
+        // dest = incoming & ((texel << incoming.h)-texel)
+        RSB(AL, 0, dest.reg, texel.reg, reg_imm(texel.reg, LSL, incoming.h));
+        AND(AL, 0, dest.reg, dest.reg, incoming.reg);
+        dest.l = incoming.l;
+        dest.h = incoming.h;
+        dest.flags |= (incoming.flags & CLEAR_LO);
+    } else if (Ni == 1) {
+        MOV(AL, 0, dest.reg, reg_imm(incoming.reg, LSL, 31-incoming.h));
+        AND(AL, 0, dest.reg, texel.reg, reg_imm(dest.reg, ASR, 31));
+        dest.l = 0;
+        dest.h = Nt;
+    } else {
+        int inReg = incoming.reg;
+        int shift = incoming.l;
+        if ((Nt + Ni) > 32) {
+            // we will overflow, reduce the precision of Ni to 8 bits
+            // (Note Nt cannot be more than 10 bits which happens with 
+            // 565 textures and GGL_LINEAR)
+            shift += Ni-8;
+            Ni = 8;
+        }
+
+        // modulate by the component with the lowest precision
+        if (Nt >= Ni) {
+            if (shift) {
+                // XXX: we should be able to avoid this shift
+                // when shift==16 && Nt<16 && Ni<16, in which
+                // we could use SMULBT below.
+                MOV(AL, 0, dest.reg, reg_imm(inReg, LSR, shift));
+                inReg = dest.reg;
+                shift = 0;
+            }
+            // operation:           (Cf*Ct)/((1<<Ni)-1)
+            // approximated with:   Cf*(Ct + Ct>>(Ni-1))>>Ni
+            // this operation doesn't change texel's size
+            ADD(AL, 0, dest.reg, inReg, reg_imm(inReg, LSR, Ni-1));
+            if (Nt<16 && Ni<16) SMULBB(AL, dest.reg, texel.reg, dest.reg);
+            else                MUL(AL, 0, dest.reg, texel.reg, dest.reg);
+            dest.l = Ni;
+            dest.h = Nt + Ni;            
+        } else {
+            if (shift && (shift != 16)) {
+                // if shift==16, we can use 16-bits mul instructions later
+                MOV(AL, 0, dest.reg, reg_imm(inReg, LSR, shift));
+                inReg = dest.reg;
+                shift = 0;
+            }
+            // operation:           (Cf*Ct)/((1<<Nt)-1)
+            // approximated with:   Ct*(Cf + Cf>>(Nt-1))>>Nt
+            // this operation doesn't change incoming's size
+            Scratch scratches(registerFile());
+            int t = (texel.flags & CORRUPTIBLE) ? texel.reg : dest.reg;
+            if (t == inReg)
+                t = scratches.obtain();
+            ADD(AL, 0, t, texel.reg, reg_imm(texel.reg, LSR, Nt-1));
+            if (Nt<16 && Ni<16) {
+                if (shift==16)  SMULBT(AL, dest.reg, t, inReg);
+                else            SMULBB(AL, dest.reg, t, inReg);
+            } else              MUL(AL, 0, dest.reg, t, inReg);
+            dest.l = Nt;
+            dest.h = Nt + Ni;
+        }
+
+        // low bits are not valid
+        dest.flags |= CLEAR_LO;
+
+        // no need to keep more than 8 bits/component
+        if (dest.size() > 8)
+            dest.l = dest.h-8;
+    }
+!!!9901964.cpp!!!	decal(inout dest : component_t, in incoming : component_t, in incomingTexel : pixel_t, in component : int) : void
+    // RGBA:
+    // Cv = Cf*(1 - At) + Ct*At = Cf + (Ct - Cf)*At
+    // Av = Af
+    Scratch locals(registerFile());
+    integer_t texel(locals.obtain(), 32, CORRUPTIBLE);            
+    integer_t factor(locals.obtain(), 32, CORRUPTIBLE);
+    extract(texel, incomingTexel, component);
+    extract(factor, incomingTexel, GGLFormat::ALPHA);
+
+    // no need to keep more than 8-bits for decal 
+    int Ni = incoming.size();
+    int shift = incoming.l;
+    if (Ni > 8) {
+        shift += Ni-8;
+        Ni = 8;
+    }
+    integer_t incomingNorm(incoming.reg, Ni, incoming.flags);
+    if (shift) {
+        MOV(AL, 0, dest.reg, reg_imm(incomingNorm.reg, LSR, shift));
+        incomingNorm.reg = dest.reg;
+        incomingNorm.flags |= CORRUPTIBLE;
+    }
+    ADD(AL, 0, factor.reg, factor.reg, reg_imm(factor.reg, LSR, factor.s-1));
+    build_blendOneMinusFF(dest, factor, incomingNorm, texel);
+!!!9902092.cpp!!!	blend(inout dest : component_t, in incoming : component_t, in incomingTexel : pixel_t, in component : int, in tmu : int) : void
+    // RGBA:
+    // Cv = (1 - Ct)*Cf + Ct*Cc = Cf + (Cc - Cf)*Ct
+    // Av = At*Af
+
+    if (component == GGLFormat::ALPHA) {
+        modulate(dest, incoming, incomingTexel, component);
+        return;
+    }
+    
+    Scratch locals(registerFile());
+    integer_t color(locals.obtain(), 8, CORRUPTIBLE);            
+    integer_t factor(locals.obtain(), 32, CORRUPTIBLE);
+    LDRB(AL, color.reg, mBuilderContext.Rctx,
+            immed12_pre(GGL_OFFSETOF(state.texture[tmu].env_color[component])));
+    extract(factor, incomingTexel, component);
+
+    // no need to keep more than 8-bits for blend 
+    int Ni = incoming.size();
+    int shift = incoming.l;
+    if (Ni > 8) {
+        shift += Ni-8;
+        Ni = 8;
+    }
+    integer_t incomingNorm(incoming.reg, Ni, incoming.flags);
+    if (shift) {
+        MOV(AL, 0, dest.reg, reg_imm(incomingNorm.reg, LSR, shift));
+        incomingNorm.reg = dest.reg;
+        incomingNorm.flags |= CORRUPTIBLE;
+    }
+    ADD(AL, 0, factor.reg, factor.reg, reg_imm(factor.reg, LSR, factor.s-1));
+    build_blendOneMinusFF(dest, factor, incomingNorm, color);
+!!!9902220.cpp!!!	add(inout dest : component_t, in incoming : component_t, in incomingTexel : pixel_t, in component : int) : void
+    // RGBA:
+    // Cv = Cf + Ct;
+    Scratch locals(registerFile());
+    
+    component_t incomingTemp(incoming);
+
+    // use "dest" as a temporary for extracting the texel, unless "dest"
+    // overlaps "incoming".
+    integer_t texel(dest.reg, 32, CORRUPTIBLE);
+    if (dest.reg == incomingTemp.reg)
+        texel.reg = locals.obtain();
+    extract(texel, incomingTexel, component);
+
+    if (texel.s < incomingTemp.size()) {
+        expand(texel, texel, incomingTemp.size());
+    } else if (texel.s > incomingTemp.size()) {
+        if (incomingTemp.flags & CORRUPTIBLE) {
+            expand(incomingTemp, incomingTemp, texel.s);
+        } else {
+            incomingTemp.reg = locals.obtain();
+            expand(incomingTemp, incoming, texel.s);
+        }
+    }
+
+    if (incomingTemp.l) {
+        ADD(AL, 0, dest.reg, texel.reg,
+                reg_imm(incomingTemp.reg, LSR, incomingTemp.l));
+    } else {
+        ADD(AL, 0, dest.reg, texel.reg, incomingTemp.reg);
+    }
+    dest.l = 0;
+    dest.h = texel.size();
+    component_sat(dest);
+!!!9902348.cpp!!!	store(in addr : pointer_t, in s : pixel_t, in flags : uint32_t = 0) : void
+    
+    const int bits = addr.size;
+    const int inc = (flags & WRITE_BACK)?1:0;
+    switch (bits) {
+    case 32:
+        if (inc)    STR(AL, s.reg, addr.reg, immed12_post(4));
+        else        STR(AL, s.reg, addr.reg);
+        break;
+    case 24:
+        // 24 bits formats are a little special and used only for RGB
+        // 0x00BBGGRR is unpacked as R,G,B
+        STRB(AL, s.reg, addr.reg, immed12_pre(0));
+        MOV(AL, 0, s.reg, reg_imm(s.reg, ROR, 8));
+        STRB(AL, s.reg, addr.reg, immed12_pre(1));
+        MOV(AL, 0, s.reg, reg_imm(s.reg, ROR, 8));
+        STRB(AL, s.reg, addr.reg, immed12_pre(2));
+        if (!(s.flags & CORRUPTIBLE)) {
+            MOV(AL, 0, s.reg, reg_imm(s.reg, ROR, 16));
+        }
+        if (inc)
+            ADD(AL, 0, addr.reg, addr.reg, imm(3));
+        break;
+    case 16:
+        if (inc)    STRH(AL, s.reg, addr.reg, immed8_post(2));
+        else        STRH(AL, s.reg, addr.reg);
+        break;
+    case  8:
+        if (inc)    STRB(AL, s.reg, addr.reg, immed12_post(1));
+        else        STRB(AL, s.reg, addr.reg);
+        break;
+    }
+!!!9902476.cpp!!!	load(in addr : pointer_t, in s : pixel_t, in flags : uint32_t = 0) : void
+    
+    Scratch scratches(registerFile());    
+    int s0;
+
+    const int bits = addr.size;
+    const int inc = (flags & WRITE_BACK)?1:0;
+    switch (bits) {
+    case 32:
+        if (inc)    LDR(AL, s.reg, addr.reg, immed12_post(4));
+        else        LDR(AL, s.reg, addr.reg);
+        break;
+    case 24:
+        // 24 bits formats are a little special and used only for RGB
+        // R,G,B is packed as 0x00BBGGRR 
+        s0 = scratches.obtain();
+        if (s.reg != addr.reg) {
+            LDRB(AL, s.reg, addr.reg, immed12_pre(0));      // R
+            LDRB(AL, s0, addr.reg, immed12_pre(1));         // G
+            ORR(AL, 0, s.reg, s.reg, reg_imm(s0, LSL, 8));
+            LDRB(AL, s0, addr.reg, immed12_pre(2));         // B
+            ORR(AL, 0, s.reg, s.reg, reg_imm(s0, LSL, 16));
+        } else {
+            int s1 = scratches.obtain();
+            LDRB(AL, s1, addr.reg, immed12_pre(0));         // R
+            LDRB(AL, s0, addr.reg, immed12_pre(1));         // G
+            ORR(AL, 0, s1, s1, reg_imm(s0, LSL, 8));
+            LDRB(AL, s0, addr.reg, immed12_pre(2));         // B
+            ORR(AL, 0, s.reg, s1, reg_imm(s0, LSL, 16));
+        }
+        if (inc)
+            ADD(AL, 0, addr.reg, addr.reg, imm(3));
+        break;        
+    case 16:
+        if (inc)    LDRH(AL, s.reg, addr.reg, immed8_post(2));
+        else        LDRH(AL, s.reg, addr.reg);
+        break;
+    case  8:
+        if (inc)    LDRB(AL, s.reg, addr.reg, immed12_post(1));
+        else        LDRB(AL, s.reg, addr.reg);
+        break;
+    }
+!!!9902604.cpp!!!	extract(inout d : integer_t, in s : pixel_t, in component : int) : void
+    extract(d,  s.reg,
+                s.format.c[component].h,
+                s.format.c[component].l,
+                s.size());
+!!!9902732.cpp!!!	extract(inout d : component_t, in s : pixel_t, in component : int) : void
+    integer_t r(d.reg, 32, d.flags);
+    extract(r,  s.reg,
+                s.format.c[component].h,
+                s.format.c[component].l,
+                s.size());
+    d = component_t(r);
+!!!9902860.cpp!!!	extract(inout d : integer_t, in s : int, in h : int, in l : int, in bits : int = 32) : void
+    const int maskLen = h-l;
+
+#ifdef __mips__
+    assert(maskLen<=11);
+#else
+    assert(maskLen<=8);
+#endif
+    assert(h);
+    
+#if __ARM_ARCH__ >= 7
+    const int mask = (1<<maskLen)-1;
+    if ((h == bits) && !l && (s != d.reg)) {
+        MOV(AL, 0, d.reg, s);                   // component = packed;
+    } else if ((h == bits) && l) {
+        MOV(AL, 0, d.reg, reg_imm(s, LSR, l));  // component = packed >> l;
+    } else if (!l && isValidImmediate(mask)) {
+        AND(AL, 0, d.reg, s, imm(mask));        // component = packed & mask;
+    } else if (!l && isValidImmediate(~mask)) {
+        BIC(AL, 0, d.reg, s, imm(~mask));       // component = packed & mask;
+    } else {
+        UBFX(AL, d.reg, s, l, maskLen);         // component = (packed & mask) >> l;
+    }
+#else
+    if (h != bits) {
+        const int mask = ((1<<maskLen)-1) << l;
+        if (isValidImmediate(mask)) {
+            AND(AL, 0, d.reg, s, imm(mask));    // component = packed & mask;
+        } else if (isValidImmediate(~mask)) {
+            BIC(AL, 0, d.reg, s, imm(~mask));   // component = packed & mask;
+        } else {
+            MOV(AL, 0, d.reg, reg_imm(s, LSL, 32-h));
+            l += 32-h;
+            h = 32;
+        }
+        s = d.reg;
+    }
+    
+    if (l) {
+        MOV(AL, 0, d.reg, reg_imm(s, LSR, l));  // component = packed >> l;
+        s = d.reg;
+    }
+    
+    if (s != d.reg) {
+        MOV(AL, 0, d.reg, s);
+    }
+#endif
+
+    d.s = maskLen;
+!!!9902988.cpp!!!	expand(inout dst : integer_t, in src : integer_t, in dbits : int) : void
+    assert(src.size());
+
+    int sbits = src.size();
+    int s = src.reg;
+    int d = dst.reg;
+
+    // be sure to set 'dst' after we read 'src' as they may be identical
+    dst.s = dbits;
+    dst.flags = 0;
+
+    if (dbits<=sbits) {
+        if (s != d) {
+            MOV(AL, 0, d, s);
+        }
+        return;
+    }
+
+    if (sbits == 1) {
+        RSB(AL, 0, d, s, reg_imm(s, LSL, dbits));
+            // d = (s<<dbits) - s;
+        return;
+    }
+
+    if (dbits % sbits) {
+        MOV(AL, 0, d, reg_imm(s, LSL, dbits-sbits));
+            // d = s << (dbits-sbits);
+        dbits -= sbits;
+        do {
+            ORR(AL, 0, d, d, reg_imm(d, LSR, sbits));
+                // d |= d >> sbits;
+            dbits -= sbits;
+            sbits *= 2;
+        } while(dbits>0);
+        return;
+    }
+    
+    dbits -= sbits;
+    do {
+        ORR(AL, 0, d, s, reg_imm(s, LSL, sbits));
+            // d |= d<<sbits;
+        s = d;        
+        dbits -= sbits;
+        if (sbits*2 < dbits) {
+            sbits *= 2;
+        }
+    } while(dbits>0);
+!!!9903116.cpp!!!	expand(inout d : integer_t, in s : component_t, in dbits : int) : void
+    if (s.l || (s.flags & CLEAR_HI)) {
+        extract(d, s.reg, s.h, s.l, 32);
+        expand(d, d, dbits);
+    } else {
+        expand(d, integer_t(s.reg, s.size(), s.flags), dbits);
+    }
+!!!9903244.cpp!!!	expand(inout d : component_t, in s : component_t, in dbits : int) : void
+    integer_t r(d.reg, 32, d.flags);
+    expand(r, s, dbits);
+    d = component_t(r);
+!!!9903372.cpp!!!	downshift(inout d : pixel_t, in component : int, in s : component_t, in dither : reg_t) : void
+    const needs_t& needs = mBuilderContext.needs;
+    Scratch scratches(registerFile());
+
+    int sh = s.h;
+    int sl = s.l;
+    int maskHiBits = (sh!=32) ? ((s.flags & CLEAR_HI)?1:0) : 0;
+    int maskLoBits = (sl!=0)  ? ((s.flags & CLEAR_LO)?1:0) : 0;
+    int sbits = sh - sl;
+
+    int dh = d.format.c[component].h;
+    int dl = d.format.c[component].l;
+    int dbits = dh - dl;
+    int dithering = 0;
+    
+    ALOGE_IF(sbits<dbits, "sbits (%d) < dbits (%d) in downshift", sbits, dbits);
+
+    if (sbits>dbits) {
+        // see if we need to dither
+        dithering = mDithering;
+    }
+    
+    int ireg = d.reg;
+    if (!(d.flags & FIRST)) {
+        if (s.flags & CORRUPTIBLE)  {
+            ireg = s.reg;
+        } else {
+            ireg = scratches.obtain();
+        }
+    }
+    d.flags &= ~FIRST;
+
+    if (maskHiBits) {
+        // we need to mask the high bits (and possibly the lowbits too)
+        // and we might be able to use immediate mask.
+        if (!dithering) {
+            // we don't do this if we only have maskLoBits because we can
+            // do it more efficiently below (in the case where dl=0)
+            const int offset = sh - dbits;
+            if (dbits<=8 && offset >= 0) {
+                const uint32_t mask = ((1<<dbits)-1) << offset;
+                if (isValidImmediate(mask) || isValidImmediate(~mask)) {
+                    build_and_immediate(ireg, s.reg, mask, 32);
+                    sl = offset;
+                    s.reg = ireg; 
+                    sbits = dbits;
+                    maskLoBits = maskHiBits = 0;
+                }
+            }
+        } else {
+            // in the dithering case though, we need to preserve the lower bits
+            const uint32_t mask = ((1<<sbits)-1) << sl;
+            if (isValidImmediate(mask) || isValidImmediate(~mask)) {
+                build_and_immediate(ireg, s.reg, mask, 32);
+                s.reg = ireg; 
+                maskLoBits = maskHiBits = 0;
+            }
+        }
+    }
+
+    // XXX: we could special case (maskHiBits & !maskLoBits)
+    // like we do for maskLoBits below, but it happens very rarely
+    // that we have maskHiBits only and the conditions necessary to lead
+    // to better code (like doing d |= s << 24)
+
+    if (maskHiBits) {
+        MOV(AL, 0, ireg, reg_imm(s.reg, LSL, 32-sh));
+        sl += 32-sh;
+        sh = 32;
+        s.reg = ireg;
+        maskHiBits = 0;
+    }
+
+    //	Downsampling should be performed as follows:
+    //  V * ((1<<dbits)-1) / ((1<<sbits)-1)
+    //	V * [(1<<dbits)/((1<<sbits)-1)	-	1/((1<<sbits)-1)]
+    //	V * [1/((1<<sbits)-1)>>dbits	-	1/((1<<sbits)-1)]
+    //	V/((1<<(sbits-dbits))-(1>>dbits))	-	(V>>sbits)/((1<<sbits)-1)>>sbits
+    //	V/((1<<(sbits-dbits))-(1>>dbits))	-	(V>>sbits)/(1-(1>>sbits))
+    //
+    //	By approximating (1>>dbits) and (1>>sbits) to 0:
+    //
+    //		V>>(sbits-dbits)	-	V>>sbits
+    //
+	//  A good approximation is V>>(sbits-dbits),
+    //  but better one (needed for dithering) is:
+    //
+    //		(V>>(sbits-dbits)<<sbits	-	V)>>sbits
+    //		(V<<dbits	-	V)>>sbits
+    //		(V	-	V>>dbits)>>(sbits-dbits)
+
+    // Dithering is done here
+    if (dithering) {
+        comment("dithering");
+        if (sl) {
+            MOV(AL, 0, ireg, reg_imm(s.reg, LSR, sl));
+            sh -= sl;
+            sl = 0;
+            s.reg = ireg; 
+        }
+        // scaling (V-V>>dbits)
+        SUB(AL, 0, ireg, s.reg, reg_imm(s.reg, LSR, dbits));
+        const int shift = (GGL_DITHER_BITS - (sbits-dbits));
+        if (shift>0)        ADD(AL, 0, ireg, ireg, reg_imm(dither.reg, LSR, shift));
+        else if (shift<0)   ADD(AL, 0, ireg, ireg, reg_imm(dither.reg, LSL,-shift));
+        else                ADD(AL, 0, ireg, ireg, dither.reg);
+        s.reg = ireg; 
+    }
+
+    if ((maskLoBits|dithering) && (sh > dbits)) {
+        int shift = sh-dbits;
+        if (dl) {
+            MOV(AL, 0, ireg, reg_imm(s.reg, LSR, shift));
+            if (ireg == d.reg) {
+                MOV(AL, 0, d.reg, reg_imm(ireg, LSL, dl));
+            } else {
+                ORR(AL, 0, d.reg, d.reg, reg_imm(ireg, LSL, dl));
+            }
+        } else {
+            if (ireg == d.reg) {
+                MOV(AL, 0, d.reg, reg_imm(s.reg, LSR, shift));
+            } else {
+                ORR(AL, 0, d.reg, d.reg, reg_imm(s.reg, LSR, shift));
+            }
+        }
+    } else {
+        int shift = sh-dh;
+        if (shift>0) {
+            if (ireg == d.reg) {
+                MOV(AL, 0, d.reg, reg_imm(s.reg, LSR, shift));
+            } else {
+                ORR(AL, 0, d.reg, d.reg, reg_imm(s.reg, LSR, shift));
+            }
+        } else if (shift<0) {
+            if (ireg == d.reg) {
+                MOV(AL, 0, d.reg, reg_imm(s.reg, LSL, -shift));
+            } else {
+                ORR(AL, 0, d.reg, d.reg, reg_imm(s.reg, LSL, -shift));
+            }
+        } else {
+            if (ireg == d.reg) {
+                if (s.reg != d.reg) {
+                    MOV(AL, 0, d.reg, s.reg);
+                }
+            } else {
+                ORR(AL, 0, d.reg, d.reg, s.reg);
+            }
+        }
+    }
+!!!9903500.cpp!!!	mul_factor(inout d : component_t, in v : integer_t, in f : integer_t) : void
+    int vs = v.size();
+    int fs = f.size();
+    int ms = vs+fs;
+
+    // XXX: we could have special cases for 1 bit mul
+
+    // all this code below to use the best multiply instruction
+    // wrt the parameters size. We take advantage of the fact
+    // that the 16-bits multiplies allow a 16-bit shift
+    // The trick is that we just make sure that we have at least 8-bits
+    // per component (which is enough for a 8 bits display).
+
+    int xy;
+    int vshift = 0;
+    int fshift = 0;
+    int smulw = 0;
+
+    if (vs<16) {
+        if (fs<16) {
+            xy = xyBB;
+        } else if (GGL_BETWEEN(fs, 24, 31)) {
+            ms -= 16;
+            xy = xyTB;
+        } else {
+            // eg: 15 * 18  ->  15 * 15
+            fshift = fs - 15;
+            ms -= fshift;
+            xy = xyBB;
+        }
+    } else if (GGL_BETWEEN(vs, 24, 31)) {
+        if (fs<16) {
+            ms -= 16;
+            xy = xyTB;
+        } else if (GGL_BETWEEN(fs, 24, 31)) {
+            ms -= 32;
+            xy = xyTT;
+        } else {
+            // eg: 24 * 18  ->  8 * 18
+            fshift = fs - 15;
+            ms -= 16 + fshift;
+            xy = xyTB;
+        }
+    } else {
+        if (fs<16) {
+            // eg: 18 * 15  ->  15 * 15
+            vshift = vs - 15;
+            ms -= vshift;
+            xy = xyBB;
+        } else if (GGL_BETWEEN(fs, 24, 31)) {
+            // eg: 18 * 24  ->  15 * 8
+            vshift = vs - 15;
+            ms -= 16 + vshift;
+            xy = xyBT;
+        } else {
+            // eg: 18 * 18  ->  (15 * 18)>>16
+            fshift = fs - 15;
+            ms -= 16 + fshift;
+            xy = yB;    //XXX SMULWB
+            smulw = 1;
+        }
+    }
+
+    ALOGE_IF(ms>=32, "mul_factor overflow vs=%d, fs=%d", vs, fs);
+
+    int vreg = v.reg;
+    int freg = f.reg;
+    if (vshift) {
+        MOV(AL, 0, d.reg, reg_imm(vreg, LSR, vshift));
+        vreg = d.reg;
+    }
+    if (fshift) {
+        MOV(AL, 0, d.reg, reg_imm(vreg, LSR, fshift));
+        freg = d.reg;
+    }
+    if (smulw)  SMULW(AL, xy, d.reg, vreg, freg);
+    else        SMUL(AL, xy, d.reg, vreg, freg);
+
+
+    d.h = ms;
+    if (mDithering) {
+        d.l = 0; 
+    } else {
+        d.l = fs; 
+        d.flags |= CLEAR_LO;
+    }
+!!!9903628.cpp!!!	mul_factor_add(inout d : component_t, in v : integer_t, in f : integer_t, in a : component_t) : void
+    // XXX: we could have special cases for 1 bit mul
+    Scratch scratches(registerFile());
+
+    int vs = v.size();
+    int fs = f.size();
+    int as = a.h;
+    int ms = vs+fs;
+
+    ALOGE_IF(ms>=32, "mul_factor_add overflow vs=%d, fs=%d, as=%d", vs, fs, as);
+
+    integer_t add(a.reg, a.h, a.flags);
+
+    // 'a' is a component_t but it is guaranteed to have
+    // its high bits set to 0. However in the dithering case,
+    // we can't get away with truncating the potentially bad bits
+    // so extraction is needed.
+
+   if ((mDithering) && (a.size() < ms)) {
+        // we need to expand a
+        if (!(a.flags & CORRUPTIBLE)) {
+            // ... but it's not corruptible, so we need to pick a
+            // temporary register.
+            // Try to uses the destination register first (it's likely
+            // to be usable, unless it aliases an input).
+            if (d.reg!=a.reg && d.reg!=v.reg && d.reg!=f.reg) {
+                add.reg = d.reg;
+            } else {
+                add.reg = scratches.obtain();
+            }
+        }
+        expand(add, a, ms); // extracts and expands
+        as = ms;
+    }
+
+    if (ms == as) {
+        if (vs<16 && fs<16) SMLABB(AL, d.reg, v.reg, f.reg, add.reg);
+        else                MLA(AL, 0, d.reg, v.reg, f.reg, add.reg);
+    } else {
+        int temp = d.reg;
+        if (temp == add.reg) {
+            // the mul will modify add.reg, we need an intermediary reg
+            if (v.flags & CORRUPTIBLE)      temp = v.reg;
+            else if (f.flags & CORRUPTIBLE) temp = f.reg;
+            else                            temp = scratches.obtain();
+        }
+
+        if (vs<16 && fs<16) SMULBB(AL, temp, v.reg, f.reg);
+        else                MUL(AL, 0, temp, v.reg, f.reg);
+
+        if (ms>as) {
+            ADD(AL, 0, d.reg, temp, reg_imm(add.reg, LSL, ms-as));
+        } else if (ms<as) {
+            // not sure if we should expand the mul instead?
+            ADD(AL, 0, d.reg, temp, reg_imm(add.reg, LSR, as-ms));
+        }
+    }
+
+    d.h = ms;
+    if (mDithering) {
+        d.l = a.l; 
+    } else {
+        d.l = fs>a.l ? fs : a.l;
+        d.flags |= CLEAR_LO;
+    }
+!!!9903756.cpp!!!	component_add(inout d : component_t, in dst : integer_t, in src : integer_t) : void
+    // here we're guaranteed that fragment.size() >= fb.size()
+    const int shift = src.size() - dst.size();
+    if (!shift) {
+        ADD(AL, 0, d.reg, src.reg, dst.reg);
+    } else {
+        ADD(AL, 0, d.reg, src.reg, reg_imm(dst.reg, LSL, shift));
+    }
+
+    d.h = src.size();
+    if (mDithering) {
+        d.l = 0;
+    } else {
+        d.l = shift;
+        d.flags |= CLEAR_LO;
+    }
+!!!9903884.cpp!!!	component_sat(in v : component_t) : void
+    const int one = ((1<<v.size())-1)<<v.l;
+    CMP(AL, v.reg, imm( 1<<v.h ));
+    if (isValidImmediate(one)) {
+        MOV(HS, 0, v.reg, imm( one ));
+    } else if (isValidImmediate(~one)) {
+        MVN(HS, 0, v.reg, imm( ~one ));
+    } else {
+        MOV(HS, 0, v.reg, imm( 1<<v.h ));
+        SUB(HS, 0, v.reg, v.reg, imm( 1<<v.l ));
+    }
+!!!9904012.cpp!!!	build_scanline_prolog(inout parts : fragment_parts_t, in needs : needs_t) : void
+    Scratch scratches(registerFile());
+    int Rctx = mBuilderContext.Rctx;
+
+    // compute count
+    comment("compute ct (# of pixels to process)");
+    parts.count.setTo(obtainReg());
+    int Rx = scratches.obtain();    
+    int Ry = scratches.obtain();
+    CONTEXT_LOAD(Rx, iterators.xl);
+    CONTEXT_LOAD(parts.count.reg, iterators.xr);
+    CONTEXT_LOAD(Ry, iterators.y);
+
+    // parts.count = iterators.xr - Rx
+    SUB(AL, 0, parts.count.reg, parts.count.reg, Rx);
+    SUB(AL, 0, parts.count.reg, parts.count.reg, imm(1));
+
+    if (mDithering) {
+        // parts.count.reg = 0xNNNNXXDD
+        // NNNN = count-1
+        // DD   = dither offset
+        // XX   = 0xxxxxxx (x = garbage)
+        Scratch scratches(registerFile());
+        int tx = scratches.obtain();
+        int ty = scratches.obtain();
+        AND(AL, 0, tx, Rx, imm(GGL_DITHER_MASK));
+        AND(AL, 0, ty, Ry, imm(GGL_DITHER_MASK));
+        ADD(AL, 0, tx, tx, reg_imm(ty, LSL, GGL_DITHER_ORDER_SHIFT));
+        ORR(AL, 0, parts.count.reg, tx, reg_imm(parts.count.reg, LSL, 16));
+    } else {
+        // parts.count.reg = 0xNNNN0000
+        // NNNN = count-1
+        MOV(AL, 0, parts.count.reg, reg_imm(parts.count.reg, LSL, 16));
+    }
+
+    if (!mAllMasked) {
+        // compute dst ptr
+        comment("compute color-buffer pointer");
+        const int cb_bits = mCbFormat.size*8;
+        int Rs = scratches.obtain();
+        parts.cbPtr.setTo(obtainReg(), cb_bits);
+        CONTEXT_LOAD(Rs, state.buffers.color.stride);
+        CONTEXT_LOAD(parts.cbPtr.reg, state.buffers.color.data);
+        SMLABB(AL, Rs, Ry, Rs, Rx);  // Rs = Rx + Ry*Rs
+        base_offset(parts.cbPtr, parts.cbPtr, Rs);
+        scratches.recycle(Rs);
+    }
+    
+    // init fog
+    const int need_fog = GGL_READ_NEEDS(P_FOG, needs.p);
+    if (need_fog) {
+        comment("compute initial fog coordinate");
+        Scratch scratches(registerFile());
+        int dfdx = scratches.obtain();
+        int ydfdy = scratches.obtain();
+        int f = ydfdy;
+        CONTEXT_LOAD(dfdx,  generated_vars.dfdx);
+        CONTEXT_LOAD(ydfdy, iterators.ydfdy);
+        MLA(AL, 0, f, Rx, dfdx, ydfdy);
+        CONTEXT_STORE(f, generated_vars.f);
+    }
+
+    // init Z coordinate
+    if ((mDepthTest != GGL_ALWAYS) || GGL_READ_NEEDS(P_MASK_Z, needs.p)) {
+        parts.z = reg_t(obtainReg());
+        comment("compute initial Z coordinate");
+        Scratch scratches(registerFile());
+        int dzdx = scratches.obtain();
+        int ydzdy = parts.z.reg;
+        CONTEXT_LOAD(dzdx,  generated_vars.dzdx);   // 1.31 fixed-point
+        CONTEXT_LOAD(ydzdy, iterators.ydzdy);       // 1.31 fixed-point
+        MLA(AL, 0, parts.z.reg, Rx, dzdx, ydzdy);
+
+        // we're going to index zbase of parts.count
+        // zbase = base + (xl-count + stride*y)*2
+        int Rs = dzdx;
+        int zbase = scratches.obtain();
+        CONTEXT_LOAD(Rs, state.buffers.depth.stride);
+        CONTEXT_LOAD(zbase, state.buffers.depth.data);
+        SMLABB(AL, Rs, Ry, Rs, Rx);
+        ADD(AL, 0, Rs, Rs, reg_imm(parts.count.reg, LSR, 16));
+        ADD(AL, 0, zbase, zbase, reg_imm(Rs, LSL, 1));
+        CONTEXT_STORE(zbase, generated_vars.zbase);
+    }
+
+    // init texture coordinates
+    init_textures(parts.coords, reg_t(Rx), reg_t(Ry));
+    scratches.recycle(Ry);
+
+    // iterated color
+    init_iterated_color(parts, reg_t(Rx));
+
+    // init coverage factor application (anti-aliasing)
+    if (mAA) {
+        parts.covPtr.setTo(obtainReg(), 16);
+        CONTEXT_LOAD(parts.covPtr.reg, state.buffers.coverage);
+        ADD(AL, 0, parts.covPtr.reg, parts.covPtr.reg, reg_imm(Rx, LSL, 1));
+    }
+!!!9904140.cpp!!!	build_smooth_shade(in parts : fragment_parts_t) : void
+    if (mSmooth && !parts.iterated_packed) {
+        // update the iterated color in a pipelined way...
+        comment("update iterated color");
+        Scratch scratches(registerFile());
+
+        const int reload = parts.reload;
+        for (int i=0 ; i<4 ; i++) {
+            if (!mInfo[i].iterated) 
+                continue;
+                
+            int c = parts.argb[i].reg;
+            int dx = parts.argb_dx[i].reg;
+            
+            if (reload & 1) {
+                c = scratches.obtain();
+                CONTEXT_LOAD(c, generated_vars.argb[i].c);
+            }
+            if (reload & 2) {
+                dx = scratches.obtain();
+                CONTEXT_LOAD(dx, generated_vars.argb[i].dx);
+            }
+            
+            if (mSmooth) {
+                ADD(AL, 0, c, c, dx);
+            }
+            
+            if (reload & 1) {
+                CONTEXT_STORE(c, generated_vars.argb[i].c);
+                scratches.recycle(c);
+            }
+            if (reload & 2) {
+                scratches.recycle(dx);
+            }
+        }
+    }
+!!!9904268.cpp!!!	build_component(inout pixel : pixel_t, in parts : fragment_parts_t, in component : int, inout regs : Scratch) : void
+    static char const * comments[] = {"alpha", "red", "green", "blue"};
+    comment(comments[component]);
+
+    // local register file
+    Scratch scratches(registerFile());
+    const int dst_component_size = pixel.component_size(component);
+
+    component_t temp(-1);
+    build_incoming_component( temp, dst_component_size,
+            parts, component, scratches, regs);
+
+    if (mInfo[component].inDest) {
+
+        // blending...
+        build_blending( temp, mDstPixel, component, scratches );
+
+        // downshift component and rebuild pixel...
+        downshift(pixel, component, temp, parts.dither);
+    }
+!!!9904396.cpp!!!	build_incoming_component(inout temp : component_t, in dst_size : int, in parts : fragment_parts_t, in component : int, inout scratches : Scratch, inout global_regs : Scratch) : void
+    const uint32_t component_mask = 1<<component;
+
+    // Figure out what we need for the blending stage...
+    int fs = component==GGLFormat::ALPHA ? mBlendSrcA : mBlendSrc;
+    int fd = component==GGLFormat::ALPHA ? mBlendDstA : mBlendDst;
+    if (fs==GGL_SRC_ALPHA_SATURATE && component==GGLFormat::ALPHA) {
+        fs = GGL_ONE;
+    }
+
+    // Figure out what we need to extract and for what reason
+    const int blending = blending_codes(fs, fd);
+
+    // Are we actually going to blend?
+    const int need_blending = (fs != int(GGL_ONE)) || (fd > int(GGL_ZERO));
+    
+    // expand the source if the destination has more bits
+    int need_expander = false;
+    for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT-1 ; i++) {
+        texture_unit_t& tmu = mTextureMachine.tmu[i];
+        if ((tmu.format_idx) &&
+            (parts.texel[i].component_size(component) < dst_size)) {
+            need_expander = true;
+        }
+    }
+
+    // do we need to extract this component?
+    const bool multiTexture = mTextureMachine.activeUnits > 1;
+    const int blend_needs_alpha_source = (component==GGLFormat::ALPHA) &&
+                                        (isAlphaSourceNeeded());
+    int need_extract = mInfo[component].needed;
+    if (mInfo[component].inDest)
+    {
+        need_extract |= ((need_blending ?
+                (blending & (BLEND_SRC|FACTOR_SRC)) : need_expander));
+        need_extract |= (mTextureMachine.mask != mTextureMachine.replaced);
+        need_extract |= mInfo[component].smooth;
+        need_extract |= mInfo[component].fog;
+        need_extract |= mDithering;
+        need_extract |= multiTexture;
+    }
+
+    if (need_extract) {
+        Scratch& regs = blend_needs_alpha_source ? global_regs : scratches;
+        component_t fragment;
+
+        // iterated color
+        build_iterated_color(fragment, parts, component, regs);
+
+        // texture environement (decal, modulate, replace)
+        build_texture_environment(fragment, parts, component, regs);
+
+        // expand the source if the destination has more bits
+        if (need_expander && (fragment.size() < dst_size)) {
+            // we're here only if we fetched a texel
+            // (so we know for sure fragment is CORRUPTIBLE)
+            expand(fragment, fragment, dst_size);
+        }
+
+        // We have a few specific things to do for the alpha-channel
+        if ((component==GGLFormat::ALPHA) &&
+            (mInfo[component].needed || fragment.size()<dst_size))
+        {
+            // convert to integer_t first and make sure
+            // we don't corrupt a needed register
+            if (fragment.l) {
+                component_t incoming(fragment);
+                modify(fragment, regs);
+                MOV(AL, 0, fragment.reg, reg_imm(incoming.reg, LSR, incoming.l));
+                fragment.h -= fragment.l;
+                fragment.l = 0;
+            }
+
+            // coverage factor application
+            build_coverage_application(fragment, parts, regs);
+
+            // alpha-test
+            build_alpha_test(fragment, parts);
+
+            if (blend_needs_alpha_source) {
+                // We keep only 8 bits for the blending stage
+                const int shift = fragment.h <= 8 ? 0 : fragment.h-8;
+                if (fragment.flags & CORRUPTIBLE) {
+                    fragment.flags &= ~CORRUPTIBLE;
+                    mAlphaSource.setTo(fragment.reg,
+                            fragment.size(), fragment.flags);
+                    if (shift) {
+                        MOV(AL, 0, mAlphaSource.reg,
+                            reg_imm(mAlphaSource.reg, LSR, shift));
+                    }
+                } else {
+                    // XXX: it would better to do this in build_blend_factor()
+                    // so we can avoid the extra MOV below.
+                    mAlphaSource.setTo(regs.obtain(),
+                            fragment.size(), CORRUPTIBLE);
+                    if (shift) {
+                        MOV(AL, 0, mAlphaSource.reg,
+                            reg_imm(fragment.reg, LSR, shift));
+                    } else {
+                        MOV(AL, 0, mAlphaSource.reg, fragment.reg);
+                    }
+                }
+                mAlphaSource.s -= shift;
+            }
+        }
+
+        // fog...
+        build_fog( fragment, component, regs );
+
+        temp = fragment;
+    } else {
+        if (mInfo[component].inDest) {
+            // extraction not needed and replace
+            // we just select the right component
+            if ((mTextureMachine.replaced & component_mask) == 0) {
+                // component wasn't replaced, so use it!
+                temp = component_t(parts.iterated, component);
+            }
+            for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT ; i++) {
+                const texture_unit_t& tmu = mTextureMachine.tmu[i];
+                if ((tmu.mask & component_mask) &&
+                    ((tmu.replaced & component_mask) == 0)) {
+                    temp = component_t(parts.texel[i], component);
+                }
+            }
+        }
+    }
+!!!9904524.cpp!!!	init_iterated_color(inout parts : fragment_parts_t, in x : reg_t) : void
+    context_t const* c = mBuilderContext.c;
+    const needs_t& needs = mBuilderContext.needs;
+
+    if (mSmooth) {
+        // NOTE: we could take this case in the mDithering + !mSmooth case,
+        // but this would use up to 4 more registers for the color components
+        // for only a little added quality.
+        // Currently, this causes the system to run out of registers in
+        // some case (see issue #719496)
+
+        comment("compute initial iterated color (smooth and/or dither case)");
+
+        parts.iterated_packed = 0;
+        parts.packed = 0;
+
+        // 0x1: color component
+        // 0x2: iterators
+        const int optReload = mOptLevel >> 1;
+        if (optReload >= 3)         parts.reload = 0; // reload nothing
+        else if (optReload == 2)    parts.reload = 2; // reload iterators
+        else if (optReload == 1)    parts.reload = 1; // reload colors
+        else if (optReload <= 0)    parts.reload = 3; // reload both
+
+        if (!mSmooth) {
+            // we're not smoothing (just dithering), we never have to 
+            // reload the iterators
+            parts.reload &= ~2;
+        }
+
+        Scratch scratches(registerFile());
+        const int t0 = (parts.reload & 1) ? scratches.obtain() : 0;
+        const int t1 = (parts.reload & 2) ? scratches.obtain() : 0;
+        for (int i=0 ; i<4 ; i++) {
+            if (!mInfo[i].iterated)
+                continue;            
+            
+            // this component exists in the destination and is not replaced
+            // by a texture unit.
+            const int c = (parts.reload & 1) ? t0 : obtainReg();              
+            if (i==0) CONTEXT_LOAD(c, iterators.ydady);
+            if (i==1) CONTEXT_LOAD(c, iterators.ydrdy);
+            if (i==2) CONTEXT_LOAD(c, iterators.ydgdy);
+            if (i==3) CONTEXT_LOAD(c, iterators.ydbdy);
+            parts.argb[i].reg = c;
+
+            if (mInfo[i].smooth) {
+                parts.argb_dx[i].reg = (parts.reload & 2) ? t1 : obtainReg();
+                const int dvdx = parts.argb_dx[i].reg;
+                CONTEXT_LOAD(dvdx, generated_vars.argb[i].dx);
+                MLA(AL, 0, c, x.reg, dvdx, c);
+                
+                // adjust the color iterator to make sure it won't overflow
+                if (!mAA) {
+                    // this is not needed when we're using anti-aliasing
+                    // because we will (have to) clamp the components
+                    // anyway.
+                    int end = scratches.obtain();
+                    MOV(AL, 0, end, reg_imm(parts.count.reg, LSR, 16));
+                    MLA(AL, 1, end, dvdx, end, c);
+                    SUB(MI, 0, c, c, end);
+                    BIC(AL, 0, c, c, reg_imm(c, ASR, 31)); 
+                    scratches.recycle(end);
+                }
+            }
+            
+            if (parts.reload & 1) {
+                CONTEXT_STORE(c, generated_vars.argb[i].c);
+            }
+        }
+    } else {
+        // We're not smoothed, so we can 
+        // just use a packed version of the color and extract the
+        // components as needed (or not at all if we don't blend)
+
+        // figure out if we need the iterated color
+        int load = 0;
+        for (int i=0 ; i<4 ; i++) {
+            component_info_t& info = mInfo[i];
+            if ((info.inDest || info.needed) && !info.replaced)
+                load |= 1;
+        }
+        
+        parts.iterated_packed = 1;
+        parts.packed = (!mTextureMachine.mask && !mBlending
+                && !mFog && !mDithering);
+        parts.reload = 0;
+        if (load || parts.packed) {
+            if (mBlending || mDithering || mInfo[GGLFormat::ALPHA].needed) {
+                comment("load initial iterated color (8888 packed)");
+                parts.iterated.setTo(obtainReg(),
+                        &(c->formats[GGL_PIXEL_FORMAT_RGBA_8888]));
+                CONTEXT_LOAD(parts.iterated.reg, packed8888);
+            } else {
+                comment("load initial iterated color (dest format packed)");
+
+                parts.iterated.setTo(obtainReg(), &mCbFormat);
+
+                // pre-mask the iterated color
+                const int bits = parts.iterated.size();
+                const uint32_t size = ((bits>=32) ? 0 : (1LU << bits)) - 1;
+                uint32_t mask = 0;
+                if (mMasking) {
+                    for (int i=0 ; i<4 ; i++) {
+                        const int component_mask = 1<<i;
+                        const int h = parts.iterated.format.c[i].h;
+                        const int l = parts.iterated.format.c[i].l;
+                        if (h && (!(mMasking & component_mask))) {
+                            mask |= ((1<<(h-l))-1) << l;
+                        }
+                    }
+                }
+
+                if (mMasking && ((mask & size)==0)) {
+                    // none of the components are present in the mask
+                } else {
+                    CONTEXT_LOAD(parts.iterated.reg, packed);
+                    if (mCbFormat.size == 1) {
+                        AND(AL, 0, parts.iterated.reg,
+                                parts.iterated.reg, imm(0xFF));
+                    } else if (mCbFormat.size == 2) {
+                        MOV(AL, 0, parts.iterated.reg,
+                                reg_imm(parts.iterated.reg, LSR, 16));
+                    }
+                }
+
+                // pre-mask the iterated color
+                if (mMasking) {
+                    build_and_immediate(parts.iterated.reg, parts.iterated.reg,
+                            mask, bits);
+                }
+            }
+        }
+    }
+!!!9904652.cpp!!!	build_iterated_color(inout fragment : component_t, in parts : fragment_parts_t, in component : int, inout regs : Scratch) : void
+    fragment.setTo( regs.obtain(), 0, 32, CORRUPTIBLE); 
+
+    if (!mInfo[component].iterated)
+        return;
+
+    if (parts.iterated_packed) {
+        // iterated colors are packed, extract the one we need
+        extract(fragment, parts.iterated, component);
+    } else {
+        fragment.h = GGL_COLOR_BITS;
+        fragment.l = GGL_COLOR_BITS - 8;
+        fragment.flags |= CLEAR_LO;
+        // iterated colors are held in their own register,
+        // (smooth and/or dithering case)
+        if (parts.reload==3) {
+            // this implies mSmooth
+            Scratch scratches(registerFile());
+            int dx = scratches.obtain();
+            CONTEXT_LOAD(fragment.reg, generated_vars.argb[component].c);
+            CONTEXT_LOAD(dx, generated_vars.argb[component].dx);
+            ADD(AL, 0, dx, fragment.reg, dx);
+            CONTEXT_STORE(dx, generated_vars.argb[component].c);
+        } else if (parts.reload & 1) {
+            CONTEXT_LOAD(fragment.reg, generated_vars.argb[component].c);
+        } else {
+            // we don't reload, so simply rename the register and mark as
+            // non CORRUPTIBLE so that the texture env or blending code
+            // won't modify this (renamed) register
+            regs.recycle(fragment.reg);
+            fragment.reg = parts.argb[component].reg;
+            fragment.flags &= ~CORRUPTIBLE;
+        }
+        if (mInfo[component].smooth && mAA) {
+            // when using smooth shading AND anti-aliasing, we need to clamp
+            // the iterators because there is always an extra pixel on the
+            // edges, which most of the time will cause an overflow
+            // (since technically its outside of the domain).
+            BIC(AL, 0, fragment.reg, fragment.reg,
+                    reg_imm(fragment.reg, ASR, 31));
+            component_sat(fragment);
+        }
+    }
+!!!9904780.cpp!!!	decodeLogicOpNeeds(in needs : needs_t) : void
+    // gather some informations about the components we need to process...
+    const int opcode = GGL_READ_NEEDS(LOGIC_OP, needs.n) | GGL_CLEAR;
+    switch(opcode) {
+    case GGL_COPY:
+        mLogicOp = 0;
+        break;
+    case GGL_CLEAR:
+    case GGL_SET:
+        mLogicOp = LOGIC_OP;
+        break;
+    case GGL_AND:
+    case GGL_AND_REVERSE:
+    case GGL_AND_INVERTED:
+    case GGL_XOR:
+    case GGL_OR:
+    case GGL_NOR:
+    case GGL_EQUIV:
+    case GGL_OR_REVERSE:
+    case GGL_OR_INVERTED:
+    case GGL_NAND:
+        mLogicOp = LOGIC_OP|LOGIC_OP_SRC|LOGIC_OP_DST;
+        break;
+    case GGL_NOOP:
+    case GGL_INVERT:
+        mLogicOp = LOGIC_OP|LOGIC_OP_DST;
+        break;        
+    case GGL_COPY_INVERTED:
+        mLogicOp = LOGIC_OP|LOGIC_OP_SRC;
+        break;
+    };        
+!!!9904908.cpp!!!	decodeTMUNeeds(in needs : needs_t, in c : context_t) : void
+    uint8_t replaced=0;
+    mTextureMachine.mask = 0;
+    mTextureMachine.activeUnits = 0;
+    for (int i=GGL_TEXTURE_UNIT_COUNT-1 ; i>=0 ; i--) {
+        texture_unit_t& tmu = mTextureMachine.tmu[i];
+        if (replaced == 0xF) {
+            // all components are replaced, skip this TMU.
+            tmu.format_idx = 0;
+            tmu.mask = 0;
+            tmu.replaced = replaced;
+            continue;
+        }
+        tmu.format_idx = GGL_READ_NEEDS(T_FORMAT, needs.t[i]);
+        tmu.format = c->formats[tmu.format_idx];
+        tmu.bits = tmu.format.size*8;
+        tmu.swrap = GGL_READ_NEEDS(T_S_WRAP, needs.t[i]);
+        tmu.twrap = GGL_READ_NEEDS(T_T_WRAP, needs.t[i]);
+        tmu.env = ggl_needs_to_env(GGL_READ_NEEDS(T_ENV, needs.t[i]));
+        tmu.pot = GGL_READ_NEEDS(T_POT, needs.t[i]);
+        tmu.linear = GGL_READ_NEEDS(T_LINEAR, needs.t[i])
+                && tmu.format.size!=3; // XXX: only 8, 16 and 32 modes for now
+
+        // 5551 linear filtering is not supported
+        if (tmu.format_idx == GGL_PIXEL_FORMAT_RGBA_5551)
+            tmu.linear = 0;
+        
+        tmu.mask = 0;
+        tmu.replaced = replaced;
+
+        if (tmu.format_idx) {
+            mTextureMachine.activeUnits++;
+            if (tmu.format.c[0].h)    tmu.mask |= 0x1;
+            if (tmu.format.c[1].h)    tmu.mask |= 0x2;
+            if (tmu.format.c[2].h)    tmu.mask |= 0x4;
+            if (tmu.format.c[3].h)    tmu.mask |= 0x8;
+            if (tmu.env == GGL_REPLACE) {
+                replaced |= tmu.mask;
+            } else if (tmu.env == GGL_DECAL) {
+                if (!tmu.format.c[GGLFormat::ALPHA].h) {
+                    // if we don't have alpha, decal does nothing
+                    tmu.mask = 0;
+                } else {
+                    // decal always ignores At
+                    tmu.mask &= ~(1<<GGLFormat::ALPHA);
+                }
+            }
+        }
+        mTextureMachine.mask |= tmu.mask;
+        //printf("%d: mask=%08lx, replaced=%08lx\n",
+        //    i, int(tmu.mask), int(tmu.replaced));
+    }
+    mTextureMachine.replaced = replaced;
+    mTextureMachine.directTexture = 0;
+    //printf("replaced=%08lx\n", mTextureMachine.replaced);
+!!!9905036.cpp!!!	init_textures(inout coords : tex_coord_t, in x : reg_t, in y : reg_t) : void
+    context_t const* c = mBuilderContext.c;
+    const needs_t& needs = mBuilderContext.needs;
+    int Rctx = mBuilderContext.Rctx;
+    int Rx = x.reg;
+    int Ry = y.reg;
+
+    if (mTextureMachine.mask) {
+        comment("compute texture coordinates");
+    }
+
+    // init texture coordinates for each tmu
+    const int cb_format_idx = GGL_READ_NEEDS(CB_FORMAT, needs.n);
+    const bool multiTexture = mTextureMachine.activeUnits > 1;
+    for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT; i++) {
+        const texture_unit_t& tmu = mTextureMachine.tmu[i];
+        if (tmu.format_idx == 0)
+            continue;
+        if ((tmu.swrap == GGL_NEEDS_WRAP_11) &&
+            (tmu.twrap == GGL_NEEDS_WRAP_11)) 
+        {
+            // 1:1 texture
+            pointer_t& txPtr = coords[i].ptr;
+            txPtr.setTo(obtainReg(), tmu.bits);
+            CONTEXT_LOAD(txPtr.reg, state.texture[i].iterators.ydsdy);
+            ADD(AL, 0, Rx, Rx, reg_imm(txPtr.reg, ASR, 16));    // x += (s>>16)
+            CONTEXT_LOAD(txPtr.reg, state.texture[i].iterators.ydtdy);
+            ADD(AL, 0, Ry, Ry, reg_imm(txPtr.reg, ASR, 16));    // y += (t>>16)
+            // merge base & offset
+            CONTEXT_LOAD(txPtr.reg, generated_vars.texture[i].stride);
+            SMLABB(AL, Rx, Ry, txPtr.reg, Rx);               // x+y*stride
+            CONTEXT_LOAD(txPtr.reg, generated_vars.texture[i].data);
+            base_offset(txPtr, txPtr, Rx);
+        } else {
+            Scratch scratches(registerFile());
+            reg_t& s = coords[i].s;
+            reg_t& t = coords[i].t;
+            // s = (x * dsdx)>>16 + ydsdy
+            // s = (x * dsdx)>>16 + (y*dsdy)>>16 + s0
+            // t = (x * dtdx)>>16 + ydtdy
+            // t = (x * dtdx)>>16 + (y*dtdy)>>16 + t0
+            s.setTo(obtainReg());
+            t.setTo(obtainReg());
+            const int need_w = GGL_READ_NEEDS(W, needs.n);
+            if (need_w) {
+                CONTEXT_LOAD(s.reg, state.texture[i].iterators.ydsdy);
+                CONTEXT_LOAD(t.reg, state.texture[i].iterators.ydtdy);
+            } else {
+                int ydsdy = scratches.obtain();
+                int ydtdy = scratches.obtain();
+                CONTEXT_LOAD(s.reg, generated_vars.texture[i].dsdx);
+                CONTEXT_LOAD(ydsdy, state.texture[i].iterators.ydsdy);
+                CONTEXT_LOAD(t.reg, generated_vars.texture[i].dtdx);
+                CONTEXT_LOAD(ydtdy, state.texture[i].iterators.ydtdy);
+                MLA(AL, 0, s.reg, Rx, s.reg, ydsdy);
+                MLA(AL, 0, t.reg, Rx, t.reg, ydtdy);
+            }
+            
+            if ((mOptLevel&1)==0) {
+                CONTEXT_STORE(s.reg, generated_vars.texture[i].spill[0]);
+                CONTEXT_STORE(t.reg, generated_vars.texture[i].spill[1]);
+                recycleReg(s.reg);
+                recycleReg(t.reg);
+            }
+        }
+
+        // direct texture?
+        if (!multiTexture && !mBlending && !mDithering && !mFog && 
+            cb_format_idx == tmu.format_idx && !tmu.linear &&
+            mTextureMachine.replaced == tmu.mask) 
+        {
+                mTextureMachine.directTexture = i + 1; 
+        }
+    }
+!!!9905164.cpp!!!	build_textures(inout parts : fragment_parts_t, inout regs : Scratch) : void
+    context_t const* c = mBuilderContext.c;
+    const needs_t& needs = mBuilderContext.needs;
+    int Rctx = mBuilderContext.Rctx;
+
+    // We don't have a way to spill registers automatically
+    // spill depth and AA regs, when we know we may have to.
+    // build the spill list...
+    uint32_t spill_list = 0;
+    for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT; i++) {
+        const texture_unit_t& tmu = mTextureMachine.tmu[i];
+        if (tmu.format_idx == 0)
+            continue;
+        if (tmu.linear) {
+            // we may run out of register if we have linear filtering
+            // at 1 or 4 bytes / pixel on any texture unit.
+            if (tmu.format.size == 1) {
+                // if depth and AA enabled, we'll run out of 1 register
+                if (parts.z.reg > 0 && parts.covPtr.reg > 0)
+                    spill_list |= 1<<parts.covPtr.reg;
+            }
+            if (tmu.format.size == 4) {
+                // if depth or AA enabled, we'll run out of 1 or 2 registers
+                if (parts.z.reg > 0)
+                    spill_list |= 1<<parts.z.reg;
+                if (parts.covPtr.reg > 0)   
+                    spill_list |= 1<<parts.covPtr.reg;
+            }
+        }
+    }
+
+    Spill spill(registerFile(), *this, spill_list);
+
+    const bool multiTexture = mTextureMachine.activeUnits > 1;
+    for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT; i++) {
+        const texture_unit_t& tmu = mTextureMachine.tmu[i];
+        if (tmu.format_idx == 0)
+            continue;
+
+        pointer_t& txPtr = parts.coords[i].ptr;
+        pixel_t& texel = parts.texel[i];
+            
+        // repeat...
+        if ((tmu.swrap == GGL_NEEDS_WRAP_11) &&
+            (tmu.twrap == GGL_NEEDS_WRAP_11))
+        { // 1:1 textures
+            comment("fetch texel");
+            texel.setTo(regs.obtain(), &tmu.format);
+            load(txPtr, texel, WRITE_BACK);
+        } else {
+            Scratch scratches(registerFile());
+            reg_t& s = parts.coords[i].s;
+            reg_t& t = parts.coords[i].t;
+            if ((mOptLevel&1)==0) {
+                comment("reload s/t (multitexture or linear filtering)");
+                s.reg = scratches.obtain();
+                t.reg = scratches.obtain();
+                CONTEXT_LOAD(s.reg, generated_vars.texture[i].spill[0]);
+                CONTEXT_LOAD(t.reg, generated_vars.texture[i].spill[1]);
+            }
+
+            if (registerFile().status() & RegisterFile::OUT_OF_REGISTERS)
+                return;
+
+            comment("compute repeat/clamp");
+            int u       = scratches.obtain();
+            int v       = scratches.obtain();
+            int width   = scratches.obtain();
+            int height  = scratches.obtain();
+            int U = 0;
+            int V = 0;
+
+            if (registerFile().status() & RegisterFile::OUT_OF_REGISTERS)
+                return;
+
+            CONTEXT_LOAD(width,  generated_vars.texture[i].width);
+            CONTEXT_LOAD(height, generated_vars.texture[i].height);
+
+            int FRAC_BITS = 0;
+            if (tmu.linear) {
+                // linear interpolation
+                if (tmu.format.size == 1) {
+                    // for 8-bits textures, we can afford
+                    // 7 bits of fractional precision at no
+                    // additional cost (we can't do 8 bits
+                    // because filter8 uses signed 16 bits muls)
+                    FRAC_BITS = 7;
+                } else if (tmu.format.size == 2) {
+                    // filter16() is internally limited to 4 bits, so:
+                    // FRAC_BITS=2 generates less instructions,
+                    // FRAC_BITS=3,4,5 creates unpleasant artifacts,
+                    // FRAC_BITS=6+ looks good
+                    FRAC_BITS = 6;
+                } else if (tmu.format.size == 4) {
+                    // filter32() is internally limited to 8 bits, so:
+                    // FRAC_BITS=4 looks good
+                    // FRAC_BITS=5+ looks better, but generates 3 extra ipp
+                    FRAC_BITS = 6;
+                } else {
+                    // for all other cases we use 4 bits.
+                    FRAC_BITS = 4;
+                }
+            }
+            wrapping(u, s.reg, width,  tmu.swrap, FRAC_BITS);
+            wrapping(v, t.reg, height, tmu.twrap, FRAC_BITS);
+
+            if (tmu.linear) {
+                comment("compute linear filtering offsets");
+                // pixel size scale
+                const int shift = 31 - gglClz(tmu.format.size);
+                U = scratches.obtain();
+                V = scratches.obtain();
+
+                if (registerFile().status() & RegisterFile::OUT_OF_REGISTERS)
+                    return;
+
+                // sample the texel center
+                SUB(AL, 0, u, u, imm(1<<(FRAC_BITS-1)));
+                SUB(AL, 0, v, v, imm(1<<(FRAC_BITS-1)));
+
+                // get the fractionnal part of U,V
+                AND(AL, 0, U, u, imm((1<<FRAC_BITS)-1));
+                AND(AL, 0, V, v, imm((1<<FRAC_BITS)-1));
+
+                // compute width-1 and height-1
+                SUB(AL, 0, width,  width,  imm(1));
+                SUB(AL, 0, height, height, imm(1));
+
+                // get the integer part of U,V and clamp/wrap
+                // and compute offset to the next texel
+                if (tmu.swrap == GGL_NEEDS_WRAP_REPEAT) {
+                    // u has already been REPEATed
+                    MOV(AL, 1, u, reg_imm(u, ASR, FRAC_BITS));
+                    MOV(MI, 0, u, width);                    
+                    CMP(AL, u, width);
+                    MOV(LT, 0, width, imm(1 << shift));
+                    if (shift)
+                        MOV(GE, 0, width, reg_imm(width, LSL, shift));
+                    RSB(GE, 0, width, width, imm(0));
+                } else {
+                    // u has not been CLAMPed yet
+                    // algorithm:
+                    // if ((u>>4) >= width)
+                    //      u = width<<4
+                    //      width = 0
+                    // else
+                    //      width = 1<<shift
+                    // u = u>>4; // get integer part
+                    // if (u<0)
+                    //      u = 0
+                    //      width = 0
+                    // generated_vars.rt = width
+                    
+                    CMP(AL, width, reg_imm(u, ASR, FRAC_BITS));
+                    MOV(LE, 0, u, reg_imm(width, LSL, FRAC_BITS));
+                    MOV(LE, 0, width, imm(0));
+                    MOV(GT, 0, width, imm(1 << shift));
+                    MOV(AL, 1, u, reg_imm(u, ASR, FRAC_BITS));
+                    MOV(MI, 0, u, imm(0));
+                    MOV(MI, 0, width, imm(0));
+                }
+                CONTEXT_STORE(width, generated_vars.rt);
+
+                const int stride = width;
+                CONTEXT_LOAD(stride, generated_vars.texture[i].stride);
+                if (tmu.twrap == GGL_NEEDS_WRAP_REPEAT) {
+                    // v has already been REPEATed
+                    MOV(AL, 1, v, reg_imm(v, ASR, FRAC_BITS));
+                    MOV(MI, 0, v, height);
+                    CMP(AL, v, height);
+                    MOV(LT, 0, height, imm(1 << shift));
+                    if (shift)
+                        MOV(GE, 0, height, reg_imm(height, LSL, shift));
+                    RSB(GE, 0, height, height, imm(0));
+                    MUL(AL, 0, height, stride, height);
+                } else {
+                    // v has not been CLAMPed yet
+                    CMP(AL, height, reg_imm(v, ASR, FRAC_BITS));
+                    MOV(LE, 0, v, reg_imm(height, LSL, FRAC_BITS));
+                    MOV(LE, 0, height, imm(0));
+                    if (shift) {
+                        MOV(GT, 0, height, reg_imm(stride, LSL, shift));
+                    } else {
+                        MOV(GT, 0, height, stride);
+                    }
+                    MOV(AL, 1, v, reg_imm(v, ASR, FRAC_BITS));
+                    MOV(MI, 0, v, imm(0));
+                    MOV(MI, 0, height, imm(0));
+                }
+                CONTEXT_STORE(height, generated_vars.lb);
+            }
+    
+            scratches.recycle(width);
+            scratches.recycle(height);
+
+            // iterate texture coordinates...
+            comment("iterate s,t");
+            int dsdx = scratches.obtain();
+            int dtdx = scratches.obtain();
+
+            if (registerFile().status() & RegisterFile::OUT_OF_REGISTERS)
+                return;
+
+            CONTEXT_LOAD(dsdx, generated_vars.texture[i].dsdx);
+            CONTEXT_LOAD(dtdx, generated_vars.texture[i].dtdx);
+            ADD(AL, 0, s.reg, s.reg, dsdx);
+            ADD(AL, 0, t.reg, t.reg, dtdx);
+            if ((mOptLevel&1)==0) {
+                CONTEXT_STORE(s.reg, generated_vars.texture[i].spill[0]);
+                CONTEXT_STORE(t.reg, generated_vars.texture[i].spill[1]);
+                scratches.recycle(s.reg);
+                scratches.recycle(t.reg);
+            }
+            scratches.recycle(dsdx);
+            scratches.recycle(dtdx);
+
+            // merge base & offset...
+            comment("merge base & offset");
+            texel.setTo(regs.obtain(), &tmu.format);
+            txPtr.setTo(texel.reg, tmu.bits);
+            int stride = scratches.obtain();
+
+            if (registerFile().status() & RegisterFile::OUT_OF_REGISTERS)
+                return;
+
+            CONTEXT_LOAD(stride,    generated_vars.texture[i].stride);
+            CONTEXT_LOAD(txPtr.reg, generated_vars.texture[i].data);
+            SMLABB(AL, u, v, stride, u);    // u+v*stride 
+            base_offset(txPtr, txPtr, u);
+
+            // load texel
+            if (!tmu.linear) {
+                comment("fetch texel");
+                load(txPtr, texel, 0);
+            } else {
+                // recycle registers we don't need anymore
+                scratches.recycle(u);
+                scratches.recycle(v);
+                scratches.recycle(stride);
+
+                comment("fetch texel, bilinear");
+                switch (tmu.format.size) {
+                case 1:  filter8(parts, texel, tmu, U, V, txPtr, FRAC_BITS); break;
+                case 2: filter16(parts, texel, tmu, U, V, txPtr, FRAC_BITS); break;
+                case 3: filter24(parts, texel, tmu, U, V, txPtr, FRAC_BITS); break;
+                case 4: filter32(parts, texel, tmu, U, V, txPtr, FRAC_BITS); break;
+                }
+            }            
+        }
+    }
+!!!9905292.cpp!!!	filter8(in parts : fragment_parts_t, inout texel : pixel_t, in tmu : texture_unit_t, in U : int, in V : int, inout txPtr : pointer_t, in FRAC_BITS : int) : void
+    if (tmu.format.components != GGL_ALPHA &&
+        tmu.format.components != GGL_LUMINANCE)
+    {
+        // this is a packed format, and we don't support
+        // linear filtering (it's probably RGB 332)
+        // Should not happen with OpenGL|ES
+        LDRB(AL, texel.reg, txPtr.reg);
+        return;
+    }
+
+    // ------------------------
+    // about ~22 cycles / pixel
+    Scratch scratches(registerFile());
+
+    int pixel= scratches.obtain();
+    int d    = scratches.obtain();
+    int u    = scratches.obtain();
+    int k    = scratches.obtain();
+    int rt   = scratches.obtain();
+    int lb   = scratches.obtain();
+
+    // RB -> U * V
+
+    CONTEXT_LOAD(rt, generated_vars.rt);
+    CONTEXT_LOAD(lb, generated_vars.lb);
+
+    int offset = pixel;
+    ADD(AL, 0, offset, lb, rt);
+    LDRB(AL, pixel, txPtr.reg, reg_scale_pre(offset));
+    SMULBB(AL, u, U, V);
+    SMULBB(AL, d, pixel, u);
+    RSB(AL, 0, k, u, imm(1<<(FRAC_BITS*2)));
+    
+    // LB -> (1-U) * V
+    RSB(AL, 0, U, U, imm(1<<FRAC_BITS));
+    LDRB(AL, pixel, txPtr.reg, reg_scale_pre(lb));
+    SMULBB(AL, u, U, V);
+    SMLABB(AL, d, pixel, u, d);
+    SUB(AL, 0, k, k, u);
+    
+    // LT -> (1-U)*(1-V)
+    RSB(AL, 0, V, V, imm(1<<FRAC_BITS));
+    LDRB(AL, pixel, txPtr.reg);
+    SMULBB(AL, u, U, V);
+    SMLABB(AL, d, pixel, u, d);
+
+    // RT -> U*(1-V)
+    LDRB(AL, pixel, txPtr.reg, reg_scale_pre(rt));
+    SUB(AL, 0, u, k, u);
+    SMLABB(AL, texel.reg, pixel, u, d);
+    
+    for (int i=0 ; i<4 ; i++) {
+        if (!texel.format.c[i].h) continue;
+        texel.format.c[i].h = FRAC_BITS*2+8;
+        texel.format.c[i].l = FRAC_BITS*2; // keeping 8 bits in enough
+    }
+    texel.format.size = 4;
+    texel.format.bitsPerPixel = 32;
+    texel.flags |= CLEAR_LO;
+!!!9905420.cpp!!!	filter16(in parts : fragment_parts_t, inout texel : pixel_t, in tmu : texture_unit_t, in U : int, in V : int, inout txPtr : pointer_t, in FRAC_BITS : int) : void
+    
+    // compute the mask
+    // XXX: it would be nice if the mask below could be computed
+    // automatically.
+    uint32_t mask = 0;
+    int shift = 0;
+    int prec = 0;
+    switch (tmu.format_idx) {
+        case GGL_PIXEL_FORMAT_RGB_565:
+            // source: 00000ggg.ggg00000 | rrrrr000.000bbbbb
+            // result: gggggggg.gggrrrrr | rrrrr0bb.bbbbbbbb
+            mask = 0x07E0F81F;
+            shift = 16;
+            prec = 5;
+            break;
+        case GGL_PIXEL_FORMAT_RGBA_4444:
+            // 0000,1111,0000,1111 | 0000,1111,0000,1111
+            mask = 0x0F0F0F0F;
+            shift = 12;
+            prec = 4;
+            break;
+        case GGL_PIXEL_FORMAT_LA_88:
+            // 0000,0000,1111,1111 | 0000,0000,1111,1111
+            // AALL -> 00AA | 00LL
+            mask = 0x00FF00FF;
+            shift = 8;
+            prec = 8;
+            break;
+        default:
+            // unsupported format, do something sensical...
+            ALOGE("Unsupported 16-bits texture format (%d)", tmu.format_idx);
+            LDRH(AL, texel.reg, txPtr.reg);
+            return;
+    }
+
+    const int adjust = FRAC_BITS*2 - prec;
+    const int round  = 0;
+
+    // update the texel format
+    texel.format.size = 4;
+    texel.format.bitsPerPixel = 32;
+    texel.flags |= CLEAR_HI|CLEAR_LO;
+    for (int i=0 ; i<4 ; i++) {
+        if (!texel.format.c[i].h) continue;
+        const uint32_t offset = (mask & tmu.format.mask(i)) ? 0 : shift;
+        texel.format.c[i].h = tmu.format.c[i].h + offset + prec;
+        texel.format.c[i].l = texel.format.c[i].h - (tmu.format.bits(i) + prec);
+    }
+
+    // ------------------------
+    // about ~40 cycles / pixel
+    Scratch scratches(registerFile());
+
+    int pixel= scratches.obtain();
+    int d    = scratches.obtain();
+    int u    = scratches.obtain();
+    int k    = scratches.obtain();
+
+    // RB -> U * V
+    int offset = pixel;
+    CONTEXT_LOAD(offset, generated_vars.rt);
+    CONTEXT_LOAD(u, generated_vars.lb);
+    ADD(AL, 0, offset, offset, u);
+
+    LDRH(AL, pixel, txPtr.reg, reg_pre(offset));
+    SMULBB(AL, u, U, V);
+    ORR(AL, 0, pixel, pixel, reg_imm(pixel, LSL, shift));
+    build_and_immediate(pixel, pixel, mask, 32);
+    if (adjust) {
+        if (round)
+            ADD(AL, 0, u, u, imm(1<<(adjust-1)));
+        MOV(AL, 0, u, reg_imm(u, LSR, adjust));
+    }
+    MUL(AL, 0, d, pixel, u);
+    RSB(AL, 0, k, u, imm(1<<prec));
+    
+    // LB -> (1-U) * V
+    CONTEXT_LOAD(offset, generated_vars.lb);
+    RSB(AL, 0, U, U, imm(1<<FRAC_BITS));
+    LDRH(AL, pixel, txPtr.reg, reg_pre(offset));
+    SMULBB(AL, u, U, V);
+    ORR(AL, 0, pixel, pixel, reg_imm(pixel, LSL, shift));
+    build_and_immediate(pixel, pixel, mask, 32);
+    if (adjust) {
+        if (round)
+            ADD(AL, 0, u, u, imm(1<<(adjust-1)));
+        MOV(AL, 0, u, reg_imm(u, LSR, adjust));
+    }
+    MLA(AL, 0, d, pixel, u, d);
+    SUB(AL, 0, k, k, u);
+    
+    // LT -> (1-U)*(1-V)
+    RSB(AL, 0, V, V, imm(1<<FRAC_BITS));
+    LDRH(AL, pixel, txPtr.reg);
+    SMULBB(AL, u, U, V);
+    ORR(AL, 0, pixel, pixel, reg_imm(pixel, LSL, shift));
+    build_and_immediate(pixel, pixel, mask, 32);
+    if (adjust) {
+        if (round)
+            ADD(AL, 0, u, u, imm(1<<(adjust-1)));
+        MOV(AL, 0, u, reg_imm(u, LSR, adjust));
+    }
+    MLA(AL, 0, d, pixel, u, d);
+
+    // RT -> U*(1-V)            
+    CONTEXT_LOAD(offset, generated_vars.rt);
+    LDRH(AL, pixel, txPtr.reg, reg_pre(offset));
+    SUB(AL, 0, u, k, u);
+    ORR(AL, 0, pixel, pixel, reg_imm(pixel, LSL, shift));
+    build_and_immediate(pixel, pixel, mask, 32);
+    MLA(AL, 0, texel.reg, pixel, u, d);
+!!!9905548.cpp!!!	filter24(in parts : fragment_parts_t, inout texel : pixel_t, in tmu : texture_unit_t, in U : int, in V : int, inout txPtr : pointer_t, in FRAC_BITS : int) : void
+    // not supported yet (currently disabled)
+    load(txPtr, texel, 0);
+!!!9905676.cpp!!!	filter32(in parts : fragment_parts_t, inout texel : pixel_t, in tmu : texture_unit_t, in U : int, in V : int, inout txPtr : pointer_t, in FRAC_BITS : int) : void
+    const int adjust = FRAC_BITS*2 - 8;
+    const int round  = 0;
+
+    // ------------------------
+    // about ~38 cycles / pixel
+    Scratch scratches(registerFile());
+    
+    int pixel= scratches.obtain();
+    int dh   = scratches.obtain();
+    int u    = scratches.obtain();
+    int k    = scratches.obtain();
+
+    int temp = scratches.obtain();
+    int dl   = scratches.obtain();
+    int mask = scratches.obtain();
+
+    MOV(AL, 0, mask, imm(0xFF));
+    ORR(AL, 0, mask, mask, imm(0xFF0000));
+
+    // RB -> U * V
+    int offset = pixel;
+    CONTEXT_LOAD(offset, generated_vars.rt);
+    CONTEXT_LOAD(u, generated_vars.lb);
+    ADD(AL, 0, offset, offset, u);
+
+    LDR(AL, pixel, txPtr.reg, reg_scale_pre(offset));
+    SMULBB(AL, u, U, V);
+    AND(AL, 0, temp, mask, pixel);
+    if (adjust) {
+        if (round)
+            ADD(AL, 0, u, u, imm(1<<(adjust-1)));
+        MOV(AL, 0, u, reg_imm(u, LSR, adjust));
+    }
+    MUL(AL, 0, dh, temp, u);
+    AND(AL, 0, temp, mask, reg_imm(pixel, LSR, 8));
+    MUL(AL, 0, dl, temp, u);
+    RSB(AL, 0, k, u, imm(0x100));
+
+    // LB -> (1-U) * V
+    CONTEXT_LOAD(offset, generated_vars.lb);
+    RSB(AL, 0, U, U, imm(1<<FRAC_BITS));
+    LDR(AL, pixel, txPtr.reg, reg_scale_pre(offset));
+    SMULBB(AL, u, U, V);
+    AND(AL, 0, temp, mask, pixel);
+    if (adjust) {
+        if (round)
+            ADD(AL, 0, u, u, imm(1<<(adjust-1)));
+        MOV(AL, 0, u, reg_imm(u, LSR, adjust));
+    }
+    MLA(AL, 0, dh, temp, u, dh);    
+    AND(AL, 0, temp, mask, reg_imm(pixel, LSR, 8));
+    MLA(AL, 0, dl, temp, u, dl);
+    SUB(AL, 0, k, k, u);
+
+    // LT -> (1-U)*(1-V)
+    RSB(AL, 0, V, V, imm(1<<FRAC_BITS));
+    LDR(AL, pixel, txPtr.reg);
+    SMULBB(AL, u, U, V);
+    AND(AL, 0, temp, mask, pixel);
+    if (adjust) {
+        if (round)
+            ADD(AL, 0, u, u, imm(1<<(adjust-1)));
+        MOV(AL, 0, u, reg_imm(u, LSR, adjust));
+    }
+    MLA(AL, 0, dh, temp, u, dh);    
+    AND(AL, 0, temp, mask, reg_imm(pixel, LSR, 8));
+    MLA(AL, 0, dl, temp, u, dl);
+
+    // RT -> U*(1-V)            
+    CONTEXT_LOAD(offset, generated_vars.rt);
+    LDR(AL, pixel, txPtr.reg, reg_scale_pre(offset));
+    SUB(AL, 0, u, k, u);
+    AND(AL, 0, temp, mask, pixel);
+    MLA(AL, 0, dh, temp, u, dh);    
+    AND(AL, 0, temp, mask, reg_imm(pixel, LSR, 8));
+    MLA(AL, 0, dl, temp, u, dl);
+
+    AND(AL, 0, dh, mask, reg_imm(dh, LSR, 8));
+    AND(AL, 0, dl, dl, reg_imm(mask, LSL, 8));
+    ORR(AL, 0, texel.reg, dh, dl);
+!!!9905804.cpp!!!	build_texture_environment(inout fragment : component_t, in parts : fragment_parts_t, in component : int, inout regs : Scratch) : void
+    const uint32_t component_mask = 1<<component;
+    const bool multiTexture = mTextureMachine.activeUnits > 1;
+    for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT ; i++) {
+        texture_unit_t& tmu = mTextureMachine.tmu[i];
+
+        if (tmu.mask & component_mask) {
+            // replace or modulate with this texture
+            if ((tmu.replaced & component_mask) == 0) {
+                // not replaced by a later tmu...
+
+                Scratch scratches(registerFile());
+                pixel_t texel(parts.texel[i]);
+
+                if (multiTexture && 
+                    tmu.swrap == GGL_NEEDS_WRAP_11 &&
+                    tmu.twrap == GGL_NEEDS_WRAP_11)
+                {
+                    texel.reg = scratches.obtain();
+                    texel.flags |= CORRUPTIBLE;
+                    comment("fetch texel (multitexture 1:1)");
+                    load(parts.coords[i].ptr, texel, WRITE_BACK);
+                 }
+
+                component_t incoming(fragment);
+                modify(fragment, regs);
+                
+                switch (tmu.env) {
+                case GGL_REPLACE:
+                    extract(fragment, texel, component);
+                    break;
+                case GGL_MODULATE:
+                    modulate(fragment, incoming, texel, component);
+                    break;
+                case GGL_DECAL:
+                    decal(fragment, incoming, texel, component);
+                    break;
+                case GGL_BLEND:
+                    blend(fragment, incoming, texel, component, i);
+                    break;
+                case GGL_ADD:
+                    add(fragment, incoming, texel, component);
+                    break;
+                }
+            }
+        }
+    }
+!!!9905932.cpp!!!	wrapping(in d : int, in coord : int, in size : int, in tx_wrap : int, in tx_linear : int) : void
+    // notes:
+    // if tx_linear is set, we need 4 extra bits of precision on the result
+    // SMULL/UMULL is 3 cycles
+    Scratch scratches(registerFile());
+    int c = coord;
+    if (tx_wrap == GGL_NEEDS_WRAP_REPEAT) {
+        // UMULL takes 4 cycles (interlocked), and we can get away with
+        // 2 cycles using SMULWB, but we're loosing 16 bits of precision
+        // out of 32 (this is not a problem because the iterator keeps
+        // its full precision)
+        // UMULL(AL, 0, size, d, c, size);
+        // note: we can't use SMULTB because it's signed.
+        MOV(AL, 0, d, reg_imm(c, LSR, 16-tx_linear));
+        SMULWB(AL, d, d, size);
+    } else if (tx_wrap == GGL_NEEDS_WRAP_CLAMP_TO_EDGE) {
+        if (tx_linear) {
+            // 1 cycle
+            MOV(AL, 0, d, reg_imm(coord, ASR, 16-tx_linear));
+        } else {
+            // 4 cycles (common case)
+            MOV(AL, 0, d, reg_imm(coord, ASR, 16));
+            BIC(AL, 0, d, d, reg_imm(d, ASR, 31));
+            CMP(AL, d, size);
+            SUB(GE, 0, d, size, imm(1));
+        }
+    }
+!!!9906060.cpp!!!	build_fog(inout temp : component_t, in component : int, inout regs : Scratch) : void
+   if (mInfo[component].fog) {
+        Scratch scratches(registerFile());
+        comment("fog");
+
+        integer_t fragment(temp.reg, temp.h, temp.flags);
+        if (!(temp.flags & CORRUPTIBLE)) {
+            temp.reg = regs.obtain();
+            temp.flags |= CORRUPTIBLE;
+        }
+
+        integer_t fogColor(scratches.obtain(), 8, CORRUPTIBLE); 
+        LDRB(AL, fogColor.reg, mBuilderContext.Rctx,
+                immed12_pre(GGL_OFFSETOF(state.fog.color[component])));
+
+        integer_t factor(scratches.obtain(), 16, CORRUPTIBLE);
+        CONTEXT_LOAD(factor.reg, generated_vars.f);
+
+        // clamp fog factor (TODO: see if there is a way to guarantee
+        // we won't overflow, when setting the iterators)
+        BIC(AL, 0, factor.reg, factor.reg, reg_imm(factor.reg, ASR, 31));
+        CMP(AL, factor.reg, imm( 0x10000 ));
+        MOV(HS, 0, factor.reg, imm( 0x10000 ));
+
+        build_blendFOneMinusF(temp, factor, fragment, fogColor);
+    }
+!!!9906188.cpp!!!	build_blending(inout temp : component_t, in pixel : pixel_t, in component : int, inout regs : Scratch) : void
+   if (!mInfo[component].blend)
+        return;
+        
+    int fs = component==GGLFormat::ALPHA ? mBlendSrcA : mBlendSrc;
+    int fd = component==GGLFormat::ALPHA ? mBlendDstA : mBlendDst;
+    if (fs==GGL_SRC_ALPHA_SATURATE && component==GGLFormat::ALPHA)
+        fs = GGL_ONE;
+    const int blending = blending_codes(fs, fd);
+    if (!temp.size()) {
+        // here, blending will produce something which doesn't depend on
+        // that component (eg: GL_ZERO:GL_*), so the register has not been
+        // allocated yet. Will never be used as a source.
+        temp = component_t(regs.obtain(), CORRUPTIBLE);
+    }
+
+    // we are doing real blending...
+    // fb:          extracted dst
+    // fragment:    extracted src
+    // temp:        component_t(fragment) and result
+
+    // scoped register allocator
+    Scratch scratches(registerFile());
+    comment("blending");
+
+    // we can optimize these cases a bit...
+    // (1) saturation is not needed
+    // (2) we can use only one multiply instead of 2
+    // (3) we can reduce the register pressure
+    //      R = S*f + D*(1-f) = (S-D)*f + D
+    //      R = S*(1-f) + D*f = (D-S)*f + S
+
+    const bool same_factor_opt1 =
+        (fs==GGL_DST_COLOR && fd==GGL_ONE_MINUS_DST_COLOR) ||
+        (fs==GGL_SRC_COLOR && fd==GGL_ONE_MINUS_SRC_COLOR) ||
+        (fs==GGL_DST_ALPHA && fd==GGL_ONE_MINUS_DST_ALPHA) ||
+        (fs==GGL_SRC_ALPHA && fd==GGL_ONE_MINUS_SRC_ALPHA);
+
+    const bool same_factor_opt2 =
+        (fs==GGL_ONE_MINUS_DST_COLOR && fd==GGL_DST_COLOR) ||
+        (fs==GGL_ONE_MINUS_SRC_COLOR && fd==GGL_SRC_COLOR) || 
+        (fs==GGL_ONE_MINUS_DST_ALPHA && fd==GGL_DST_ALPHA) ||
+        (fs==GGL_ONE_MINUS_SRC_ALPHA && fd==GGL_SRC_ALPHA);
+
+
+    // XXX: we could also optimize these cases:
+    // R = S*f + D*f = (S+D)*f
+    // R = S*(1-f) + D*(1-f) = (S+D)*(1-f)
+    // R = S*D + D*S = 2*S*D
+
+
+    // see if we need to extract 'component' from the destination (fb)
+    integer_t fb;
+    if (blending & (BLEND_DST|FACTOR_DST)) { 
+        fb.setTo(scratches.obtain(), 32); 
+        extract(fb, pixel, component);
+        if (mDithering) {
+            // XXX: maybe what we should do instead, is simply
+            // expand fb -or- fragment to the larger of the two
+            if (fb.size() < temp.size()) {
+                // for now we expand 'fb' to min(fragment, 8)
+                int new_size = temp.size() < 8 ? temp.size() : 8;
+                expand(fb, fb, new_size);
+            }
+        }
+    }
+
+
+    // convert input fragment to integer_t
+    if (temp.l && (temp.flags & CORRUPTIBLE)) {
+        MOV(AL, 0, temp.reg, reg_imm(temp.reg, LSR, temp.l));
+        temp.h -= temp.l;
+        temp.l = 0;
+    }
+    integer_t fragment(temp.reg, temp.size(), temp.flags);
+
+    // if not done yet, convert input fragment to integer_t
+    if (temp.l) {
+        // here we know temp is not CORRUPTIBLE
+        fragment.reg = scratches.obtain();
+        MOV(AL, 0, fragment.reg, reg_imm(temp.reg, LSR, temp.l));
+        fragment.flags |= CORRUPTIBLE;
+    }
+
+    if (!(temp.flags & CORRUPTIBLE)) {
+        // temp is not corruptible, but since it's the destination it
+        // will be modified, so we need to allocate a new register.
+        temp.reg = regs.obtain();
+        temp.flags &= ~CORRUPTIBLE;
+        fragment.flags &= ~CORRUPTIBLE;
+    }
+
+    if ((blending & BLEND_SRC) && !same_factor_opt1) {
+        // source (fragment) is needed for the blending stage
+        // so it's not CORRUPTIBLE (unless we're doing same_factor_opt1)
+        fragment.flags &= ~CORRUPTIBLE;
+    }
+
+
+    if (same_factor_opt1) {
+        //  R = S*f + D*(1-f) = (S-D)*f + D
+        integer_t factor;
+        build_blend_factor(factor, fs, 
+                component, pixel, fragment, fb, scratches);
+        // fb is always corruptible from this point
+        fb.flags |= CORRUPTIBLE;
+        build_blendFOneMinusF(temp, factor, fragment, fb);
+    } else if (same_factor_opt2) {
+        //  R = S*(1-f) + D*f = (D-S)*f + S
+        integer_t factor;
+        // fb is always corrruptible here
+        fb.flags |= CORRUPTIBLE;
+        build_blend_factor(factor, fd,
+                component, pixel, fragment, fb, scratches);
+        build_blendOneMinusFF(temp, factor, fragment, fb);
+    } else {
+        integer_t src_factor;
+        integer_t dst_factor;
+
+        // if destination (fb) is not needed for the blending stage, 
+        // then it can be marked as CORRUPTIBLE
+        if (!(blending & BLEND_DST)) {
+            fb.flags |= CORRUPTIBLE;
+        }
+
+        // XXX: try to mark some registers as CORRUPTIBLE
+        // in most case we could make those corruptible
+        // when we're processing the last component
+        // but not always, for instance
+        //    when fragment is constant and not reloaded
+        //    when fb is needed for logic-ops or masking
+        //    when a register is aliased (for instance with mAlphaSource)
+
+        // blend away...
+        if (fs==GGL_ZERO) {
+            if (fd==GGL_ZERO) {         // R = 0
+                // already taken care of
+            } else if (fd==GGL_ONE) {   // R = D
+                // already taken care of
+            } else {                    // R = D*fd
+                // compute fd
+                build_blend_factor(dst_factor, fd,
+                        component, pixel, fragment, fb, scratches);
+                mul_factor(temp, fb, dst_factor);
+            }
+        } else if (fs==GGL_ONE) {
+            if (fd==GGL_ZERO) {         // R = S
+                // NOP, taken care of
+            } else if (fd==GGL_ONE) {   // R = S + D
+                component_add(temp, fb, fragment); // args order matters
+                component_sat(temp);
+            } else {                    // R = S + D*fd
+                // compute fd
+                build_blend_factor(dst_factor, fd,
+                        component, pixel, fragment, fb, scratches);
+                mul_factor_add(temp, fb, dst_factor, component_t(fragment));
+                component_sat(temp);
+            }
+        } else {
+            // compute fs
+            build_blend_factor(src_factor, fs, 
+                    component, pixel, fragment, fb, scratches);
+            if (fd==GGL_ZERO) {         // R = S*fs
+                mul_factor(temp, fragment, src_factor);
+            } else if (fd==GGL_ONE) {   // R = S*fs + D
+                mul_factor_add(temp, fragment, src_factor, component_t(fb));
+                component_sat(temp);
+            } else {                    // R = S*fs + D*fd
+                mul_factor(temp, fragment, src_factor);
+                if (scratches.isUsed(src_factor.reg))
+                    scratches.recycle(src_factor.reg);
+                // compute fd
+                build_blend_factor(dst_factor, fd,
+                        component, pixel, fragment, fb, scratches);
+                mul_factor_add(temp, fb, dst_factor, temp);
+                if (!same_factor_opt1 && !same_factor_opt2) {
+                    component_sat(temp);
+                }
+            }
+        }
+    }
+
+    // now we can be corrupted (it's the dest)
+    temp.flags |= CORRUPTIBLE;
+!!!9906316.cpp!!!	build_blend_factor(inout factor : integer_t, in f : int, in component : int, in dst_pixel : pixel_t, inout fragment : integer_t, inout fb : integer_t, inout scratches : Scratch) : void
+    integer_t src_alpha(fragment);
+
+    // src_factor/dst_factor won't be used after blending,
+    // so it's fine to mark them as CORRUPTIBLE (if not aliased)
+    factor.flags |= CORRUPTIBLE;
+
+    switch(f) {
+    case GGL_ONE_MINUS_SRC_ALPHA:
+    case GGL_SRC_ALPHA:
+        if (component==GGLFormat::ALPHA && !isAlphaSourceNeeded()) {
+            // we're processing alpha, so we already have
+            // src-alpha in fragment, and we need src-alpha just this time.
+        } else {
+           // alpha-src will be needed for other components
+            if (!mBlendFactorCached || mBlendFactorCached==f) {
+                src_alpha = mAlphaSource;
+                factor = mAlphaSource;
+                factor.flags &= ~CORRUPTIBLE;           
+                // we already computed the blend factor before, nothing to do.
+                if (mBlendFactorCached)
+                    return;
+                // this is the first time, make sure to compute the blend
+                // factor properly.
+                mBlendFactorCached = f;
+                break;
+            } else {
+                // we have a cached alpha blend factor, but we want another one,
+                // this should really not happen because by construction,
+                // we cannot have BOTH source and destination
+                // blend factors use ALPHA *and* ONE_MINUS_ALPHA (because
+                // the blending stage uses the f/(1-f) optimization
+                
+                // for completeness, we handle this case though. Since there
+                // are only 2 choices, this meens we want "the other one"
+                // (1-factor)
+                factor = mAlphaSource;
+                factor.flags &= ~CORRUPTIBLE;           
+                RSB(AL, 0, factor.reg, factor.reg, imm((1<<factor.s)));
+                mBlendFactorCached = f;
+                return;
+            }                
+        }
+        // fall-through...
+    case GGL_ONE_MINUS_DST_COLOR:
+    case GGL_DST_COLOR:
+    case GGL_ONE_MINUS_SRC_COLOR:
+    case GGL_SRC_COLOR:
+    case GGL_ONE_MINUS_DST_ALPHA:
+    case GGL_DST_ALPHA:
+    case GGL_SRC_ALPHA_SATURATE:
+        // help us find out what register we can use for the blend-factor
+        // CORRUPTIBLE registers are chosen first, or a new one is allocated.
+        if (fragment.flags & CORRUPTIBLE) {
+            factor.setTo(fragment.reg, 32, CORRUPTIBLE);
+            fragment.flags &= ~CORRUPTIBLE;
+        } else if (fb.flags & CORRUPTIBLE) {
+            factor.setTo(fb.reg, 32, CORRUPTIBLE);
+            fb.flags &= ~CORRUPTIBLE;
+        } else {
+            factor.setTo(scratches.obtain(), 32, CORRUPTIBLE);
+        } 
+        break;
+    }
+
+    // XXX: doesn't work if size==1
+
+    switch(f) {
+    case GGL_ONE_MINUS_DST_COLOR:
+    case GGL_DST_COLOR:
+        factor.s = fb.s;
+        ADD(AL, 0, factor.reg, fb.reg, reg_imm(fb.reg, LSR, fb.s-1));
+        break;
+    case GGL_ONE_MINUS_SRC_COLOR:
+    case GGL_SRC_COLOR:
+        factor.s = fragment.s;
+        ADD(AL, 0, factor.reg, fragment.reg,
+            reg_imm(fragment.reg, LSR, fragment.s-1));
+        break;
+    case GGL_ONE_MINUS_SRC_ALPHA:
+    case GGL_SRC_ALPHA:
+        factor.s = src_alpha.s;
+        ADD(AL, 0, factor.reg, src_alpha.reg,
+                reg_imm(src_alpha.reg, LSR, src_alpha.s-1));
+        break;
+    case GGL_ONE_MINUS_DST_ALPHA:
+    case GGL_DST_ALPHA:
+        // XXX: should be precomputed
+        extract(factor, dst_pixel, GGLFormat::ALPHA);
+        ADD(AL, 0, factor.reg, factor.reg,
+                reg_imm(factor.reg, LSR, factor.s-1));
+        break;
+    case GGL_SRC_ALPHA_SATURATE:
+        // XXX: should be precomputed
+        // XXX: f = min(As, 1-Ad)
+        // btw, we're guaranteed that Ad's size is <= 8, because
+        // it's extracted from the framebuffer
+        break;
+    }
+
+    switch(f) {
+    case GGL_ONE_MINUS_DST_COLOR:
+    case GGL_ONE_MINUS_SRC_COLOR:
+    case GGL_ONE_MINUS_DST_ALPHA:
+    case GGL_ONE_MINUS_SRC_ALPHA:
+        RSB(AL, 0, factor.reg, factor.reg, imm((1<<factor.s)));
+    }
+    
+    // don't need more than 8-bits for the blend factor
+    // and this will prevent overflows in the multiplies later
+    if (factor.s > 8) {
+        MOV(AL, 0, factor.reg, reg_imm(factor.reg, LSR, factor.s-8));
+        factor.s = 8;
+    }
+!!!9906444.cpp!!!	build_blendFOneMinusF(inout temp : component_t, in factor : integer_t, in fragment : integer_t, in fb : integer_t) : void
+    //  R = S*f + D*(1-f) = (S-D)*f + D
+    Scratch scratches(registerFile());
+    // compute S-D
+    integer_t diff(fragment.flags & CORRUPTIBLE ?
+            fragment.reg : scratches.obtain(), fb.size(), CORRUPTIBLE);
+    const int shift = fragment.size() - fb.size();
+    if (shift>0)        RSB(AL, 0, diff.reg, fb.reg, reg_imm(fragment.reg, LSR, shift));
+    else if (shift<0)   RSB(AL, 0, diff.reg, fb.reg, reg_imm(fragment.reg, LSL,-shift));
+    else                RSB(AL, 0, diff.reg, fb.reg, fragment.reg);
+    mul_factor_add(temp, diff, factor, component_t(fb));
+!!!9906572.cpp!!!	build_blendOneMinusFF(inout temp : component_t, in factor : integer_t, in fragment : integer_t, in fb : integer_t) : void
+    //  R = S*f + D*(1-f) = (S-D)*f + D
+    Scratch scratches(registerFile());
+    // compute D-S
+    integer_t diff(fb.flags & CORRUPTIBLE ?
+            fb.reg : scratches.obtain(), fb.size(), CORRUPTIBLE);
+    const int shift = fragment.size() - fb.size();
+    if (shift>0)        SUB(AL, 0, diff.reg, fb.reg, reg_imm(fragment.reg, LSR, shift));
+    else if (shift<0)   SUB(AL, 0, diff.reg, fb.reg, reg_imm(fragment.reg, LSL,-shift));
+    else                SUB(AL, 0, diff.reg, fb.reg, fragment.reg);
+    mul_factor_add(temp, diff, factor, component_t(fragment));
+!!!9906700.cpp!!!	build_coverage_application(inout fragment : component_t, in parts : fragment_parts_t, inout regs : Scratch) : void
+    // here fragment.l is guarenteed to be 0
+    if (mAA) {
+        // coverages are 1.15 fixed-point numbers
+        comment("coverage application");
+
+        component_t incoming(fragment);
+        modify(fragment, regs);
+
+        Scratch scratches(registerFile());
+        int cf = scratches.obtain();
+        LDRH(AL, cf, parts.covPtr.reg, immed8_post(2));
+        if (fragment.h > 31) {
+            fragment.h--;
+            SMULWB(AL, fragment.reg, incoming.reg, cf);
+        } else {
+            MOV(AL, 0, fragment.reg, reg_imm(incoming.reg, LSL, 1));
+            SMULWB(AL, fragment.reg, fragment.reg, cf);
+        }
+    }
+!!!9906828.cpp!!!	build_alpha_test(inout fragment : component_t, in parts : fragment_parts_t) : void
+    if (mAlphaTest != GGL_ALWAYS) {
+        comment("Alpha Test");
+        Scratch scratches(registerFile());
+        int ref = scratches.obtain();
+        const int shift = GGL_COLOR_BITS-fragment.size();
+        CONTEXT_LOAD(ref, state.alpha_test.ref);
+        if (shift) CMP(AL, fragment.reg, reg_imm(ref, LSR, shift));
+        else       CMP(AL, fragment.reg, ref);
+        int cc = NV;
+        switch (mAlphaTest) {
+        case GGL_NEVER:     cc = NV;    break;
+        case GGL_LESS:      cc = LT;    break;
+        case GGL_EQUAL:     cc = EQ;    break;
+        case GGL_LEQUAL:    cc = LS;    break;
+        case GGL_GREATER:   cc = HI;    break;
+        case GGL_NOTEQUAL:  cc = NE;    break;
+        case GGL_GEQUAL:    cc = HS;    break;
+        }
+        B(cc^1, "discard_after_textures");
+    }
+!!!9906956.cpp!!!	build_depth_test(in parts : fragment_parts_t, in mask : uint32_t) : void
+    mask &= Z_TEST|Z_WRITE;
+    const needs_t& needs = mBuilderContext.needs;
+    const int zmask = GGL_READ_NEEDS(P_MASK_Z, needs.p);
+    Scratch scratches(registerFile());
+
+    if (mDepthTest != GGL_ALWAYS || zmask) {
+        int cc=AL, ic=AL;
+        switch (mDepthTest) {
+        case GGL_LESS:      ic = HI;    break;
+        case GGL_EQUAL:     ic = EQ;    break;
+        case GGL_LEQUAL:    ic = HS;    break;
+        case GGL_GREATER:   ic = LT;    break;
+        case GGL_NOTEQUAL:  ic = NE;    break;
+        case GGL_GEQUAL:    ic = LS;    break;
+        case GGL_NEVER:
+            // this never happens, because it's taken care of when 
+            // computing the needs. but we keep it for completness.
+            comment("Depth Test (NEVER)");
+            B(AL, "discard_before_textures");
+            return;
+        case GGL_ALWAYS:
+            // we're here because zmask is enabled
+            mask &= ~Z_TEST;    // test always passes.
+            break;
+        }
+        
+        // inverse the condition
+        cc = ic^1;
+        
+        if ((mask & Z_WRITE) && !zmask) {
+            mask &= ~Z_WRITE;
+        }
+        
+        if (!mask)
+            return;
+
+        comment("Depth Test");
+
+        int zbase = scratches.obtain();
+        int depth = scratches.obtain();
+        int z = parts.z.reg;
+        
+        CONTEXT_LOAD(zbase, generated_vars.zbase);  // stall
+        SUB(AL, 0, zbase, zbase, reg_imm(parts.count.reg, LSR, 15));
+            // above does zbase = zbase + ((count >> 16) << 1)
+
+        if (mask & Z_TEST) {
+            LDRH(AL, depth, zbase);  // stall
+            CMP(AL, depth, reg_imm(z, LSR, 16));
+            B(cc, "discard_before_textures");
+        }
+        if (mask & Z_WRITE) {
+            if (mask == Z_WRITE) {
+                // only z-write asked, cc is meaningless
+                ic = AL;
+            }
+            MOV(AL, 0, depth, reg_imm(z, LSR, 16));
+            STRH(ic, depth, zbase);
+        }
+    }
+!!!9907084.cpp!!!	build_iterate_z(in parts : fragment_parts_t) : void
+    const needs_t& needs = mBuilderContext.needs;
+    if ((mDepthTest != GGL_ALWAYS) || GGL_READ_NEEDS(P_MASK_Z, needs.p)) {
+        Scratch scratches(registerFile());
+        int dzdx = scratches.obtain();
+        CONTEXT_LOAD(dzdx, generated_vars.dzdx);    // stall
+        ADD(AL, 0, parts.z.reg, parts.z.reg, dzdx); 
+    }
+!!!9907212.cpp!!!	build_iterate_f(in parts : fragment_parts_t) : void
+    const needs_t& needs = mBuilderContext.needs;
+    if (GGL_READ_NEEDS(P_FOG, needs.p)) {
+        Scratch scratches(registerFile());
+        int dfdx = scratches.obtain();
+        int f = scratches.obtain();
+        CONTEXT_LOAD(f,     generated_vars.f);
+        CONTEXT_LOAD(dfdx,  generated_vars.dfdx);   // stall
+        ADD(AL, 0, f, f, dfdx);
+        CONTEXT_STORE(f,    generated_vars.f);
+    }
+!!!9907340.cpp!!!	build_iterate_texture_coordinates(in parts : fragment_parts_t) : void
+    const bool multiTexture = mTextureMachine.activeUnits > 1;
+    for (int i=0 ; i<GGL_TEXTURE_UNIT_COUNT; i++) {
+        const texture_unit_t& tmu = mTextureMachine.tmu[i];
+        if (tmu.format_idx == 0)
+            continue;
+
+        if ((tmu.swrap == GGL_NEEDS_WRAP_11) &&
+            (tmu.twrap == GGL_NEEDS_WRAP_11))
+        { // 1:1 textures
+            const pointer_t& txPtr = parts.coords[i].ptr;
+            ADD(AL, 0, txPtr.reg, txPtr.reg, imm(txPtr.size>>3));
+        } else {
+            Scratch scratches(registerFile());
+            int s = parts.coords[i].s.reg;
+            int t = parts.coords[i].t.reg;
+            if ((mOptLevel&1)==0) {
+                s = scratches.obtain();
+                t = scratches.obtain();
+                CONTEXT_LOAD(s, generated_vars.texture[i].spill[0]);
+                CONTEXT_LOAD(t, generated_vars.texture[i].spill[1]);
+            }
+            int dsdx = scratches.obtain();
+            int dtdx = scratches.obtain();
+            CONTEXT_LOAD(dsdx, generated_vars.texture[i].dsdx);
+            CONTEXT_LOAD(dtdx, generated_vars.texture[i].dtdx);
+            ADD(AL, 0, s, s, dsdx);
+            ADD(AL, 0, t, t, dtdx);
+            if ((mOptLevel&1)==0) {
+                CONTEXT_STORE(s, generated_vars.texture[i].spill[0]);
+                CONTEXT_STORE(t, generated_vars.texture[i].spill[1]);
+            }
+        }
+    }
+!!!9907468.cpp!!!	build_logic_op(inout pixel : pixel_t, inout regs : Scratch) : void
+    const needs_t& needs = mBuilderContext.needs;
+    const int opcode = GGL_READ_NEEDS(LOGIC_OP, needs.n) | GGL_CLEAR;
+    if (opcode == GGL_COPY)
+        return;
+    
+    comment("logic operation");
+
+    pixel_t s(pixel);
+    if (!(pixel.flags & CORRUPTIBLE)) {
+        pixel.reg = regs.obtain();
+        pixel.flags |= CORRUPTIBLE;
+    }
+    
+    pixel_t d(mDstPixel);
+    switch(opcode) {
+    case GGL_CLEAR:         MOV(AL, 0, pixel.reg, imm(0));          break;
+    case GGL_AND:           AND(AL, 0, pixel.reg, s.reg, d.reg);    break;
+    case GGL_AND_REVERSE:   BIC(AL, 0, pixel.reg, s.reg, d.reg);    break;
+    case GGL_COPY:                                                  break;
+    case GGL_AND_INVERTED:  BIC(AL, 0, pixel.reg, d.reg, s.reg);    break;
+    case GGL_NOOP:          MOV(AL, 0, pixel.reg, d.reg);           break;
+    case GGL_XOR:           EOR(AL, 0, pixel.reg, s.reg, d.reg);    break;
+    case GGL_OR:            ORR(AL, 0, pixel.reg, s.reg, d.reg);    break;
+    case GGL_NOR:           ORR(AL, 0, pixel.reg, s.reg, d.reg);
+                            MVN(AL, 0, pixel.reg, pixel.reg);       break;
+    case GGL_EQUIV:         EOR(AL, 0, pixel.reg, s.reg, d.reg);
+                            MVN(AL, 0, pixel.reg, pixel.reg);       break;
+    case GGL_INVERT:        MVN(AL, 0, pixel.reg, d.reg);           break;
+    case GGL_OR_REVERSE:    // s | ~d == ~(~s & d)
+                            BIC(AL, 0, pixel.reg, d.reg, s.reg);
+                            MVN(AL, 0, pixel.reg, pixel.reg);       break;
+    case GGL_COPY_INVERTED: MVN(AL, 0, pixel.reg, s.reg);           break;
+    case GGL_OR_INVERTED:   // ~s | d == ~(s & ~d)
+                            BIC(AL, 0, pixel.reg, s.reg, d.reg);
+                            MVN(AL, 0, pixel.reg, pixel.reg);       break;
+    case GGL_NAND:          AND(AL, 0, pixel.reg, s.reg, d.reg);
+                            MVN(AL, 0, pixel.reg, pixel.reg);       break;
+    case GGL_SET:           MVN(AL, 0, pixel.reg, imm(0));          break;
+    };        
+!!!9907596.cpp!!!	build_masking(inout pixel : pixel_t, inout regs : Scratch) : void
+    if (!mMasking || mAllMasked) {
+        return;
+    }
+
+    comment("color mask");
+
+    pixel_t fb(mDstPixel);
+    pixel_t s(pixel);
+    if (!(pixel.flags & CORRUPTIBLE)) {
+        pixel.reg = regs.obtain();
+        pixel.flags |= CORRUPTIBLE;
+    }
+
+    int mask = 0;
+    for (int i=0 ; i<4 ; i++) {
+        const int component_mask = 1<<i;
+        const int h = fb.format.c[i].h;
+        const int l = fb.format.c[i].l;
+        if (h && (!(mMasking & component_mask))) {
+            mask |= ((1<<(h-l))-1) << l;
+        }
+    }
+
+    // There is no need to clear the masked components of the source
+    // (unless we applied a logic op), because they're already zeroed 
+    // by construction (masked components are not computed)
+
+    if (mLogicOp) {
+        const needs_t& needs = mBuilderContext.needs;
+        const int opcode = GGL_READ_NEEDS(LOGIC_OP, needs.n) | GGL_CLEAR;
+        if (opcode != GGL_CLEAR) {
+            // clear masked component of source
+            build_and_immediate(pixel.reg, s.reg, mask, fb.size());
+            s = pixel;
+        }
+    }
+
+    // clear non masked components of destination
+    build_and_immediate(fb.reg, fb.reg, ~mask, fb.size()); 
+
+    // or back the channels that were masked
+    if (s.reg == fb.reg) {
+         // this is in fact a MOV
+        if (s.reg == pixel.reg) {
+            // ugh. this in in fact a nop
+        } else {
+            MOV(AL, 0, pixel.reg, fb.reg);
+        }
+    } else {
+        ORR(AL, 0, pixel.reg, s.reg, fb.reg);
+    }
+!!!9907724.cpp!!!	build_and_immediate(in d : int, in s : int, in mask : uint32_t, in bits : int) : void
+    uint32_t rot;
+    uint32_t size = ((bits>=32) ? 0 : (1LU << bits)) - 1;
+    mask &= size;
+
+    if (mask == size) {
+        if (d != s)
+            MOV( AL, 0, d, s);
+        return;
+    }
+    
+    if (getCodegenArch() == CODEGEN_ARCH_MIPS) {
+        // MIPS can do 16-bit imm in 1 instr, 32-bit in 3 instr
+        // the below ' while (mask)' code is buggy on mips
+        // since mips returns true on isValidImmediate()
+        // then we get multiple AND instr (positive logic)
+        AND( AL, 0, d, s, imm(mask) );
+        return;
+    }
+
+    int negative_logic = !isValidImmediate(mask);
+    if (negative_logic) {
+        mask = ~mask & size;
+    }
+    normalize(mask, rot);
+
+    if (mask) {
+        while (mask) {
+            uint32_t bitpos = find_bottom(mask);
+            int shift = rot + bitpos;
+            uint32_t m = mask & (0xff << bitpos);
+            mask &= ~m;
+            m >>= bitpos;
+            int32_t newMask =  (m<<shift) | (m>>(32-shift));
+            if (!negative_logic) {
+                AND( AL, 0, d, s, imm(newMask) );
+            } else {
+                BIC( AL, 0, d, s, imm(newMask) );
+            }
+            s = d;
+        }
+    } else {
+        MOV( AL, 0, d, imm(0));
+    }
+!!!9907852.cpp!!!	isAlphaSourceNeeded() : bool
+    // XXX: also needed for alpha-test
+    const int bs = mBlendSrc;
+    const int bd = mBlendDst;
+    return  bs==GGL_SRC_ALPHA_SATURATE ||
+            bs==GGL_SRC_ALPHA || bs==GGL_ONE_MINUS_SRC_ALPHA ||
+            bd==GGL_SRC_ALPHA || bd==GGL_ONE_MINUS_SRC_ALPHA ; 
+!!!9907980.cpp!!!	blending_codes(in fs : int, in fd : int) : int
+    int blending = 0;
+    switch(fs) {
+    case GGL_ONE:
+        blending |= BLEND_SRC;
+        break;
+
+    case GGL_ONE_MINUS_DST_COLOR:
+    case GGL_DST_COLOR:
+        blending |= FACTOR_DST|BLEND_SRC;
+        break;
+    case GGL_ONE_MINUS_DST_ALPHA:
+    case GGL_DST_ALPHA:
+        // no need to extract 'component' from the destination
+        // for the blend factor, because we need ALPHA only.
+        blending |= BLEND_SRC;
+        break;
+
+    case GGL_ONE_MINUS_SRC_COLOR:
+    case GGL_SRC_COLOR:    
+        blending |= FACTOR_SRC|BLEND_SRC;
+        break;
+    case GGL_ONE_MINUS_SRC_ALPHA:
+    case GGL_SRC_ALPHA:
+    case GGL_SRC_ALPHA_SATURATE:
+        blending |= FACTOR_SRC|BLEND_SRC;
+        break;
+    }
+    switch(fd) {
+    case GGL_ONE:
+        blending |= BLEND_DST;
+        break;
+
+    case GGL_ONE_MINUS_DST_COLOR:
+    case GGL_DST_COLOR:
+        blending |= FACTOR_DST|BLEND_DST;
+        break;
+    case GGL_ONE_MINUS_DST_ALPHA:
+    case GGL_DST_ALPHA:
+        blending |= FACTOR_DST|BLEND_DST;
+        break;
+
+    case GGL_ONE_MINUS_SRC_COLOR:
+    case GGL_SRC_COLOR:    
+        blending |= FACTOR_SRC|BLEND_DST;
+        break;
+    case GGL_ONE_MINUS_SRC_ALPHA:
+    case GGL_SRC_ALPHA:
+        // no need to extract 'component' from the source
+        // for the blend factor, because we need ALPHA only.
+        blending |= BLEND_DST;
+        break;
+    }
+    return blending;

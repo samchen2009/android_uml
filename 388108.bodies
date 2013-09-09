@@ -1,0 +1,321 @@
+class AudioCommandThread
+!!!865164.cpp!!!	AudioCommandThread(in name : String8)
+    mpToneGenerator = NULL;
+!!!865292.cpp!!!	~AudioCommandThread()
+    if (mName != "" && !mAudioCommands.isEmpty()) {
+        release_wake_lock(mName.string());
+    }
+    mAudioCommands.clear();
+    delete mpToneGenerator;
+!!!865420.cpp!!!	dump(in fd : int) : status_t
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    snprintf(buffer, SIZE, "AudioCommandThread %p Dump\n", this);
+    result.append(buffer);
+    write(fd, result.string(), result.size());
+
+    bool locked = tryLock(mLock);
+    if (!locked) {
+        String8 result2(kCmdDeadlockedString);
+        write(fd, result2.string(), result2.size());
+    }
+
+    snprintf(buffer, SIZE, "- Commands:\n");
+    result = String8(buffer);
+    result.append("   Command Time        Wait pParam\n");
+    for (size_t i = 0; i < mAudioCommands.size(); i++) {
+        mAudioCommands[i]->dump(buffer, SIZE);
+        result.append(buffer);
+    }
+    result.append("  Last Command\n");
+    mLastCommand.dump(buffer, SIZE);
+    result.append(buffer);
+
+    write(fd, result.string(), result.size());
+
+    if (locked) mLock.unlock();
+
+    return NO_ERROR;
+!!!865548.cpp!!!	onFirstRef() : void
+    if (mName != "") {
+        run(mName.string(), ANDROID_PRIORITY_AUDIO);
+    } else {
+        run("AudioCommand", ANDROID_PRIORITY_AUDIO);
+    }
+!!!865676.cpp!!!	threadLoop() : bool
+    nsecs_t waitTime = INT64_MAX;
+
+    mLock.lock();
+    while (!exitPending())
+    {
+        while (!mAudioCommands.isEmpty()) {
+            nsecs_t curTime = systemTime();
+            // commands are sorted by increasing time stamp: execute them from index 0 and up
+            if (mAudioCommands[0]->mTime <= curTime) {
+                AudioCommand *command = mAudioCommands[0];
+                mAudioCommands.removeAt(0);
+                mLastCommand = *command;
+
+                switch (command->mCommand) {
+                case START_TONE: {
+                    mLock.unlock();
+                    ToneData *data = (ToneData *)command->mParam;
+                    ALOGV("AudioCommandThread() processing start tone %d on stream %d",
+                            data->mType, data->mStream);
+                    delete mpToneGenerator;
+                    mpToneGenerator = new ToneGenerator(data->mStream, 1.0);
+                    mpToneGenerator->startTone(data->mType);
+                    delete data;
+                    mLock.lock();
+                    }break;
+                case STOP_TONE: {
+                    mLock.unlock();
+                    ALOGV("AudioCommandThread() processing stop tone");
+                    if (mpToneGenerator != NULL) {
+                        mpToneGenerator->stopTone();
+                        delete mpToneGenerator;
+                        mpToneGenerator = NULL;
+                    }
+                    mLock.lock();
+                    }break;
+                case SET_VOLUME: {
+                    VolumeData *data = (VolumeData *)command->mParam;
+                    ALOGV("AudioCommandThread() processing set volume stream %d, \
+                            volume %f, output %d", data->mStream, data->mVolume, data->mIO);
+                    command->mStatus = AudioSystem::setStreamVolume(data->mStream,
+                                                                    data->mVolume,
+                                                                    data->mIO);
+                    if (command->mWaitStatus) {
+                        command->mCond.signal();
+                        mWaitWorkCV.wait(mLock);
+                    }
+                    delete data;
+                    }break;
+                case SET_PARAMETERS: {
+                    ParametersData *data = (ParametersData *)command->mParam;
+                    ALOGV("AudioCommandThread() processing set parameters string %s, io %d",
+                            data->mKeyValuePairs.string(), data->mIO);
+                    command->mStatus = AudioSystem::setParameters(data->mIO, data->mKeyValuePairs);
+                    if (command->mWaitStatus) {
+                        command->mCond.signal();
+                        mWaitWorkCV.wait(mLock);
+                    }
+                    delete data;
+                    }break;
+                case SET_VOICE_VOLUME: {
+                    VoiceVolumeData *data = (VoiceVolumeData *)command->mParam;
+                    ALOGV("AudioCommandThread() processing set voice volume volume %f",
+                            data->mVolume);
+                    command->mStatus = AudioSystem::setVoiceVolume(data->mVolume);
+                    if (command->mWaitStatus) {
+                        command->mCond.signal();
+                        mWaitWorkCV.wait(mLock);
+                    }
+                    delete data;
+                    }break;
+                default:
+                    ALOGW("AudioCommandThread() unknown command %d", command->mCommand);
+                }
+                delete command;
+                waitTime = INT64_MAX;
+            } else {
+                waitTime = mAudioCommands[0]->mTime - curTime;
+                break;
+            }
+        }
+        // release delayed commands wake lock
+        if (mName != "" && mAudioCommands.isEmpty()) {
+            release_wake_lock(mName.string());
+        }
+        ALOGV("AudioCommandThread() going to sleep");
+        mWaitWorkCV.waitRelative(mLock, waitTime);
+        ALOGV("AudioCommandThread() waking up");
+    }
+    mLock.unlock();
+    return false;
+!!!865804.cpp!!!	exit() : void
+    ALOGV("AudioCommandThread::exit");
+    {
+        AutoMutex _l(mLock);
+        requestExit();
+        mWaitWorkCV.signal();
+    }
+    requestExitAndWait();
+!!!865932.cpp!!!	startToneCommand(in type : tone_type, in stream : audio_stream_type_t) : void
+    AudioCommand *command = new AudioCommand();
+    command->mCommand = START_TONE;
+    ToneData *data = new ToneData();
+    data->mType = type;
+    data->mStream = stream;
+    command->mParam = (void *)data;
+    Mutex::Autolock _l(mLock);
+    insertCommand_l(command);
+    ALOGV("AudioCommandThread() adding tone start type %d, stream %d", type, stream);
+    mWaitWorkCV.signal();
+!!!866060.cpp!!!	stopToneCommand() : void
+    AudioCommand *command = new AudioCommand();
+    command->mCommand = STOP_TONE;
+    command->mParam = NULL;
+    Mutex::Autolock _l(mLock);
+    insertCommand_l(command);
+    ALOGV("AudioCommandThread() adding tone stop");
+    mWaitWorkCV.signal();
+!!!866188.cpp!!!	volumeCommand(in stream : audio_stream_type_t, in volume : float, in output : audio_io_handle_t, in delayMs : int = 0) : status_t
+    status_t status = NO_ERROR;
+
+    AudioCommand *command = new AudioCommand();
+    command->mCommand = SET_VOLUME;
+    VolumeData *data = new VolumeData();
+    data->mStream = stream;
+    data->mVolume = volume;
+    data->mIO = output;
+    command->mParam = data;
+    Mutex::Autolock _l(mLock);
+    insertCommand_l(command, delayMs);
+    ALOGV("AudioCommandThread() adding set volume stream %d, volume %f, output %d",
+            stream, volume, output);
+    mWaitWorkCV.signal();
+    if (command->mWaitStatus) {
+        command->mCond.wait(mLock);
+        status =  command->mStatus;
+        mWaitWorkCV.signal();
+    }
+    return status;
+!!!866316.cpp!!!	parametersCommand(in ioHandle : audio_io_handle_t, in keyValuePairs : char, in delayMs : int = 0) : status_t
+    status_t status = NO_ERROR;
+
+    AudioCommand *command = new AudioCommand();
+    command->mCommand = SET_PARAMETERS;
+    ParametersData *data = new ParametersData();
+    data->mIO = ioHandle;
+    data->mKeyValuePairs = String8(keyValuePairs);
+    command->mParam = data;
+    Mutex::Autolock _l(mLock);
+    insertCommand_l(command, delayMs);
+    ALOGV("AudioCommandThread() adding set parameter string %s, io %d ,delay %d",
+            keyValuePairs, ioHandle, delayMs);
+    mWaitWorkCV.signal();
+    if (command->mWaitStatus) {
+        command->mCond.wait(mLock);
+        status =  command->mStatus;
+        mWaitWorkCV.signal();
+    }
+    return status;
+!!!866444.cpp!!!	voiceVolumeCommand(in volume : float, in delayMs : int = 0) : status_t
+    status_t status = NO_ERROR;
+
+    AudioCommand *command = new AudioCommand();
+    command->mCommand = SET_VOICE_VOLUME;
+    VoiceVolumeData *data = new VoiceVolumeData();
+    data->mVolume = volume;
+    command->mParam = data;
+    Mutex::Autolock _l(mLock);
+    insertCommand_l(command, delayMs);
+    ALOGV("AudioCommandThread() adding set voice volume volume %f", volume);
+    mWaitWorkCV.signal();
+    if (command->mWaitStatus) {
+        command->mCond.wait(mLock);
+        status =  command->mStatus;
+        mWaitWorkCV.signal();
+    }
+    return status;
+!!!866572.cpp!!!	insertCommand_l(inout command : AudioCommand, in delayMs : int = 0) : void
+    ssize_t i;  // not size_t because i will count down to -1
+    Vector <AudioCommand *> removedCommands;
+
+    nsecs_t time = 0;
+    command->mTime = systemTime() + milliseconds(delayMs);
+
+    // acquire wake lock to make sure delayed commands are processed
+    if (mName != "" && mAudioCommands.isEmpty()) {
+        acquire_wake_lock(PARTIAL_WAKE_LOCK, mName.string());
+    }
+
+    // check same pending commands with later time stamps and eliminate them
+    for (i = mAudioCommands.size()-1; i >= 0; i--) {
+        AudioCommand *command2 = mAudioCommands[i];
+        // commands are sorted by increasing time stamp: no need to scan the rest of mAudioCommands
+        if (command2->mTime <= command->mTime) break;
+        if (command2->mCommand != command->mCommand) continue;
+
+        switch (command->mCommand) {
+        case SET_PARAMETERS: {
+            ParametersData *data = (ParametersData *)command->mParam;
+            ParametersData *data2 = (ParametersData *)command2->mParam;
+            if (data->mIO != data2->mIO) break;
+            ALOGV("Comparing parameter command %s to new command %s",
+                    data2->mKeyValuePairs.string(), data->mKeyValuePairs.string());
+            AudioParameter param = AudioParameter(data->mKeyValuePairs);
+            AudioParameter param2 = AudioParameter(data2->mKeyValuePairs);
+            for (size_t j = 0; j < param.size(); j++) {
+                String8 key;
+                String8 value;
+                param.getAt(j, key, value);
+                for (size_t k = 0; k < param2.size(); k++) {
+                    String8 key2;
+                    String8 value2;
+                    param2.getAt(k, key2, value2);
+                    if (key2 == key) {
+                        param2.remove(key2);
+                        ALOGV("Filtering out parameter %s", key2.string());
+                        break;
+                    }
+                }
+            }
+            // if all keys have been filtered out, remove the command.
+            // otherwise, update the key value pairs
+            if (param2.size() == 0) {
+                removedCommands.add(command2);
+            } else {
+                data2->mKeyValuePairs = param2.toString();
+            }
+            time = command2->mTime;
+        } break;
+
+        case SET_VOLUME: {
+            VolumeData *data = (VolumeData *)command->mParam;
+            VolumeData *data2 = (VolumeData *)command2->mParam;
+            if (data->mIO != data2->mIO) break;
+            if (data->mStream != data2->mStream) break;
+            ALOGV("Filtering out volume command on output %d for stream %d",
+                    data->mIO, data->mStream);
+            removedCommands.add(command2);
+            time = command2->mTime;
+        } break;
+        case START_TONE:
+        case STOP_TONE:
+        default:
+            break;
+        }
+    }
+
+    // remove filtered commands
+    for (size_t j = 0; j < removedCommands.size(); j++) {
+        // removed commands always have time stamps greater than current command
+        for (size_t k = i + 1; k < mAudioCommands.size(); k++) {
+            if (mAudioCommands[k] == removedCommands[j]) {
+                ALOGV("suppressing command: %d", mAudioCommands[k]->mCommand);
+                mAudioCommands.removeAt(k);
+                break;
+            }
+        }
+    }
+    removedCommands.clear();
+
+    // wait for status only if delay is 0 and command time was not modified above
+    if (delayMs == 0 && time == 0) {
+        command->mWaitStatus = true;
+    } else {
+        command->mWaitStatus = false;
+    }
+    // update command time if modified above
+    if (time != 0) {
+        command->mTime = time;
+    }
+
+    // insert command at the right place according to its time stamp
+    ALOGV("inserting command: %d at index %d, num commands %d",
+            command->mCommand, (int)i+1, mAudioCommands.size());
+    mAudioCommands.insertAt(command, i + 1);

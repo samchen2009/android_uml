@@ -1,0 +1,275 @@
+class InputState
+!!!1246220.cpp!!!	isNeutral() : bool
+    return mKeyMementos.isEmpty() && mMotionMementos.isEmpty();
+!!!1246348.cpp!!!	isHovering(in deviceId : int32_t, in source : uint32_t, in displayId : int32_t) : bool
+    for (size_t i = 0; i < mMotionMementos.size(); i++) {
+        const MotionMemento& memento = mMotionMementos.itemAt(i);
+        if (memento.deviceId == deviceId
+                && memento.source == source
+                && memento.displayId == displayId
+                && memento.hovering) {
+            return true;
+        }
+    }
+    return false;
+!!!1246476.cpp!!!	trackKey(in entry : KeyEntry, in action : int32_t, in flags : int32_t) : bool
+    switch (action) {
+    case AKEY_EVENT_ACTION_UP: {
+        if (entry->flags & AKEY_EVENT_FLAG_FALLBACK) {
+            for (size_t i = 0; i < mFallbackKeys.size(); ) {
+                if (mFallbackKeys.valueAt(i) == entry->keyCode) {
+                    mFallbackKeys.removeItemsAt(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        ssize_t index = findKeyMemento(entry);
+        if (index >= 0) {
+            mKeyMementos.removeAt(index);
+            return true;
+        }
+        /* FIXME: We can't just drop the key up event because that prevents creating
+         * popup windows that are automatically shown when a key is held and then
+         * dismissed when the key is released.  The problem is that the popup will
+         * not have received the original key down, so the key up will be considered
+         * to be inconsistent with its observed state.  We could perhaps handle this
+         * by synthesizing a key down but that will cause other problems.
+         *
+         * So for now, allow inconsistent key up events to be dispatched.
+         *
+#if DEBUG_OUTBOUND_EVENT_DETAILS
+        ALOGD("Dropping inconsistent key up event: deviceId=%d, source=%08x, "
+                "keyCode=%d, scanCode=%d",
+                entry->deviceId, entry->source, entry->keyCode, entry->scanCode);
+#endif
+        return false;
+        */
+        return true;
+    }
+
+    case AKEY_EVENT_ACTION_DOWN: {
+        ssize_t index = findKeyMemento(entry);
+        if (index >= 0) {
+            mKeyMementos.removeAt(index);
+        }
+        addKeyMemento(entry, flags);
+        return true;
+    }
+
+    default:
+        return true;
+    }
+!!!1246604.cpp!!!	trackMotion(in entry : MotionEntry, in action : int32_t, in flags : int32_t) : bool
+    int32_t actionMasked = action & AMOTION_EVENT_ACTION_MASK;
+    switch (actionMasked) {
+    case AMOTION_EVENT_ACTION_UP:
+    case AMOTION_EVENT_ACTION_CANCEL: {
+        ssize_t index = findMotionMemento(entry, false /*hovering*/);
+        if (index >= 0) {
+            mMotionMementos.removeAt(index);
+            return true;
+        }
+#if DEBUG_OUTBOUND_EVENT_DETAILS
+        ALOGD("Dropping inconsistent motion up or cancel event: deviceId=%d, source=%08x, "
+                "actionMasked=%d",
+                entry->deviceId, entry->source, actionMasked);
+#endif
+        return false;
+    }
+
+    case AMOTION_EVENT_ACTION_DOWN: {
+        ssize_t index = findMotionMemento(entry, false /*hovering*/);
+        if (index >= 0) {
+            mMotionMementos.removeAt(index);
+        }
+        addMotionMemento(entry, flags, false /*hovering*/);
+        return true;
+    }
+
+    case AMOTION_EVENT_ACTION_POINTER_UP:
+    case AMOTION_EVENT_ACTION_POINTER_DOWN:
+    case AMOTION_EVENT_ACTION_MOVE: {
+        ssize_t index = findMotionMemento(entry, false /*hovering*/);
+        if (index >= 0) {
+            MotionMemento& memento = mMotionMementos.editItemAt(index);
+            memento.setPointers(entry);
+            return true;
+        }
+        if (actionMasked == AMOTION_EVENT_ACTION_MOVE
+                && (entry->source & (AINPUT_SOURCE_CLASS_JOYSTICK
+                        | AINPUT_SOURCE_CLASS_NAVIGATION))) {
+            // Joysticks and trackballs can send MOVE events without corresponding DOWN or UP.
+            return true;
+        }
+#if DEBUG_OUTBOUND_EVENT_DETAILS
+        ALOGD("Dropping inconsistent motion pointer up/down or move event: "
+                "deviceId=%d, source=%08x, actionMasked=%d",
+                entry->deviceId, entry->source, actionMasked);
+#endif
+        return false;
+    }
+
+    case AMOTION_EVENT_ACTION_HOVER_EXIT: {
+        ssize_t index = findMotionMemento(entry, true /*hovering*/);
+        if (index >= 0) {
+            mMotionMementos.removeAt(index);
+            return true;
+        }
+#if DEBUG_OUTBOUND_EVENT_DETAILS
+        ALOGD("Dropping inconsistent motion hover exit event: deviceId=%d, source=%08x",
+                entry->deviceId, entry->source);
+#endif
+        return false;
+    }
+
+    case AMOTION_EVENT_ACTION_HOVER_ENTER:
+    case AMOTION_EVENT_ACTION_HOVER_MOVE: {
+        ssize_t index = findMotionMemento(entry, true /*hovering*/);
+        if (index >= 0) {
+            mMotionMementos.removeAt(index);
+        }
+        addMotionMemento(entry, flags, true /*hovering*/);
+        return true;
+    }
+
+    default:
+        return true;
+    }
+!!!1246732.cpp!!!	synthesizeCancelationEvents(in currentTime : nsecs_t, inout outEvents : Vector<EventEntry*>, in options : CancelationOptions) : void
+    for (size_t i = 0; i < mKeyMementos.size(); i++) {
+        const KeyMemento& memento = mKeyMementos.itemAt(i);
+        if (shouldCancelKey(memento, options)) {
+            outEvents.push(new KeyEntry(currentTime,
+                    memento.deviceId, memento.source, memento.policyFlags,
+                    AKEY_EVENT_ACTION_UP, memento.flags | AKEY_EVENT_FLAG_CANCELED,
+                    memento.keyCode, memento.scanCode, memento.metaState, 0, memento.downTime));
+        }
+    }
+
+    for (size_t i = 0; i < mMotionMementos.size(); i++) {
+        const MotionMemento& memento = mMotionMementos.itemAt(i);
+        if (shouldCancelMotion(memento, options)) {
+            outEvents.push(new MotionEntry(currentTime,
+                    memento.deviceId, memento.source, memento.policyFlags,
+                    memento.hovering
+                            ? AMOTION_EVENT_ACTION_HOVER_EXIT
+                            : AMOTION_EVENT_ACTION_CANCEL,
+                    memento.flags, 0, 0, 0,
+                    memento.xPrecision, memento.yPrecision, memento.downTime,
+                    memento.displayId,
+                    memento.pointerCount, memento.pointerProperties, memento.pointerCoords));
+        }
+    }
+!!!1246860.cpp!!!	clear() : void
+    mKeyMementos.clear();
+    mMotionMementos.clear();
+    mFallbackKeys.clear();
+!!!1246988.cpp!!!	copyPointerStateTo(inout other : InputState) : void
+    for (size_t i = 0; i < mMotionMementos.size(); i++) {
+        const MotionMemento& memento = mMotionMementos.itemAt(i);
+        if (memento.source & AINPUT_SOURCE_CLASS_POINTER) {
+            for (size_t j = 0; j < other.mMotionMementos.size(); ) {
+                const MotionMemento& otherMemento = other.mMotionMementos.itemAt(j);
+                if (memento.deviceId == otherMemento.deviceId
+                        && memento.source == otherMemento.source
+                        && memento.displayId == otherMemento.displayId) {
+                    other.mMotionMementos.removeAt(j);
+                } else {
+                    j += 1;
+                }
+            }
+            other.mMotionMementos.push(memento);
+        }
+    }
+!!!1247116.cpp!!!	getFallbackKey(in originalKeyCode : int32_t) : int32_t
+    ssize_t index = mFallbackKeys.indexOfKey(originalKeyCode);
+    return index >= 0 ? mFallbackKeys.valueAt(index) : -1;
+!!!1247244.cpp!!!	setFallbackKey(in originalKeyCode : int32_t, in fallbackKeyCode : int32_t) : void
+    ssize_t index = mFallbackKeys.indexOfKey(originalKeyCode);
+    if (index >= 0) {
+        mFallbackKeys.replaceValueAt(index, fallbackKeyCode);
+    } else {
+        mFallbackKeys.add(originalKeyCode, fallbackKeyCode);
+    }
+!!!1247372.cpp!!!	removeFallbackKey(in originalKeyCode : int32_t) : void
+    mFallbackKeys.removeItem(originalKeyCode);
+!!!1247756.cpp!!!	findKeyMemento(in entry : KeyEntry) : ssize_t
+    for (size_t i = 0; i < mKeyMementos.size(); i++) {
+        const KeyMemento& memento = mKeyMementos.itemAt(i);
+        if (memento.deviceId == entry->deviceId
+                && memento.source == entry->source
+                && memento.keyCode == entry->keyCode
+                && memento.scanCode == entry->scanCode) {
+            return i;
+        }
+    }
+    return -1;
+!!!1247884.cpp!!!	findMotionMemento(in entry : MotionEntry, in hovering : bool) : ssize_t
+    for (size_t i = 0; i < mMotionMementos.size(); i++) {
+        const MotionMemento& memento = mMotionMementos.itemAt(i);
+        if (memento.deviceId == entry->deviceId
+                && memento.source == entry->source
+                && memento.displayId == entry->displayId
+                && memento.hovering == hovering) {
+            return i;
+        }
+    }
+    return -1;
+!!!1248012.cpp!!!	addKeyMemento(in entry : KeyEntry, in flags : int32_t) : void
+    mKeyMementos.push();
+    KeyMemento& memento = mKeyMementos.editTop();
+    memento.deviceId = entry->deviceId;
+    memento.source = entry->source;
+    memento.keyCode = entry->keyCode;
+    memento.scanCode = entry->scanCode;
+    memento.metaState = entry->metaState;
+    memento.flags = flags;
+    memento.downTime = entry->downTime;
+    memento.policyFlags = entry->policyFlags;
+!!!1248140.cpp!!!	addMotionMemento(in entry : MotionEntry, in flags : int32_t, in hovering : bool) : void
+    mMotionMementos.push();
+    MotionMemento& memento = mMotionMementos.editTop();
+    memento.deviceId = entry->deviceId;
+    memento.source = entry->source;
+    memento.flags = flags;
+    memento.xPrecision = entry->xPrecision;
+    memento.yPrecision = entry->yPrecision;
+    memento.downTime = entry->downTime;
+    memento.displayId = entry->displayId;
+    memento.setPointers(entry);
+    memento.hovering = hovering;
+    memento.policyFlags = entry->policyFlags;
+!!!1248268.cpp!!!	shouldCancelKey(in memento : KeyMemento, in options : CancelationOptions) : bool
+    if (options.keyCode != -1 && memento.keyCode != options.keyCode) {
+        return false;
+    }
+
+    if (options.deviceId != -1 && memento.deviceId != options.deviceId) {
+        return false;
+    }
+
+    switch (options.mode) {
+    case CancelationOptions::CANCEL_ALL_EVENTS:
+    case CancelationOptions::CANCEL_NON_POINTER_EVENTS:
+        return true;
+    case CancelationOptions::CANCEL_FALLBACK_EVENTS:
+        return memento.flags & AKEY_EVENT_FLAG_FALLBACK;
+    default:
+        return false;
+    }
+!!!1248396.cpp!!!	shouldCancelMotion(in memento : MotionMemento, in options : CancelationOptions) : bool
+    if (options.deviceId != -1 && memento.deviceId != options.deviceId) {
+        return false;
+    }
+
+    switch (options.mode) {
+    case CancelationOptions::CANCEL_ALL_EVENTS:
+        return true;
+    case CancelationOptions::CANCEL_POINTER_EVENTS:
+        return memento.source & AINPUT_SOURCE_CLASS_POINTER;
+    case CancelationOptions::CANCEL_NON_POINTER_EVENTS:
+        return !(memento.source & AINPUT_SOURCE_CLASS_POINTER);
+    default:
+        return false;
+    }

@@ -1,0 +1,519 @@
+class ANetworkSession
+!!!724364.cpp!!!	ANetworkSession()
+    mPipeFd[0] = mPipeFd[1] = -1;
+!!!724492.cpp!!!	start() : status_t
+    if (mThread != NULL) {
+        return INVALID_OPERATION;
+    }
+
+    int res = pipe(mPipeFd);
+    if (res != 0) {
+        mPipeFd[0] = mPipeFd[1] = -1;
+        return -errno;
+    }
+
+    mThread = new NetworkThread(this);
+
+    status_t err = mThread->run("ANetworkSession", ANDROID_PRIORITY_AUDIO);
+
+    if (err != OK) {
+        mThread.clear();
+
+        close(mPipeFd[0]);
+        close(mPipeFd[1]);
+        mPipeFd[0] = mPipeFd[1] = -1;
+
+        return err;
+    }
+
+    return OK;
+!!!724620.cpp!!!	stop() : status_t
+    if (mThread == NULL) {
+        return INVALID_OPERATION;
+    }
+
+    mThread->requestExit();
+    interrupt();
+    mThread->requestExitAndWait();
+
+    mThread.clear();
+
+    close(mPipeFd[0]);
+    close(mPipeFd[1]);
+    mPipeFd[0] = mPipeFd[1] = -1;
+
+    return OK;
+!!!724748.cpp!!!	createRTSPClient(in host : char, in port : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    return createClientOrServer(
+            kModeCreateRTSPClient,
+            NULL /* addr */,
+            0 /* port */,
+            host,
+            port,
+            notify,
+            sessionID);
+!!!724876.cpp!!!	createRTSPServer(in addr : in_addr, in port : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    return createClientOrServer(
+            kModeCreateRTSPServer,
+            &addr,
+            port,
+            NULL /* remoteHost */,
+            0 /* remotePort */,
+            notify,
+            sessionID);
+!!!725004.cpp!!!	createUDPSession(in localPort : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    return createUDPSession(localPort, NULL, 0, notify, sessionID);
+!!!725132.cpp!!!	createUDPSession(in localPort : uint, in remoteHost : char, in remotePort : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    return createClientOrServer(
+            kModeCreateUDPSession,
+            NULL /* addr */,
+            localPort,
+            remoteHost,
+            remotePort,
+            notify,
+            sessionID);
+!!!725260.cpp!!!	connectUDPSession(in sessionID : int32_t, in remoteHost : char, in remotePort : uint) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    ssize_t index = mSessions.indexOfKey(sessionID);
+
+    if (index < 0) {
+        return -ENOENT;
+    }
+
+    const sp<Session> session = mSessions.valueAt(index);
+    int s = session->socket();
+
+    struct sockaddr_in remoteAddr;
+    memset(remoteAddr.sin_zero, 0, sizeof(remoteAddr.sin_zero));
+    remoteAddr.sin_family = AF_INET;
+    remoteAddr.sin_port = htons(remotePort);
+
+    status_t err = OK;
+    struct hostent *ent = gethostbyname(remoteHost);
+    if (ent == NULL) {
+        err = -h_errno;
+    } else {
+        remoteAddr.sin_addr.s_addr = *(in_addr_t *)ent->h_addr;
+
+        int res = connect(
+                s,
+                (const struct sockaddr *)&remoteAddr,
+                sizeof(remoteAddr));
+
+        if (res < 0) {
+            err = -errno;
+        }
+    }
+
+    return err;
+!!!725388.cpp!!!	createTCPDatagramSession(in addr : in_addr, in port : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    return createClientOrServer(
+            kModeCreateTCPDatagramSessionPassive,
+            &addr,
+            port,
+            NULL /* remoteHost */,
+            0 /* remotePort */,
+            notify,
+            sessionID);
+!!!725516.cpp!!!	createTCPDatagramSession(in localPort : uint, in remoteHost : char, in remotePort : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    return createClientOrServer(
+            kModeCreateTCPDatagramSessionActive,
+            NULL /* addr */,
+            localPort,
+            remoteHost,
+            remotePort,
+            notify,
+            sessionID);
+!!!725644.cpp!!!	destroySession(in sessionID : int32_t) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    ssize_t index = mSessions.indexOfKey(sessionID);
+
+    if (index < 0) {
+        return -ENOENT;
+    }
+
+    mSessions.removeItemsAt(index);
+
+    interrupt();
+
+    return OK;
+!!!725772.cpp!!!	sendRequest(in sessionID : int32_t, in data : void, in size : ssize_t = -1) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    ssize_t index = mSessions.indexOfKey(sessionID);
+
+    if (index < 0) {
+        return -ENOENT;
+    }
+
+    const sp<Session> session = mSessions.valueAt(index);
+
+    status_t err = session->sendRequest(data, size);
+
+    interrupt();
+
+    return err;
+!!!725900.cpp!!!	~ANetworkSession()
+    stop();
+!!!726028.cpp!!!	createClientOrServer(in mode : Mode, in localAddr : in_addr, in port : uint, in remoteHost : char, in remotePort : uint, in notify : sp<AMessage>, inout sessionID : int32_t) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    *sessionID = 0;
+    status_t err = OK;
+    int s, res;
+    sp<Session> session;
+
+    s = socket(
+            AF_INET,
+            (mode == kModeCreateUDPSession) ? SOCK_DGRAM : SOCK_STREAM,
+            0);
+
+    if (s < 0) {
+        err = -errno;
+        goto bail;
+    }
+
+    if (mode == kModeCreateRTSPServer
+            || mode == kModeCreateTCPDatagramSessionPassive) {
+        const int yes = 1;
+        res = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        if (res < 0) {
+            err = -errno;
+            goto bail2;
+        }
+    }
+
+    if (mode == kModeCreateUDPSession) {
+        int size = 256 * 1024;
+
+        res = setsockopt(s, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+
+        if (res < 0) {
+            err = -errno;
+            goto bail2;
+        }
+
+        res = setsockopt(s, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+
+        if (res < 0) {
+            err = -errno;
+            goto bail2;
+        }
+    }
+
+    err = MakeSocketNonBlocking(s);
+
+    if (err != OK) {
+        goto bail2;
+    }
+
+    struct sockaddr_in addr;
+    memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
+    addr.sin_family = AF_INET;
+
+    if (mode == kModeCreateRTSPClient
+            || mode == kModeCreateTCPDatagramSessionActive) {
+        struct hostent *ent= gethostbyname(remoteHost);
+        if (ent == NULL) {
+            err = -h_errno;
+            goto bail2;
+        }
+
+        addr.sin_addr.s_addr = *(in_addr_t *)ent->h_addr;
+        addr.sin_port = htons(remotePort);
+    } else if (localAddr != NULL) {
+        addr.sin_addr = *localAddr;
+        addr.sin_port = htons(port);
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(port);
+    }
+
+    if (mode == kModeCreateRTSPClient
+            || mode == kModeCreateTCPDatagramSessionActive) {
+        in_addr_t x = ntohl(addr.sin_addr.s_addr);
+        ALOGI("connecting socket %d to %d.%d.%d.%d:%d",
+              s,
+              (x >> 24),
+              (x >> 16) & 0xff,
+              (x >> 8) & 0xff,
+              x & 0xff,
+              ntohs(addr.sin_port));
+
+        res = connect(s, (const struct sockaddr *)&addr, sizeof(addr));
+
+        CHECK_LT(res, 0);
+        if (errno == EINPROGRESS) {
+            res = 0;
+        }
+    } else {
+        res = bind(s, (const struct sockaddr *)&addr, sizeof(addr));
+
+        if (res == 0) {
+            if (mode == kModeCreateRTSPServer
+                    || mode == kModeCreateTCPDatagramSessionPassive) {
+                res = listen(s, 4);
+            } else {
+                CHECK_EQ(mode, kModeCreateUDPSession);
+
+                if (remoteHost != NULL) {
+                    struct sockaddr_in remoteAddr;
+                    memset(remoteAddr.sin_zero, 0, sizeof(remoteAddr.sin_zero));
+                    remoteAddr.sin_family = AF_INET;
+                    remoteAddr.sin_port = htons(remotePort);
+
+                    struct hostent *ent= gethostbyname(remoteHost);
+                    if (ent == NULL) {
+                        err = -h_errno;
+                        goto bail2;
+                    }
+
+                    remoteAddr.sin_addr.s_addr = *(in_addr_t *)ent->h_addr;
+
+                    res = connect(
+                            s,
+                            (const struct sockaddr *)&remoteAddr,
+                            sizeof(remoteAddr));
+                }
+            }
+        }
+    }
+
+    if (res < 0) {
+        err = -errno;
+        goto bail2;
+    }
+
+    Session::State state;
+    switch (mode) {
+        case kModeCreateRTSPClient:
+            state = Session::CONNECTING;
+            break;
+
+        case kModeCreateTCPDatagramSessionActive:
+            state = Session::CONNECTING;
+            break;
+
+        case kModeCreateTCPDatagramSessionPassive:
+            state = Session::LISTENING_TCP_DGRAMS;
+            break;
+
+        case kModeCreateRTSPServer:
+            state = Session::LISTENING_RTSP;
+            break;
+
+        default:
+            CHECK_EQ(mode, kModeCreateUDPSession);
+            state = Session::DATAGRAM;
+            break;
+    }
+
+    session = new Session(
+            mNextSessionID++,
+            state,
+            s,
+            notify);
+
+    if (mode == kModeCreateTCPDatagramSessionActive) {
+        session->setIsRTSPConnection(false);
+    } else if (mode == kModeCreateRTSPClient) {
+        session->setIsRTSPConnection(true);
+    }
+
+    mSessions.add(session->sessionID(), session);
+
+    interrupt();
+
+    *sessionID = session->sessionID();
+
+    goto bail;
+
+bail2:
+    close(s);
+    s = -1;
+
+bail:
+    return err;
+!!!726156.cpp!!!	threadLoop() : void
+    fd_set rs, ws;
+    FD_ZERO(&rs);
+    FD_ZERO(&ws);
+
+    FD_SET(mPipeFd[0], &rs);
+    int maxFd = mPipeFd[0];
+
+    {
+        Mutex::Autolock autoLock(mLock);
+
+        for (size_t i = 0; i < mSessions.size(); ++i) {
+            const sp<Session> &session = mSessions.valueAt(i);
+
+            int s = session->socket();
+
+            if (s < 0) {
+                continue;
+            }
+
+            if (session->wantsToRead()) {
+                FD_SET(s, &rs);
+                if (s > maxFd) {
+                    maxFd = s;
+                }
+            }
+
+            if (session->wantsToWrite()) {
+                FD_SET(s, &ws);
+                if (s > maxFd) {
+                    maxFd = s;
+                }
+            }
+        }
+    }
+
+    int res = select(maxFd + 1, &rs, &ws, NULL, NULL /* tv */);
+
+    if (res == 0) {
+        return;
+    }
+
+    if (res < 0) {
+        if (errno == EINTR) {
+            return;
+        }
+
+        ALOGE("select failed w/ error %d (%s)", errno, strerror(errno));
+        return;
+    }
+
+    if (FD_ISSET(mPipeFd[0], &rs)) {
+        char c;
+        ssize_t n;
+        do {
+            n = read(mPipeFd[0], &c, 1);
+        } while (n < 0 && errno == EINTR);
+
+        if (n < 0) {
+            ALOGW("Error reading from pipe (%s)", strerror(errno));
+        }
+
+        --res;
+    }
+
+    {
+        Mutex::Autolock autoLock(mLock);
+
+        List<sp<Session> > sessionsToAdd;
+
+        for (size_t i = mSessions.size(); res > 0 && i-- > 0;) {
+            const sp<Session> &session = mSessions.valueAt(i);
+
+            int s = session->socket();
+
+            if (s < 0) {
+                continue;
+            }
+
+            if (FD_ISSET(s, &rs) || FD_ISSET(s, &ws)) {
+                --res;
+            }
+
+            if (FD_ISSET(s, &rs)) {
+                if (session->isRTSPServer() || session->isTCPDatagramServer()) {
+                    struct sockaddr_in remoteAddr;
+                    socklen_t remoteAddrLen = sizeof(remoteAddr);
+
+                    int clientSocket = accept(
+                            s, (struct sockaddr *)&remoteAddr, &remoteAddrLen);
+
+                    if (clientSocket >= 0) {
+                        status_t err = MakeSocketNonBlocking(clientSocket);
+
+                        if (err != OK) {
+                            ALOGE("Unable to make client socket non blocking, "
+                                  "failed w/ error %d (%s)",
+                                  err, strerror(-err));
+
+                            close(clientSocket);
+                            clientSocket = -1;
+                        } else {
+                            in_addr_t addr = ntohl(remoteAddr.sin_addr.s_addr);
+
+                            ALOGI("incoming connection from %d.%d.%d.%d:%d "
+                                  "(socket %d)",
+                                  (addr >> 24),
+                                  (addr >> 16) & 0xff,
+                                  (addr >> 8) & 0xff,
+                                  addr & 0xff,
+                                  ntohs(remoteAddr.sin_port),
+                                  clientSocket);
+
+                            sp<Session> clientSession =
+                                // using socket sd as sessionID
+                                new Session(
+                                        mNextSessionID++,
+                                        Session::CONNECTED,
+                                        clientSocket,
+                                        session->getNotificationMessage());
+
+                            clientSession->setIsRTSPConnection(
+                                    session->isRTSPServer());
+
+                            sessionsToAdd.push_back(clientSession);
+                        }
+                    } else {
+                        ALOGE("accept returned error %d (%s)",
+                              errno, strerror(errno));
+                    }
+                } else {
+                    status_t err = session->readMore();
+                    if (err != OK) {
+                        ALOGE("readMore on socket %d failed w/ error %d (%s)",
+                              s, err, strerror(-err));
+                    }
+                }
+            }
+
+            if (FD_ISSET(s, &ws)) {
+                status_t err = session->writeMore();
+                if (err != OK) {
+                    ALOGE("writeMore on socket %d failed w/ error %d (%s)",
+                          s, err, strerror(-err));
+                }
+            }
+        }
+
+        while (!sessionsToAdd.empty()) {
+            sp<Session> session = *sessionsToAdd.begin();
+            sessionsToAdd.erase(sessionsToAdd.begin());
+
+            mSessions.add(session->sessionID(), session);
+
+            ALOGI("added clientSession %d", session->sessionID());
+        }
+    }
+!!!726284.cpp!!!	interrupt() : void
+    static const char dummy = 0;
+
+    ssize_t n;
+    do {
+        n = write(mPipeFd[1], &dummy, 1);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0) {
+        ALOGW("Error writing to pipe (%s)", strerror(errno));
+    }
+!!!726412.cpp!!!	MakeSocketNonBlocking(in s : int) : status_t
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) {
+        flags = 0;
+    }
+
+    int res = fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    if (res < 0) {
+        return -errno;
+    }
+
+    return OK;

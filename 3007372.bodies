@@ -1,0 +1,235 @@
+class TunerControllerService
+!!!12273548.java!!!	onCreate() : void
+
+        Log.d(LOG_TAG, "onCreate() ");
+        super.onCreate();
+
+        // Holds the application Context
+        mContext = getApplicationContext();
+        Wrapper.getWrapperInstance().setContext(mContext);
+        mCreated = true;
+
+        Intent intent = new Intent(TvIntents.ACTION_TV_PLAYER_STARTED);
+        mContext.startService(intent);
+
+        mHandler = new Handler(Looper.getMainLooper());
+
+        mLineupServiceConnection = new LineupServiceConnection(mContext);
+        mLineupServiceConnection.connect();
+
+        Log.d(LOG_TAG, "mContext:" + mContext);
+
+        // register FrameworkEventListener for get event from usdtv framework
+        final FrameworkEventListener mEventListener = FrameworkEventListener
+                .getFrameworkEventListenerInstance();
+        mEventListener.registerAppListener(mContext);
+
+        final Device tunerDevice = PairingDevice.buildInternalTunerDevice(mContext);
+        addDevice(tunerDevice);
+        setChannelUpdateInterval(tunerDevice.getId(), CHANNEL_UPDATE_INTERVAL_MS);
+
+        final List<Device> videoDevices = PairingDevice.getExternalVideoDevices(mContext);
+        for (Device device : videoDevices) {
+            addDevice(device);
+        }
+
+        mChannelListContentObserver = new ChannelListContentObserver(mHandler);
+        registerChannelListObserver();
+!!!12273676.java!!!	buildController(in device : Device) : AbstractDeviceController
+        return ControllerFactory.createController(getDeviceControllerContext(), getSettings(),
+                device.getId());
+!!!12273932.java!!!	buildLocalBinder() : Binder
+        return new TunerControllerBinder();
+!!!12274060.java!!!	onDestroy() : void
+        Log.d(LOG_TAG,
+                "----------------------On Destroy Called-----------------------------------------");
+
+        mCreated = false;
+        mLineupServiceConnection.disconnect();
+        mLineupServiceConnection = null;
+
+        // try {
+        // //Setting true for Power Mode
+        // TvFramework.getInstance().getMiscellaneousInstance().flashUpdate(true,
+        // 0);
+        // } catch (Exception e) {
+        // Log.d(LOG_TAG, "Exception in Setting Power", e);
+        // }
+        super.onDestroy();
+
+        // dismiss No signal messages when LiveTV is exited
+        WidgetManager.dismissEventAlert(mContext);
+
+        // fix 1785 "No Signal" appears after switching to a connected
+        // IRBlaster device from a disconnected HDMI port
+        // Solution: Unregister listener only when LiveTV is not running, then AV event
+        // can be passed to UI even if TunerControllerService is destroyed and OneWayController
+        // take place.
+        if (mUnregisterListenerRunnable == null) {
+            mUnregisterListenerRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    boolean isLiveTvAlive = WidgetManager.checkActivityRunning(mContext,
+                            WidgetManager.TV_PLAYER_ACTIVITY_NAME);
+                    Log.d(LOG_TAG, "mUnregisterListenerRunnable isLiveTvAlive=" + isLiveTvAlive);
+                    if (!isLiveTvAlive && !mCreated) {
+                        final FrameworkEventListener mEventListener = FrameworkEventListener
+                                .getFrameworkEventListenerInstance();
+                        mEventListener.unregisterAppListener();
+                    }
+                }
+            };
+        }
+        mHandler.removeCallbacks(mUnregisterListenerRunnable);
+        mHandler.postDelayed(mUnregisterListenerRunnable, 2000);
+
+        unRegisterChannelListObserver();
+!!!12274188.java!!!	loadChannelList(in deviceId : String, in lineupId : String, inout updateOnly : boolean) : Channel
+        Log.d(LOG_TAG, "loadChannelList deviceId=" + deviceId + " lineupId=" + lineupId);
+        if (!PairingDevice.TUNER_DEVICE_ID.equals(deviceId))
+            return null;
+
+        List<Channel> latestChannels = null;
+        if (!mLineupServiceConnection.waitForConnection()) {
+            // Connection timed out.
+        } else {
+            try {
+                latestChannels = mLineupServiceConnection.getBoundService().getChannels(lineupId);
+            } catch (RemoteException e) {
+                mLineupServiceConnection.disconnect();
+            }
+        }
+        // Pass back the merge lineup to update GTV channel list database
+        return mergeChannelList(latestChannels, getScannedChannelList(deviceId));
+!!!12274316.java!!!	getScannedChannelList(in deviceId : String) : Channel
+        final List<USDTVServiceData> serviceData = TvFramework.getInstance().getLiveTvInstance()
+                .getServiceList();
+        if (serviceData == null) {
+            return null;
+        }
+        List<Channel> channels = new ArrayList<Channel>();
+        final int tunerMode = TvFramework.getInstance().getTunerInstance()
+                .getTunerMode(this).ordinal();
+        for (USDTVServiceData usdtvServiceData : serviceData) {
+            if (usdtvServiceData != null) {
+                int majorNo = usdtvServiceData.getMajorNo();
+                int minorNo = usdtvServiceData.getMinorNo();
+                final String channelName = usdtvServiceData.getServiceName();
+                if (majorNo == ChannelDetails.INVALID_MAJOR_NUMBER) {
+                    majorNo = minorNo;
+                    minorNo = 0;
+                }
+                final ChannelNumber channelNumber = new ChannelNumber(majorNo, minorNo);
+                int disabled = ((usdtvServiceData.getServiceFlag()
+                        & ServiceModificationFlags.Skip_Flag)
+                        == ServiceModificationFlags.Skip_Flag) ? 1 : 0;
+                Log.d(LOG_TAG, "getScannedChannelList: major No = " + majorNo
+                        + " minor No = " + minorNo
+                        + " channel Name = " + channelName
+                        + " disabled=" + disabled);
+
+                Channel channel = new Channel.Builder(channelNumber)
+                        .setName(channelName)
+                        .setCallSign(""/* entry.callsign */)
+                        .setUri(new ChannelStreamInfo(PairingDevice.TUNER_DEVICE_ID,
+                                                        channelNumber.toString(),
+                                                        channelName,
+                                                        usdtvServiceData.getServiceId(),
+                                                        tunerMode,
+                                                        disabled).getTvUrl())
+                        .setEnabled(disabled==0)
+                        .build();
+
+                channels.add(channel);
+            } else {
+                Log.d(LOG_TAG, "usdtvServiceData = null");
+            }
+        }
+        return channels;
+!!!12274444.java!!!	mergeChannelList(inout lineupChannelList : List<Channel>, inout scannedChannelList : List<Channel>) : Channel
+        if (lineupChannelList == null) {
+            return scannedChannelList;
+        }
+        if (scannedChannelList == null) {
+            return null;
+        }
+        List<Channel> mergedChannelList = new ArrayList<Channel>();
+
+        // Ascending sort channels
+        Collections.sort(lineupChannelList);
+        Collections.sort(scannedChannelList);
+
+        Iterator<Channel> it1 = lineupChannelList.iterator();
+        Iterator<Channel> it2 = scannedChannelList.iterator();
+        Channel tmp1, tmp2;
+        if (!it1.hasNext()) {
+            return scannedChannelList;
+        }
+        if (!it2.hasNext()) {
+            return lineupChannelList;
+        }
+        tmp1 = it1.next();
+        tmp2 = it2.next();
+
+        while (true)
+        {
+            int result = tmp1.getChannelNumber().compareTo(tmp2.getChannelNumber());
+            if (result == 0) {
+                mergedChannelList.add(new Channel.Builder(tmp1).setUri(tmp2.getUri()).build());
+                if (it1.hasNext() && it2.hasNext()) {
+                    tmp1 = it1.next();
+                    tmp2 = it2.next();
+                } else {
+                    break;
+                }
+            } else if (result < 0) {
+                if (it1.hasNext()) {
+                    tmp1 = it1.next();
+                } else {
+                    mergedChannelList.add(tmp2);
+                    break;
+                }
+            } else {
+                mergedChannelList.add(tmp2);
+                if (it2.hasNext()) {
+                    tmp2 = it2.next();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        /*
+         * when at the end of lineupChannelList, there are still some items in
+         * scannedChannelList. Put the remaining items in scannedChannelList
+         * into mergedChannelList.
+         */
+        while (it2.hasNext()) {
+            mergedChannelList.add(it2.next());
+        }
+        return mergedChannelList;
+!!!12274572.java!!!	resumeParentalControl() : void
+        Log.d(LOG_TAG, "resumeParentalControl()");
+        ParentalControl pcSettings = TvFramework.getInstance().getParentalControlInstance();
+        if (pcSettings == null) {
+            ProgramaticException.displayMessage(getApplicationContext(), LOG_TAG,
+                    " PC Setting instance is null");
+        }
+        pcSettings.startPCLockedService(true);
+        // This is Not required here as region should not be set to None
+        // During Every Bootup.
+        /*
+         * int status = pcSettings.setCurrentRegion(
+         * RegionId.REG_NONE.ordinal()); if (status != ErrorCodes.SUCCESS) {
+         * Log.e(LOG_TAG, "Platform returned Status While Setting the Region : "
+         * + status); }
+         */
+!!!12274700.java!!!	registerChannelListObserver() : void
+        if (mContext != null && mChannelListContentObserver != null) {
+            mContext.getContentResolver().registerContentObserver(Streams.STREAMS_URI, true,
+                    mChannelListContentObserver);
+        }
+!!!12274828.java!!!	unRegisterChannelListObserver() : void
+        if (mContext != null && mChannelListContentObserver != null) {
+            mContext.getContentResolver().unregisterContentObserver(mChannelListContentObserver);
+        }

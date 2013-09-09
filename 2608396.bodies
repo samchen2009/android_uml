@@ -1,0 +1,4188 @@
+class FSService
+!!!11021068.cpp!!!	getFSService() : sp<IFSService>
+    Mutex::Autolock _l(mLock);
+    if (mFSService.get() == 0) {
+
+        sp<IServiceManager> sm = defaultServiceManager();
+        sp<IBinder> binder;
+
+        do {
+            binder = sm->getService(String16("com.berlin.service.FSService"));
+            if (binder != 0)
+                break;
+
+            usleep(500000); // 0.5 s
+
+        } while(true);
+
+        mFSService = interface_cast<IFSService>(binder);
+    }
+
+    return mFSService;
+!!!11021196.cpp!!!	FactoryService_Init(in  : void) : uint32_t
+    HRESULT nResult = S_OK;
+    if(mFssInit)
+        return android::OK;
+
+    source_control = new SourceControl();
+
+    nResult = MV_OSAL_Init ();
+    if (nResult != S_OK) {
+        FSS_LOGE ("MV_OSAL_Init returned %d\n", nResult);
+        return android::INVALID_OPERATION;
+    }
+
+    FSS_SET_FACTORY_PARTITION_RW();
+    nResult = MV_FMISL_Init();
+    if ( nResult != S_OK ) {
+        FSS_LOGE ("ERROR: MV_FMISL_Init failed!!\n");
+        FSS_SET_FACTORY_PARTITION_RO();
+        return android::INVALID_OPERATION;
+    }
+
+    MV_PQC_CONFIG facPQConfig;
+
+    facPQConfig.PQConfig.iADCMode = 1;
+    facPQConfig.PQConfig.iDIMode = 0;
+    facPQConfig.PQConfig.iACEMde = 0;
+    facPQConfig.PQConfig.iAdaptivePQ = 0;
+    facPQConfig.PQConfig.iAMBMode = 0;
+    facPQConfig.PQConfig.iCARMode = 0;
+    facPQConfig.PQConfig.iEEmode = 0;
+    facPQConfig.PQConfig.iGammaMode = 0;
+    facPQConfig.PQConfig.iICRMode = 0;
+    facPQConfig.PQConfig.iSmartDMode = 0;
+    facPQConfig.PQConfig.iVNRMode = 0;
+    facPQConfig.pDBPath = NULL;
+    nResult = MV_PQControl_Init(&facPQConfig);
+    if (nResult != S_OK) {
+        FSS_LOGE ("MV_PQService_Init failed %d\n", nResult);
+        return android::INVALID_OPERATION;
+    }
+
+    //use the value in /factory_setting/model_index.dat as the main model index.
+    //update the model index in other modules
+    int modelIndex = 1;
+    FactoryService_GetModelIndex(&modelIndex);
+    FactoryService_SetModelIndex(modelIndex, 0);
+
+    //load factory common database from avsetting to factory buffer
+    if(S_OK != LoadCommonFactoryDB()) {
+        FSS_LOGD ("ERROR: LoadCommonDB_Setting failed!!\n");
+    }
+
+    if(S_OK != LoadTunningFactoryDB()) {
+        FSS_LOGD ("ERROR: LoadCommonDB_Setting failed!!\n");
+    }
+
+    //set SSP mode according to the saved setting in the factory database
+    do {
+        MV_FmislSscCtrl_t sscCtrl = {
+            MV_FMISL_SSC_ENABLE,
+            MV_FMISL_SSC_MODE_CENTER,
+            MV_FMISL_SSP_DEFAULT_FREQ,
+            MV_FMISL_SSP_DEFAULT_AMPLITUDE};
+
+        sscCtrl.sscOnOff = (MV_FmislSscOnOff_t)mFactoryDB.sspOnoff;
+        sscCtrl.sscMode = (MV_FmislSscMode_t)mFactoryDB.sspMode;
+        sscCtrl.sscFreq = (unsigned short)mFactoryDB.sspFreq;
+        sscCtrl.sscAmplitude = (float)mFactoryDB.sspAmplitude / 10.0;
+
+        nResult = MV_FMISL_SetLvdsSSC( sscCtrl );
+        if ( nResult != S_OK )
+            return android::INVALID_OPERATION;
+    }while(false);
+
+#if 0
+    //check if the last reset factory is done or not,
+    //if not, do reset factory again
+    if( mFactoryDB.resetOngoing == 1 )
+    {
+        FSS_LOGD ("RESET ONGOING FLAG IS: %d\n", mFactoryDB.resetOngoing);
+        FSS_LOGD ("Continue reset factroy as it is not done last time\n");
+        FactoryService_DoResetUser();
+        FSS_LOGD ("Reboot system\n");
+        FactoryService_DoReboot(MV_FS_REBOOT);
+    }
+#endif
+
+    //Init aging mode
+    mAgingMode.agingInitFlag = 0;
+    initAgingMode();
+
+    //test pattern mode
+    mTestPattern = 0;
+
+    mCurrContrast = FS_PIC_CONTRAST_MAX/2;
+    mCurrBrightness = FS_PIC_BRIGHTNESS_MAX/2;
+    mCurrBacklight = FS_PIC_BACKLIGHT_MAX/2;
+
+#ifdef FS_ATSC_ENABLE
+    mFactoryScanListener =  new FactoryScanListener();
+    mFactoryScanListener->manualScanFlag = 0;
+#endif
+
+    mServiceMode = 0;
+    FactoryService_SetServiceMode(MV_FS_SERVICE_IDLE_MODE);
+
+    mFssInit = 1;
+    FSS_SET_FACTORY_PARTITION_RO();
+
+    FSS_LOGD("Init Factory Service OK.");
+    return android::OK;
+
+!!!11021324.cpp!!!	FactoryService_Uninit(in  : void) : uint32_t
+    if(!mFssInit)
+        return android::OK;
+
+    MV_FMISL_Term();
+    MV_PQControl_Term();
+
+    MV_OSAL_Task_Sleep (10);
+    MV_OSAL_Exit();
+
+    mFssInit = 0;
+
+    FSS_LOGD("Uninit Factory Service OK.");
+
+    return android::OK;
+!!!11021452.cpp!!!	FactoryService_SetServiceMode(in param : int32_t) : uint32_t
+    switch (param) {
+        case MV_FS_SERVICE_IDLE_MODE:
+        case MV_FS_SERVICE_UI_MODE_EXIT:
+        case MV_FS_SERVICE_CMD_MODE_EXIT:
+        case MV_FS_SERVICE_RC_MODE_EXIT:
+        case MV_FS_SERVICE_TEST_MODE_EXIT:
+            mServiceMode &= param;
+            break;
+
+        case MV_FS_SERVICE_UI_MODE:
+        case MV_FS_SERVICE_CMD_MODE:
+        case MV_FS_SERVICE_RC_MODE:
+        case MV_FS_SERVICE_TEST_MODE:
+            mServiceMode |= param;
+            break;
+        default:
+            FSS_LOGD("Invalid service mode %d", param);
+            return android::INVALID_OPERATION;
+    }
+
+    if(mServiceMode) {
+        FSS_SET_FACTORY_PARTITION_RW();
+    } else {
+        FSS_SET_FACTORY_PARTITION_RO();
+    }
+    FSS_LOGD("Set service mode %d", param);
+    FSS_LOGD("Service mode is updated to %d", mServiceMode);
+
+    return android::OK;
+!!!11021580.cpp!!!	FactoryService_GetServiceMode(inout param : int32_t) : uint32_t
+    *param = mServiceMode;
+    FSS_LOGD("Current service mode is %d", mServiceMode);
+    return android::OK;
+!!!11021708.cpp!!!	FactoryService_SetModelIndex(in param : int32_t, in saveToDefault : int32_t) : uint32_t
+    FFS_ENTER();
+    char commandBuf[256];
+
+    //set model index in buffer
+    FSS_LOGD("SET MODEL INDEX: from %d to %d", mFactoryDB.modelIndex, param);
+    if(mFactoryDB.modelIndex == param)
+    {
+        FSS_LOGD ("Set to the same model index, skip it");
+        return android::OK;
+    }
+    mFactoryDB.modelIndex = param;
+
+    //write model_index.dat
+    if( MV_FMISL_SetModelIndex( param, saveToDefault ) != S_OK )
+        return android::INVALID_OPERATION;
+
+    //set model index in fts
+    sprintf(commandBuf,"fts -s board_model %d",param);
+    system(commandBuf);
+
+    //set model index in avsetting
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT,
+                                    MV_FS_DB_FIELD_IDX_MODEL_INDEX);
+
+    //load tunning database as model index is changed
+    //nResult = LoadTunningFactoryDB();
+
+    FFS_EXIT();
+!!!11021836.cpp!!!	FactoryService_GetModelIndex(inout param : int32_t) : uint32_t
+    if( MV_FMISL_GetModelIndex( &mFactoryDB.modelIndex ) != S_OK )
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    *param = mFactoryDB.modelIndex;
+    FSS_LOGD("Get model index = %d",mFactoryDB.modelIndex);
+    return android::OK;
+!!!11021964.cpp!!!	FactoryService_SetPanelID(in param : int32_t) : uint32_t
+    FSS_LOGD("Set panel index = %d", param);
+
+    if( MV_FMISL_SetPanelIndex( param ) != S_OK )
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    return android::OK;
+!!!11022092.cpp!!!	FactoryService_GetPanelID(inout param : int32_t) : uint32_t
+    if( MV_FMISL_GetPanelIndex( param ) != S_OK )
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    FSS_LOGD("Get panel index = %d", *param);
+
+    return android::OK;
+!!!11022220.cpp!!!	FactoryService_SetModelName(inout param : String8) : uint32_t
+    return android::OK;
+!!!11022348.cpp!!!	FactoryService_GetModelName(inout param : String8) : uint32_t
+    return android::OK;
+!!!11022476.cpp!!!	FactoryService_SetDataSN(inout param : String8) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD ("Set SN: %s", param.string() );
+    memset(mFactoryDB.szSerialNumber,'\0',MV_FS_SERIAL_NO_LEN);
+    strcpy(mFactoryDB.szSerialNumber, param.string());
+//    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT,
+//                                      MV_FS_DB_FIELD_IDX_SERIAL_NUMBER);
+
+    FFS_EXIT();
+!!!11022604.cpp!!!	FactoryService_GetDataSN(inout param : String8) : uint32_t
+    param = mFactoryDB.szSerialNumber;
+    FSS_LOGD ("Get SN: %s", param.string() );
+    return android::OK;
+!!!11022732.cpp!!!	FactoryService_SetBootupLogo(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD ("Set logo: %d", param );
+    mFactoryDB.energyLogo = param;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT,
+                                    MV_FS_DB_FIELD_IDX_ENERGY_LOGO);
+
+    FFS_EXIT();
+!!!11022860.cpp!!!	FactoryService_GetBootupLogo(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_ENERGY_LOGO);
+    *param = mFactoryDB.energyLogo;
+    FSS_LOGD ("Get logo: %d", *param );
+
+    return android::OK;
+!!!11022988.cpp!!!	FactoryService_SetSetupWizard(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD ("Set Setup Wizard: %d", param );
+    mFactoryDB.setupWizard = param;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT,
+                                    MV_FS_DB_FIELD_IDX_SETUP_WINZARD);
+
+    FFS_EXIT();
+!!!11023116.cpp!!!	FactoryService_GetSetupWizard(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SETUP_WINZARD);
+
+    *param = mFactoryDB.setupWizard;
+    FSS_LOGD ("Get Setup Wizard: %d", *param );
+
+    return android::OK;
+!!!11023244.cpp!!!	FactoryService_SetSSCOnOff(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    MV_FmislSscCtrl_t sscCtrl = {
+        MV_FMISL_SSC_ENABLE,
+        MV_FMISL_SSC_MODE_CENTER,
+        MV_FMISL_SSP_DEFAULT_FREQ,
+        MV_FMISL_SSP_DEFAULT_AMPLITUDE};
+
+    sscCtrl.sscOnOff = (MV_FmislSscOnOff_t)param;
+    sscCtrl.sscMode = (MV_FmislSscMode_t)mFactoryDB.sspMode;
+    sscCtrl.sscFreq = (unsigned short)mFactoryDB.sspFreq;
+    sscCtrl.sscAmplitude = (float)mFactoryDB.sspAmplitude / 10.0;
+
+    nResult = MV_FMISL_SetLvdsSSC( sscCtrl );
+    if ( nResult != S_OK )
+        return android::INVALID_OPERATION;
+
+    mFactoryDB.sspOnoff = (int)param;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_ONOFF);
+    FFS_EXIT();
+!!!11023372.cpp!!!	FactoryService_SetSSCMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    MV_FmislSscCtrl_t sscCtrl = {
+        MV_FMISL_SSC_ENABLE,
+        MV_FMISL_SSC_MODE_CENTER,
+        MV_FMISL_SSP_DEFAULT_FREQ,
+        MV_FMISL_SSP_DEFAULT_AMPLITUDE};
+
+    sscCtrl.sscOnOff = (MV_FmislSscOnOff_t)mFactoryDB.sspOnoff;
+    sscCtrl.sscMode = (MV_FmislSscMode_t)param;
+    sscCtrl.sscFreq = (unsigned short)mFactoryDB.sspFreq;
+    sscCtrl.sscAmplitude = (float)mFactoryDB.sspAmplitude / 10.0;
+
+    nResult = MV_FMISL_SetLvdsSSC( sscCtrl );
+    if ( nResult != S_OK )
+        return android::INVALID_OPERATION;
+
+    mFactoryDB.sspMode = (int)param;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_MODE);
+
+    FFS_EXIT();
+
+!!!11023500.cpp!!!	FactoryService_SetSSCFreq(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    MV_FmislSscCtrl_t sscCtrl = {
+        MV_FMISL_SSC_ENABLE,
+        MV_FMISL_SSC_MODE_CENTER,
+        MV_FMISL_SSP_DEFAULT_FREQ,
+        MV_FMISL_SSP_DEFAULT_AMPLITUDE};
+
+    sscCtrl.sscOnOff = (MV_FmislSscOnOff_t)mFactoryDB.sspOnoff;
+    sscCtrl.sscMode = (MV_FmislSscMode_t)mFactoryDB.sspMode;
+    sscCtrl.sscFreq = param;
+    sscCtrl.sscAmplitude = (float)mFactoryDB.sspAmplitude / 10.0;
+
+    nResult = MV_FMISL_SetLvdsSSC( sscCtrl );
+    if ( nResult != S_OK )
+        return android::INVALID_OPERATION;
+
+    mFactoryDB.sspFreq = (int)param;
+
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_FREQ);
+    FFS_EXIT();
+!!!11023628.cpp!!!	FactoryService_SetSSCAmp(in param : float) : uint32_t
+    FFS_ENTER();
+    MV_FmislSscCtrl_t sscCtrl = {
+        MV_FMISL_SSC_ENABLE,
+        MV_FMISL_SSC_MODE_CENTER,
+        MV_FMISL_SSP_DEFAULT_FREQ,
+        MV_FMISL_SSP_DEFAULT_AMPLITUDE};
+
+    sscCtrl.sscOnOff = (MV_FmislSscOnOff_t)mFactoryDB.sspOnoff;
+    sscCtrl.sscMode = (MV_FmislSscMode_t)mFactoryDB.sspMode;
+    sscCtrl.sscFreq = (unsigned short)mFactoryDB.sspFreq;
+    sscCtrl.sscAmplitude = param;
+
+    nResult = MV_FMISL_SetLvdsSSC( sscCtrl );
+    if ( nResult != S_OK )
+        return android::INVALID_OPERATION;
+
+    mFactoryDB.sspAmplitude = (int)(param * 10);
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_AMPLITUDE);
+    FFS_EXIT();
+!!!11023756.cpp!!!	FactoryService_GetSSCOnOff(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_ONOFF);
+
+    *param = mFactoryDB.sspOnoff;
+    return android::OK;
+!!!11023884.cpp!!!	FactoryService_GetSSCMode(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_MODE);
+
+    *param = mFactoryDB.sspMode;
+    return android::OK;
+!!!11024012.cpp!!!	FactoryService_GetSSCFreq(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_FREQ);
+
+    *param = mFactoryDB.sspFreq;
+    return android::OK;
+!!!11024140.cpp!!!	FactoryService_GetSSCAmp(inout param : float) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SSP_AMPLITUDE);
+
+    *param = (float)mFactoryDB.sspAmplitude/10.0;
+    return android::OK;
+!!!11024268.cpp!!!	FactoryService_SetInputSource(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Set input source: %d",param );
+
+    //set source via usdtv service
+    nResult = setSource(param);
+
+    FFS_EXIT();
+!!!11024396.cpp!!!	FactoryService_GetInputSource(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    int32_t input_source;
+
+    input_source = getSource();
+
+    if ((input_source == MV_FS_DTV_INPUT) ||
+        (input_source == MV_FS_ATV_INPUT))
+    {
+        *param = MV_FS_TV_INPUT;
+    }
+    else
+    {
+        *param = input_source;
+    }
+
+    FFS_EXIT();
+!!!11024524.cpp!!!	FactoryService_SetTruVolumeOnOff(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    UINT8 state = (UINT8)param;
+    int avSrc = 0;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+
+    FSS_LOGD("Set audio SRS tru volume = %d\n",param );
+
+    for( avSrc = TV_SourceAtv; avSrc <= TV_SourceStream ; avSrc++ )
+    {
+        if( avSrc == TV_SourceDtv )
+            continue;
+        source_control->setAudioProperty(avSrc, TV_AUDIO_SRS_TruVolume, state );
+        MV_OSAL_Task_Sleep(20);
+    }
+
+    mFactoryDB.soundAvl = (int)param;
+    updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_AUDIO_AVL);
+
+    FFS_EXIT();
+!!!11024652.cpp!!!	FactoryService_GetTruVolumeOnOff(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_AUDIO_AVL);
+    *param = mFactoryDB.soundAvl;
+    FSS_LOGD("Get audio SRS tru volume = %d\n", *param );
+    return android::OK;
+!!!11024780.cpp!!!	FactoryService_SetSoundSrsMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    mFactoryDB.soundSrsMode = param;
+    FFS_EXIT();
+!!!11024908.cpp!!!	FactoryService_GetSoundSrsMode(inout param : int32_t) : uint32_t
+    *param = mFactoryDB.soundSrsMode;
+    return android::OK;
+!!!11025036.cpp!!!	FactoryService_SetSoundHardBypass(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    int avSrc = 0;
+
+    FSS_LOGD("Set Sound Hard Bypass = %d\n", param );
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    source_control->setAudioProperty(avSrc, TV_AUDIO_ApplyBypass, param );
+    mFactoryDB.soundHardBypass = param;
+    updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_AUDIO_HARD_BYPASS);
+
+    FFS_EXIT();
+!!!11025164.cpp!!!	FactoryService_GetSoundHardBypass(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_AUDIO_HARD_BYPASS);
+    *param = mFactoryDB.soundHardBypass;
+    FSS_LOGD("Get Sound Hard Bypass = %d\n", *param );
+    return android::OK;
+!!!11025292.cpp!!!	FactoryService_SetSpeakerType(in param : int32_t) : uint32_t
+    if( MV_FMISL_SetSpeakerIndex( param ) != S_OK )
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    return android::OK;
+!!!11025420.cpp!!!	FactoryService_GetSpeakerType(inout param : int32_t) : uint32_t
+    if( MV_FMISL_GetSpeakerIndex( param ) != S_OK )
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    return android::OK;
+!!!11025548.cpp!!!	FactoryService_SetSoundInternalSpeaker(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FFS_EXIT();
+!!!11025676.cpp!!!	FactoryService_SetSoundMute(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    int avSrc = 0;
+    int currentVolume = 25;
+
+    FSS_LOGD("Set sound mute state = %d\n",param );
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+
+    if(param == MV_FS_MUTE_ON ) {
+        /* TODO, get current volume first and save it here */
+
+        /* Set volume to 0 to mute */
+        source_control->setAudioProperty(avSrc, TV_AUDIO_Volume, 0 );
+    } else {
+        source_control->setAudioProperty(avSrc, TV_AUDIO_Volume, currentVolume );
+    }
+
+    FFS_EXIT();
+!!!11025804.cpp!!!	FactoryService_SetColortempValue(in type : int32_t, in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    MV_PQC_PICTURE_PROPERTY pqCtrlType;
+    int32_t CTvalue;
+    int32_t dbField;
+    bool ifStore = false;
+    int32_t source;
+
+    FSServiceSpec_GetCtSource(&source);
+    FSS_LOGD("Source : %d, color temp mode : %d \n", source, mColortemp);
+
+    switch (type)
+    {
+        case MV_FS_COLOR_TEMP_GAIN_RED:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_REDGAIN;
+            if(param != mFactoryDB.colorTemp[source][mColortemp].nGainRed){
+                mFactoryDB.colorTemp[source][mColortemp].nGainRed = param;
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN;
+            }
+            CTvalue = param;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_GAIN_GREEN:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_GREENGAIN;
+            if(param != mFactoryDB.colorTemp[source][mColortemp].nGainGreen){
+                mFactoryDB.colorTemp[source][mColortemp].nGainGreen = param;
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GGAIN;
+            }
+            CTvalue = param;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_GAIN_BLUE:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_BLUEGAIN;
+            if(param != mFactoryDB.colorTemp[source][mColortemp].nGainBlue){
+                mFactoryDB.colorTemp[source][mColortemp].nGainBlue = param;
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BGAIN;
+            }
+            CTvalue = param;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_OFFSET_RED:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_REDOFFSET;
+            if(param != mFactoryDB.colorTemp[source][mColortemp].nOffsetRed)
+            {
+                mFactoryDB.colorTemp[source][mColortemp].nOffsetRed = param;
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_ROFFSET;
+            }
+            CTvalue = param + mFactoryDB.whiteBalance[mColortemp].RDRVOffset;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_OFFSET_GREEN:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_GREENOFFSET;
+            if(param != mFactoryDB.colorTemp[source][mColortemp].nOffsetGreen){
+                mFactoryDB.colorTemp[source][mColortemp].nOffsetGreen = param;
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GOFFSET;
+            }
+            CTvalue = param + mFactoryDB.whiteBalance[mColortemp].GDRVOffset;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_OFFSET_BLUE:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_BLUEOFFSET;
+            if(param != mFactoryDB.colorTemp[source][mColortemp].nOffsetBlue){
+                mFactoryDB.colorTemp[source][mColortemp].nOffsetBlue = param;
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET;
+            }
+            CTvalue = param + mFactoryDB.whiteBalance[mColortemp].BDRVOffset;
+            break;
+        }
+        default:
+        {
+            FSS_LOGD("Color Temp Type is invalid");
+            return android::INVALID_OPERATION;
+            break;
+        }
+    }
+
+    if ((nResult=MV_PQC_SetPictureProperty(pqCtrlType,
+        MV_FS_CT_GAIN_PF_DOWN_CONVERSTION*CTvalue)) != S_OK)
+    {
+        FSS_LOGD("MV_PQC_FacSetColorTempValue is failed");
+    }
+
+    FSS_LOGD("Color Temp type : %d, value : %d", type, CTvalue);
+    if (ifStore)
+    {
+        nResult = updateFactoryDatabase(source, dbField);
+    }
+
+    FFS_EXIT();
+!!!11025932.cpp!!!	FactoryService_GetColortempValue(in type : int32_t, inout param : int32_t) : uint32_t
+    HRESULT nResult = S_OK;
+    int32_t source;
+
+    FSServiceSpec_GetCtSource(&source);
+    getColortempValue(source,type,param);
+
+    return android::OK;
+!!!11026060.cpp!!!	FactoryService_SetWhiteBalValue(in type : int32_t, in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    MV_PQC_PICTURE_PROPERTY pqCtrlType;
+
+    int32_t CTvalue;
+    int32_t dbField;
+    bool ifStore = false;
+    int32_t source;
+
+    if(mColortemp == MV_FS_COLOR_TEMP_TYPE_STANDARD)
+    {
+        FSS_LOGD("current color temp mode is standard, change is not allowed.");
+        return android::INVALID_OPERATION;
+    }
+
+    FSServiceSpec_GetCtSource(&source);
+
+    switch (type)
+    {
+        case MV_FS_WHITE_BAL_RDRV_OFFSET:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_REDGAIN;
+            if(param!=mFactoryDB.whiteBalance[mColortemp].RDRVOffset)
+            {
+                ifStore = true;
+                dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_RGAIN;
+                mFactoryDB.whiteBalance[mColortemp].RDRVOffset = param;
+            }
+            CTvalue = mFactoryDB.colorTemp[source][mColortemp].nGainRed + param;
+            FSS_LOGD("nGainRed: %d, RDRVOffset : %d, CTvalue: %d",
+                      mFactoryDB.colorTemp[source][mColortemp].nGainRed,
+                      mFactoryDB.whiteBalance[mColortemp].RDRVOffset, CTvalue);
+            break;
+        }
+        case MV_FS_WHITE_BAL_GDRV_OFFSET:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_GREENGAIN;
+            if(param!=mFactoryDB.whiteBalance[mColortemp].GDRVOffset)
+            {
+                ifStore=true;
+                dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GGAIN;
+                mFactoryDB.whiteBalance[mColortemp].GDRVOffset = param;
+            }
+            CTvalue =
+                mFactoryDB.colorTemp[source][mColortemp].nGainGreen + param;
+            FSS_LOGD("nGainGreen: %d, GDRVOffset : %d, CTvalue: %d",
+                      mFactoryDB.colorTemp[source][mColortemp].nGainGreen,
+                      mFactoryDB.whiteBalance[mColortemp].GDRVOffset, CTvalue);
+            break;
+        }
+        case MV_FS_WHITE_BAL_BDRV_OFFSET:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_BLUEGAIN;
+            if(param!=mFactoryDB.whiteBalance[mColortemp].BDRVOffset)
+            {
+                ifStore=true;
+                dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BGAIN;
+                mFactoryDB.whiteBalance[mColortemp].BDRVOffset = param;
+            }
+            CTvalue =
+                mFactoryDB.colorTemp[source][mColortemp].nGainBlue + param;
+            FSS_LOGD("nGainBlue: %d, BDRVOffset : %d, CTvalue: %d",
+                      mFactoryDB.colorTemp[source][mColortemp].nGainBlue,
+                      mFactoryDB.whiteBalance[mColortemp].BDRVOffset, CTvalue);
+            break;
+        }
+        case MV_FS_WHITE_BAL_RCUT_OFFSET:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_REDOFFSET;
+            if(param!=mFactoryDB.whiteBalance[mColortemp].RCUTOffset)
+            {
+                ifStore=true;
+                dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_ROFFSET;
+                mFactoryDB.whiteBalance[mColortemp].RCUTOffset = param;
+            }
+            CTvalue =
+                mFactoryDB.colorTemp[source][mColortemp].nOffsetRed + param;
+            FSS_LOGD("nOffsetRed : %d, RCUTOffset : %d, CTvalue: %d",
+                      mFactoryDB.colorTemp[source][mColortemp].nOffsetRed,
+                      mFactoryDB.whiteBalance[mColortemp].RCUTOffset,CTvalue);
+            break;
+        }
+        case MV_FS_WHITE_BAL_GCUT_OFFSET:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_GREENOFFSET;
+            if(param!=mFactoryDB.whiteBalance[mColortemp].GCUTOffset)
+            {
+                ifStore=true;
+                dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GOFFSET;
+                mFactoryDB.whiteBalance[mColortemp].GCUTOffset = param;
+            }
+            CTvalue =
+                 mFactoryDB.colorTemp[source][mColortemp].nOffsetGreen + param;
+            FSS_LOGD("nOffsetGreen: %d, GCUTOffset: %d, CTvalue: %d",
+                      mFactoryDB.colorTemp[source][mColortemp].nOffsetGreen,
+                      mFactoryDB.whiteBalance[mColortemp].GCUTOffset, CTvalue);
+            break;
+        }
+        case MV_FS_WHITE_BAL_BCUT_OFFSET:
+        {
+            pqCtrlType = MV_PQC_PICTURE_CT_BLUEOFFSET;
+            if(param!=mFactoryDB.whiteBalance[mColortemp].BCUTOffset)
+            {
+                ifStore=true;
+                dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BOFFSET;
+                mFactoryDB.whiteBalance[mColortemp].BCUTOffset = param;
+            }
+            CTvalue =
+                mFactoryDB.colorTemp[source][mColortemp].nOffsetBlue + param;
+            FSS_LOGD("nOffsetBlue: %d, BCUTOffset: %d, CTvalue: %d",
+                      mFactoryDB.colorTemp[source][mColortemp].nOffsetBlue,
+                      mFactoryDB.whiteBalance[mColortemp].BCUTOffset, CTvalue);
+            break;
+        }
+        default:
+        {
+            FSS_LOGD("nType is invalid");
+            return android::INVALID_OPERATION;
+            break;
+        }
+    }
+
+    if (S_OK != MV_PQC_SetPictureProperty(pqCtrlType,
+                            MV_FS_CT_GAIN_PF_DOWN_CONVERSTION*CTvalue))
+    {
+        FSS_LOGD("MV_PQC_SetPictureProperty is failed");
+    }
+    FSS_LOGD("mFactoryDB.modelIndex=%d, coltempmode: %d\n",
+               mFactoryDB.modelIndex, mColortemp);
+
+    if (ifStore)
+    {
+        updateFactoryDatabase(source, dbField);
+    }
+
+    FFS_EXIT();
+!!!11026188.cpp!!!	FactoryService_GetWhiteBalValue(in type : int32_t, inout param : int32_t) : uint32_t
+
+    HRESULT nResult = S_OK;
+    int32_t source = 0;
+
+    FSS_LOGD("Color temp mode : %d \n", mColortemp);
+
+    FSServiceSpec_GetCtSource(&source);
+
+    switch (type) {
+        case MV_FS_WHITE_BAL_RDRV_OFFSET:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_RGAIN);
+            *param = mFactoryDB.whiteBalance[mColortemp].RDRVOffset;
+            FSS_LOGD("Red DRV : %d",
+                mFactoryDB.whiteBalance[mColortemp].RDRVOffset);
+            break;
+        }
+        case MV_FS_WHITE_BAL_GDRV_OFFSET:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GGAIN);
+            *param = mFactoryDB.whiteBalance[mColortemp].GDRVOffset;
+            FSS_LOGD("Green DRV : %d",
+                mFactoryDB.whiteBalance[mColortemp].GDRVOffset);
+            break;
+        }
+        case MV_FS_WHITE_BAL_BDRV_OFFSET:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BGAIN);
+            *param = mFactoryDB.whiteBalance[mColortemp].BDRVOffset;
+            FSS_LOGD("Blue DRV : %d",
+                mFactoryDB.whiteBalance[mColortemp].BDRVOffset);
+            break;
+        }
+        case MV_FS_WHITE_BAL_RCUT_OFFSET:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_ROFFSET);
+            *param = mFactoryDB.whiteBalance[mColortemp].RCUTOffset;
+            FSS_LOGD("Red CUT : %d",
+                mFactoryDB.whiteBalance[mColortemp].RCUTOffset);
+            break;
+        }
+        case MV_FS_WHITE_BAL_GCUT_OFFSET:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GOFFSET);
+            *param = mFactoryDB.whiteBalance[mColortemp].GCUTOffset;
+            FSS_LOGD("Green CUT : %d",
+                mFactoryDB.whiteBalance[mColortemp].GCUTOffset);
+            break;
+        }
+        case MV_FS_WHITE_BAL_BCUT_OFFSET:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BOFFSET);
+            *param = mFactoryDB.whiteBalance[mColortemp].BCUTOffset;
+            FSS_LOGD("Blue CUT : %d",
+                mFactoryDB.whiteBalance[mColortemp].BCUTOffset);
+            break;
+        }
+        default:
+        {
+            FSS_LOGD("nType is invalid");
+            return android::INVALID_OPERATION;
+        }
+    }
+
+    return android::OK;
+!!!11026316.cpp!!!	FactoryService_SetPictureCurve(in type : int32_t, in mode : int32_t, in param : int32_t) : uint32_t
+    int32_t avSrc = 0;
+    TvFactoryProperty curvePonit;
+    TvPictureProperty bcshMode;
+
+    if( (type < MV_FS_CURVE_2D_POINT_0) || (type > MV_FS_CURVE_POINT_MAX) ) {
+        FSS_LOGE("Invalid curve point type!");
+        return android::INVALID_OPERATION;
+    }
+
+    switch(mode){
+        case MV_FS_CURVE_BRIGHTNESS:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_BRIGHTNESS_CurvePhy + type);
+            bcshMode = TV_PICTURE_Brightness;
+            FSS_LOGD("Set Picture Brightness Curve = %d\n", param );
+            break;
+        case MV_FS_CURVE_CONTREST:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_CONTRAST_CurvePhy + type);
+            bcshMode = TV_PICTURE_Contrast;
+            FSS_LOGD("Set Picture Contrast Curve = %d\n", param );
+            break;
+        case MV_FS_CURVE_COLOR:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_SATURATION_CurvePhy + type);
+            bcshMode = TV_PICTURE_Saturation;
+            FSS_LOGD("Set Picture Color Curve = %d\n", param );
+            break;
+        case MV_FS_CURVE_SHARPNESS:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_SHARPNESS_CurvePhy + type);
+            bcshMode = TV_PICTURE_Sharpness;
+            FSS_LOGD("Set Picture Sharpness Curve = %d\n", param );
+            break;
+        case MV_FS_CURVE_BACKLIGHT:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_BACKLIGHT_CurvePhy + type);
+            bcshMode = TV_PICTURE_Backlight;
+            FSS_LOGD("Set Picture Backlight Curve = %d\n", param );
+            break;
+        default:
+            FSS_LOGD("Error Set Picture Curve\n" );
+            return android::INVALID_OPERATION;
+     }
+
+    // Refresh the picture in real time.
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    source_control->setFactoryProperty(avSrc, curvePonit, param );
+    source_control->getVideoProperty(avSrc, bcshMode, &param );
+    source_control->setVideoProperty(avSrc, bcshMode, param );
+
+    return android::OK;
+!!!11026444.cpp!!!	FactoryService_GetPictureCurve(in type : int32_t, in mode : int32_t, inout param : int32_t) : uint32_t
+    int32_t avSrc = 0;
+    TvFactoryProperty curvePonit;
+
+    if( (type < MV_FS_CURVE_2D_POINT_0) || (type > MV_FS_CURVE_POINT_MAX) ) {
+        FSS_LOGE("Invalid curve point type!");
+        return android::INVALID_OPERATION;
+    }
+
+    switch(mode) {
+        case MV_FS_CURVE_BRIGHTNESS:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_BRIGHTNESS_CurvePhy + type);
+            FSS_LOGD("Get Curve type brightness\n" );
+            break;
+        case MV_FS_CURVE_CONTREST:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_CONTRAST_CurvePhy + type);
+            FSS_LOGD("Get Curve type contrast\n" );
+            break;
+        case MV_FS_CURVE_COLOR:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_SATURATION_CurvePhy + type);
+            FSS_LOGD("Get Curve type color\n" );
+            break;
+        case MV_FS_CURVE_SHARPNESS:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_SHARPNESS_CurvePhy + type);
+            FSS_LOGD("Get Curve type sharpness\n" );
+            break;
+        case MV_FS_CURVE_BACKLIGHT:
+            curvePonit = (TvFactoryProperty)(TV_FACTORY_BACKLIGHT_CurvePhy + type);
+            FSS_LOGD("Get Curve type backlight\n" );
+            break;
+        default:
+            FSS_LOGD("Error Get Picture Curve");
+            return android::INVALID_OPERATION;
+     }
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    source_control->getFactoryProperty(avSrc, curvePonit, param );
+    FSS_LOGD("Get Curve type %d value = %d\n", mode, *param );
+
+    return android::OK;
+
+!!!11026572.cpp!!!	FactoryService_SetVolumeCurve(in type : int32_t, in param : int32_t) : uint32_t
+    int32_t avSrc = 0;
+    int32_t curveValue = 0;
+
+    if(param > 0) {
+       curveValue = param;
+    }else {
+       FSS_LOGD("Try to set a wrong volume curve value= %d\n", param );
+       return android::INVALID_OPERATION;
+    }
+
+    if (type >= MV_FS_VOLUME_CURVE_MAX) {
+        FSS_LOGD("Try to set a wrong volume curve type = %d\n", type );
+        return android::INVALID_OPERATION;
+    }
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    switch(type) {
+        case MV_FS_VOLUME_CURVE_0:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_VolumeCurve, curveValue);
+            FSS_LOGD("Set volume curve 0 = %d\n", curveValue );
+            break;
+
+        case MV_FS_VOLUME_CURVE_25:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_VolumeCurve+1, curveValue);
+            FSS_LOGD("Set volume curve 25 = %d\n", curveValue );
+            break;
+
+        case MV_FS_VOLUME_CURVE_50:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_VolumeCurve+2, curveValue);
+            FSS_LOGD("Set volume curve 50 = %d\n", curveValue );
+            break;
+
+        case MV_FS_VOLUME_CURVE_75:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_VolumeCurve+3, curveValue);
+            FSS_LOGD("Set volume curve 75 = %d\n", curveValue );
+            break;
+        case MV_FS_VOLUME_CURVE_100:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_VolumeCurve+4, curveValue);
+            FSS_LOGD("Set volume curve 100 = %d\n", curveValue );
+            break;
+
+        default:
+            FSS_LOGD("Error Set volume curve\n");
+            return android::INVALID_OPERATION;
+    }
+    return android::OK;
+!!!11026700.cpp!!!	FactoryService_GetVolumeCurve(in type : int32_t, inout param : int32_t) : uint32_t
+    int32_t avSrc = 0;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+
+    switch(type) {
+        case MV_FS_VOLUME_CURVE_0:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_VolumeCurve, param);
+            FSS_LOGD("Get volume curve 0 = %d\n", *param );
+            break;
+
+        case MV_FS_VOLUME_CURVE_25:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_VolumeCurve+1, param);
+            FSS_LOGD("Get volume curve 25 = %d\n", *param );
+            break;
+
+        case MV_FS_VOLUME_CURVE_50:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_VolumeCurve+2, param);
+            FSS_LOGD("Get volume curve 50 = %d\n", *param );
+            break;
+
+        case MV_FS_VOLUME_CURVE_75:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_VolumeCurve+3, param);
+            FSS_LOGD("Get volume curve 75 = %d\n", *param );
+            break;
+        case MV_FS_VOLUME_CURVE_100:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_VolumeCurve+4, param);
+            FSS_LOGD("Get volume curve 100 = %d\n", *param );
+            break;
+
+        default:
+            FSS_LOGD("Error Get volume curve\n");
+            return android::INVALID_OPERATION;
+    }
+    return android::OK;
+!!!11026828.cpp!!!	FactoryService_SetSoundEqualizer(in type : int32_t, in param : int32_t) : uint32_t
+    HRESULT nResult = S_OK;
+    int32_t avSrc;
+
+    if((param>12)||(param<-12))
+        return android::INVALID_OPERATION;
+
+    if( type > MV_FS_EQUALIZER_10KHZ )
+        return android::INVALID_OPERATION;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+
+    switch(type) {
+        case MV_FS_EQUALIZER_120HZ:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_Band0, param);
+            FSS_LOGD("Set EQUALIZER_120HZ = %d\n",param );
+            break;
+
+        case MV_FS_EQUALIZER_500HZ:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_Band1, param);
+            FSS_LOGD("Set EQUALIZER_500HZ = %d\n",param );
+            break;
+
+        case MV_FS_EQUALIZER_1500HZ:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_Band2, param);
+            FSS_LOGD("Set EQUALIZER_1500HZ = %d\n",param );
+            break;
+
+        case MV_FS_EQUALIZER_5KHZ:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_Band3, param);
+            FSS_LOGD("Set EQUALIZER_5KHZ = %d\n",param );
+            break;
+        case MV_FS_EQUALIZER_10KHZ:
+            source_control->setAudioProperty(avSrc, TV_AUDIO_Band4, param);
+            FSS_LOGD("Set EQUALIZER_10KHZ = %d\n",param );
+            break;
+
+        default:
+            FSS_LOGD("Error Set EQUALIZER value\n");
+            return android::INVALID_OPERATION;
+    }
+
+    return android::OK;
+!!!11026956.cpp!!!	FactoryService_GetSoundEqualizer(in type : int32_t, inout param : int32_t) : uint32_t
+    HRESULT nResult = S_OK;
+    int32_t avSrc = 0;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+
+    switch(type){
+        case MV_FS_EQUALIZER_120HZ:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_Band0, param);
+            FSS_LOGD("Get EQUALIZER_120HZ = %d\n",*param );
+            break;
+        case MV_FS_EQUALIZER_500HZ:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_Band1, param);
+            FSS_LOGD("Get EQUALIZER_500HZ = %d\n",*param );
+            break;
+        case MV_FS_EQUALIZER_1500HZ:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_Band2, param);
+            FSS_LOGD("Get EQUALIZER_1500HZ = %d\n",*param );
+            break;
+        case MV_FS_EQUALIZER_5KHZ:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_Band3, param);
+            FSS_LOGD("Get EQUALIZER_5kHZ = %d\n",*param );
+            break;
+        case MV_FS_EQUALIZER_10KHZ:
+            source_control->getAudioProperty(avSrc, TV_AUDIO_Band4, param);
+            FSS_LOGD("Get EQUALIZER_10kHZ = %d\n",*param );
+            break;
+        default:
+            FSS_LOGD("Error Get EQUALIZER value\n");
+            return android::INVALID_OPERATION;
+    }
+
+    if((*param>12)||(*param<-12))
+            return android::INVALID_OPERATION;
+
+    return android::OK;
+!!!11027084.cpp!!!	FactoryService_SetVolumePrescale(in param : int32_t) : uint32_t
+    int32_t avSrc = 0;
+    int32_t gain = 0;
+
+    if(param > 0) {
+         gain = (uint32_t)param;
+    } else {
+         FSS_LOGD("Set a wrong volume prescale = %d\n", param );
+         return android::INVALID_OPERATION;
+    }
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    source_control->setAudioProperty(avSrc, TV_AUDIO_SourceGain, gain);
+    FSS_LOGD("Set Volume prescale = %d\n", param );
+
+    return android::OK;
+!!!11027212.cpp!!!	FactoryService_GetVolumePrescale(inout param : int32_t) : uint32_t
+    int32_t avSrc;
+    int32_t gain = 0;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    source_control->getAudioProperty(avSrc, TV_AUDIO_SourceGain, &gain);
+    *param = gain;
+    FSS_LOGD("Get Volume prescale = %d\n", gain );
+
+    return android::OK;
+!!!11027340.cpp!!!	FactoryService_CopyColortempData(in param : int32_t) : uint32_t
+    int32_t current = getSource();
+    int start, end;
+    start = param;
+    end = start+1;
+    if ((param < MV_FS_COLOR_TEMP_TYPE_STANDARD) ||
+        (param >= MV_FS_COLOR_TEMP_TYPE_MAX)) {
+        start = MV_FS_COLOR_TEMP_TYPE_STANDARD;
+        end = MV_FS_COLOR_TEMP_TYPE_MAX;
+    }
+
+    for(int32_t colortemp = start; colortemp<end; colortemp++)
+    {
+        for(int32_t source = MV_FS_FIRST_INPUT;
+            source < MV_FS_MAX_INPUT_SRC;
+            source++)
+        {
+            if(current == source) continue;
+            memcpy(&(mFactoryDB.colorTemp[source][colortemp]),
+                   &(mFactoryDB.colorTemp[current][colortemp]),
+                   sizeof(MV_COLOR_TEMP));
+            for(int32_t dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN;
+                dbField < MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET + 1;
+                dbField++)
+            {
+                updateFactoryDatabase(source, dbField);
+            }
+        }
+    }
+    return android::OK;
+!!!11027468.cpp!!!	FactoryService_SetFullWhitePattern(in param : int32_t) : uint32_t
+    int32_t Currentsource = 0;
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &Currentsource, false);
+
+    if (param)
+    {
+        source_control->getVideoProperty(Currentsource,
+                                         TV_PICTURE_Contrast,
+                                         &mCurrContrast);
+        source_control->getVideoProperty(Currentsource,
+                                         TV_PICTURE_Brightness,
+                                         &mCurrBrightness);
+        source_control->getVideoProperty(Currentsource,
+                                         TV_PICTURE_Backlight,
+                                         &mCurrBacklight);
+
+        source_control->setVideoProperty(Currentsource,
+                                         TV_PICTURE_Contrast,
+                                         FS_PIC_CONTRAST_MAX);
+        source_control->setVideoProperty(Currentsource,
+                                         TV_PICTURE_Brightness,
+                                         FS_PIC_BRIGHTNESS_MAX);
+        source_control->setVideoProperty(Currentsource,
+                                         TV_PICTURE_Backlight,
+                                         FS_PIC_BACKLIGHT_MAX);
+
+    }
+    else
+    {
+        source_control->setVideoProperty(Currentsource,
+                                         TV_PICTURE_Contrast,
+                                         mCurrContrast);
+        source_control->setVideoProperty(Currentsource,
+                                         TV_PICTURE_Brightness,
+                                         mCurrBrightness);
+        source_control->setVideoProperty(Currentsource,
+                                         TV_PICTURE_Backlight,
+                                         mCurrBacklight);
+
+        if( setTestPattern(MV_PQC_COLOR_PATTERN_OFF, 0) != S_OK)
+        {
+            FSS_LOGD("Set Test Pattern failed\n" );
+           return android::INVALID_OPERATION;
+        }
+    }
+    muteVideo(false);
+
+    return android::OK;
+!!!11027596.cpp!!!	FactoryService_SetTestPattern(in type : int32_t, in value : int32_t) : uint32_t
+    FFS_ENTER();
+
+    setTestPattern(type, value);
+
+    FFS_EXIT();
+!!!11027724.cpp!!!	FactoryService_SetNetMacAddr(in port : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+    char mac[64];
+    memcpy(mac, param.string(),6);
+    FSS_LOGD("%x:%x:%x:%x:%x:%x",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    nResult = setNetMacAddr( mac, port );
+    FFS_EXIT();
+!!!11027852.cpp!!!	FactoryService_GetNetMacAddr(in port : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+    char mac[64];
+    nResult = getNetMacAddr( mac, port );
+    FSS_LOGD("%x:%x:%x:%x:%x:%x",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    param.setTo(mac, 6);
+    FFS_EXIT();
+!!!11027980.cpp!!!	FactoryService_SetNetIpAddr(in port : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+    char ip[128];
+    memset(ip,'\0',128);
+    strcpy(ip, param.string());
+    FSS_LOGD("ip:%s",ip);
+    nResult = setNetIpAddr( ip, port );
+    FFS_EXIT();
+!!!11028108.cpp!!!	FactoryService_GetNetIpAddr(in port : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+    char ip[128];
+
+    nResult = getNetIpAddr( ip, port );
+    if (( ip[0] < '0' ) || ( ip[0] > '9' ))
+        strcpy(ip,"0.0.0.0");
+
+    FSS_LOGD("ip:%s",ip);
+    param = ip;
+
+    FFS_EXIT();
+!!!11028236.cpp!!!	FactoryService_DoNetPing(in times : int32_t, inout dest : String8, inout ssid : String8, inout result : int32_t) : uint32_t
+    FFS_ENTER();
+    char szDest[128],szSsid[128];
+
+    strcpy(szDest, dest.string());
+    strcpy(szSsid, ssid.string());
+    if(strcmp("(null)", szSsid)==0)
+        nResult = MV_FMISL_DoNetPing(times, szDest, NULL, result);
+    else
+        nResult = MV_FMISL_DoNetPing(times, szDest, szSsid, result);
+
+    FFS_EXIT();
+!!!11028364.cpp!!!	FactoryService_DoRebootRecovery() : uint32_t
+    //do reboot recovery
+    system("reboot recovery");
+
+    return android::OK;
+!!!11028492.cpp!!!	FactoryService_DoReboot(in param : int32_t) : uint32_t
+    if( param == MV_FS_REBOOT )
+    {
+        system("sync");
+        usleep(100000); //wait 100ms
+        system("reboot");
+        FSS_LOGD( "System Reboot...\n");
+    }
+    else if ( param == MV_FS_MASTER_CLEAR )
+    {
+        char intent[256] = {0};
+
+        ENABLE_ADB()
+        sprintf(intent, "am broadcast -a android.intent.action.MASTER_CLEAR" );
+        system(intent);
+        FSS_LOGD( "Do MasterClaer, send AM command %s \n", intent);
+        DISABLE_ADB()
+    }
+    else
+    {
+        FSS_LOGD( "Reboot skipped\n");
+        return android::OK;
+    }
+
+    return android::OK;
+!!!11028620.cpp!!!	FactoryService_DoResetCommon(in resetType : MV_FS_CTRL_Type_t) : uint32_t
+    FFS_ENTER();
+
+    char fsChannelDb[50] = { '\0' };
+    int cur_source = 0;
+    char intent[256] = {0};
+    int param = 50;
+    int major = 0, minor = 0;
+
+    //reset AVSetting AQ/PQ setting
+    int32_t Currentsource;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &Currentsource, false);
+    if (MV_FS_CTRL_RESET_FACTORY == resetType) {
+        source_control->setFactoryProperty(Currentsource, TV_FACTORY_Reset, MV_FS_RESET_ALL);
+    } else if (MV_FS_CTRL_RESET_USER == resetType) {
+        source_control->setFactoryProperty(Currentsource, TV_FACTORY_Reset, MV_FS_RESET_USER);
+    }
+
+    //set burning mode to off
+    if (FactoryService_SetAgingMode( 0 ) != S_OK )
+    {
+        FSS_LOGD("Error: set aging mode failed !!!!\n");
+        nResult = E_FAIL;
+    }
+
+    //set audio language to English
+    FactoryService_SetAudioLanguage(MV_FS_AUDIO_LANGUAGE_ENGLISH);
+
+    //set MTS(SAP) to STEREO
+    FactoryService_SetChannelMtsMode(MV_FS_ANALOG_AUDIO_STEREO);
+
+#ifdef FS_ATSC_ENABLE
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return android::INVALID_OPERATION;
+    }
+
+    //Stop all working module to avoid data/status race case
+    mUSDTVService->usdtvMasterReset();
+
+    //reset CC
+    mUSDTVService->usdtvResetCaptionSettings();
+
+    //reset rating and parental control data
+    mUSDTVService->usdtvResetParentalLockSettings();
+    mUSDTVService->usdtvResetServiceLock();
+
+    //change source to ATV
+    setSource(MV_FS_TV_INPUT);
+
+    //clean channel list
+    mUSDTVService->usdtvTunerCleanChannelList();
+
+    //Do preset ATV
+    //FactoryService_SetATVChannelPreset();
+
+    //set channel to 2
+    sp < USDTVPresetService> mUSDTVPresetServiceData = new USDTVPresetService();
+    mUSDTVPresetServiceData->mMajorNum = 0xFFFF;
+    mUSDTVPresetServiceData->mMinorNum = 2;
+    mUSDTVPresetServiceData->mDBType = 0;
+    mUSDTVService->usdtvPresetService(mUSDTVPresetServiceData);
+
+    major = 2;
+    minor = 0;
+    FactoryService_SetChannel(major, minor);
+
+    //reset tuner mode to antenna
+    FactoryService_SetSignalType(MV_FS_SIGTYPE_ANTENNA);
+#endif
+
+    FFS_EXIT();
+!!!11028748.cpp!!!	FactoryService_DoResetFactory() : uint32_t
+    FFS_ENTER();
+
+    //remove factory version file and model index file
+    FactoryService_SetModelIndex(FSSERVICE_DEFUALT_MODELINDEX, false);
+
+    //if application set the default model index,
+    //use the application-set default model index as the default model index
+    if( access( FSSERVICE_DEFUALT_MODELINDEX_FILE, F_OK ) == 0 )
+    {
+        char cmd[256] = { '\0' };
+
+        sprintf(cmd, "cp %s %s", FSSERVICE_DEFUALT_MODELINDEX_FILE,
+                                 FSSERVICE_MODELINDEX_FILE);
+        system( cmd );
+    }
+
+    //reset color temp mode
+    FactoryService_CtrlSet(MV_FS_CTRL_VIDEO_PROPERTY,
+                           MV_FS_VIDEO_COLOR_TEMPERATURE_USER,
+                           MV_FS_COLOR_TEMP_TYPE_STANDARD);
+
+    FactoryService_CtrlSet(MV_FS_CTRL_VIDEO_PROPERTY,
+                           MV_FS_VIDEO_COLOR_TEMPERATURE,
+                           MV_FS_COLOR_TEMP_TYPE_STANDARD);
+
+    //set power mode to 1
+    FactoryService_SetPowerMode(1);
+
+    //reset common settings
+    FactoryService_DoResetCommon(MV_FS_CTRL_RESET_FACTORY);
+
+    ENABLE_ADB()
+    //switch souce to DTV
+    system("am startservice -a \
+            com.google.tv.mediadevices.SET_DEFAULT_DEVICE_SERVICE \
+            -e device_id TUNER");
+    DISABLE_ADB()
+
+    FFS_EXIT();
+!!!11028876.cpp!!!	FactoryService_DoResetUser() : uint32_t
+    FFS_ENTER();
+
+    //set reset ongoing
+    mFactoryDB.resetOngoing = 0;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_RESET_ONGOING);
+
+    //reset factory setting
+    mFactoryDB.soundSrsOnOff = 0;
+    FactoryService_SetToFactoryMode(0);
+    FactoryService_SetSoundHardBypass(0);
+    FactoryService_SetPowerMode(0);
+
+    //reset SSP setting
+    FactoryService_SetSSCOnOff(MV_FMISL_SSC_ENABLE);
+    FactoryService_SetSSCFreq(50);
+    FactoryService_SetSSCAmp(5.0);
+
+    //reset common settings
+    FactoryService_DoResetCommon(MV_FS_CTRL_RESET_USER);
+
+    //reset user finished
+    mFactoryDB.resetOngoing = 0;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_RESET_ONGOING);
+    ENABLE_ADB()
+
+    FactoryService_SetFactoryStatus(0);
+
+    //switch source to DTV
+    system("am startservice -a \
+            com.google.tv.mediadevices.SET_DEFAULT_DEVICE_SERVICE \
+            -e device_id TUNER");
+    DISABLE_ADB()
+
+    FFS_EXIT();
+!!!11029004.cpp!!!	FactoryService_SetChannelPreset(in type : int32_t, in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    switch( type )
+    {
+        case MV_FS_DTV_US_PRESET_CHANNEL:
+            FactoryService_SetDTVChannelPreset(param);
+            break;
+
+        case MV_FS_ATV_US_PRESET_CHANNEL:
+            FactoryService_SetATVChannelPreset();
+            break;
+
+        case MV_FS_FACTORY_PRESET_CHANNEL:
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11029132.cpp!!!	FactoryService_GetChannelPreset(inout param : int32_t) : uint32_t
+    *param = mFactoryDB.factoryId;
+    return android::OK;
+!!!11029260.cpp!!!	FactoryService_SetATVChannelPreset() : uint32_t
+    uint32_t res;
+
+    FSS_LOGD("FactoryService_SetATVChannelPreset start!");
+#ifdef FS_ATSC_ENABLE
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    res = mUSDTVService->usdtvPresetAllNTSCChan();
+
+    if(res == USDTV_SUCCESS)
+    {
+        FSS_LOGD("Set ATV Channel preset successfully");
+    }
+    else
+    {
+        FSS_LOGD("Set ATV Channel preset failed");
+    }
+#endif
+    return android::OK;
+!!!11029388.cpp!!!	FactoryService_SetDTVChannelPreset(in param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t currentSource;
+    int32_t digitalModType = 0;
+    int32_t analogModType = 1<<5;
+    uint32_t analogInput = 0;
+    uint32_t digitalInput = 0;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    FSS_LOGD("Manual scan flag is %d", mFactoryScanListener->manualScanFlag);
+    if(mFactoryScanListener->manualScanFlag)
+    {
+        //add a scan timeout here to avoid if there is no respond in usdtv
+        //service and cause the manual scan flag can't be reset.
+        time_t scanSeconds = 0;
+        int scanInterval = 0;
+        scanSeconds = time((time_t *)NULL);
+        scanInterval = scanSeconds - startSeconds;
+        FSS_LOGD("scan interval %d, scan seconds %ld, start seconds %ld",
+                  scanInterval, scanSeconds, startSeconds );
+        if( scanInterval < 15)
+        {
+            FSS_LOGD("Manual Channel is busy, ignore this calling...");
+            return android::INVALID_OPERATION;
+        }
+        else
+        {
+            mFactoryScanListener->manualScanFlag = 0;
+            startSeconds = 0;
+            FSS_LOGD("Manual Channel wait timeout, reset manual scan flag");
+        }
+    }
+
+    // get current modulation cable or antenna
+    currentSource = mUSDTVService->usdtvGetCurrentSource();
+    FSS_LOGD("Current channel source is=%d", currentSource);
+
+    if((currentSource==MV_FS_USDTV_ANALOG_CABLE_INPUT ||
+        currentSource==MV_FS_USDTV_CABLE_INPUT))
+    {
+        digitalInput = MV_FS_USDTV_CABLE_INPUT;
+        analogInput = MV_FS_USDTV_ANALOG_CABLE_INPUT;
+        digitalModType = 1<<10;  //64QAM
+        FSS_LOGD("Channel type is CABLE, Modulation Type = %d", digitalModType);
+    }
+    else if((currentSource==MV_FS_USDTV_ANALOG_ATSC_INPUT ||
+             currentSource==MV_FS_USDTV_ATSC_INPUT))
+    {
+        digitalInput = MV_FS_USDTV_ATSC_INPUT;
+        analogInput = MV_FS_USDTV_ANALOG_ATSC_INPUT;
+        digitalModType = 1<<6;  //8VSB
+        FSS_LOGD("Channel type is Antenna, Modulation Type = %d",
+                  digitalModType);
+    }
+    else // return if it is not TV input
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    uint32_t freqDigital =
+        mUSDTVService->usdtvGetFreqByPhyChannelNumber(digitalModType, param);
+    uint32_t freqAnalog =
+        mUSDTVService->usdtvGetFreqByPhyChannelNumber(analogModType, param);
+
+    uint32_t favGroupAll = 1<<12;
+    if(mUSDTVService->usdtvGetNumServices(favGroupAll, freqDigital) > 0)
+    {
+        // It should tune to the first channel of that freq,
+        // however no easy way to know the channel number now,
+        // so we do the digital scan
+        mUSDTVService->usdtvStartChannelScan(0,  // MANUAL_SEARCH
+                                             2,  // SEARCH_DIGITAL
+                                             freqDigital,
+                                             0,
+                                             digitalInput,
+                                             NULL,
+                                             false);
+        FSS_LOGD("Do digital scan, frequency is %d", freqDigital);
+    }
+    else
+    {
+        mFactoryScanListener->freqDigital = freqDigital;
+        mFactoryScanListener->digitalInput = digitalInput;
+        mFactoryScanListener->manualScanFlag++;
+        startSeconds = time((time_t *)NULL);
+
+        mUSDTVService->usdtvStartChannelScan(0,  // MANUAL_SEARCH
+                                             1,  // SEARCH_ANALOG
+                                             freqAnalog,// start freq
+                                             0, //end freq
+                                             analogInput,
+                                             mFactoryScanListener,
+                                             false);
+        FSS_LOGD("Do analog/digital scan, first scan analog, then digital");
+        FSS_LOGD("Digital Scan Frequency is %d MHz, \
+                  Analog Scan Frequency is %d MHz", freqDigital, freqAnalog);
+    }
+#endif
+    return android::OK;
+!!!11029516.cpp!!!	FactoryService_GetChannelType(inout param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t currentSource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    currentSource = mUSDTVService->usdtvGetCurrentSource();
+
+    FSS_LOGD("Current channel source is=%d", currentSource);
+
+    if (currentSource == MV_FS_USDTV_ATSC_INPUT ||
+        currentSource == MV_FS_USDTV_CABLE_INPUT)
+    {
+        *param = MV_FS_CHTYPE_DIGITAL;
+        FSS_LOGD("Current channel type is DIGITAL channel");
+    }
+    else if (currentSource == MV_FS_USDTV_ANALOG_ATSC_INPUT ||
+        currentSource == MV_FS_USDTV_ANALOG_CABLE_INPUT)
+    {
+        *param = MV_FS_CHTYPE_ANALOG;
+        FSS_LOGD("Current channel type is ANALOG channel");
+    }
+    else
+        return android::INVALID_OPERATION;
+#endif
+    return android::OK;
+!!!11029644.cpp!!!	FactoryService_GetSignalType(inout param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t currentSource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    currentSource = mUSDTVService->usdtvGetCurrentSource();
+    FSS_LOGD("Current channel source is=%d", currentSource);
+
+    if (currentSource == MV_FS_USDTV_ATSC_INPUT ||
+        currentSource == MV_FS_USDTV_ANALOG_ATSC_INPUT)
+    {
+        *param = MV_FS_SIGTYPE_ANTENNA;
+        FSS_LOGD("Current signal type is ANTENNA signal");
+    }
+    else if (currentSource == MV_FS_USDTV_CABLE_INPUT ||
+        currentSource == MV_FS_USDTV_ANALOG_CABLE_INPUT)
+    {
+        *param = MV_FS_SIGTYPE_CABLE;
+        FSS_LOGD("Current signal type is CABLE signal");
+    }
+    else
+        return android::INVALID_OPERATION;
+#endif
+    return android::OK;
+!!!11029772.cpp!!!	FactoryService_SetSignalType(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+#ifdef FS_ATSC_ENABLE
+    int32_t currentSource;
+
+    mFactoryDB.signalType = param;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    if(param == MV_FS_SIGTYPE_ANTENNA)
+    {
+        mUSDTVService->usdtvSetTunerMode(MV_FS_USDTV_ATSC_INPUT);
+    }
+    else if(param == MV_FS_SIGTYPE_CABLE)
+    {
+        mUSDTVService->usdtvSetTunerMode(MV_FS_USDTV_CABLE_INPUT);
+    }
+    else
+        return android::INVALID_OPERATION;
+
+    FSS_LOGD("SET SIGNAL TYPE IS:%d", mFactoryDB.signalType);
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_SIGNAL_TYPE);
+#endif
+    FFS_EXIT();
+!!!11029900.cpp!!!	FactoryService_DoChannelUpDown(in param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t currentSource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    currentSource = mUSDTVService->usdtvGetCurrentSource();
+    FSS_LOGD("Current source is=%d", currentSource);
+    if(currentSource > 3 ) // return if it is not TV input
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    if ( param )
+    {
+        mUSDTVService->usdtvChannelNavigate(0);
+        FSS_LOGD("Do Channel UP OK!");
+    }
+    else
+    {
+        mUSDTVService->usdtvChannelNavigate(1);
+        FSS_LOGD("Do Channel Down OK!");
+    }
+#endif
+    return android::OK;
+!!!11030028.cpp!!!	FactoryService_SetChannel(in major : int32_t, in minor : int32_t) : int32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    if(minor==0)
+    {
+        minor = major;
+        major = 0xffff;
+    }
+
+    FSS_LOGD("Switch to channel %d-%d", major, minor);
+    uint32_t res = mUSDTVService->usdtvChannelChange(false,
+                                                    (uint32_t)major,
+                                                    (uint32_t)minor,
+                                                    NULL);
+    if(res == USDTV_SUCCESS)
+        return android::OK;
+    else
+        return android::INVALID_OPERATION;
+#endif
+    return android::OK;
+!!!11030156.cpp!!!	FactoryService_GetChannel(inout param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    uint32_t major = 0, minor = 0;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    const sp<USDTVServiceId> serviceId = new USDTVServiceId();
+    sp<USDTVServiceData> service_info = new USDTVServiceData();
+    uint32_t res = mUSDTVService->usdtvGetServiceDetails (
+                                    (int32_t)USDTV_CURRENT_SERVICE,
+                                    (uint32_t)1<<12, serviceId,
+                                    (void *)&service_info);
+
+    if(res == USDTV_SUCCESS)
+    {
+        if((uint32_t)service_info->mMajorNum==0xffff)
+        {
+            major = (uint32_t)service_info->mMinorNum;
+            minor = 0;
+        }
+        else
+        {
+            major = (uint32_t)service_info->mMajorNum;
+            minor = (uint32_t)service_info->mMinorNum;
+        }
+        FSS_LOGD("Get channel %d-%d", major,minor);
+        *param =
+            (((uint32_t)major << 16) & 0xFFFF0000) | ((uint32_t)minor & 0xFFFF);
+        FSS_LOGD("Return channel value %d", *param);
+        return android::OK;
+    }
+    else
+        return android::INVALID_OPERATION;
+#endif
+    return android::OK;
+!!!11030284.cpp!!!	FactoryService_SetChannelDemodType(in param : int32_t) : uint32_t
+    return android::OK;
+!!!11030412.cpp!!!	FactoryService_StartChannelAutoScan() : uint32_t
+    FFS_ENTER();
+#ifdef FS_ATSC_ENABLE
+    char intent[256] = {0};
+
+    ENABLE_ADB()
+    sprintf(intent, "am broadcast -a com.marvell.tvsettingfreud.AUTOSCAN" );
+    system(intent);
+    DISABLE_ADB()
+#endif
+    FFS_EXIT();
+!!!11030540.cpp!!!	FactoryService_DoADCCalibration() : uint32_t
+    FFS_ENTER();
+
+    int nInputSource;
+    int i = 0, j = 0;
+    int nInvalidPattern = 0;
+
+    MV_PQC_ADC_CALIB_DATA calibData;
+    SETZERO (calibData);
+    calibData.xSamples = MV_ADC_CALIBRATION_X_SAMPLE;
+    calibData.ySamples = MV_ADC_CALIBRATION_Y_SAMPLE;
+
+    nInputSource = getSource();
+
+    //reset ADC calibration result
+    calibData.gain[0] = 1;
+    calibData.gain[1] = 1;
+    calibData.gain[2] = 1;
+    calibData.offset[0] = 0;
+    calibData.offset[1] = 0;
+    calibData.offset[2] = 0;
+    mFactoryDB.mv_input_source[nInputSource].adc.nGainRed =
+                calibData.gain[0]*MV_FS_ADC_GAIN_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nGainGreen =
+                calibData.gain[1]*MV_FS_ADC_GAIN_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nGainBlue =
+                calibData.gain[2]*MV_FS_ADC_GAIN_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nOffsetRed =
+                calibData.offset[0]*MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nOffsetGreen =
+                calibData.offset[1]*MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nOffsetBlue =
+                calibData.offset[2]*MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION;
+
+    mFactoryDB.mv_input_source[nInputSource].bADCDone = 0;
+    MV_PQC_SetADCGainOffset(&calibData);
+    for(i = MV_FS_DB_FIELD_IDX_ADC_DB_STATUS;
+        i < MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET + 1;
+        i++)
+    {
+        nResult = updateFactoryDatabase(nInputSource, i);
+    }
+    usleep(200000); //0.2s
+
+    if (MV_PQC_ADCCalibration(&calibData) != 0)
+    {
+        FSS_LOGE("MV_PQC_ADCCalibration failed");
+        return android::INVALID_OPERATION;
+    }
+
+    for(i = 0; i < 3; i++)
+    {
+        for(j = 0; j < 3; j++)
+        {
+            int diff = abs(calibData.readValues[i][j],
+                       calibData.expectedValues[i][j]) *
+                       200/(calibData.readValues[i][j] +
+                       calibData.expectedValues[i][j]);
+            if(diff > FSSERVICE_ADC_INVALID_PATTER_DIFF_THRESHOLD && (i != j)){
+                nInvalidPattern = TRUE;
+            }
+            FSS_LOGD("readValue[%d][%d]=%d\n",
+                        i,j,calibData.readValues[i][j]);
+            FSS_LOGD("expectValue[%d][%d]=%d\n",
+                        i,j,calibData.expectedValues[i][j]);
+            FSS_LOGD("DIFF = %d\n",diff);
+        }
+    }
+
+    FSS_LOGD("nGainRed=%f,nGainGreen=%f,nGainBlue=%f,\
+              nOffsetRed=%f,nOffsetGreen=%f,nOffsetBlue=%f\n",
+             (float) calibData.gain[0],(float) calibData.gain[1],
+             (float) calibData.gain[2],(float) calibData.offset[0],
+             (float) calibData.offset[1],(float) calibData.offset[2]);
+
+    if(nInvalidPattern){
+        FSS_LOGE("ADC INVALID PATTERN\n");
+        return android::INVALID_OPERATION;
+    }
+
+    if (MV_PQC_SetADCGainOffset(&calibData) != 0)
+    {
+        FSS_LOGD("MV_PQC_SetADCGainOffset failed");
+//        return android::INVALID_OPERATION;
+    }
+
+    //Now store calibrates values for this source into factory DB
+    mFactoryDB.mv_input_source[nInputSource].adc.nGainRed =
+                calibData.gain[0]*MV_FS_ADC_GAIN_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nGainGreen =
+                calibData.gain[1]*MV_FS_ADC_GAIN_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nGainBlue =
+                calibData.gain[2]*MV_FS_ADC_GAIN_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nOffsetRed =
+                calibData.offset[0]*MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nOffsetGreen =
+                calibData.offset[1]*MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION;
+    mFactoryDB.mv_input_source[nInputSource].adc.nOffsetBlue =
+                calibData.offset[2]*MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION;
+
+    //Update ADC status, and will store gain/offset in database.
+    mFactoryDB.mv_input_source[nInputSource].bADCDone = 1;
+    for(i = MV_FS_DB_FIELD_IDX_ADC_DB_STATUS;
+        i < MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET + 1;
+        i++)
+    {
+        nResult = updateFactoryDatabase(nInputSource, i);
+    }
+
+    FFS_EXIT();
+!!!11030668.cpp!!!	FactoryService_GetADCStatus(inout param : int32_t) : uint32_t
+    int nInputSource;
+    nInputSource = getSource();
+    getFactoryDatabase(nInputSource, MV_FS_DB_FIELD_IDX_ADC_DB_STATUS);
+
+    *param = mFactoryDB.mv_input_source[nInputSource].bADCDone;
+
+    FSS_LOGD("Current ADC status=%d,source=%d\n",*param,nInputSource);
+
+    return android::OK;
+!!!11030796.cpp!!!	FactoryService_CleanADCStatus() : uint32_t
+    FFS_ENTER();
+    int nInputSource;
+    nInputSource = getSource();
+
+    mFactoryDB.mv_input_source[nInputSource].bADCDone = 0;
+
+    FSS_LOGD("Clean source=%d ADC status\n",nInputSource);
+
+    nResult = updateFactoryDatabase(nInputSource, MV_FS_DB_FIELD_IDX_ADC_DB_STATUS);
+    FFS_EXIT();
+!!!11030924.cpp!!!	FactoryService_SetADCData(in source : int32_t, in type : int32_t, in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    MV_PQC_ADC_CALIB_DATA calibData;
+
+    if ((source != MV_FS_COMPONENT_INPUT) &&
+        (source != MV_FS_VGA_INPUT))
+    {
+        FSS_LOGD("invalid argument nInputSource=%d", source);
+        return MV_INVALID_PARAMETER;
+    }
+
+    /* check the input parameters - for gain the range is 0~2000 */
+    if ((type == MV_FS_ADC_GAIN_RED) ||
+        (type == MV_FS_ADC_GAIN_GREEN) ||
+        (type == MV_FS_ADC_GAIN_BLUE)) {
+        if ((param < MV_MIN_ADC_GAIN_VALUE || param > MV_MAX_ADC_GAIN_VALUE)) {
+            FSS_LOGD("invalid gain value ..Range is 0 ~200 ");
+            return MV_INVALID_PARAMETER;
+        }
+    }
+
+    /* check the input parameters - for offset the range is -10000 to 10000 */
+    if ((type == MV_FS_ADC_OFFSET_RED) ||
+        (type == MV_FS_ADC_OFFSET_GREEN) ||
+        (type == MV_FS_ADC_OFFSET_BLUE)) {
+        if ((param < MV_MIN_ADC_OFFSET_VALUE ||
+            param > MV_MAX_ADC_OFFSET_VALUE))
+        {
+            FSS_LOGD("invalid gain value ..Range is -100 ~ 100");
+            return MV_INVALID_PARAMETER;
+        }
+    }
+
+    switch (type) {
+        case MV_FS_ADC_GAIN_RED:
+            mFactoryDB.mv_input_source[source].adc.nGainRed = param;
+            nResult = updateFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_RGAIN);
+            break;
+        case MV_FS_ADC_GAIN_GREEN:
+            mFactoryDB.mv_input_source[source].adc.nGainGreen = param;
+            nResult = updateFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_GGAIN);
+            break;
+        case MV_FS_ADC_GAIN_BLUE:
+            mFactoryDB.mv_input_source[source].adc.nGainBlue = param;
+            nResult = updateFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_BGAIN);
+            break;
+        case MV_FS_ADC_OFFSET_RED:
+            mFactoryDB.mv_input_source[source].adc.nOffsetRed = param;
+            nResult = updateFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_ROFFSET);
+            break;
+        case MV_FS_ADC_OFFSET_GREEN:
+            mFactoryDB.mv_input_source[source].adc.nOffsetGreen = param;
+            nResult = updateFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_GOFFSET);
+            break;
+        case MV_FS_ADC_OFFSET_BLUE:
+            mFactoryDB.mv_input_source[source].adc.nOffsetBlue = param;
+            nResult = updateFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET);
+            break;
+        default:
+            FSS_LOGD("invalid nType=%d", type);
+            return android::INVALID_OPERATION;
+    }
+    FSS_LOGD("Set source=%d, adc type=%d, data=%d\n", source, type, param);
+
+    calibData.gain[0] =
+        (float) (mFactoryDB.mv_input_source[source].adc.nGainRed /
+            MV_FS_ADC_GAIN_PF_DOWN_CONVERSION);
+    calibData.gain[1] =
+        (float) (mFactoryDB.mv_input_source[source].adc.nGainGreen /
+            MV_FS_ADC_GAIN_PF_DOWN_CONVERSION);
+    calibData.gain[2] =
+        (float) (mFactoryDB.mv_input_source[source].adc.nGainBlue /
+            MV_FS_ADC_GAIN_PF_DOWN_CONVERSION);
+    calibData.offset[0] =
+        (float) (mFactoryDB.mv_input_source[source].adc.nOffsetRed/
+        MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION);
+    calibData.offset[1] =
+        (float) (mFactoryDB.mv_input_source[source].adc.nOffsetGreen/
+        MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION);
+    calibData.offset[2] =
+        (float) (mFactoryDB.mv_input_source[source].adc.nOffsetBlue/
+        MV_FS_ADC_OFFSET_PF_DOWN_CONVERSION);
+
+    FSS_LOGE("adc calibration data: %f, %f, %f, %f, %f, %f",
+        calibData.gain[0], calibData.gain[1], calibData.gain[2],
+        calibData.offset[0], calibData.offset[1], calibData.offset[2]);
+
+    if (MV_PQC_SetADCGainOffset(&calibData) != S_OK) {
+        FSS_LOGE("MV_PQC_SetADCGainOffset failed");
+        return android::INVALID_OPERATION;
+    }
+
+    FFS_EXIT();
+!!!11031052.cpp!!!	FactoryService_GetADCData(in source : int32_t, in type : int32_t, inout param : int32_t) : uint32_t
+    if ((source < MV_FS_TV_INPUT) && (source >= MV_FS_MAX_INPUT_SRC))
+    {
+        FSS_LOGD("invalid argument nInputSource=%d", source);
+        return android::INVALID_OPERATION;
+    }
+
+    switch (type) {
+        case MV_FS_ADC_GAIN_RED:
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_RGAIN);
+            *param = mFactoryDB.mv_input_source[source].adc.nGainRed;
+            break;
+        case MV_FS_ADC_GAIN_GREEN:
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_GGAIN);
+            *param = mFactoryDB.mv_input_source[source].adc.nGainGreen;
+            break;
+        case MV_FS_ADC_GAIN_BLUE:
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_BGAIN);
+            *param = mFactoryDB.mv_input_source[source].adc.nGainBlue;
+            break;
+        case MV_FS_ADC_OFFSET_RED:
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_ROFFSET);
+            *param = mFactoryDB.mv_input_source[source].adc.nOffsetRed;
+            break;
+        case MV_FS_ADC_OFFSET_GREEN:
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_GOFFSET);
+            *param = mFactoryDB.mv_input_source[source].adc.nOffsetGreen;
+            break;
+        case MV_FS_ADC_OFFSET_BLUE:
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET);
+            *param = mFactoryDB.mv_input_source[source].adc.nOffsetBlue;
+            break;
+        default:
+            FSS_LOGD("invalid nType=%d", type);
+            return android::INVALID_OPERATION;
+    }
+
+    FSS_LOGD("InputSource [%d], Type [%d], Value [%d]", source, type, *param);
+    return android::OK;
+!!!11031180.cpp!!!	FactoryService_DoVgaAutoAdjust() : uint32_t
+    int32_t avSrc = 0;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    source_control->setVideoProperty(avSrc, TV_PICTURE_AutoAjust, 1 );
+    return android::OK;
+!!!11031308.cpp!!!	FactoryService_GetVersion(in type : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+    char ver[256];
+    FSS_LOGD("FactoryService_GetVersion start");
+    memset (ver, 0, sizeof(ver));
+    nResult = MV_FMISL_GetVersion( (MV_FmislVertion_t)type, ver );
+    FSS_LOGD("FactoryService_GetVersion end");
+    param = ver;
+    FFS_EXIT();
+!!!11031436.cpp!!!	FactoryService_GetSystemRunningTime(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+    nResult = MV_FMISL_GetSystemRunningTime( param );
+    FFS_EXIT();
+!!!11031564.cpp!!!	FactoryService_GetBacklightRunningTime(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+    nResult = MV_FMISL_GetBacklightRunningTime( param );
+    FFS_EXIT();
+!!!11031692.cpp!!!	FactoryService_SetAgingMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    if ((param != MV_FS_AGING_ON) && (param != MV_FS_AGING_OFF))
+    {
+        FSS_LOGE ("Invalid mode=%d", param);
+        return android::INVALID_OPERATION;
+    }
+
+    mFactoryDB.bAgingMode = param;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_AGING_MODE);
+    FSS_LOGD("Set aging mode = %d\n",param);
+
+    FFS_EXIT();
+!!!11031820.cpp!!!	FactoryService_GetAgingMode(inout param : int32_t) : uint32_t
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_AGING_MODE);
+
+    *param = mFactoryDB.bAgingMode;
+    FSS_LOGD("Get aging mode = %d\n", *param);
+    return android::OK;
+!!!11031948.cpp!!!	FactoryService_SetAgingTimer(in param : int32_t) : uint32_t
+    setAgingTimer(param);
+    return android::OK;
+!!!11032076.cpp!!!	FactoryService_GetAgingTimer(inout param : int32_t) : uint32_t
+    getAgingTimer(param);
+    return android::OK;
+!!!11032204.cpp!!!	FactoryService_SetHDCPKey(inout param : String8) : uint32_t
+    return android::OK;
+!!!11032332.cpp!!!	FactoryService_GetHDCPKey(inout param : String8) : uint32_t
+    FFS_ENTER();
+    int i = 0;
+    int facSrc = 0;
+    int hmdiSrc = 0;
+    char hdcp[256];
+
+    facSrc= getSource();
+    if ((facSrc < MV_FS_HDMI1_INPUT) || (facSrc > MV_FS_HDMI4_INPUT))
+    {
+        return android::INVALID_OPERATION;
+    }
+
+    hmdiSrc = facSrc - MV_FS_HDMI1_INPUT + 1;
+
+    memset (hdcp, 0, sizeof(hdcp));
+    nResult = MV_FMISL_GetHDCPKey( hmdiSrc, (char *)hdcp );
+    for (i = 0; i < 5; i++)
+    {
+      FSS_LOGD("FactoryService_GetHDCPKey hdcpKey[%d] = %x", i, hdcp[i]);
+    }
+    param.setTo(hdcp, 5);
+
+    FFS_EXIT();
+!!!11032460.cpp!!!	FactoryService_SetIrReceiverMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+//    nResult = MV_FMISL_SetIrReceiverMode( param + 1 );
+    FSS_LOGD("Set IR receiver mode = %d\n",param);
+    FFS_EXIT();
+!!!11032588.cpp!!!	FactoryService_SetToFactoryMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    mFactoryDB.tofactoryMode = param;
+
+    FSS_LOGD("Set ToFactoryMode: %d", mFactoryDB.tofactoryMode);
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_TOFACTORY_MODE);
+    FFS_EXIT();
+!!!11032716.cpp!!!	FactoryService_GetToFactoryMode(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_TOFACTORY_MODE);
+    *param= mFactoryDB.tofactoryMode;
+    FSS_LOGD ("Get ToFactoryMode: %d", *param);
+
+    FFS_EXIT();
+!!!11032844.cpp!!!	FactoryService_SetFactoryStatus(in param : int32_t) : uint32_t
+    FFS_ENTER();
+    mFactoryDB.factoryStatus = param;
+
+    if(param) {
+        FSS_SET_FACTORY_PARTITION_RW();
+        nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_FACTORY_MODE);
+    } else {
+        nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_FACTORY_MODE);
+        usleep(500000);
+        FSS_SET_FACTORY_PARTITION_RO();
+    }
+
+    FSS_LOGD("Set Factory Status: %d", param );
+
+    FFS_EXIT();
+!!!11032972.cpp!!!	FactoryService_GetFactoryStatus(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_FACTORY_MODE);
+    *param= mFactoryDB.factoryStatus;
+    FSS_LOGD ("Get Factory Status: %d", *param);
+
+    FFS_EXIT();
+!!!11033100.cpp!!!	FactoryService_SetPowerMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD ("Set Power Mode: %d", param);
+
+    //update power mode info in fts
+    setAndroidPowermode(param);
+
+    //update info in DB
+    mFactoryDB.powerMode = param;
+    nResult = updateFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_POWER_MODE);
+
+    FFS_EXIT();
+!!!11033228.cpp!!!	FactoryService_GetPowerMode(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    getFactoryDatabase(MV_FS_INVALID_INPUT, MV_FS_DB_FIELD_IDX_POWER_MODE);
+    *param = mFactoryDB.powerMode;
+    FSS_LOGD ("Get Power Mode: %d", *param);
+
+    FFS_EXIT();
+!!!11033356.cpp!!!	FactoryService_SetChannelMtsMode(in param : int32_t) : uint32_t
+    FFS_ENTER();
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return android::INVALID_OPERATION;
+    }
+
+    FSS_LOGD("Set MTS mode: %d", param );
+    uint32_t res = mUSDTVService->usdtvSetPrefAnalogMTSMode((uint32_t)param);
+    if(res == USDTV_SUCCESS)
+        nResult = S_OK;
+    else
+        nResult = E_FAIL;
+#endif
+    FFS_EXIT();
+!!!11033484.cpp!!!	FactoryService_GetChannelMtsMode(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return android::INVALID_OPERATION;
+    }
+
+    *param = mUSDTVService->usdtvGetPrefAnalogMTSMode();
+    FSS_LOGD("get MTS mode: %d", *param );
+
+    if(*param <= MV_FS_ANALOG_AUDIO_SAP)
+        nResult = S_OK;
+    else
+        nResult = E_FAIL;
+#endif
+    FFS_EXIT();
+!!!11033612.cpp!!!	FactoryService_SetAudioLanguage(in param : int32_t) : uint32_t
+    FFS_ENTER();
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return android::INVALID_OPERATION;
+    }
+
+    FSS_LOGD("Set audio language: %d", param );
+    uint32_t res = mUSDTVService->usdtvSetPrefAudioLanguage ((uint32_t)param);
+    if(res == USDTV_SUCCESS)
+        nResult = S_OK;
+    else
+        nResult = E_FAIL;
+#endif
+    FFS_EXIT();
+!!!11033740.cpp!!!	FactoryService_GetAudioLanguage(inout param : int32_t) : uint32_t
+    FFS_ENTER();
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return android::INVALID_OPERATION;
+    }
+
+    *param = mUSDTVService->usdtvGetPrefAudioLanguage();
+    FSS_LOGD("get audio language: %d", *param );
+    if(*param < MV_FS_AUDIO_LANGUAGE_MAX)
+        nResult = S_OK;
+    else
+        nResult = E_FAIL;
+#endif
+    FFS_EXIT();
+!!!11033868.cpp!!!	FactoryService_SetEDID(in port : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+    char edid[MV_FS_HDMI_EDID_LEN];
+    int i,hdmi_port,PHY_Address_pos = 0;
+    unsigned char checksum;
+
+    if ( port >= MV_FS_EDID_PORT_MAX)
+    {
+        FSS_LOGE("Invalid param %d", port);
+        return android::INVALID_OPERATION;
+    }
+
+    memset(edid,'\0',MV_FS_HDMI_EDID_LEN);
+    memcpy(edid,param.string(),MV_FS_HDMI_EDID_LEN);
+
+
+    if( port == MV_FS_EDID_PORT_VGA) //VGA
+    {
+        nResult = MV_FMISL_SetEdid(AMP_AVIN_SOURCE_TYPE_VGA_01,
+                                   &edid[0],
+                                   MV_FS_VGA_EDID_LEN);
+        FSS_LOGD("Write VGA EDID Done");
+    }
+    else //HDMI
+    {
+        for(i=128; i<MV_FS_HDMI_EDID_LEN; i++)
+        {
+            if(edid[i]==0x03 && edid[i+1] == 0x0C && edid[i+2] == 0x00)
+            {
+                PHY_Address_pos = i + 3;
+                FSS_LOGD("CEC physical address was found at pos[0x%x]=%x\n",
+                          PHY_Address_pos, edid[PHY_Address_pos]);
+            }
+        }
+
+        for(hdmi_port=0; hdmi_port<4; hdmi_port++)
+        {
+            memcpy(edid,param.string(),MV_FS_HDMI_EDID_LEN);
+            if( PHY_Address_pos !=0 )
+            {
+                char cec_address = edid[PHY_Address_pos] + 0x10*hdmi_port;
+                /*update physical CEC address*/
+                edid[PHY_Address_pos] = cec_address;
+                checksum = edid[255] - 0x10*hdmi_port;
+                FSS_LOGD("CEC physical address had been changed to 0x%x, \
+                          checksum changed from 0x%x to 0x%x\n",
+                          cec_address, edid[255], checksum);
+                edid[255] = checksum; /*update checksum */
+
+            }
+            nResult = MV_FMISL_SetEdid(AMP_AVIN_SOURCE_TYPE_HDMI_01 + hdmi_port,
+                                       &edid[0],
+                                       MV_FS_HDMI_EDID_LEN);
+            FSS_LOGD("VDEC_WriteDefaultInternalEDID to HDMI%d finished\n",
+                      hdmi_port);
+        }
+    }
+    FFS_EXIT();
+!!!11033996.cpp!!!	FactoryService_GetEDID(in port : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+
+    char edid[MV_FS_HDMI_EDID_LEN];
+
+    if ( port >= MV_FS_EDID_PORT_MAX)
+    {
+        FSS_LOGE("Invalid param %d", port);
+        return android::INVALID_OPERATION;
+    }
+
+    memset(edid,'\0',MV_FS_HDMI_EDID_LEN);
+    if( port == MV_FS_EDID_PORT_VGA) //VGA
+    {
+        nResult = MV_FMISL_GetEdid(AMP_AVIN_SOURCE_TYPE_VGA_01,
+                           (char *)edid,
+                           MV_FS_VGA_EDID_LEN);
+        FSS_LOGD("Read VGA EDID: %s", edid);
+    }
+    else
+    {
+        nResult = MV_FMISL_GetEdid(AMP_AVIN_SOURCE_TYPE_HDMI_01 + port,
+                   (char *)edid,
+                   MV_FS_HDMI_EDID_LEN);
+        FSS_LOGD("Read HDMI %d EDID: %s",port, edid);
+    }
+
+    param.setTo(edid,MV_FS_HDMI_EDID_LEN);
+    FFS_EXIT();
+!!!11034124.cpp!!!	FactoryService_SetCCDMode(in param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    uint32_t res =
+        mUSDTVService->usdtvSetClosedCaptionModeStatus ((uint32_t)param);
+    if(res == USDTV_SUCCESS)
+    {
+        FSS_LOGD("Set CC Mode %d OK!", param);
+        return android::OK;
+    }
+    else
+    {
+        FSS_LOGD("Set CC Mode %d Failed!", param);
+        return android::INVALID_OPERATION;
+    }
+#endif
+    return android::OK;
+!!!11034252.cpp!!!	FactoryService_GetCCDMode(inout param : int32_t) : uint32_t
+#ifdef FS_ATSC_ENABLE
+    int32_t Currentsource;
+
+    sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+    if (mUSDTVService == 0) {
+        FSS_LOGD("get_USDTVService failed!");
+        return PERMISSION_DENIED;
+    }
+
+    FSS_LOGD("get_USDTVService OK!");
+
+    *param = mUSDTVService->usdtvGetClosedCaptionModeStatus();
+    if(*param < MV_FS_CC_DISPLAY_WHEN_MUTE_ON)
+    {
+        FSS_LOGD("Get CC Mode %d OK!", *param);
+        return android::OK;
+    }
+    else
+    {
+        FSS_LOGD("Get CC Mode %d Failed!", *param);
+        return android::INVALID_OPERATION;
+    }
+#endif
+    return android::OK;
+
+!!!11034380.cpp!!!	FactoryService_PowerPanel(in param : int32_t) : uint32_t
+    if(param == MV_FS_PANEL_POWER_OFF) {
+        system("su -c /system/vendor/bin/test_disp_lvds -p off");
+        FSS_LOGD("Power off panel");
+    } else {
+        system("su -c /system/vendor/bin/test_disp_lvds -p on");
+        FSS_LOGD("Power on panel");
+    }
+
+    return android::OK;
+!!!11034508.cpp!!!	FactoryService_SetVideoProperty(in property : int32_t, in param : int32_t) : uint32_t
+    int32_t Currentsource;
+    uint32_t videoProperty;
+    int32_t propertyType;
+
+    FSS_LOGD("Set Video Property: %d, param: %d\n",property, param );
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &Currentsource, false);
+    videoProperty = convertToAvSettingVideoProperty(property, &propertyType);
+    if(propertyType == MV_FS_PROPERTY_FACTORY_TYPE)
+    {
+        FSS_LOGD("Set AVsetting factory Property: %d, param: %d\n",videoProperty, param );
+        source_control->setFactoryProperty(Currentsource,
+                                    (TvFactoryProperty)videoProperty, param);
+    }
+    else
+    {
+        FSS_LOGD("Set AVsetting video Property: %d, param: %d\n",videoProperty, param );
+        source_control->setVideoProperty(Currentsource,
+                                    (TvPictureProperty)videoProperty, param);
+
+    }
+
+    switch(property)
+    {
+        case MV_FS_VIDEO_COLOR_TEMPERATURE:
+            mColortemp = param;
+            break;
+
+        default:
+            break;
+    }
+
+    FSS_LOGD("Set Video Property Done\n");
+    return android::OK;
+!!!11034636.cpp!!!	FactoryService_GetVideoProperty(in property : int32_t, inout param : int32_t) : uint32_t
+    int32_t CurrentSource;
+    uint32_t videoProperty;
+    int32_t propertyType;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &CurrentSource, false);
+    videoProperty = convertToAvSettingVideoProperty(property, &propertyType);
+    if(propertyType == MV_FS_PROPERTY_FACTORY_TYPE)
+    {
+        source_control->getFactoryProperty(CurrentSource,
+                                    (TvFactoryProperty)videoProperty, param);
+        FSS_LOGD("Get AVsetting factory Property: %d, param: %d\n",videoProperty, *param );
+    }
+    else
+    {
+        source_control->getVideoProperty(CurrentSource,
+                                    (TvPictureProperty)videoProperty, param);
+        FSS_LOGD("Get AVsetting video Property: %d, param: %d\n",videoProperty, *param );
+    }
+
+    switch(property)
+    {
+        case MV_FS_VIDEO_COLOR_TEMPERATURE:
+            mColortemp = *param;
+            break;
+
+        default:
+            break;
+    }
+
+    FSS_LOGD("Get Video Property %d, Param: %d\n", property, *param);
+    return android::OK;
+!!!11034764.cpp!!!	FactoryService_SetAudioProperty(in property : int32_t, in param : int32_t) : uint32_t
+    int32_t Currentsource;
+    uint32_t audioProperty;
+
+    FSS_LOGD("Set Audio Property: %d, param: %d\n",property, param );
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &Currentsource, false);
+    audioProperty = convertToAvSettingAudioProperty(property);
+    source_control->setAudioProperty(Currentsource, audioProperty, param);
+
+    FSS_LOGD("Set Audio Property Done\n");
+    return android::OK;
+!!!11034892.cpp!!!	FactoryService_GetAudioProperty(in property : int32_t, inout param : int32_t) : uint32_t
+    int32_t CurrentSource;
+    uint32_t audioProperty;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &CurrentSource, false);
+    audioProperty = convertToAvSettingAudioProperty(property);
+    source_control->getAudioProperty(CurrentSource, audioProperty, param);
+
+    FSS_LOGD("Get Audio Property %d, Param: %d\n", property, *param);
+    return android::OK;
+!!!11035020.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_REBOOT_RECOVERY:
+            nResult = FactoryService_DoRebootRecovery();
+            break;
+
+        case MV_FS_CTRL_RESET_USER:
+            nResult = FactoryService_DoResetUser();
+            break;
+
+        case MV_FS_CTRL_RESET_FACTORY:
+            nResult = FactoryService_DoResetFactory();
+            break;
+
+        case MV_FS_CTRL_DO_VGA_AUTO_ADJUST:
+            nResult = FactoryService_DoVgaAutoAdjust();
+            break;
+
+        case MV_FS_CTRL_VIDEO_AUTO_ADC_CALIBRATION:
+            nResult = FactoryService_DoADCCalibration();
+            break;
+
+        case MV_FS_CTRL_VIDEO_ADC_STATUS_CLEAN:
+            nResult = FactoryService_CleanADCStatus();
+            break;
+
+        case MV_FS_CTRL_CHANNEL_AUTO_SCAN:
+            nResult = FactoryService_StartChannelAutoScan();
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11035148.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t, in param : float) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_SSC_AMPLITUDE:
+            nResult = FactoryService_SetSSCAmp(param);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11035276.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t, in param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    uint32_t ret = S_OK;
+    ret = FSServiceSpec_CtrlSet(ctrlType, param, MV_FS_FUNC_PRESET );
+
+    if( ret == MV_STOP )
+    {
+        FSS_LOGD("Handle all in specific ctrl function,\
+                  common ctrl function not called.");
+        return android::OK;
+    }
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_PANEL_INDEX:
+            nResult = FactoryService_SetPanelID(param);
+            break;
+
+        case MV_FS_CTRL_SERVICE_MODE:
+            nResult = FactoryService_SetServiceMode(param);
+            break;
+
+        case MV_FS_CTRL_BOOTUP_LOGO:
+            nResult = FactoryService_SetBootupLogo(param);
+            break;
+
+        case MV_FS_CTRL_SETUP_WIZARD:
+            nResult = FactoryService_SetSetupWizard(param);
+            break;
+
+        case MV_FS_CTRL_SSC_ONOFF:
+            nResult = FactoryService_SetSSCOnOff(param);
+            break;
+
+        case MV_FS_CTRL_SSC_MODE:
+            nResult = FactoryService_SetSSCMode(param);
+            break;
+
+        case MV_FS_CTRL_SSC_FREQ:
+            nResult = FactoryService_SetSSCFreq(param);
+            break;
+
+        case MV_FS_CTRL_INPUT_SOURCE:
+            nResult = FactoryService_SetInputSource(param);
+            break;
+
+        case MV_FS_CTRL_IR_RECEIVER:
+            nResult = FactoryService_SetIrReceiverMode(param);
+            break;
+
+        case MV_FS_CTRL_RC_TO_FACTORY:
+            nResult = FactoryService_SetToFactoryMode(param);
+            break;
+
+        case MV_FS_CTRL_FACTORY_STATUS:
+            nResult = FactoryService_SetFactoryStatus(param);
+            break;
+
+        case MV_FS_CTRL_POWER_MODE:
+            nResult = FactoryService_SetPowerMode(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_TRU_VOLUME:
+            nResult = FactoryService_SetTruVolumeOnOff(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_SRS_MODE:
+            nResult = FactoryService_SetSoundSrsMode(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_HARD_BYPASS:
+            nResult = FactoryService_SetSoundHardBypass(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_SPEAKER_TYPE:
+            nResult = FactoryService_SetSpeakerType(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_INTERNAL_SPEAKER:
+            nResult = FactoryService_SetSoundInternalSpeaker(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_MUTE:
+            nResult = FactoryService_SetSoundMute(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_VOLUME_PRESCALE:
+            nResult = FactoryService_SetVolumePrescale(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_LANUAGE:
+            nResult = FactoryService_SetAudioLanguage(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_COLOR_TEMP_COPY:
+            nResult = FactoryService_CopyColortempData(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_AGING_MODE:
+            nResult = FactoryService_SetAgingMode(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_AGING_TIMER:
+            nResult = FactoryService_SetAgingTimer(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_FULL_WHITE_PATTERN:
+            nResult = FactoryService_SetFullWhitePattern(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_HORIZONTAL_POSITION:
+            nResult =
+              FactoryService_SetVideoProperty(MV_FS_VIDEO_HORIPOSITION, param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_HORIZONTAL_SIZE:
+            nResult =
+              FactoryService_SetVideoProperty(MV_FS_VIDEO_HORISIZE, param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_VERTICAL_POSITION:
+            nResult =
+              FactoryService_SetVideoProperty(MV_FS_VIDEO_VERTPOSITION, param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_VERTICAL_SIZE:
+            nResult =
+              FactoryService_SetVideoProperty(MV_FS_VIDEO_VERTSIZE, param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_CCD_MODE:
+            nResult = FactoryService_SetCCDMode(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_UP_DOWN:
+            nResult = FactoryService_DoChannelUpDown(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_TRANSMISSION_TYPE:
+            nResult = FactoryService_SetSignalType(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_DEMOD_TYPE:
+            nResult = FactoryService_SetChannelDemodType(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_MTS_MODE:
+            nResult = FactoryService_SetChannelMtsMode(param);
+            break;
+
+        case MV_FS_CTRL_REBOOT:
+            nResult = FactoryService_DoReboot(param);
+            break;
+
+        case MV_FS_CTRL_PANEL_POWER:
+            nResult = FactoryService_PowerPanel(param);
+            break;
+
+        default:
+            break;
+    }
+
+    ret = FSServiceSpec_CtrlSet(ctrlType, param, MV_FS_FUNC_POSTSET );
+    if( ret != S_OK )
+    {
+        FSS_LOGE("Run specific ctrl function failed.");
+    }
+
+    FFS_EXIT();
+!!!11035404.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_MODEL_NAME:
+            nResult = FactoryService_SetModelName(param);
+            break;
+
+        case MV_FS_CTRL_SN:
+            nResult = FactoryService_SetDataSN(param);
+            break;
+
+        case MV_FS_CTRL_HDCP:
+            nResult = FactoryService_SetHDCPKey(param);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11035532.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t, in param1 : int32_t, in param2 : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    uint32_t ret = S_OK;
+    ret = FSServiceSpec_CtrlSet(ctrlType, param1, param2, MV_FS_FUNC_PRESET );
+
+    if( ret == MV_STOP )
+    {
+        FSS_LOGD("Handle all in specific ctrl function,\
+                  common ctrl function not called.");
+        return android::OK;
+    }
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_MODEL_INDEX:
+            nResult = FactoryService_SetModelIndex(param1, param2);
+            break;
+
+        case MV_FS_CTRL_VIDEO_PROPERTY:
+            nResult = FactoryService_SetVideoProperty(param1,param2);
+            break;
+
+        case MV_FS_CTRL_AUDIO_PROPERTY:
+            nResult = FactoryService_SetAudioProperty(param1,param2);
+            break;
+
+        case MV_FS_CTRL_AUDIO_VOLUME_CURVE:
+            nResult = FactoryService_SetVolumeCurve(param1,param2);
+            break;
+
+        case MV_FS_CTRL_AUDIO_EQUALIZER:
+            nResult = FactoryService_SetSoundEqualizer(param1,param2);
+            break;
+
+        case MV_FS_CTRL_VIDEO_COLOR_TEMP_VALUE:
+            nResult = FactoryService_SetColortempValue(param1,param2);
+            break;
+
+        case MV_FS_CTRL_VIDEO_WHITE_BALANCE:
+            nResult = FactoryService_SetWhiteBalValue(param1,param2);
+            break;
+
+        case MV_FS_CTRL_VIDEO_TEST_PATTERN:
+            nResult = FactoryService_SetTestPattern(param1,param2);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_PRESET:
+            nResult = FactoryService_SetChannelPreset(param1,param2);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_TUNE:
+            nResult = FactoryService_SetChannel(param1,param2);
+            break;
+
+        default:
+            break;
+    }
+
+    ret = FSServiceSpec_CtrlSet(ctrlType, param1, param2, MV_FS_FUNC_POSTSET );
+    if( ret != S_OK )
+    {
+        FSS_LOGE("Run specific ctrl function failed.");
+    }
+
+    FFS_EXIT();
+!!!11035660.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t, in param1 : int32_t, inout param2 : String8) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_NET_MAC_ADDR:
+            nResult = FactoryService_SetNetMacAddr(param1, param2);
+            break;
+
+        case MV_FS_CTRL_NET_IP_ADDR:
+            nResult = FactoryService_SetNetIpAddr(param1, param2);
+            break;
+
+        case MV_FS_CTRL_EDID:
+            nResult = FactoryService_SetEDID(param1, param2);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11035788.cpp!!!	FactoryService_CtrlSet(in ctrlType : int32_t, in param1 : int32_t, in param2 : int32_t, in param3 : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Set Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_VIDEO_PICTURE_CURVE:
+            nResult = FactoryService_SetPictureCurve(param1,param2,param3);
+            break;
+
+        case MV_FS_CTRL_VIDEO_ADC_DATA:
+            nResult = FactoryService_SetADCData(param1,param2,param3);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11035916.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, inout param : float) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_SSC_AMPLITUDE:
+            nResult = FactoryService_GetSSCAmp(param);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036044.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, inout param : String8) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_MODEL_NAME:
+            nResult = FactoryService_GetModelName(param);
+            break;
+
+        case MV_FS_CTRL_SN:
+            nResult = FactoryService_GetDataSN(param);
+            break;
+
+        case MV_FS_CTRL_HDCP:
+            nResult = FactoryService_GetHDCPKey(param);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036172.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, inout param : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_MODEL_INDEX:
+            nResult = FactoryService_GetModelIndex(param);
+            break;
+
+        case MV_FS_CTRL_PANEL_INDEX:
+            nResult = FactoryService_GetPanelID(param);
+            break;
+
+        case MV_FS_CTRL_SERVICE_MODE:
+            nResult = FactoryService_GetServiceMode(param);
+            break;
+
+        case MV_FS_CTRL_BOOTUP_LOGO:
+            nResult = FactoryService_GetBootupLogo(param);
+            break;
+
+        case MV_FS_CTRL_SETUP_WIZARD:
+            nResult = FactoryService_GetSetupWizard(param);
+            break;
+
+        case MV_FS_CTRL_SSC_ONOFF:
+            nResult = FactoryService_GetSSCOnOff(param);
+            break;
+
+        case MV_FS_CTRL_SSC_MODE:
+            nResult = FactoryService_GetSSCMode(param);
+            break;
+
+        case MV_FS_CTRL_SSC_FREQ:
+            nResult = FactoryService_GetSSCFreq(param);
+            break;
+
+        case MV_FS_CTRL_INPUT_SOURCE:
+            nResult = FactoryService_GetInputSource(param);
+            break;
+
+        case MV_FS_CTRL_SYSTEM_TIME:
+            nResult = FactoryService_GetSystemRunningTime(param);
+            break;
+
+        case MV_FS_CTRL_BACKLIGHT_TIME:
+            nResult = FactoryService_GetBacklightRunningTime(param);
+            break;
+
+        case MV_FS_CTRL_RC_TO_FACTORY:
+            nResult = FactoryService_GetToFactoryMode(param);
+            break;
+
+        case MV_FS_CTRL_FACTORY_STATUS:
+            nResult = FactoryService_GetFactoryStatus(param);
+            break;
+
+        case MV_FS_CTRL_POWER_MODE:
+            nResult = FactoryService_GetPowerMode(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_TRU_VOLUME:
+            nResult = FactoryService_GetTruVolumeOnOff(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_SRS_MODE:
+            nResult = FactoryService_GetSoundSrsMode(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_HARD_BYPASS:
+            nResult = FactoryService_GetSoundHardBypass(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_SPEAKER_TYPE:
+            nResult = FactoryService_GetSpeakerType(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_VOLUME_PRESCALE:
+            nResult = FactoryService_GetVolumePrescale(param);
+            break;
+
+        case MV_FS_CTRL_AUDIO_LANUAGE:
+            nResult = FactoryService_GetAudioLanguage(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_AGING_MODE:
+            nResult = FactoryService_GetAgingMode(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_AGING_TIMER:
+            nResult = FactoryService_GetAgingTimer(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_ADC_STATUS:
+            nResult = FactoryService_GetADCStatus(param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_HORIZONTAL_POSITION:
+            nResult =
+              FactoryService_GetVideoProperty(MV_FS_VIDEO_HORIPOSITION, param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_HORIZONTAL_SIZE:
+            nResult =
+              FactoryService_GetVideoProperty(MV_FS_VIDEO_HORISIZE, param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_VERTICAL_POSITION:
+            nResult =
+              FactoryService_GetVideoProperty(MV_FS_VIDEO_VERTPOSITION, param);
+            break;
+
+        case MV_FS_CTRL_VIDEO_VERTICAL_SIZE:
+            nResult =
+              FactoryService_GetVideoProperty(MV_FS_VIDEO_VERTSIZE, param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_CCD_MODE:
+            nResult = FactoryService_GetCCDMode(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_PRESET:
+            nResult = FactoryService_GetChannelPreset(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_TUNE:
+            nResult = FactoryService_GetChannel(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_TRANSMISSION_TYPE:
+            nResult = FactoryService_GetSignalType(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_SIGNAL_TYPE:
+            nResult = FactoryService_GetChannelType(param);
+            break;
+
+        case MV_FS_CTRL_CHANNEL_MTS_MODE:
+            nResult = FactoryService_GetChannelMtsMode(param);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036300.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, in param1 : int32_t, inout param2 : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    uint32_t ret = S_OK;
+    ret = FSServiceSpec_CtrlGet(ctrlType, param1, param2, MV_FS_FUNC_PRESET );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_VIDEO_PROPERTY:
+            nResult = FactoryService_GetVideoProperty(param1,param2);
+            break;
+
+        case MV_FS_CTRL_AUDIO_PROPERTY:
+            nResult = FactoryService_GetAudioProperty(param1,param2);
+            break;
+
+        case MV_FS_CTRL_AUDIO_VOLUME_CURVE:
+            nResult = FactoryService_GetVolumeCurve(param1,param2);
+            break;
+
+        case MV_FS_CTRL_AUDIO_EQUALIZER:
+            nResult = FactoryService_GetSoundEqualizer(param1,param2);
+            break;
+
+        case MV_FS_CTRL_VIDEO_COLOR_TEMP_VALUE:
+            nResult = FactoryService_GetColortempValue(param1,param2);
+            break;
+
+        case MV_FS_CTRL_VIDEO_WHITE_BALANCE:
+            nResult = FactoryService_GetWhiteBalValue(param1,param2);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036428.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, in param1 : int32_t, inout param2 : String8) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_VERSION:
+            nResult = FactoryService_GetVersion(param1, param2);
+            break;
+
+        case MV_FS_CTRL_EDID:
+            nResult = FactoryService_GetEDID(param1,param2);
+            break;
+
+        case MV_FS_CTRL_NET_MAC_ADDR:
+            nResult = FactoryService_GetNetMacAddr(param1, param2);
+            break;
+
+        case MV_FS_CTRL_NET_IP_ADDR:
+            nResult = FactoryService_GetNetIpAddr(param1, param2);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036556.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, in param1 : int32_t, in param2 : int32_t, inout param3 : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_VIDEO_PICTURE_CURVE:
+            nResult = FactoryService_GetPictureCurve(param1,param2,param3);
+            break;
+
+        case MV_FS_CTRL_VIDEO_ADC_DATA:
+            nResult = FactoryService_GetADCData(param1,param2,param3);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036684.cpp!!!	FactoryService_CtrlGet(in ctrlType : int32_t, in param1 : int32_t, inout param2 : String8, inout param3 : String8, inout param4 : int32_t) : uint32_t
+    FFS_ENTER();
+
+    FSS_LOGD("Ctrl Get Type: %d",ctrlType );
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_NET_PING:
+            nResult = FactoryService_DoNetPing(param1,param2,param3,param4);
+            break;
+
+        default:
+            break;
+    }
+
+    FFS_EXIT();
+!!!11036812.cpp!!!	FSService()
+    FactoryService_Init();
+!!!11036940.cpp!!!	~FSService()
+    FactoryService_Uninit();
+!!!11037068.cpp!!!	getSource() : uint32_t
+    int32_t avSrc = 0;
+    int32_t tvSubSrc = 0;
+    int32_t facSrc = MV_FS_INVALID_INPUT;
+
+    source_control->getSource(MV_FS_DISP_PLANE_MAIN, &avSrc, false);
+    facSrc = av2facSource(avSrc);
+
+    if (facSrc == MV_FS_TV_INPUT) {
+        source_control->getSubSource(avSrc, &tvSubSrc);
+
+        if(tvSubSrc == TV_SourceDtv) {
+            facSrc = MV_FS_DTV_INPUT;
+            FSS_LOGD("Get DTV sub source");
+        } else {
+            facSrc = MV_FS_ATV_INPUT;
+            FSS_LOGD("Get ATV sub source");
+        }
+    }
+
+    FSS_LOGD("Get factory source %d", facSrc);
+
+    return facSrc;
+!!!11037196.cpp!!!	setSource(in source : uint32_t) : uint32_t
+    char intent[256] = {0};
+    char inputSrcName[128] = {0};
+    char inputSrcId[64] = {0};
+    int inputSource = MV_FS_FIRST_INPUT;
+
+    switch (source)
+    {
+        case MV_FS_TV_INPUT:
+        case MV_FS_DTV_INPUT:
+        case MV_FS_ATV_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=TUNER" );
+            strcpy( inputSrcId, "TUNER");
+            break;
+        case MV_FS_HDMI1_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=HDMI_1" );
+            strcpy( inputSrcId, "HDMI_1");
+            break;
+        case MV_FS_HDMI2_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=HDMI_2" );
+            strcpy( inputSrcId, "HDMI_2");
+            break;
+        case MV_FS_HDMI3_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=HDMI_3" );
+            strcpy( inputSrcId, "HDMI_3");
+            break;
+        case MV_FS_HDMI4_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=HDMI_4" );
+            strcpy( inputSrcId, "HDMI_4");
+            break;
+        case MV_FS_COMPONENT_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=COMPONENT" );
+            strcpy( inputSrcId, "COMPONENT");
+            break;
+        case MV_FS_COMPOSITE1_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=COMPOSITE" );
+            strcpy( inputSrcId, "COMPOSITE");
+            break;
+        case MV_FS_VGA_INPUT:
+            strcpy( inputSrcName, "tv://passthrough?deviceId=VGA" );
+            strcpy( inputSrcId, "VGA");
+            break;
+        default:
+            inputSource = MV_FS_INVALID_INPUT;
+            break;
+    }
+
+    if ( inputSource != MV_FS_INVALID_INPUT )
+    {
+        ENABLE_ADB()
+
+        memset(intent, '\0', sizeof(intent));
+        sprintf(intent,
+            "am start -a android.intent.action.VIEW -d com.marvell.willowtv.controller.device.%s",
+            (char *)inputSrcName);
+        system(intent);
+        FSS_LOGD( "Send AM command %s \n", intent);
+
+        memset(intent, '\0', sizeof(intent));
+        sprintf(intent,
+            "am startservice -a \
+            com.google.tv.mediadevices.SET_DEFAULT_DEVICE_SERVICE \
+            -e device_id com.marvell.willowtv.controller.device.%s",
+            (char *)inputSrcId);
+        system(intent);
+        FSS_LOGD( "Send AM command %s \n", intent);
+
+        DISABLE_ADB()
+    }
+    return android::OK;
+!!!11037324.cpp!!!	setTestPattern(in pattern : int32_t, in ire : int32_t) : uint32_t
+    uint32_t res = 0;
+
+    Mutex::Autolock _l(fac_lock_);
+    FSS_LOGD("pattern:%d,ire:%d", pattern, ire);
+    mTestPattern = (MV_PQC_COLOR_PATTERN_OFF == pattern)?false:true;
+    res = MV_PQC_SetPictureProperty(MV_PQC_PICTURE_TESTPATTERN,
+                                    ((pattern<<8) + ire));
+
+    return res;
+!!!11037452.cpp!!!	getColortempValue(in source : int32_t, in type : int32_t, inout param : int32_t) : uint32_t
+    switch (type)
+    {
+        case MV_FS_COLOR_TEMP_GAIN_RED:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN);
+            *param = mFactoryDB.colorTemp[source][mColortemp].nGainRed;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_GAIN_GREEN:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GGAIN);
+            *param = mFactoryDB.colorTemp[source][mColortemp].nGainGreen;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_GAIN_BLUE:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BGAIN);
+            *param = mFactoryDB.colorTemp[source][mColortemp].nGainBlue;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_OFFSET_RED:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_ROFFSET);
+            *param = mFactoryDB.colorTemp[source][mColortemp].nOffsetRed;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_OFFSET_GREEN:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GOFFSET);
+            *param = mFactoryDB.colorTemp[source][mColortemp].nOffsetGreen;
+            break;
+        }
+        case MV_FS_COLOR_TEMP_OFFSET_BLUE:
+        {
+            getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET);
+            *param = mFactoryDB.colorTemp[source][mColortemp].nOffsetBlue;
+            break;
+        }
+        default:
+        {
+            FSS_LOGD("nType is invalid");
+            return android::INVALID_OPERATION;
+        }
+    }
+
+    FSS_LOGD("mFactoryDB.modelIndex : %d \n",
+                mFactoryDB.modelIndex);
+    FSS_LOGD("Source : %d \n", source);
+    FSS_LOGD("Color temp mode : %d \n", mColortemp);
+    FSS_LOGD("Type [%d]: value [%d] \n", type, *param);
+
+    return android::OK;
+!!!11037580.cpp!!!	updateFactoryDatabase(in facSrc : int32_t, in fieldID : int32_t) : uint32_t
+    uint32_t nResult = S_OK;
+    int32_t avSrc;
+
+    avSrc = fac2avSource(facSrc);
+    switch (fieldID)
+    {
+        case MV_FS_DB_FIELD_IDX_MODEL_INDEX:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_ModelIndex,
+                                               mFactoryDB.modelIndex);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_ONOFF:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_OnOff,
+                                               mFactoryDB.sspOnoff);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_MODE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_Mode,
+                                               mFactoryDB.sspMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_FREQ:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_Frequency,
+                                               mFactoryDB.sspFreq);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_AMPLITUDE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_Amplitude,
+                                               mFactoryDB.sspAmplitude);
+            break;
+        case MV_FS_DB_FIELD_IDX_SPEAKER_TYPE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SpeakerType,
+                                               mFactoryDB.speakerType);
+            break;
+        case MV_FS_DB_FIELD_IDX_ENERGY_LOGO:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_LogoStatus,
+                                               mFactoryDB.energyLogo);
+        case MV_FS_DB_FIELD_IDX_SETUP_WINZARD:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SetupWizard,
+                                               mFactoryDB.setupWizard);
+            break;
+        case MV_FS_DB_FIELD_IDX_AGING_MODE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_AgingMode,
+                                               mFactoryDB.bAgingMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_FACTORY_ID:
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_FactoryID,
+                                               mFactoryDB.factoryId);
+            break;
+        case MV_FS_DB_FIELD_IDX_FACTORY_MODE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_FactoryMode,
+                                               mFactoryDB.factoryStatus);
+            break;
+        case MV_FS_DB_FIELD_IDX_AUDIO_HARD_BYPASS:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_AQHardBypass,
+                                               mFactoryDB.soundHardBypass);
+            break;
+        case MV_FS_DB_FIELD_IDX_POWER_MODE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_PowerMode,
+                                               mFactoryDB.powerMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_TOFACTORY_MODE:
+            source_control->setFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_Reserved1,
+                                               mFactoryDB.tofactoryMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_MODE:
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ColorTempMode,
+                                               mColortemp);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_RGAIN:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCRGain,
+                                               mFactoryDB.mv_input_source[facSrc].adc.nGainRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_GGAIN:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCGGain,
+                                               mFactoryDB.mv_input_source[facSrc].adc.nGainGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_BGAIN:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCBGain,
+                                               mFactoryDB.mv_input_source[facSrc].adc.nGainBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_ROFFSET:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCROffset,
+                                               mFactoryDB.mv_input_source[facSrc].adc.nOffsetRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_GOFFSET:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCGOffset,
+                                               mFactoryDB.mv_input_source[facSrc].adc.nOffsetGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCBOffset,
+                                               mFactoryDB.mv_input_source[facSrc].adc.nOffsetBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_STATUS:
+            facSrc = av2facSource(avSrc);
+            source_control->setFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCDone,
+                                               mFactoryDB.mv_input_source[facSrc].adc.bCalibrated);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempRGain,
+                                            mFactoryDB.colorTemp[facSrc][mColortemp].nGainRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GGAIN:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempGGain,
+                                            mFactoryDB.colorTemp[facSrc][mColortemp].nGainGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BGAIN:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempBGain,
+                                            mFactoryDB.colorTemp[facSrc][mColortemp].nGainBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_ROFFSET:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempROffset,
+                                            mFactoryDB.colorTemp[facSrc][mColortemp].nOffsetRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GOFFSET:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempGOffset,
+                                            mFactoryDB.colorTemp[facSrc][mColortemp].nOffsetGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempBOffset,
+                                            mFactoryDB.colorTemp[facSrc][mColortemp].nOffsetBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_RGAIN:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceRGain,
+                                            mFactoryDB.whiteBalance[mColortemp].RDRVOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GGAIN:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceGGain,
+                                            mFactoryDB.whiteBalance[mColortemp].GDRVOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BGAIN:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceBGain,
+                                            mFactoryDB.whiteBalance[mColortemp].BDRVOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_ROFFSET:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceROffset,
+                                            mFactoryDB.whiteBalance[mColortemp].RCUTOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GOFFSET:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceGOffset,
+                                            mFactoryDB.whiteBalance[mColortemp].GCUTOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BOFFSET:
+            source_control->setFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceBOffset,
+                                            mFactoryDB.whiteBalance[mColortemp].BCUTOffset);
+            break;
+
+        default:
+            break;
+    }
+
+    return nResult;
+!!!11037708.cpp!!!	getFactoryDatabase(in facSrc : int32_t, in fieldID : int32_t) : uint32_t
+    uint32_t nResult = S_OK;
+    int32_t avSrc;
+
+    avSrc = fac2avSource(facSrc);
+
+    switch (fieldID)
+    {
+        case MV_FS_DB_FIELD_IDX_MODEL_INDEX:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_ModelIndex,
+                                               &mFactoryDB.sspOnoff);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_ONOFF:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_OnOff,
+                                               &mFactoryDB.sspOnoff);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_MODE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_Mode,
+                                               &mFactoryDB.sspMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_FREQ:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_Frequency,
+                                               &mFactoryDB.sspFreq);
+            break;
+        case MV_FS_DB_FIELD_IDX_SSP_AMPLITUDE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SSP_Amplitude,
+                                               &mFactoryDB.sspAmplitude);
+            break;
+        case MV_FS_DB_FIELD_IDX_SPEAKER_TYPE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SpeakerType,
+                                               &mFactoryDB.speakerType);
+            break;
+        case MV_FS_DB_FIELD_IDX_ENERGY_LOGO:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_LogoStatus,
+                                               &mFactoryDB.energyLogo);
+        case MV_FS_DB_FIELD_IDX_SETUP_WINZARD:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_SetupWizard,
+                                               &mFactoryDB.setupWizard);
+            break;
+        case MV_FS_DB_FIELD_IDX_AGING_MODE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_AgingMode,
+                                               &mFactoryDB.bAgingMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_FACTORY_ID:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_FactoryID,
+                                               &mFactoryDB.factoryId);
+            break;
+        case MV_FS_DB_FIELD_IDX_FACTORY_MODE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_FactoryMode,
+                                               &mFactoryDB.factoryStatus);
+            break;
+        case MV_FS_DB_FIELD_IDX_AUDIO_HARD_BYPASS:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_AQHardBypass,
+                                               &mFactoryDB.soundHardBypass);
+            break;
+        case MV_FS_DB_FIELD_IDX_POWER_MODE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_PowerMode,
+                                               &mFactoryDB.powerMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_TOFACTORY_MODE:
+            source_control->getFactoryProperty(TV_SourceInvalid,
+                                               TV_FACTORY_PROPERTY_Reserved1,
+                                               &mFactoryDB.tofactoryMode);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_MODE:
+            source_control->getFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ColorTempMode,
+                                               &mColortemp);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_RGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCRGain,
+                                               &mFactoryDB.mv_input_source[facSrc].adc.nGainRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_GGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCGGain,
+                                               &mFactoryDB.mv_input_source[facSrc].adc.nGainGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_BGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCBGain,
+                                               &mFactoryDB.mv_input_source[facSrc].adc.nGainBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_ROFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                               TV_FACTORY_PROPERTY_ADCROffset,
+                                               &mFactoryDB.mv_input_source[facSrc].adc.nOffsetRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_GOFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ADCGOffset,
+                                            &mFactoryDB.mv_input_source[facSrc].adc.nOffsetGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ADCBOffset,
+                                            &mFactoryDB.mv_input_source[facSrc].adc.nOffsetBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_ADC_DB_STATUS:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ADCDone,
+                                            &mFactoryDB.mv_input_source[facSrc].adc.bCalibrated);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempRGain,
+                                            &mFactoryDB.colorTemp[facSrc][mColortemp].nGainRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempGGain,
+                                            &mFactoryDB.colorTemp[facSrc][mColortemp].nGainGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempBGain,
+                                            &mFactoryDB.colorTemp[facSrc][mColortemp].nGainBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_ROFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempROffset,
+                                            &mFactoryDB.colorTemp[facSrc][mColortemp].nOffsetRed);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GOFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempGOffset,
+                                            &mFactoryDB.colorTemp[facSrc][mColortemp].nOffsetGreen);
+            break;
+        case MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_ColorTempBOffset,
+                                            &mFactoryDB.colorTemp[facSrc][mColortemp].nOffsetBlue);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_RGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceRGain,
+                                            &mFactoryDB.whiteBalance[mColortemp].RDRVOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceGGain,
+                                            &mFactoryDB.whiteBalance[mColortemp].GDRVOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BGAIN:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceBGain,
+                                            &mFactoryDB.whiteBalance[mColortemp].BDRVOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_ROFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceROffset,
+                                            &mFactoryDB.whiteBalance[mColortemp].RCUTOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_GOFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceGOffset,
+                                            &mFactoryDB.whiteBalance[mColortemp].GCUTOffset);
+            break;
+        case MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BOFFSET:
+            source_control->getFactoryProperty(avSrc,
+                                            TV_FACTORY_PROPERTY_WhiteBalanceBOffset,
+                                            &mFactoryDB.whiteBalance[mColortemp].BCUTOffset);
+            break;
+
+        default:
+            break;
+    }
+
+    return nResult;
+!!!11037836.cpp!!!	LoadCommonFactoryDB(in  : void) : uint32_t
+    int32_t i = 0;
+
+    FSS_LOGD("Loading factory common DB to buffer...");
+
+    for(i = MV_FS_DB_FIELD_IDX_MODEL_INDEX;
+        i < MV_FS_DB_FIELD_IDX_ADC_DB_STATUS;
+        i++)
+    {
+        getFactoryDatabase(MV_FS_INVALID_INPUT, i);
+    }
+
+    FSS_LOGD("Loading factory common DB done");
+    return android::OK;
+!!!11037964.cpp!!!	LoadTunningFactoryDB(in  : void) : uint32_t
+    int32_t dbField;
+    int32_t source;
+    int32_t colorTemp;
+
+    FSS_LOGD("Loading factory tunning DB to buffer...");
+
+    for( source = MV_FS_HDMI1_INPUT;
+         source < MV_FS_MAX_INPUT_SRC;
+         source++)
+    {
+        if(source == MV_FS_INVALID_INPUT )
+            continue;
+
+        //load ADC
+        for( dbField = MV_FS_DB_FIELD_IDX_ADC_DB_RGAIN;
+             dbField < MV_FS_DB_FIELD_IDX_ADC_DB_BOFFSET + 1;
+             dbField++ )
+        {
+            getFactoryDatabase(source, dbField);
+        }
+
+        for(colorTemp = MV_FS_COLOR_TEMP_TYPE_STANDARD;
+            colorTemp < MV_FS_COLOR_TEMP_TYPE_MAX;
+            colorTemp++)
+        {
+            //load color temperature
+            mColortemp = colorTemp;
+            for( dbField = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN;
+                 dbField < MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET + 1;
+                 dbField++ )
+            {
+                getFactoryDatabase(source, dbField);
+            }
+
+            //load white balance
+            for( dbField = MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_RGAIN;
+                 dbField < MV_FS_DB_FIELD_IDX_WHITE_BALANCE_DB_BOFFSET + 1;
+                 dbField++ )
+            {
+                getFactoryDatabase(source, dbField);
+            }
+        }
+    }
+
+    source = getSource();
+    getFactoryDatabase(source, MV_FS_DB_FIELD_IDX_COLOR_TEMP_MODE);
+
+    FSS_LOGD("Loading factory tunning DB Done");
+    return android::OK;
+!!!11038092.cpp!!!	initAgingMode() : void
+    int32_t currAgingMode;
+
+    mAgingMode.agingFlag = 0;
+
+    FactoryService_GetAgingMode(&currAgingMode);
+    if (mAgingMode.agingInitFlag != 1)
+    {
+        if (currAgingMode == MV_FS_AGING_ON)
+        {
+#ifdef FS_ATSC_ENABLE
+            int32_t tryCount = 50;
+            do {
+                sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+                if (mUSDTVService == 0) {
+                    FSS_LOGD("get USDTVService failed, waiting for it is ready");
+                    usleep(100000);
+                    tryCount++;
+                } else {
+                    FSS_LOGD("USDTVService is ready");
+                    break;
+                }
+            } while(tryCount);
+#endif
+            FSS_LOGD("Get initialized aging mode is ON");
+        }
+        else
+        {
+            FSS_LOGD("Get initialized aging mode is OFF");
+        }
+
+        pthread_t agingthread;
+
+        /* create aging thread */
+        pthread_create (&agingthread, NULL, &staticAgingModeThread,this);
+    }
+    else
+    {
+        FSS_LOGD("It's initialized Already ..!!\n");
+    }
+!!!11038220.cpp!!!	agingModeThread(inout ptr : void) : void
+    int32_t signalPresent;
+    int32_t facSrc = 0;
+
+    while(1)
+    {
+        if (mFactoryDB.bAgingMode == AGING_MODE_ON)
+        {
+            facSrc = getSource();
+            switch(facSrc)
+            {
+                case MV_FS_STREAM_INPUT:
+                case MV_FS_INVALID_INPUT:
+                    if(!mAgingMode.agingFlag) {
+                        FSS_LOGD("set aging mode when booting up!");
+                        FSServiceSpec_SetAgingMode(AGING_MODE_ON, MV_FS_FUNC_POSTSET);
+                        mAgingMode.agingFlag = 1;
+                        continue;
+                    }
+                    break;
+
+                case MV_FS_ATV_INPUT: //passthrough
+                    if(!mAgingMode.agingFlag) {
+                        FSS_LOGD("set aging mode when booting up!");
+                        FSServiceSpec_SetAgingMode(AGING_MODE_ON, MV_FS_FUNC_POSTSET);
+                        mAgingMode.agingFlag = 1;
+                        continue;
+                    }
+                case MV_FS_COMPONENT_INPUT:
+                case MV_FS_COMPOSITE1_INPUT:
+                case MV_FS_HDMI1_INPUT:
+                case MV_FS_HDMI2_INPUT:
+                case MV_FS_HDMI3_INPUT:
+                case MV_FS_HDMI4_INPUT:
+                case MV_FS_VGA_INPUT:
+                    int32_t vipSiStatus;
+                    MV_FMISL_GetVipSiStatus(&vipSiStatus);
+                    if( MV_FMISL_VIP_SI_STABLE != vipSiStatus)
+                    {
+                        int32_t bMute;
+
+                        MV_FMISL_GetVideoPlaneMute(&bMute);
+                        if(bMute)
+                        {
+                            //set white test pattern
+                            setTestPattern(MV_PQC_COLOR_PATTERN_GREY, 0);
+                            //set to high brightness and contrast
+                            FSServiceSpec_SetAgingMode(AGING_MODE_ON, MV_FS_FUNC_POSTSET);
+                            //if aging mode is on, set source to unmute to
+                            //show high brightness and contrast when no signal
+                            FSS_LOGD("set video to unmute as aging mode is on");
+                            MV_FMISL_SetVideoPlaneMute(false);
+                        }
+                    }
+                    break;
+
+#ifdef FS_ATSC_ENABLE
+                case MV_FS_DTV_INPUT:
+                    {
+                        sp<USDTVTunerSignalStrength> localTunerSigStrength =
+                                                new USDTVTunerSignalStrength();
+
+                        sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+                        if (mUSDTVService == 0) {
+                            FSS_LOGD("get_USDTVService failed!");
+                        }
+
+                        mUSDTVService->ustdvGetTunerSignalStrength(
+                                            (void *)&localTunerSigStrength);
+
+                        if( localTunerSigStrength->mTunerState == 5 )
+                        {
+                            int32_t bMute;
+
+                            MV_FMISL_GetVideoPlaneMute(&bMute);
+                            if(bMute)
+                            {
+                                //set white test pattern
+                                setTestPattern(MV_PQC_COLOR_PATTERN_GREY, 0);
+                                //set to high brightness and contrast
+                                FSServiceSpec_SetAgingMode(AGING_MODE_ON, MV_FS_FUNC_POSTSET);
+                                //if aging mode is on, set source to unmute to
+                                //show high brightness and contrast when no signal
+                                FSS_LOGD("set video to unmute as aging mode is on");
+                                MV_FMISL_SetVideoPlaneMute(false);
+                            }
+                        }
+                    }
+                    break;
+#endif
+                default:
+                    break;
+            }
+        }
+
+        sleep(1);
+    }
+
+    return NULL;
+!!!11038348.cpp!!!	setAgingTimer(in mode : uint32_t) : void
+    switch (mode) {
+    case MV_FS_AGING_TIMER_RESET:
+    {
+        mAgingMode.agingTimerCount = 0;
+        break;
+    }
+    case MV_FS_AGING_TIMER_START:
+    {
+        mAgingMode.startAgingTimer = AGING_TIMER_ON;
+        break;
+    }
+    case MV_FS_AGING_TIMER_STOP:
+    {
+        mAgingMode.startAgingTimer = AGING_TIMER_OFF;
+        break;
+    }
+    default:
+    break;
+    }
+!!!11038476.cpp!!!	getAgingTimer(inout value : int32_t) : void
+    if (value != NULL) {
+        *value = mAgingMode.agingTimerCount;
+    }
+!!!11038732.cpp!!!	FSServiceSpec__Init(in  : void) : MV_FS_ERROR_CODES
+    return MV_OK;
+!!!11038860.cpp!!!	FSServiceSpec_SetModelIndex(in param : int32_t, in preset : int8_t) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+    int32_t prescaleValue = 0;
+    int32_t volume = 0;
+    int32_t audioMode = 0;
+
+    //No preset needed
+    if( preset )
+        return MV_OK;
+
+    //set audio prescale
+    FactoryService_GetVolumePrescale(&prescaleValue);
+    FactoryService_SetVolumePrescale(prescaleValue);
+    FSS_LOGD("Set audio prescale to %d", prescaleValue);
+
+    //set audio curve
+    FactoryService_GetAudioProperty(MV_FS_AUDIO_VOLUME, &volume);
+    FactoryService_SetAudioProperty(MV_FS_AUDIO_VOLUME, volume);
+    FSS_LOGD("Set audio volume to %d", volume);
+
+    //set audio mode
+    FactoryService_GetAudioProperty(MV_FS_AUDIO_MODE, &audioMode);
+    FactoryService_SetAudioProperty(MV_FS_AUDIO_MODE, audioMode);
+    FSS_LOGD("Set audio mode to %d", audioMode);
+
+    return MV_OK;
+!!!11038988.cpp!!!	FSServiceSpec_SetAgingMode(in param : int32_t, in preset : int8_t) : MV_FS_ERROR_CODES
+    if( preset )
+        return MV_OK;
+
+    int32_t facSrc = 0;
+
+    facSrc = getSource();
+
+    //Bug: if set video property in atv aging mode, it will cause factory UI no respond
+    //Remove the condition after the bug is fixed.
+    if (( facSrc != MV_FS_STREAM_INPUT ) &&
+        ( facSrc != MV_FS_INVALID_INPUT ))
+    {
+        if(param == MV_FS_AGING_ON)
+        {
+            //set picture mode to user mode
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_PICTUREMODE,
+                                            MV_FS_PICTURE_MODE_TYPE_USER);
+
+            //set high brightness and high contrast in aging mode
+            FSS_LOGD("Set brightness/contrast to 100!");
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_BRIGHTNESS, 100);
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_CONTRAST, 100);
+        }
+        else
+        {
+            int32_t current_pic_mode;
+
+            //if current pic mode is not user mode, set pic mode to user mode
+            //and change the contrast/brightness back
+            FactoryService_GetVideoProperty(MV_FS_VIDEO_PICTUREMODE,
+                                            &current_pic_mode);
+            FSS_LOGD("current pic mode is %d",current_pic_mode );
+            if(current_pic_mode != MV_FS_PICTURE_MODE_TYPE_USER)
+            {
+                FactoryService_SetVideoProperty(MV_FS_VIDEO_PICTUREMODE,
+                                                MV_FS_PICTURE_MODE_TYPE_USER);
+            }
+
+            //set brightness/contrast back to default
+            FSS_LOGD("Set the brightness/contrast to default!");
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_BRIGHTNESS, 50);
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_CONTRAST, 50);
+        }
+    }
+
+#ifdef FS_ATSC_ENABLE
+    //Notify usdtv service to show snow noise screen
+    if (( facSrc == MV_FS_ATV_INPUT ) || ( facSrc == MV_FS_STREAM_INPUT ))
+    {
+        sp<IUSDTVService>& mUSDTVService = get_USDTVService();
+        if (mUSDTVService == 0) {
+            FSS_LOGE("get_USDTVService failed!");
+            return MV_NOT_SUPPORT;
+        }
+
+        mUSDTVService->usdtvSetATSCFactoryMode(param);
+        FSS_LOGD("Set ATSC factory mode to %d", param);
+    }
+#endif
+
+    //wait for a while until the changed PQ data is saved to database.
+    usleep(2000000);
+
+    return MV_OK;
+!!!11039116.cpp!!!	FSServiceSpec_GetCtSource(inout ctSource : int32_t) : MV_FS_ERROR_CODES
+    uint32_t source = getSource();
+
+    switch( source )
+    {
+        case MV_FS_HDMI1_INPUT:
+        case MV_FS_HDMI2_INPUT:
+        case MV_FS_HDMI3_INPUT:
+        case MV_FS_HDMI4_INPUT:
+            *ctSource = MV_FS_HDMI1_INPUT;
+            break;
+
+        default:
+            *ctSource = source;
+            break;
+    }
+    FSS_LOGD("Get CT source: %d",*ctSource);
+
+    return MV_OK;
+!!!11039244.cpp!!!	FSServiceSpec_SetColortempValue(in type : int32_t, in param : int32_t, in preset : int32_t) : MV_FS_ERROR_CODES
+    if( preset )
+    {
+        if (mColortemp != MV_FS_COLOR_TEMP_TYPE_STANDARD)
+        {
+            FSS_LOGD("Warn: Haven't changed color temp to standard mode, current mode=%d.",
+                      mColortemp);
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_COLOR_TEMPERATURE,
+                                          MV_FS_COLOR_TEMP_TYPE_STANDARD);
+            FSS_LOGD("Set color temp mode to standard.");
+        }
+        return MV_OK;
+    }
+
+    int32_t currentSource;
+    int32_t destSource;
+    int32_t fieldID = MV_FS_DB_FIELD_IDX_MAX;
+
+    FSServiceSpec_GetCtSource(&currentSource);
+
+    if (currentSource == MV_FS_COMPONENT_INPUT )
+    {
+        //Update same group sources' CT values
+        for( destSource = 0; destSource < MV_FS_MAX_INPUT_SRC; destSource++)
+        {
+            //skip the following sources
+            if((destSource == MV_FS_HDMI2_INPUT) ||
+               (destSource == MV_FS_HDMI3_INPUT) ||
+               (destSource == MV_FS_HDMI4_INPUT) ||
+               (destSource == MV_FS_COMPOSITE2_INPUT) ||
+               (destSource == MV_FS_COMPONENT_INPUT) ||
+               (destSource == MV_FS_STREAM_INPUT) ||
+               (destSource == MV_FS_INVALID_INPUT) )
+            {
+                continue;
+            }
+
+            //update the color temp value in buffer
+            switch (type)
+            {
+                case MV_FS_COLOR_TEMP_GAIN_RED:
+                {
+                    mFactoryDB.colorTemp[destSource][mColortemp].nGainRed = param;
+                    fieldID = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_RGAIN;
+                    FSS_LOGD("Update CT R GAIN: %d, Source: %d",param,destSource);
+                    break;
+                }
+                case MV_FS_COLOR_TEMP_GAIN_GREEN:
+                {
+                    mFactoryDB.colorTemp[destSource][mColortemp].nGainGreen = param;
+                    fieldID = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GGAIN;
+                    FSS_LOGD("Update CT G GAIN: %d, Source: %d",param,destSource);
+                    break;
+                }
+                case MV_FS_COLOR_TEMP_GAIN_BLUE:
+                {
+                    mFactoryDB.colorTemp[destSource][mColortemp].nGainBlue = param;
+                    fieldID = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BGAIN;
+                    FSS_LOGD("Update CT B GAIN: %d, Source: %d",param,destSource);
+                    break;
+                }
+                case MV_FS_COLOR_TEMP_OFFSET_RED:
+                {
+                    mFactoryDB.colorTemp[destSource][mColortemp].nOffsetRed = param;
+                    fieldID = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_ROFFSET;
+                    FSS_LOGD("Update CT R OFFSET: %d, Source: %d",param,destSource);
+                    break;
+                }
+                case MV_FS_COLOR_TEMP_OFFSET_GREEN:
+                {
+                    mFactoryDB.colorTemp[destSource][mColortemp].nOffsetGreen = param;
+                    fieldID = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_GOFFSET;
+                    FSS_LOGD("Update CT G OFFSET: %d, Source: %d",param,destSource);
+                    break;
+                }
+                case MV_FS_COLOR_TEMP_OFFSET_BLUE:
+                {
+                    mFactoryDB.colorTemp[destSource][mColortemp].nOffsetBlue = param;
+                    fieldID = MV_FS_DB_FIELD_IDX_COLOR_TEMP_DB_BOFFSET;
+                    FSS_LOGD("Update CT B OFFSET: %d, Source: %d",param,destSource);
+                    break;
+                }
+                default:
+                {
+                    FSS_LOGD("MV_FS_SetColortempValue: nType is invalid");
+                    break;
+                }
+            }
+
+            //update the color temp value in database
+            FSS_LOGD("Update CT database, source: %d", destSource);
+            updateFactoryDatabase(destSource, fieldID);
+        }
+    }
+
+    return MV_OK;
+!!!11039372.cpp!!!	FSServiceSpec_GetColortempValue(in type : int32_t, inout param : int32_t, in preset : int32_t) : MV_FS_ERROR_CODES
+    if( preset )
+    {
+        if (mColortemp != MV_FS_COLOR_TEMP_TYPE_STANDARD)
+        {
+            FSS_LOGD("Warn: Haven't changed color temp to standard mode, current mode=%d.",
+                     mColortemp);
+            FactoryService_SetVideoProperty(MV_FS_VIDEO_COLOR_TEMPERATURE,
+                                          MV_FS_COLOR_TEMP_TYPE_STANDARD);
+            FSS_LOGD("Set color temp mode to standard.");
+        }
+        return MV_OK;
+    }
+
+    return MV_OK;
+!!!11039500.cpp!!!	FSServiceSpec_CtrlSet(in ctrlType : int32_t, in param : int32_t, in preSet : int32_t) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_MODEL_INDEX:
+            ret = FSServiceSpec_SetModelIndex(param, preSet);
+            break;
+
+        case MV_FS_CTRL_VIDEO_AGING_MODE:
+            ret = FSServiceSpec_SetAgingMode(param, preSet);
+            break;
+
+        default:
+            ret = MV_OK;
+            break;
+    }
+
+    return ret;
+!!!11039628.cpp!!!	FSServiceSpec_CtrlSet(in ctrlType : int32_t, inout param : String8, in preSet : int32_t) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+
+    switch( ctrlType )
+    {
+        default:
+            break;
+    }
+
+    return ret;
+!!!11039756.cpp!!!	FSServiceSpec_CtrlSet(in ctrlType : int32_t, in param1 : int32_t, in param2 : int32_t, in preSet : int32_t) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_VIDEO_COLOR_TEMP_VALUE:
+            ret = FSServiceSpec_SetColortempValue(param1, param2, preSet);
+            break;
+
+        default:
+            break;
+    }
+
+    return ret;
+!!!11039884.cpp!!!	FSServiceSpec_CtrlGet(in ctrlType : int32_t, inout param : String8) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+
+    switch( ctrlType )
+    {
+        default:
+            break;
+    }
+
+    return ret;
+!!!11040012.cpp!!!	FSServiceSpec_CtrlGet(in ctrlType : int32_t, inout param : int32_t) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+
+    switch( ctrlType )
+    {
+        default:
+            break;
+    }
+
+    return ret;
+!!!11040140.cpp!!!	FSServiceSpec_CtrlGet(in ctrlType : int32_t, in param1 : int32_t, inout param2 : int32_t, in preSet : int32_t) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+
+    switch( ctrlType )
+    {
+        case MV_FS_CTRL_VIDEO_COLOR_TEMP_VALUE:
+            ret = FSServiceSpec_GetColortempValue(param1,param2,preSet);
+            break;
+
+        default:
+            break;
+    }
+
+    return ret;
+!!!11040268.cpp!!!	FSServiceSpec_CtrlGet(in ctrlType : int32_t, in param1 : int32_t, inout param2 : String8) : MV_FS_ERROR_CODES
+    MV_FS_ERROR_CODES ret = MV_OK;
+
+    switch( ctrlType )
+    {
+        default:
+            break;
+    }
+
+    return ret;

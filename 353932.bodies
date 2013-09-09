@@ -1,0 +1,212 @@
+class MP3Extractor
+!!!633868.cpp!!!	MP3Extractor(in source : sp<DataSource>, in meta : sp<AMessage>)
+    off64_t pos = 0;
+    off64_t post_id3_pos;
+    uint32_t header;
+    bool success;
+
+    int64_t meta_offset;
+    uint32_t meta_header;
+    int64_t meta_post_id3_offset;
+    if (meta != NULL
+            && meta->findInt64("offset", &meta_offset)
+            && meta->findInt32("header", (int32_t *)&meta_header)
+            && meta->findInt64("post-id3-offset", &meta_post_id3_offset)) {
+        // The sniffer has already done all the hard work for us, simply
+        // accept its judgement.
+        pos = (off64_t)meta_offset;
+        header = meta_header;
+        post_id3_pos = (off64_t)meta_post_id3_offset;
+
+        success = true;
+    } else {
+        success = Resync(mDataSource, 0, &pos, &post_id3_pos, &header);
+    }
+
+    if (!success) {
+        // mInitCheck will remain NO_INIT
+        return;
+    }
+
+    mFirstFramePos = pos;
+    mFixedHeader = header;
+
+    size_t frame_size;
+    int sample_rate;
+    int num_channels;
+    int bitrate;
+    GetMPEGAudioFrameSize(
+            header, &frame_size, &sample_rate, &num_channels, &bitrate);
+
+    unsigned layer = 4 - ((header >> 17) & 3);
+
+    mMeta = new MetaData;
+
+    switch (layer) {
+        case 1:
+            mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_I);
+            break;
+        case 2:
+            mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_II);
+            break;
+        case 3:
+            mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG);
+            break;
+        default:
+            TRESPASS();
+    }
+
+    mMeta->setInt32(kKeySampleRate, sample_rate);
+    mMeta->setInt32(kKeyBitRate, bitrate * 1000);
+    mMeta->setInt32(kKeyChannelCount, num_channels);
+
+    sp<XINGSeeker> seeker = XINGSeeker::CreateFromSource(mDataSource, mFirstFramePos);
+
+    if (seeker == NULL) {
+        mSeeker = VBRISeeker::CreateFromSource(mDataSource, post_id3_pos);
+    } else {
+        mSeeker = seeker;
+        int encd = seeker->getEncoderDelay();
+        int encp = seeker->getEncoderPadding();
+        if (encd != 0 || encp != 0) {
+            mMeta->setInt32(kKeyEncoderDelay, encd);
+            mMeta->setInt32(kKeyEncoderPadding, encp);
+        }
+    }
+
+    if (mSeeker != NULL) {
+        // While it is safe to send the XING/VBRI frame to the decoder, this will
+        // result in an extra 1152 samples being output. The real first frame to
+        // decode is after the XING/VBRI frame, so skip there.
+        mFirstFramePos += frame_size;
+    }
+
+    int64_t durationUs;
+
+    if (mSeeker == NULL || !mSeeker->getDuration(&durationUs)) {
+        off64_t fileSize;
+        if (mDataSource->getSize(&fileSize) == OK) {
+            durationUs = 8000LL * (fileSize - mFirstFramePos) / bitrate;
+        } else {
+            durationUs = -1;
+        }
+    }
+
+    if (durationUs >= 0) {
+        mMeta->setInt64(kKeyDuration, durationUs);
+    }
+
+    mInitCheck = OK;
+
+    // Get iTunes-style gapless info if present.
+    // When getting the id3 tag, skip the V1 tags to prevent the source cache
+    // from being iterated to the end of the file.
+    ID3 id3(mDataSource, true);
+    if (id3.isValid()) {
+        ID3::Iterator *com = new ID3::Iterator(id3, "COM");
+        if (com->done()) {
+            delete com;
+            com = new ID3::Iterator(id3, "COMM");
+        }
+        while(!com->done()) {
+            String8 commentdesc;
+            String8 commentvalue;
+            com->getString(&commentdesc, &commentvalue);
+            const char * desc = commentdesc.string();
+            const char * value = commentvalue.string();
+
+            // first 3 characters are the language, which we don't care about
+            if(strlen(desc) > 3 && strcmp(desc + 3, "iTunSMPB") == 0) {
+
+                int32_t delay, padding;
+                if (sscanf(value, " %*x %x %x %*x", &delay, &padding) == 2) {
+                    mMeta->setInt32(kKeyEncoderDelay, delay);
+                    mMeta->setInt32(kKeyEncoderPadding, padding);
+                }
+                break;
+            }
+            com->next();
+        }
+        delete com;
+        com = NULL;
+    }
+!!!633996.cpp!!!	countTracks() : size_t
+    return mInitCheck != OK ? 0 : 1;
+!!!634124.cpp!!!	getTrack(in index : size_t) : sp<MediaSource>
+    if (mInitCheck != OK || index != 0) {
+        return NULL;
+    }
+
+    return new MP3Source(
+            mMeta, mDataSource, mFirstFramePos, mFixedHeader,
+            mSeeker);
+!!!634252.cpp!!!	getTrackMetaData(in index : size_t, in flags : uint32_t) : sp<MetaData>
+    if (mInitCheck != OK || index != 0) {
+        return NULL;
+    }
+
+    return mMeta;
+!!!634380.cpp!!!	getMetaData() : sp<MetaData>
+    sp<MetaData> meta = new MetaData;
+
+    if (mInitCheck != OK) {
+        return meta;
+    }
+
+    meta->setCString(kKeyMIMEType, "audio/mpeg");
+
+    ID3 id3(mDataSource);
+
+    if (!id3.isValid()) {
+        return meta;
+    }
+
+    struct Map {
+        int key;
+        const char *tag1;
+        const char *tag2;
+    };
+    static const Map kMap[] = {
+        { kKeyAlbum, "TALB", "TAL" },
+        { kKeyArtist, "TPE1", "TP1" },
+        { kKeyAlbumArtist, "TPE2", "TP2" },
+        { kKeyComposer, "TCOM", "TCM" },
+        { kKeyGenre, "TCON", "TCO" },
+        { kKeyTitle, "TIT2", "TT2" },
+        { kKeyYear, "TYE", "TYER" },
+        { kKeyAuthor, "TXT", "TEXT" },
+        { kKeyCDTrackNumber, "TRK", "TRCK" },
+        { kKeyDiscNumber, "TPA", "TPOS" },
+        { kKeyCompilation, "TCP", "TCMP" },
+    };
+    static const size_t kNumMapEntries = sizeof(kMap) / sizeof(kMap[0]);
+
+    for (size_t i = 0; i < kNumMapEntries; ++i) {
+        ID3::Iterator *it = new ID3::Iterator(id3, kMap[i].tag1);
+        if (it->done()) {
+            delete it;
+            it = new ID3::Iterator(id3, kMap[i].tag2);
+        }
+
+        if (it->done()) {
+            delete it;
+            continue;
+        }
+
+        String8 s;
+        it->getString(&s);
+        delete it;
+
+        meta->setCString(kMap[i].key, s);
+    }
+
+    size_t dataSize;
+    String8 mime;
+    const void *data = id3.getAlbumArt(&dataSize, &mime);
+
+    if (data) {
+        meta->setData(kKeyAlbumArt, MetaData::TYPE_NONE, data, dataSize);
+        meta->setCString(kKeyAlbumArtMIME, mime.string());
+    }
+
+    return meta;

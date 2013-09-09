@@ -1,0 +1,182 @@
+class TestHandler
+!!!1908748.cpp!!!	startServer(in localPort : uint) : void
+    sp<AMessage> msg = new AMessage(kWhatStartServer, id());
+    msg->setInt32("localPort", localPort);
+    msg->post();
+!!!1908876.cpp!!!	startClient(in remoteHost : char, in remotePort : uint) : void
+    sp<AMessage> msg = new AMessage(kWhatStartClient, id());
+    msg->setString("remoteHost", remoteHost);
+    msg->setInt32("remotePort", remotePort);
+    msg->post();
+!!!1909132.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatStartClient:
+        {
+            AString remoteHost;
+            CHECK(msg->findString("remoteHost", &remoteHost));
+
+            int32_t remotePort;
+            CHECK(msg->findInt32("remotePort", &remotePort));
+
+            sp<AMessage> notify = new AMessage(kWhatUDPNotify, id());
+
+            CHECK_EQ((status_t)OK,
+                     mNetSession->createUDPSession(
+                         0 /* localPort */,
+                         remoteHost.c_str(),
+                         remotePort,
+                         notify,
+                         &mUDPSession));
+
+            postSendPacket();
+            break;
+        }
+
+        case kWhatStartServer:
+        {
+            mIsServer = true;
+
+            int32_t localPort;
+            CHECK(msg->findInt32("localPort", &localPort));
+
+            sp<AMessage> notify = new AMessage(kWhatUDPNotify, id());
+
+            CHECK_EQ((status_t)OK,
+                     mNetSession->createUDPSession(
+                         localPort, notify, &mUDPSession));
+
+            break;
+        }
+
+        case kWhatSendPacket:
+        {
+            char buffer[12];
+            memset(buffer, 0, sizeof(buffer));
+
+            buffer[0] = mSeqNo >> 24;
+            buffer[1] = (mSeqNo >> 16) & 0xff;
+            buffer[2] = (mSeqNo >> 8) & 0xff;
+            buffer[3] = mSeqNo & 0xff;
+            ++mSeqNo;
+
+            int64_t nowUs = ALooper::GetNowUs();
+            buffer[4] = nowUs >> 56;
+            buffer[5] = (nowUs >> 48) & 0xff;
+            buffer[6] = (nowUs >> 40) & 0xff;
+            buffer[7] = (nowUs >> 32) & 0xff;
+            buffer[8] = (nowUs >> 24) & 0xff;
+            buffer[9] = (nowUs >> 16) & 0xff;
+            buffer[10] = (nowUs >> 8) & 0xff;
+            buffer[11] = nowUs & 0xff;
+
+            CHECK_EQ((status_t)OK,
+                     mNetSession->sendRequest(
+                         mUDPSession, buffer, sizeof(buffer)));
+
+            postSendPacket(20000ll);
+            break;
+        }
+
+        case kWhatUDPNotify:
+        {
+            int32_t reason;
+            CHECK(msg->findInt32("reason", &reason));
+
+            switch (reason) {
+                case ANetworkSession::kWhatError:
+                {
+                    int32_t sessionID;
+                    CHECK(msg->findInt32("sessionID", &sessionID));
+
+                    int32_t err;
+                    CHECK(msg->findInt32("err", &err));
+
+                    AString detail;
+                    CHECK(msg->findString("detail", &detail));
+
+                    ALOGE("An error occurred in session %d (%d, '%s/%s').",
+                          sessionID,
+                          err,
+                          detail.c_str(),
+                          strerror(-err));
+
+                    mNetSession->destroySession(sessionID);
+                    break;
+                }
+
+                case ANetworkSession::kWhatDatagram:
+                {
+                    int32_t sessionID;
+                    CHECK(msg->findInt32("sessionID", &sessionID));
+
+                    sp<ABuffer> data;
+                    CHECK(msg->findBuffer("data", &data));
+
+                    if (mIsServer) {
+                        if (!mConnected) {
+                            AString fromAddr;
+                            CHECK(msg->findString("fromAddr", &fromAddr));
+
+                            int32_t fromPort;
+                            CHECK(msg->findInt32("fromPort", &fromPort));
+
+                            CHECK_EQ((status_t)OK,
+                                     mNetSession->connectUDPSession(
+                                         mUDPSession, fromAddr.c_str(), fromPort));
+
+                            mConnected = true;
+                        }
+
+                        int64_t nowUs = ALooper::GetNowUs();
+
+                        sp<ABuffer> buffer = new ABuffer(data->size() + 8);
+                        memcpy(buffer->data(), data->data(), data->size());
+
+                        uint8_t *ptr = buffer->data() + data->size();
+
+                        *ptr++ = nowUs >> 56;
+                        *ptr++ = (nowUs >> 48) & 0xff;
+                        *ptr++ = (nowUs >> 40) & 0xff;
+                        *ptr++ = (nowUs >> 32) & 0xff;
+                        *ptr++ = (nowUs >> 24) & 0xff;
+                        *ptr++ = (nowUs >> 16) & 0xff;
+                        *ptr++ = (nowUs >> 8) & 0xff;
+                        *ptr++ = nowUs & 0xff;
+
+                        CHECK_EQ((status_t)OK,
+                                 mNetSession->sendRequest(
+                                     mUDPSession, buffer->data(), buffer->size()));
+                    } else {
+                        CHECK_EQ(data->size(), 20u);
+
+                        uint32_t seqNo = U32_AT(data->data());
+                        int64_t t1 = U64_AT(data->data() + 4);
+                        int64_t t2 = U64_AT(data->data() + 12);
+
+                        int64_t t3;
+                        CHECK(data->meta()->findInt64("arrivalTimeUs", &t3));
+
+#if 0
+                        printf("roundtrip seqNo %u, time = %lld us\n",
+                               seqNo, t3 - t1);
+#else
+                        mTotalTimeUs += t3 - t1;
+                        ++mCount;
+                        printf("avg. roundtrip time %.2f us\n", mTotalTimeUs / mCount);
+#endif
+                    }
+                    break;
+                }
+
+                default:
+                    TRESPASS();
+            }
+
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!1909260.cpp!!!	postSendPacket(in delayUs : int64_t = 0ll) : void
+    (new AMessage(kWhatSendPacket, id()))->post(delayUs);

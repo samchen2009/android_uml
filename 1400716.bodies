@@ -1,0 +1,189 @@
+class NetworkStatsRecorder
+!!!8569996.java!!!	NetworkStatsRecorder(inout rotator : FileRotator, inout observer : NonMonotonicObserver, inout dropBox : DropBoxManager, in cookie : String, in bucketDuration : long, inout onlyTags : boolean)
+        mRotator = checkNotNull(rotator, "missing FileRotator");
+        mObserver = checkNotNull(observer, "missing NonMonotonicObserver");
+        mDropBox = checkNotNull(dropBox, "missing DropBoxManager");
+        mCookie = cookie;
+
+        mBucketDuration = bucketDuration;
+        mOnlyTags = onlyTags;
+
+        mPending = new NetworkStatsCollection(bucketDuration);
+        mSinceBoot = new NetworkStatsCollection(bucketDuration);
+
+        mPendingRewriter = new CombiningRewriter(mPending);
+!!!8570124.java!!!	setPersistThreshold(in thresholdBytes : long) : void
+        if (LOGV) Slog.v(TAG, "setPersistThreshold() with " + thresholdBytes);
+        mPersistThresholdBytes = MathUtils.constrain(
+                thresholdBytes, 1 * KB_IN_BYTES, 100 * MB_IN_BYTES);
+!!!8570252.java!!!	resetLocked() : void
+        mLastSnapshot = null;
+        mPending.reset();
+        mSinceBoot.reset();
+        mComplete.clear();
+!!!8570380.java!!!	getTotalSinceBootLocked(inout template : NetworkTemplate) : Entry
+        return mSinceBoot.getSummary(template, Long.MIN_VALUE, Long.MAX_VALUE).getTotal(null);
+!!!8570508.java!!!	getOrLoadCompleteLocked() : NetworkStatsCollection
+        NetworkStatsCollection complete = mComplete != null ? mComplete.get() : null;
+        if (complete == null) {
+            if (LOGD) Slog.d(TAG, "getOrLoadCompleteLocked() reading from disk for " + mCookie);
+            try {
+                complete = new NetworkStatsCollection(mBucketDuration);
+                mRotator.readMatching(complete, Long.MIN_VALUE, Long.MAX_VALUE);
+                complete.recordCollection(mPending);
+                mComplete = new WeakReference<NetworkStatsCollection>(complete);
+            } catch (IOException e) {
+                Log.wtf(TAG, "problem completely reading network stats", e);
+                recoverFromWtf();
+            }
+        }
+        return complete;
+!!!8570636.java!!!	recordSnapshotLocked(inout snapshot : NetworkStats, inout ifaceIdent : Map<String, NetworkIdentitySet>, in currentTimeMillis : long) : void
+        final HashSet<String> unknownIfaces = Sets.newHashSet();
+
+        // skip recording when snapshot missing
+        if (snapshot == null) return;
+
+        // assume first snapshot is bootstrap and don't record
+        if (mLastSnapshot == null) {
+            mLastSnapshot = snapshot;
+            return;
+        }
+
+        final NetworkStatsCollection complete = mComplete != null ? mComplete.get() : null;
+
+        final NetworkStats delta = NetworkStats.subtract(
+                snapshot, mLastSnapshot, mObserver, mCookie);
+        final long end = currentTimeMillis;
+        final long start = end - delta.getElapsedRealtime();
+
+        NetworkStats.Entry entry = null;
+        for (int i = 0; i < delta.size(); i++) {
+            entry = delta.getValues(i, entry);
+            final NetworkIdentitySet ident = ifaceIdent.get(entry.iface);
+            if (ident == null) {
+                unknownIfaces.add(entry.iface);
+                continue;
+            }
+
+            // skip when no delta occurred
+            if (entry.isEmpty()) continue;
+
+            // only record tag data when requested
+            if ((entry.tag == TAG_NONE) != mOnlyTags) {
+                mPending.recordData(ident, entry.uid, entry.set, entry.tag, start, end, entry);
+
+                // also record against boot stats when present
+                if (mSinceBoot != null) {
+                    mSinceBoot.recordData(ident, entry.uid, entry.set, entry.tag, start, end, entry);
+                }
+
+                // also record against complete dataset when present
+                if (complete != null) {
+                    complete.recordData(ident, entry.uid, entry.set, entry.tag, start, end, entry);
+                }
+            }
+        }
+
+        mLastSnapshot = snapshot;
+
+        if (LOGV && unknownIfaces.size() > 0) {
+            Slog.w(TAG, "unknown interfaces " + unknownIfaces + ", ignoring those stats");
+        }
+!!!8570764.java!!!	maybePersistLocked(in currentTimeMillis : long) : void
+        final long pendingBytes = mPending.getTotalBytes();
+        if (pendingBytes >= mPersistThresholdBytes) {
+            forcePersistLocked(currentTimeMillis);
+        } else {
+            mRotator.maybeRotate(currentTimeMillis);
+        }
+!!!8570892.java!!!	forcePersistLocked(in currentTimeMillis : long) : void
+        if (mPending.isDirty()) {
+            if (LOGD) Slog.d(TAG, "forcePersistLocked() writing for " + mCookie);
+            try {
+                mRotator.rewriteActive(mPendingRewriter, currentTimeMillis);
+                mRotator.maybeRotate(currentTimeMillis);
+                mPending.reset();
+            } catch (IOException e) {
+                Log.wtf(TAG, "problem persisting pending stats", e);
+                recoverFromWtf();
+            }
+        }
+!!!8571020.java!!!	removeUidsLocked(inout uids : int) : void
+        try {
+            // Rewrite all persisted data to migrate UID stats
+            mRotator.rewriteAll(new RemoveUidRewriter(mBucketDuration, uids));
+        } catch (IOException e) {
+            Log.wtf(TAG, "problem removing UIDs " + Arrays.toString(uids), e);
+            recoverFromWtf();
+        }
+
+        // Remove any pending stats
+        mPending.removeUids(uids);
+        mSinceBoot.removeUids(uids);
+
+        // Clear UID from current stats snapshot
+        if (mLastSnapshot != null) {
+            mLastSnapshot = mLastSnapshot.withoutUids(uids);
+        }
+
+        final NetworkStatsCollection complete = mComplete != null ? mComplete.get() : null;
+        if (complete != null) {
+            complete.removeUids(uids);
+        }
+!!!8572428.java!!!	importLegacyNetworkLocked(inout file : File) : void
+        // legacy file still exists; start empty to avoid double importing
+        mRotator.deleteAll();
+
+        final NetworkStatsCollection collection = new NetworkStatsCollection(mBucketDuration);
+        collection.readLegacyNetwork(file);
+
+        final long startMillis = collection.getStartMillis();
+        final long endMillis = collection.getEndMillis();
+
+        if (!collection.isEmpty()) {
+            // process legacy data, creating active file at starting time, then
+            // using end time to possibly trigger rotation.
+            mRotator.rewriteActive(new CombiningRewriter(collection), startMillis);
+            mRotator.maybeRotate(endMillis);
+        }
+!!!8572556.java!!!	importLegacyUidLocked(inout file : File) : void
+        // legacy file still exists; start empty to avoid double importing
+        mRotator.deleteAll();
+
+        final NetworkStatsCollection collection = new NetworkStatsCollection(mBucketDuration);
+        collection.readLegacyUid(file, mOnlyTags);
+
+        final long startMillis = collection.getStartMillis();
+        final long endMillis = collection.getEndMillis();
+
+        if (!collection.isEmpty()) {
+            // process legacy data, creating active file at starting time, then
+            // using end time to possibly trigger rotation.
+            mRotator.rewriteActive(new CombiningRewriter(collection), startMillis);
+            mRotator.maybeRotate(endMillis);
+        }
+!!!8572684.java!!!	dumpLocked(inout pw : IndentingPrintWriter, inout fullHistory : boolean) : void
+        pw.print("Pending bytes: "); pw.println(mPending.getTotalBytes());
+        if (fullHistory) {
+            pw.println("Complete history:");
+            getOrLoadCompleteLocked().dump(pw);
+        } else {
+            pw.println("History since boot:");
+            mSinceBoot.dump(pw);
+        }
+!!!8572812.java!!!	recoverFromWtf() : void
+        if (DUMP_BEFORE_DELETE) {
+            final ByteArrayOutputStream os = new ByteArrayOutputStream();
+            try {
+                mRotator.dumpAll(os);
+            } catch (IOException e) {
+                // ignore partial contents
+                os.reset();
+            } finally {
+                IoUtils.closeQuietly(os);
+            }
+            mDropBox.addData(TAG_NETSTATS_DUMP, os.toByteArray(), 0);
+        }
+
+        mRotator.deleteAll();

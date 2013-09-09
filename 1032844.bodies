@@ -1,0 +1,185 @@
+class RuntimeInit
+!!!5522700.java!!!	commonInit() : void
+        if (DEBUG) Slog.d(TAG, "Entered RuntimeInit!");
+
+        /* set default handler; this applies to all threads in the VM */
+        Thread.setDefaultUncaughtExceptionHandler(new UncaughtHandler());
+
+        /*
+         * Install a TimezoneGetter subclass for ZoneInfo.db
+         */
+        TimezoneGetter.setInstance(new TimezoneGetter() {
+            @Override
+            public String getId() {
+                return SystemProperties.get("persist.sys.timezone");
+            }
+        });
+        TimeZone.setDefault(null);
+
+        /*
+         * Sets handler for java.util.logging to use Android log facilities.
+         * The odd "new instance-and-then-throw-away" is a mirror of how
+         * the "java.util.logging.config.class" system property works. We
+         * can't use the system property here since the logger has almost
+         * certainly already been initialized.
+         */
+        LogManager.getLogManager().reset();
+        new AndroidConfig();
+
+        /*
+         * Sets the default HTTP User-Agent used by HttpURLConnection.
+         */
+        String userAgent = getDefaultUserAgent();
+        System.setProperty("http.agent", userAgent);
+
+        /*
+         * Wire socket tagging to traffic stats.
+         */
+        NetworkManagementSocketTagger.install();
+
+        /*
+         * If we're running in an emulator launched with "-trace", put the
+         * VM into emulator trace profiling mode so that the user can hit
+         * F9/F10 at any time to capture traces.  This has performance
+         * consequences, so it's not something you want to do always.
+         */
+        String trace = SystemProperties.get("ro.kernel.android.tracing");
+        if (trace.equals("1")) {
+            Slog.i(TAG, "NOTE: emulator trace profiling enabled");
+            Debug.enableEmulatorTraceOutput();
+        }
+
+        initialized = true;
+!!!5522828.java!!!	getDefaultUserAgent() : String
+        StringBuilder result = new StringBuilder(64);
+        result.append("Dalvik/");
+        result.append(System.getProperty("java.vm.version")); // such as 1.1.0
+        result.append(" (Linux; U; Android ");
+
+        String version = Build.VERSION.RELEASE; // "1.0" or "3.4b5"
+        result.append(version.length() > 0 ? version : "1.0");
+
+        // add the model for the release build
+        if ("REL".equals(Build.VERSION.CODENAME)) {
+            String model = Build.MODEL;
+            if (model.length() > 0) {
+                result.append("; ");
+                result.append(model);
+            }
+        }
+        String id = Build.ID; // "MASTER" or "M4-rc20"
+        if (id.length() > 0) {
+            result.append(" Build/");
+            result.append(id);
+        }
+        result.append(")");
+        return result.toString();
+!!!5522956.java!!!	invokeStaticMain(in className : String, inout argv : String) : void
+        Class<?> cl;
+
+        try {
+            cl = Class.forName(className);
+        } catch (ClassNotFoundException ex) {
+            throw new RuntimeException(
+                    "Missing class when invoking static main " + className,
+                    ex);
+        }
+
+        Method m;
+        try {
+            m = cl.getMethod("main", new Class[] { String[].class });
+        } catch (NoSuchMethodException ex) {
+            throw new RuntimeException(
+                    "Missing static main on " + className, ex);
+        } catch (SecurityException ex) {
+            throw new RuntimeException(
+                    "Problem getting static main on " + className, ex);
+        }
+
+        int modifiers = m.getModifiers();
+        if (! (Modifier.isStatic(modifiers) && Modifier.isPublic(modifiers))) {
+            throw new RuntimeException(
+                    "Main method is not public and static on " + className);
+        }
+
+        /*
+         * This throw gets caught in ZygoteInit.main(), which responds
+         * by invoking the exception's run() method. This arrangement
+         * clears up all the stack frames that were required in setting
+         * up the process.
+         */
+        throw new ZygoteInit.MethodAndArgsCaller(m, argv);
+!!!5523084.java!!!	main(inout argv : String) : void
+        if (argv.length == 2 && argv[1].equals("application")) {
+            if (DEBUG) Slog.d(TAG, "RuntimeInit: Starting application");
+            redirectLogStreams();
+        } else {
+            if (DEBUG) Slog.d(TAG, "RuntimeInit: Starting tool");
+        }
+
+        commonInit();
+
+        /*
+         * Now that we're running in interpreted code, call back into native code
+         * to run the system.
+         */
+        nativeFinishInit();
+
+        if (DEBUG) Slog.d(TAG, "Leaving RuntimeInit!");
+!!!5523212.java!!!	zygoteInit(in targetSdkVersion : int, inout argv : String) : void
+        if (DEBUG) Slog.d(TAG, "RuntimeInit: Starting application from zygote");
+
+        redirectLogStreams();
+
+        commonInit();
+        nativeZygoteInit();
+
+        applicationInit(targetSdkVersion, argv);
+!!!5523340.java!!!	wrapperInit(in targetSdkVersion : int, inout argv : String) : void
+        if (DEBUG) Slog.d(TAG, "RuntimeInit: Starting application from wrapper");
+
+        applicationInit(targetSdkVersion, argv);
+!!!5523468.java!!!	applicationInit(in targetSdkVersion : int, inout argv : String) : void
+        // If the application calls System.exit(), terminate the process
+        // immediately without running any shutdown hooks.  It is not possible to
+        // shutdown an Android application gracefully.  Among other things, the
+        // Android runtime shutdown hooks close the Binder driver, which can cause
+        // leftover running threads to crash before the process actually exits.
+        nativeSetExitWithoutCleanup(true);
+
+        // We want to be fairly aggressive about heap utilization, to avoid
+        // holding on to a lot of memory that isn't needed.
+        VMRuntime.getRuntime().setTargetHeapUtilization(0.75f);
+        VMRuntime.getRuntime().setTargetSdkVersion(targetSdkVersion);
+
+        final Arguments args;
+        try {
+            args = new Arguments(argv);
+        } catch (IllegalArgumentException ex) {
+            Slog.e(TAG, ex.getMessage());
+            // let the process exit
+            return;
+        }
+
+        // Remaining arguments are passed to the start class's static main
+        invokeStaticMain(args.startClass, args.startArgs);
+!!!5523596.java!!!	redirectLogStreams() : void
+        System.out.close();
+        System.setOut(new AndroidPrintStream(Log.INFO, "System.out"));
+        System.err.close();
+        System.setErr(new AndroidPrintStream(Log.WARN, "System.err"));
+!!!5523724.java!!!	wtf(in tag : String, inout t : Throwable) : void
+        try {
+            if (ActivityManagerNative.getDefault().handleApplicationWtf(
+                    mApplicationObject, tag, new ApplicationErrorReport.CrashInfo(t))) {
+                // The Activity Manager has already written us off -- now exit.
+                Process.killProcess(Process.myPid());
+                System.exit(10);
+            }
+        } catch (Throwable t2) {
+            Slog.e(TAG, "Error reporting WTF", t2);
+        }
+!!!5523852.java!!!	setApplicationObject(inout app : IBinder) : void
+        mApplicationObject = app;
+!!!5523980.java!!!	getApplicationObject() : IBinder
+        return mApplicationObject;

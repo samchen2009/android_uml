@@ -1,0 +1,166 @@
+class AmpAudioReceiver
+!!!10922636.cpp!!!	receiveAmpAudioChunk(inout audioChunk : AmpAudioChunk) : bool
+    size_t count;
+
+    if (mAudioResampler == NULL) {
+        SLOGE("No audio resampler available");
+        return false;
+    }
+
+    if (audioChunk->bitDepth != 16 && audioChunk->bitDepth != 32) {
+        SLOGE("Unsupported bitdepth %u", audioChunk->bitDepth);
+        return true;
+    }
+
+    if (audioChunk->channelNum != 1 && audioChunk->channelNum != 2) {
+        SLOGE("Unsupported channels %u", audioChunk->channelNum);
+        return true;
+    }
+
+    if (audioChunk->sampleRate != AmpAudioResampler::kFreq44100Hz &&
+        audioChunk->sampleRate != AmpAudioResampler::kFreq48000Hz) {
+        SLOGE("Unsupported sample rate %u", audioChunk->sampleRate);
+        return true;
+    }
+
+    AudioBufferInfo info = {
+        audioChunk->frameCount,
+        audioChunk->bitDepth,
+        audioChunk->channelNum,
+        audioChunk->sampleRate,
+    };
+
+    int res = mAudioResampler->resample(static_cast<void *>(audioChunk->chunk.i8),
+                                        &info);
+    if (res != 0)
+        return true;
+
+    // recalculate the buffer size in bytes after resample
+    count = info.frameCount * info.channelNum * (info.bitDepth / BITS_PER_BYTE);
+    return onDataReceive(static_cast<void *>(audioChunk->chunk.i8), count /* in bytes */);
+!!!10922764.cpp!!!	AmpAudioReceiver(in bitDepth : uint32_t = 16, in channelNum : uint32_t = 2, in sampleRate : uint32_t = 44100)
+    set(bitDepth, channelNum, sampleRate);
+!!!10922892.cpp!!!	~AmpAudioReceiver()
+    stopReceiver();
+    if (mAudioResampler != NULL)
+        mAudioResampler.clear();
+!!!10923020.cpp!!!	set(in bitDepth : uint32_t, in channelNum : uint32_t, in sampleRate : uint32_t) : int
+    if (bitDepth != 16 && bitDepth != 32) {
+        SLOGE("Unsupported bitDepth %u, reset to default", bitDepth);
+        bitDepth = 16;
+    }
+    if (channelNum != 2 && channelNum != 1) {
+        SLOGE("Unsupported channelNum %u, reset to default", channelNum);
+        channelNum = 2;
+    }
+    switch (sampleRate) {
+    case AmpAudioResampler::kFreq44100Hz:
+    case AmpAudioResampler::kFreq48000Hz:
+        break;
+    default:
+        SLOGE("Unsupported sampleRate %u, reset to default", sampleRate);
+        sampleRate = AmpAudioResampler::kFreq44100Hz;
+    }
+
+    if (mBitDepth == bitDepth &&
+        mChannelNum == channelNum &&
+        mSampleRate == sampleRate) {
+        return 0;
+    }
+
+    if (mAudioResampler != NULL) {
+        mAudioResampler.clear();
+        mAudioResampler = NULL;
+    }
+
+    mAudioResampler = new AmpAudioResampler(bitDepth, channelNum, sampleRate);
+    if (mAudioResampler == NULL) {
+        SLOGE("Failed to create AmpAudioResampler");
+        return -1;
+    }
+
+    mBitDepth   = bitDepth;
+    mChannelNum = channelNum;
+    mSampleRate = sampleRate;
+
+    return 0;
+!!!10923148.cpp!!!	startReceiver() : int
+    if (mAudioListener != NULL)
+        return 0;
+
+    mSocket = openAmpAudioSocket();
+    if (mSocket < 0)
+        return -1;
+
+    mAudioListener = new AmpAudioListener(this, mSocket);
+    if (mAudioListener == NULL || mAudioListener->startListener() != 0) {
+        if (mAudioListener != NULL) {
+            mAudioListener.clear();
+            mAudioListener = NULL;
+        }
+        close(mSocket);
+        mSocket = -1;
+        return -1;
+    }
+
+    return 0;
+!!!10923276.cpp!!!	stopReceiver() : int
+    if (mAudioListener == NULL)
+        return 0;
+
+    mAudioListener->stopListener();
+    mAudioListener.clear();
+    mAudioListener = NULL;
+
+    close(mSocket);
+    mSocket = -1;
+
+    return 0;
+!!!10923404.cpp!!!	pollReceiver(in timeout : int) : int
+    if (mAudioListener == NULL)
+        return 0;
+    return mAudioListener->watch(timeout);
+!!!10924300.cpp!!!	safeWrite(in fd : int, inout buf : void, in count : size_t) : ssize_t
+    size_t n;
+    ssize_t r;
+    char *ptr = static_cast<char *>(buf);
+    for (n = 0; n < count; n += static_cast<size_t>(r)) {
+        r = TEMP_FAILURE_RETRY(write(fd, static_cast<void *>(ptr+n), count-n));
+        if (r < 0) {
+            SLOGE("write failed : (%s)", strerror(errno));
+            return -1;
+        }
+    }
+    return static_cast<ssize_t>(n);
+!!!10924428.cpp!!!	openAmpAudioSocket() : int
+    struct sockaddr_un servaddr;
+    socklen_t addr_len;
+    int fd = socket(PF_UNIX, SOCK_STREAM, 0), rv;
+
+    if (fd < 0) {
+        SLOGE("socket error (%s)", strerror(errno));
+        return -1;
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sun_family = AF_UNIX;
+    snprintf(servaddr.sun_path, sizeof(servaddr.sun_path),
+                ANDROID_SOCKET_DIR "/aout_snoop");
+    addr_len = sizeof(servaddr.sun_family) + strlen(servaddr.sun_path);
+
+    rv = connect(fd, (struct sockaddr *)&servaddr, addr_len);
+    if (rv < 0) {
+        if (errno != ECONNREFUSED)
+            SLOGE("connect error (%s)", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+!!!10924556.cpp!!!	onDataReceive(inout buf : void, in count : size_t) : bool
+    if (mFd > -1) {
+        if (static_cast<size_t>(safeWrite(mFd, buf, count)) != count) {
+            return false;
+        }
+    }
+    return true;

@@ -1,0 +1,1003 @@
+class NetworkManagementService
+!!!8220556.java!!!	NetworkManagementService(inout context : Context)
+        mContext = context;
+
+        if ("simulator".equals(SystemProperties.get("ro.product.device"))) {
+            return;
+        }
+
+        mConnector = new NativeDaemonConnector(
+                new NetdCallbackReceiver(), "netd", 10, NETD_TAG, 160);
+        mThread = new Thread(mConnector, NETD_TAG);
+
+        // Add ourself to the Watchdog monitors.
+        Watchdog.getInstance().addMonitor(this);
+!!!8220684.java!!!	create(inout context : Context) : NetworkManagementService
+        final NetworkManagementService service = new NetworkManagementService(context);
+        final CountDownLatch connectedSignal = service.mConnectedSignal;
+        if (DBG) Slog.d(TAG, "Creating NetworkManagementService");
+        service.mThread.start();
+        if (DBG) Slog.d(TAG, "Awaiting socket connection");
+        connectedSignal.await();
+        if (DBG) Slog.d(TAG, "Connected");
+        return service;
+!!!8220812.java!!!	systemReady() : void
+        prepareNativeDaemon();
+        if (DBG) Slog.d(TAG, "Prepared");
+!!!8220940.java!!!	registerObserver(inout observer : INetworkManagementEventObserver) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        mObservers.register(observer);
+!!!8221068.java!!!	unregisterObserver(inout observer : INetworkManagementEventObserver) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        mObservers.unregister(observer);
+!!!8221196.java!!!	notifyInterfaceStatusChanged(in iface : String, inout up : boolean) : void
+        final int length = mObservers.beginBroadcast();
+        for (int i = 0; i < length; i++) {
+            try {
+                mObservers.getBroadcastItem(i).interfaceStatusChanged(iface, up);
+            } catch (RemoteException e) {
+            }
+        }
+        mObservers.finishBroadcast();
+!!!8221324.java!!!	notifyInterfaceLinkStateChanged(in iface : String, inout up : boolean) : void
+        final int length = mObservers.beginBroadcast();
+        for (int i = 0; i < length; i++) {
+            try {
+                mObservers.getBroadcastItem(i).interfaceLinkStateChanged(iface, up);
+            } catch (RemoteException e) {
+            }
+        }
+        mObservers.finishBroadcast();
+!!!8221452.java!!!	notifyInterfaceAdded(in iface : String) : void
+        final int length = mObservers.beginBroadcast();
+        for (int i = 0; i < length; i++) {
+            try {
+                mObservers.getBroadcastItem(i).interfaceAdded(iface);
+            } catch (RemoteException e) {
+            }
+        }
+        mObservers.finishBroadcast();
+!!!8221580.java!!!	notifyInterfaceRemoved(in iface : String) : void
+        // netd already clears out quota and alerts for removed ifaces; update
+        // our sanity-checking state.
+        mActiveAlerts.remove(iface);
+        mActiveQuotas.remove(iface);
+
+        final int length = mObservers.beginBroadcast();
+        for (int i = 0; i < length; i++) {
+            try {
+                mObservers.getBroadcastItem(i).interfaceRemoved(iface);
+            } catch (RemoteException e) {
+            }
+        }
+        mObservers.finishBroadcast();
+!!!8221708.java!!!	notifyLimitReached(in limitName : String, in iface : String) : void
+        final int length = mObservers.beginBroadcast();
+        for (int i = 0; i < length; i++) {
+            try {
+                mObservers.getBroadcastItem(i).limitReached(limitName, iface);
+            } catch (RemoteException e) {
+            }
+        }
+        mObservers.finishBroadcast();
+!!!8221836.java!!!	notifyInterfaceClassActivity(in label : String, inout active : boolean) : void
+        final int length = mObservers.beginBroadcast();
+        for (int i = 0; i < length; i++) {
+            try {
+                mObservers.getBroadcastItem(i).interfaceClassDataActivityChanged(label, active);
+            } catch (RemoteException e) {
+            }
+        }
+        mObservers.finishBroadcast();
+!!!8221964.java!!!	prepareNativeDaemon() : void
+        mBandwidthControlEnabled = false;
+
+        // only enable bandwidth control when support exists
+        final boolean hasKernelSupport = new File("/proc/net/xt_qtaguid/ctrl").exists();
+        if (hasKernelSupport) {
+            Slog.d(TAG, "enabling bandwidth control");
+            try {
+                mConnector.execute("bandwidth", "enable");
+                mBandwidthControlEnabled = true;
+            } catch (NativeDaemonConnectorException e) {
+                Log.wtf(TAG, "problem enabling bandwidth controls", e);
+            }
+        } else {
+            Slog.d(TAG, "not enabling bandwidth control");
+        }
+
+        SystemProperties.set(PROP_QTAGUID_ENABLED, mBandwidthControlEnabled ? "1" : "0");
+
+        // push any existing quota or UID rules
+        synchronized (mQuotaLock) {
+            int size = mActiveQuotas.size();
+            if (size > 0) {
+                Slog.d(TAG, "pushing " + size + " active quota rules");
+                final HashMap<String, Long> activeQuotas = mActiveQuotas;
+                mActiveQuotas = Maps.newHashMap();
+                for (Map.Entry<String, Long> entry : activeQuotas.entrySet()) {
+                    setInterfaceQuota(entry.getKey(), entry.getValue());
+                }
+            }
+
+            size = mActiveAlerts.size();
+            if (size > 0) {
+                Slog.d(TAG, "pushing " + size + " active alert rules");
+                final HashMap<String, Long> activeAlerts = mActiveAlerts;
+                mActiveAlerts = Maps.newHashMap();
+                for (Map.Entry<String, Long> entry : activeAlerts.entrySet()) {
+                    setInterfaceAlert(entry.getKey(), entry.getValue());
+                }
+            }
+
+            size = mUidRejectOnQuota.size();
+            if (size > 0) {
+                Slog.d(TAG, "pushing " + size + " active uid rules");
+                final SparseBooleanArray uidRejectOnQuota = mUidRejectOnQuota;
+                mUidRejectOnQuota = new SparseBooleanArray();
+                for (int i = 0; i < uidRejectOnQuota.size(); i++) {
+                    setUidNetworkRules(uidRejectOnQuota.keyAt(i), uidRejectOnQuota.valueAt(i));
+                }
+            }
+        }
+
+        // TODO: Push any existing firewall state
+        setFirewallEnabled(mFirewallEnabled || LockdownVpnTracker.isEnabled());
+!!!8222348.java!!!	listInterfaces() : String
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            return NativeDaemonEvent.filterMessageList(
+                    mConnector.executeForList("interface", "list"), InterfaceListResult);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8222476.java!!!	getInterfaceConfig(in iface : String) : InterfaceConfiguration
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        final NativeDaemonEvent event;
+        try {
+            event = mConnector.execute("interface", "getcfg", iface);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+
+        event.checkCode(InterfaceGetCfgResult);
+
+        // Rsp: 213 xx:xx:xx:xx:xx:xx yyy.yyy.yyy.yyy zzz flag1 flag2 flag3
+        final StringTokenizer st = new StringTokenizer(event.getMessage());
+
+        InterfaceConfiguration cfg;
+        try {
+            cfg = new InterfaceConfiguration();
+            cfg.setHardwareAddress(st.nextToken(" "));
+            InetAddress addr = null;
+            int prefixLength = 0;
+            try {
+                addr = NetworkUtils.numericToInetAddress(st.nextToken());
+            } catch (IllegalArgumentException iae) {
+                Slog.e(TAG, "Failed to parse ipaddr", iae);
+            }
+
+            try {
+                prefixLength = Integer.parseInt(st.nextToken());
+            } catch (NumberFormatException nfe) {
+                Slog.e(TAG, "Failed to parse prefixLength", nfe);
+            }
+
+            cfg.setLinkAddress(new LinkAddress(addr, prefixLength));
+            while (st.hasMoreTokens()) {
+                cfg.setFlag(st.nextToken());
+            }
+        } catch (NoSuchElementException nsee) {
+            throw new IllegalStateException("Invalid response from daemon: " + event);
+        }
+        return cfg;
+!!!8222604.java!!!	setInterfaceConfig(in iface : String, inout cfg : InterfaceConfiguration) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        LinkAddress linkAddr = cfg.getLinkAddress();
+        if (linkAddr == null || linkAddr.getAddress() == null) {
+            throw new IllegalStateException("Null LinkAddress given");
+        }
+
+        final Command cmd = new Command("interface", "setcfg", iface,
+                linkAddr.getAddress().getHostAddress(),
+                linkAddr.getNetworkPrefixLength());
+        for (String flag : cfg.getFlags()) {
+            cmd.appendArg(flag);
+        }
+
+        try {
+            mConnector.execute(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8222732.java!!!	setInterfaceDown(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        final InterfaceConfiguration ifcg = getInterfaceConfig(iface);
+        ifcg.setInterfaceDown();
+        setInterfaceConfig(iface, ifcg);
+!!!8222860.java!!!	setInterfaceUp(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        final InterfaceConfiguration ifcg = getInterfaceConfig(iface);
+        ifcg.setInterfaceUp();
+        setInterfaceConfig(iface, ifcg);
+!!!8222988.java!!!	setInterfaceIpv6PrivacyExtensions(in iface : String, inout enable : boolean) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute(
+                    "interface", "ipv6privacyextensions", iface, enable ? "enable" : "disable");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8223116.java!!!	clearInterfaceAddresses(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("interface", "clearaddrs", iface);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8223244.java!!!	enableIpv6(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("interface", "ipv6", iface, "enable");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8223372.java!!!	disableIpv6(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("interface", "ipv6", iface, "disable");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8223500.java!!!	addRoute(in interfaceName : String, inout route : RouteInfo) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        modifyRoute(interfaceName, ADD, route, DEFAULT);
+!!!8223628.java!!!	removeRoute(in interfaceName : String, inout route : RouteInfo) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        modifyRoute(interfaceName, REMOVE, route, DEFAULT);
+!!!8223756.java!!!	addSecondaryRoute(in interfaceName : String, inout route : RouteInfo) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        modifyRoute(interfaceName, ADD, route, SECONDARY);
+!!!8223884.java!!!	removeSecondaryRoute(in interfaceName : String, inout route : RouteInfo) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        modifyRoute(interfaceName, REMOVE, route, SECONDARY);
+!!!8224012.java!!!	modifyRoute(in interfaceName : String, in action : String, inout route : RouteInfo, in type : String) : void
+        final Command cmd = new Command("interface", "route", action, interfaceName, type);
+
+        // create triplet: dest-ip-addr prefixlength gateway-ip-addr
+        final LinkAddress la = route.getDestination();
+        cmd.appendArg(la.getAddress().getHostAddress());
+        cmd.appendArg(la.getNetworkPrefixLength());
+
+        if (route.getGateway() == null) {
+            if (la.getAddress() instanceof Inet4Address) {
+                cmd.appendArg("0.0.0.0");
+            } else {
+                cmd.appendArg("::0");
+            }
+        } else {
+            cmd.appendArg(route.getGateway().getHostAddress());
+        }
+
+        try {
+            mConnector.execute(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8224140.java!!!	readRouteList(in filename : String) : ArrayList<String>
+        FileInputStream fstream = null;
+        ArrayList<String> list = new ArrayList<String>();
+
+        try {
+            fstream = new FileInputStream(filename);
+            DataInputStream in = new DataInputStream(fstream);
+            BufferedReader br = new BufferedReader(new InputStreamReader(in));
+            String s;
+
+            // throw away the title line
+
+            while (((s = br.readLine()) != null) && (s.length() != 0)) {
+                list.add(s);
+            }
+        } catch (IOException ex) {
+            // return current list, possibly empty
+        } finally {
+            if (fstream != null) {
+                try {
+                    fstream.close();
+                } catch (IOException ex) {}
+            }
+        }
+
+        return list;
+!!!8224268.java!!!	getRoutes(in interfaceName : String) : RouteInfo
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        ArrayList<RouteInfo> routes = new ArrayList<RouteInfo>();
+
+        // v4 routes listed as:
+        // iface dest-addr gateway-addr flags refcnt use metric netmask mtu window IRTT
+        for (String s : readRouteList("/proc/net/route")) {
+            String[] fields = s.split("\t");
+
+            if (fields.length > 7) {
+                String iface = fields[0];
+
+                if (interfaceName.equals(iface)) {
+                    String dest = fields[1];
+                    String gate = fields[2];
+                    String flags = fields[3]; // future use?
+                    String mask = fields[7];
+                    try {
+                        // address stored as a hex string, ex: 0014A8C0
+                        InetAddress destAddr =
+                                NetworkUtils.intToInetAddress((int)Long.parseLong(dest, 16));
+                        int prefixLength =
+                                NetworkUtils.netmaskIntToPrefixLength(
+                                (int)Long.parseLong(mask, 16));
+                        LinkAddress linkAddress = new LinkAddress(destAddr, prefixLength);
+
+                        // address stored as a hex string, ex 0014A8C0
+                        InetAddress gatewayAddr =
+                                NetworkUtils.intToInetAddress((int)Long.parseLong(gate, 16));
+
+                        RouteInfo route = new RouteInfo(linkAddress, gatewayAddr);
+                        routes.add(route);
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error parsing route " + s + " : " + e);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // v6 routes listed as:
+        // dest-addr prefixlength ?? ?? gateway-addr ?? ?? ?? ?? iface
+        for (String s : readRouteList("/proc/net/ipv6_route")) {
+            String[]fields = s.split("\\s+");
+            if (fields.length > 9) {
+                String iface = fields[9].trim();
+                if (interfaceName.equals(iface)) {
+                    String dest = fields[0];
+                    String prefix = fields[1];
+                    String gate = fields[4];
+
+                    try {
+                        // prefix length stored as a hex string, ex 40
+                        int prefixLength = Integer.parseInt(prefix, 16);
+
+                        // address stored as a 32 char hex string
+                        // ex fe800000000000000000000000000000
+                        InetAddress destAddr = NetworkUtils.hexToInet6Address(dest);
+                        LinkAddress linkAddress = new LinkAddress(destAddr, prefixLength);
+
+                        InetAddress gateAddr = NetworkUtils.hexToInet6Address(gate);
+
+                        RouteInfo route = new RouteInfo(linkAddress, gateAddr);
+                        routes.add(route);
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error parsing route " + s + " : " + e);
+                        continue;
+                    }
+                }
+            }
+        }
+        return routes.toArray(new RouteInfo[routes.size()]);
+!!!8224396.java!!!	shutdown() : void
+        // TODO: remove from aidl if nobody calls externally
+        mContext.enforceCallingOrSelfPermission(SHUTDOWN, TAG);
+
+        Slog.d(TAG, "Shutting down");
+!!!8224524.java!!!	getIpForwardingEnabled() : boolean
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        final NativeDaemonEvent event;
+        try {
+            event = mConnector.execute("ipfwd", "status");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+
+        // 211 Forwarding enabled
+        event.checkCode(IpFwdStatusResult);
+        return event.getMessage().endsWith("enabled");
+!!!8224652.java!!!	setIpForwardingEnabled(inout enable : boolean) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("ipfwd", enable ? "enable" : "disable");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8224780.java!!!	startTethering(inout dhcpRange : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        // cmd is "tether start first_start first_stop second_start second_stop ..."
+        // an odd number of addrs will fail
+
+        final Command cmd = new Command("tether", "start");
+        for (String d : dhcpRange) {
+            cmd.appendArg(d);
+        }
+
+        try {
+            mConnector.execute(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8224908.java!!!	stopTethering() : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("tether", "stop");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8225036.java!!!	isTetheringStarted() : boolean
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        final NativeDaemonEvent event;
+        try {
+            event = mConnector.execute("tether", "status");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+
+        // 210 Tethering services started
+        event.checkCode(TetherStatusResult);
+        return event.getMessage().endsWith("started");
+!!!8225164.java!!!	startReverseTethering(in iface : String) : void
+        if (DBG) Slog.d(TAG, "startReverseTethering in");
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        // cmd is "tether start first_start first_stop second_start second_stop ..."
+        // an odd number of addrs will fail
+        String cmd = "tether start-reverse";
+        cmd += " " + iface;
+        if (DBG) Slog.d(TAG, "startReverseTethering cmd: " + cmd);
+        try {
+            mConnector.doCommand(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw new IllegalStateException("Unable to communicate to native daemon");
+        }
+        BluetoothTetheringDataTracker.getInstance().startReverseTether(iface);
+
+!!!8225292.java!!!	stopReverseTethering() : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.doCommand("tether stop-reverse");
+        } catch (NativeDaemonConnectorException e) {
+            throw new IllegalStateException("Unable to communicate to native daemon to stop tether");
+        }
+        BluetoothTetheringDataTracker.getInstance().stopReverseTether();
+!!!8225420.java!!!	tetherInterface(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("tether", "interface", "add", iface);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8225548.java!!!	untetherInterface(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("tether", "interface", "remove", iface);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8225676.java!!!	listTetheredInterfaces() : String
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            return NativeDaemonEvent.filterMessageList(
+                    mConnector.executeForList("tether", "interface", "list"),
+                    TetherInterfaceListResult);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8225804.java!!!	setDnsForwarders(inout dns : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        final Command cmd = new Command("tether", "dns", "set");
+        for (String s : dns) {
+            cmd.appendArg(NetworkUtils.numericToInetAddress(s).getHostAddress());
+        }
+
+        try {
+            mConnector.execute(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8225932.java!!!	getDnsForwarders() : String
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            return NativeDaemonEvent.filterMessageList(
+                    mConnector.executeForList("tether", "dns", "list"), TetherDnsFwdTgtListResult);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8226060.java!!!	modifyNat(in action : String, in internalInterface : String, in externalInterface : String) : void
+        final Command cmd = new Command("nat", action, internalInterface, externalInterface);
+
+        final NetworkInterface internalNetworkInterface = NetworkInterface.getByName(
+                internalInterface);
+        if (internalNetworkInterface == null) {
+            cmd.appendArg("0");
+        } else {
+            Collection<InterfaceAddress> interfaceAddresses = internalNetworkInterface
+                    .getInterfaceAddresses();
+            cmd.appendArg(interfaceAddresses.size());
+            for (InterfaceAddress ia : interfaceAddresses) {
+                InetAddress addr = NetworkUtils.getNetworkPart(
+                        ia.getAddress(), ia.getNetworkPrefixLength());
+                cmd.appendArg(addr.getHostAddress() + "/" + ia.getNetworkPrefixLength());
+            }
+        }
+
+        try {
+            mConnector.execute(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8226188.java!!!	enableNat(in internalInterface : String, in externalInterface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            modifyNat("enable", internalInterface, externalInterface);
+        } catch (SocketException e) {
+            throw new IllegalStateException(e);
+        }
+!!!8226316.java!!!	disableNat(in internalInterface : String, in externalInterface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            modifyNat("disable", internalInterface, externalInterface);
+        } catch (SocketException e) {
+            throw new IllegalStateException(e);
+        }
+!!!8226444.java!!!	listTtys() : String
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            return NativeDaemonEvent.filterMessageList(
+                    mConnector.executeForList("list_ttys"), TtyListResult);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8226572.java!!!	attachPppd(in tty : String, in localAddr : String, in remoteAddr : String, in dns1Addr : String, in dns2Addr : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("pppd", "attach", tty,
+                    NetworkUtils.numericToInetAddress(localAddr).getHostAddress(),
+                    NetworkUtils.numericToInetAddress(remoteAddr).getHostAddress(),
+                    NetworkUtils.numericToInetAddress(dns1Addr).getHostAddress(),
+                    NetworkUtils.numericToInetAddress(dns2Addr).getHostAddress());
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8226700.java!!!	detachPppd(in tty : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("pppd", "detach", tty);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8226828.java!!!	startAccessPoint(inout wifiConfig : WifiConfiguration, in wlanIface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            wifiFirmwareReload(wlanIface, "AP");
+            if (wifiConfig == null) {
+                mConnector.execute("softap", "set", wlanIface);
+            } else {
+                mConnector.execute("softap", "set", wlanIface, wifiConfig.SSID,
+                        getSecurityType(wifiConfig), wifiConfig.preSharedKey);
+            }
+            mConnector.execute("softap", "startap");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8226956.java!!!	getSecurityType(inout wifiConfig : WifiConfiguration) : String
+        switch (wifiConfig.getAuthType()) {
+            case KeyMgmt.WPA_PSK:
+                return "wpa-psk";
+            case KeyMgmt.WPA2_PSK:
+                return "wpa2-psk";
+            default:
+                return "open";
+        }
+!!!8227084.java!!!	wifiFirmwareReload(in wlanIface : String, in mode : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("softap", "fwreload", wlanIface, mode);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8227212.java!!!	stopAccessPoint(in wlanIface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("softap", "stopap");
+            wifiFirmwareReload(wlanIface, "STA");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8227340.java!!!	setAccessPoint(inout wifiConfig : WifiConfiguration, in wlanIface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            if (wifiConfig == null) {
+                mConnector.execute("softap", "set", wlanIface);
+            } else {
+                mConnector.execute("softap", "set", wlanIface, wifiConfig.SSID,
+                        getSecurityType(wifiConfig), wifiConfig.preSharedKey);
+            }
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8227468.java!!!	addIdleTimer(in iface : String, in timeout : int, in label : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        if (DBG) Slog.d(TAG, "Adding idletimer");
+
+        synchronized (mIdleTimerLock) {
+            IdleTimerParams params = mActiveIdleTimers.get(iface);
+            if (params != null) {
+                // the interface already has idletimer, update network count
+                params.networkCount++;
+                return;
+            }
+
+            try {
+                mConnector.execute("idletimer", "add", iface, Integer.toString(timeout), label);
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+            mActiveIdleTimers.put(iface, new IdleTimerParams(timeout, label));
+        }
+!!!8227596.java!!!	removeIdleTimer(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        if (DBG) Slog.d(TAG, "Removing idletimer");
+
+        synchronized (mIdleTimerLock) {
+            IdleTimerParams params = mActiveIdleTimers.get(iface);
+            if (params == null || --(params.networkCount) > 0) {
+                return;
+            }
+
+            try {
+                mConnector.execute("idletimer", "remove", iface,
+                        Integer.toString(params.timeout), params.label);
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+            mActiveIdleTimers.remove(iface);
+        }
+!!!8227724.java!!!	getNetworkStatsSummaryDev() : NetworkStats
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return mStatsFactory.readNetworkStatsSummaryDev();
+!!!8227852.java!!!	getNetworkStatsSummaryXt() : NetworkStats
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return mStatsFactory.readNetworkStatsSummaryXt();
+!!!8227980.java!!!	getNetworkStatsDetail() : NetworkStats
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return mStatsFactory.readNetworkStatsDetail(UID_ALL);
+!!!8228108.java!!!	setInterfaceQuota(in iface : String, in quotaBytes : long) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        // silently discard when control disabled
+        // TODO: eventually migrate to be always enabled
+        if (!mBandwidthControlEnabled) return;
+
+        synchronized (mQuotaLock) {
+            if (mActiveQuotas.containsKey(iface)) {
+                throw new IllegalStateException("iface " + iface + " already has quota");
+            }
+
+            try {
+                // TODO: support quota shared across interfaces
+                mConnector.execute("bandwidth", "setiquota", iface, quotaBytes);
+                mActiveQuotas.put(iface, quotaBytes);
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+        }
+!!!8228236.java!!!	removeInterfaceQuota(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        // silently discard when control disabled
+        // TODO: eventually migrate to be always enabled
+        if (!mBandwidthControlEnabled) return;
+
+        synchronized (mQuotaLock) {
+            if (!mActiveQuotas.containsKey(iface)) {
+                // TODO: eventually consider throwing
+                return;
+            }
+
+            mActiveQuotas.remove(iface);
+            mActiveAlerts.remove(iface);
+
+            try {
+                // TODO: support quota shared across interfaces
+                mConnector.execute("bandwidth", "removeiquota", iface);
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+        }
+!!!8228364.java!!!	setInterfaceAlert(in iface : String, in alertBytes : long) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        // silently discard when control disabled
+        // TODO: eventually migrate to be always enabled
+        if (!mBandwidthControlEnabled) return;
+
+        // quick sanity check
+        if (!mActiveQuotas.containsKey(iface)) {
+            throw new IllegalStateException("setting alert requires existing quota on iface");
+        }
+
+        synchronized (mQuotaLock) {
+            if (mActiveAlerts.containsKey(iface)) {
+                throw new IllegalStateException("iface " + iface + " already has alert");
+            }
+
+            try {
+                // TODO: support alert shared across interfaces
+                mConnector.execute("bandwidth", "setinterfacealert", iface, alertBytes);
+                mActiveAlerts.put(iface, alertBytes);
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+        }
+!!!8228492.java!!!	removeInterfaceAlert(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        // silently discard when control disabled
+        // TODO: eventually migrate to be always enabled
+        if (!mBandwidthControlEnabled) return;
+
+        synchronized (mQuotaLock) {
+            if (!mActiveAlerts.containsKey(iface)) {
+                // TODO: eventually consider throwing
+                return;
+            }
+
+            try {
+                // TODO: support alert shared across interfaces
+                mConnector.execute("bandwidth", "removeinterfacealert", iface);
+                mActiveAlerts.remove(iface);
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+        }
+!!!8228620.java!!!	setGlobalAlert(in alertBytes : long) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        // silently discard when control disabled
+        // TODO: eventually migrate to be always enabled
+        if (!mBandwidthControlEnabled) return;
+
+        try {
+            mConnector.execute("bandwidth", "setglobalalert", alertBytes);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8228748.java!!!	setUidNetworkRules(in uid : int, inout rejectOnQuotaInterfaces : boolean) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        // silently discard when control disabled
+        // TODO: eventually migrate to be always enabled
+        if (!mBandwidthControlEnabled) return;
+
+        synchronized (mQuotaLock) {
+            final boolean oldRejectOnQuota = mUidRejectOnQuota.get(uid, false);
+            if (oldRejectOnQuota == rejectOnQuotaInterfaces) {
+                // TODO: eventually consider throwing
+                return;
+            }
+
+            try {
+                mConnector.execute("bandwidth",
+                        rejectOnQuotaInterfaces ? "addnaughtyapps" : "removenaughtyapps", uid);
+                if (rejectOnQuotaInterfaces) {
+                    mUidRejectOnQuota.put(uid, true);
+                } else {
+                    mUidRejectOnQuota.delete(uid);
+                }
+            } catch (NativeDaemonConnectorException e) {
+                throw e.rethrowAsParcelableException();
+            }
+        }
+!!!8228876.java!!!	isBandwidthControlEnabled() : boolean
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return mBandwidthControlEnabled;
+!!!8229004.java!!!	getNetworkStatsUidDetail(in uid : int) : NetworkStats
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return mStatsFactory.readNetworkStatsDetail(uid);
+!!!8229132.java!!!	getNetworkStatsTethering(inout ifacePairs : String) : NetworkStats
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        if (ifacePairs.length % 2 != 0) {
+            throw new IllegalArgumentException(
+                    "unexpected ifacePairs; length=" + ifacePairs.length);
+        }
+
+        final NetworkStats stats = new NetworkStats(SystemClock.elapsedRealtime(), 1);
+        for (int i = 0; i < ifacePairs.length; i += 2) {
+            final String ifaceIn = ifacePairs[i];
+            final String ifaceOut = ifacePairs[i + 1];
+            if (ifaceIn != null && ifaceOut != null) {
+                stats.combineValues(getNetworkStatsTethering(ifaceIn, ifaceOut));
+            }
+        }
+        return stats;
+!!!8229260.java!!!	getNetworkStatsTethering(in ifaceIn : String, in ifaceOut : String) : Entry
+        final NativeDaemonEvent event;
+        try {
+            event = mConnector.execute("bandwidth", "gettetherstats", ifaceIn, ifaceOut);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+
+        event.checkCode(TetheringStatsResult);
+
+        // 221 ifaceIn ifaceOut rx_bytes rx_packets tx_bytes tx_packets
+        final StringTokenizer tok = new StringTokenizer(event.getMessage());
+        tok.nextToken();
+        tok.nextToken();
+
+        try {
+            final NetworkStats.Entry entry = new NetworkStats.Entry();
+            entry.iface = ifaceIn;
+            entry.uid = UID_TETHERING;
+            entry.set = SET_DEFAULT;
+            entry.tag = TAG_NONE;
+            entry.rxBytes = Long.parseLong(tok.nextToken());
+            entry.rxPackets = Long.parseLong(tok.nextToken());
+            entry.txBytes = Long.parseLong(tok.nextToken());
+            entry.txPackets = Long.parseLong(tok.nextToken());
+            return entry;
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException(
+                    "problem parsing tethering stats for " + ifaceIn + " " + ifaceOut + ": " + e);
+        }
+!!!8229388.java!!!	setInterfaceThrottle(in iface : String, in rxKbps : int, in txKbps : int) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("interface", "setthrottle", iface, rxKbps, txKbps);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8229516.java!!!	getInterfaceThrottle(in iface : String, inout rx : boolean) : int
+        final NativeDaemonEvent event;
+        try {
+            event = mConnector.execute("interface", "getthrottle", iface, rx ? "rx" : "tx");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+
+        if (rx) {
+            event.checkCode(InterfaceRxThrottleResult);
+        } else {
+            event.checkCode(InterfaceTxThrottleResult);
+        }
+
+        try {
+            return Integer.parseInt(event.getMessage());
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("unexpected response:" + event);
+        }
+!!!8229644.java!!!	getInterfaceRxThrottle(in iface : String) : int
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return getInterfaceThrottle(iface, true);
+!!!8229772.java!!!	getInterfaceTxThrottle(in iface : String) : int
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        return getInterfaceThrottle(iface, false);
+!!!8229900.java!!!	setDefaultInterfaceForDns(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("resolver", "setdefaultif", iface);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230028.java!!!	setDnsServersForInterface(in iface : String, inout servers : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+
+        final Command cmd = new Command("resolver", "setifdns", iface);
+        for (String s : servers) {
+            InetAddress a = NetworkUtils.numericToInetAddress(s);
+            if (a.isAnyLocalAddress() == false) {
+                cmd.appendArg(a.getHostAddress());
+            }
+        }
+
+        try {
+            mConnector.execute(cmd);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230156.java!!!	flushDefaultDnsCache() : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("resolver", "flushdefaultif");
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230284.java!!!	flushInterfaceDnsCache(in iface : String) : void
+        mContext.enforceCallingOrSelfPermission(CONNECTIVITY_INTERNAL, TAG);
+        try {
+            mConnector.execute("resolver", "flushif", iface);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230412.java!!!	setFirewallEnabled(inout enabled : boolean) : void
+        enforceSystemUid();
+        try {
+            mConnector.execute("firewall", enabled ? "enable" : "disable");
+            mFirewallEnabled = enabled;
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230540.java!!!	isFirewallEnabled() : boolean
+        enforceSystemUid();
+        return mFirewallEnabled;
+!!!8230668.java!!!	setFirewallInterfaceRule(in iface : String, inout allow : boolean) : void
+        enforceSystemUid();
+        Preconditions.checkState(mFirewallEnabled);
+        final String rule = allow ? ALLOW : DENY;
+        try {
+            mConnector.execute("firewall", "set_interface_rule", iface, rule);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230796.java!!!	setFirewallEgressSourceRule(in addr : String, inout allow : boolean) : void
+        enforceSystemUid();
+        Preconditions.checkState(mFirewallEnabled);
+        final String rule = allow ? ALLOW : DENY;
+        try {
+            mConnector.execute("firewall", "set_egress_source_rule", addr, rule);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8230924.java!!!	setFirewallEgressDestRule(in addr : String, in port : int, inout allow : boolean) : void
+        enforceSystemUid();
+        Preconditions.checkState(mFirewallEnabled);
+        final String rule = allow ? ALLOW : DENY;
+        try {
+            mConnector.execute("firewall", "set_egress_dest_rule", addr, port, rule);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8231052.java!!!	setFirewallUidRule(in uid : int, inout allow : boolean) : void
+        enforceSystemUid();
+        Preconditions.checkState(mFirewallEnabled);
+        final String rule = allow ? ALLOW : DENY;
+        try {
+            mConnector.execute("firewall", "set_uid_rule", uid, rule);
+        } catch (NativeDaemonConnectorException e) {
+            throw e.rethrowAsParcelableException();
+        }
+!!!8231180.java!!!	enforceSystemUid() : void
+        final int uid = Binder.getCallingUid();
+        if (uid != Process.SYSTEM_UID) {
+            throw new SecurityException("Only available to AID_SYSTEM");
+        }
+!!!8231308.java!!!	monitor() : void
+        if (mConnector != null) {
+            mConnector.monitor();
+        }
+!!!8231436.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(DUMP, TAG);
+
+        pw.println("NetworkManagementService NativeDaemonConnector Log:");
+        mConnector.dump(fd, pw, args);
+        pw.println();
+
+        pw.print("Bandwidth control enabled: "); pw.println(mBandwidthControlEnabled);
+
+        synchronized (mQuotaLock) {
+            pw.print("Active quota ifaces: "); pw.println(mActiveQuotas.toString());
+            pw.print("Active alert ifaces: "); pw.println(mActiveAlerts.toString());
+        }
+
+        synchronized (mUidRejectOnQuota) {
+            pw.print("UID reject on quota ifaces: [");
+            final int size = mUidRejectOnQuota.size();
+            for (int i = 0; i < size; i++) {
+                pw.print(mUidRejectOnQuota.keyAt(i));
+                if (i < size - 1) pw.print(",");
+            }
+            pw.println("]");
+        }
+
+        pw.print("Firewall enabled: "); pw.println(mFirewallEnabled);

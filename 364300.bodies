@@ -1,0 +1,207 @@
+class ARTPSource
+!!!702732.cpp!!!	ARTPSource(in id : uint32_t, in sessionDesc : sp<ASessionDescription>, in index : size_t, in notify : sp<AMessage>)
+    unsigned long PT;
+    AString desc;
+    AString params;
+    sessionDesc->getFormatType(index, &PT, &desc, &params);
+
+    if (!strncmp(desc.c_str(), "H264/", 5)) {
+        mAssembler = new AAVCAssembler(notify);
+        mIssueFIRRequests = true;
+    } else if (!strncmp(desc.c_str(), "MP4A-LATM/", 10)) {
+        mAssembler = new AMPEG4AudioAssembler(notify, params);
+    } else if (!strncmp(desc.c_str(), "H263-1998/", 10)
+            || !strncmp(desc.c_str(), "H263-2000/", 10)) {
+        mAssembler = new AH263Assembler(notify);
+        mIssueFIRRequests = true;
+    } else if (!strncmp(desc.c_str(), "AMR/", 4)) {
+        mAssembler = new AAMRAssembler(notify, false /* isWide */, params);
+    } else  if (!strncmp(desc.c_str(), "AMR-WB/", 7)) {
+        mAssembler = new AAMRAssembler(notify, true /* isWide */, params);
+    } else if (!strncmp(desc.c_str(), "MP4V-ES/", 8)
+            || !strncasecmp(desc.c_str(), "mpeg4-generic/", 14)) {
+        mAssembler = new AMPEG4ElementaryAssembler(notify, desc, params);
+        mIssueFIRRequests = true;
+    } else if (ARawAudioAssembler::Supports(desc.c_str())) {
+        mAssembler = new ARawAudioAssembler(notify, desc.c_str(), params);
+    } else if (!strncasecmp(desc.c_str(), "MP2T/", 5)) {
+        mAssembler = new AMPEG2TSAssembler(notify, desc.c_str(), params);
+    } else {
+        TRESPASS();
+    }
+!!!702860.cpp!!!	processRTPPacket(in buffer : sp<ABuffer>) : void
+    if (queuePacket(buffer) && mAssembler != NULL) {
+        mAssembler->onPacketReceived(this);
+    }
+!!!702988.cpp!!!	timeUpdate(in rtpTime : uint32_t, in ntpTime : uint64_t) : void
+    mLastNTPTime = ntpTime;
+    mLastNTPTimeUpdateUs = ALooper::GetNowUs();
+
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("time-update", true);
+    notify->setInt32("rtp-time", rtpTime);
+    notify->setInt64("ntp-time", ntpTime);
+    notify->post();
+!!!703116.cpp!!!	byeReceived() : void
+    mAssembler->onByeReceived();
+!!!703372.cpp!!!	addReceiverReport(in buffer : sp<ABuffer>) : void
+    if (buffer->size() + 32 > buffer->capacity()) {
+        ALOGW("RTCP buffer too small to accomodate RR.");
+        return;
+    }
+
+    uint8_t *data = buffer->data() + buffer->size();
+
+    data[0] = 0x80 | 1;
+    data[1] = 201;  // RR
+    data[2] = 0;
+    data[3] = 7;
+    data[4] = kSourceID >> 24;
+    data[5] = (kSourceID >> 16) & 0xff;
+    data[6] = (kSourceID >> 8) & 0xff;
+    data[7] = kSourceID & 0xff;
+
+    data[8] = mID >> 24;
+    data[9] = (mID >> 16) & 0xff;
+    data[10] = (mID >> 8) & 0xff;
+    data[11] = mID & 0xff;
+
+    data[12] = 0x00;  // fraction lost
+
+    data[13] = 0x00;  // cumulative lost
+    data[14] = 0x00;
+    data[15] = 0x00;
+
+    data[16] = mHighestSeqNumber >> 24;
+    data[17] = (mHighestSeqNumber >> 16) & 0xff;
+    data[18] = (mHighestSeqNumber >> 8) & 0xff;
+    data[19] = mHighestSeqNumber & 0xff;
+
+    data[20] = 0x00;  // Interarrival jitter
+    data[21] = 0x00;
+    data[22] = 0x00;
+    data[23] = 0x00;
+
+    uint32_t LSR = 0;
+    uint32_t DLSR = 0;
+    if (mLastNTPTime != 0) {
+        LSR = (mLastNTPTime >> 16) & 0xffffffff;
+
+        DLSR = (uint32_t)
+            ((ALooper::GetNowUs() - mLastNTPTimeUpdateUs) * 65536.0 / 1E6);
+    }
+
+    data[24] = LSR >> 24;
+    data[25] = (LSR >> 16) & 0xff;
+    data[26] = (LSR >> 8) & 0xff;
+    data[27] = LSR & 0xff;
+
+    data[28] = DLSR >> 24;
+    data[29] = (DLSR >> 16) & 0xff;
+    data[30] = (DLSR >> 8) & 0xff;
+    data[31] = DLSR & 0xff;
+
+    buffer->setRange(buffer->offset(), buffer->size() + 32);
+!!!703500.cpp!!!	addFIR(in buffer : sp<ABuffer>) : void
+    if (!mIssueFIRRequests) {
+        return;
+    }
+
+    int64_t nowUs = ALooper::GetNowUs();
+    if (mLastFIRRequestUs >= 0 && mLastFIRRequestUs + 5000000ll > nowUs) {
+        // Send FIR requests at most every 5 secs.
+        return;
+    }
+
+    mLastFIRRequestUs = nowUs;
+
+    if (buffer->size() + 20 > buffer->capacity()) {
+        ALOGW("RTCP buffer too small to accomodate FIR.");
+        return;
+    }
+
+    uint8_t *data = buffer->data() + buffer->size();
+
+    data[0] = 0x80 | 4;
+    data[1] = 206;  // PSFB
+    data[2] = 0;
+    data[3] = 4;
+    data[4] = kSourceID >> 24;
+    data[5] = (kSourceID >> 16) & 0xff;
+    data[6] = (kSourceID >> 8) & 0xff;
+    data[7] = kSourceID & 0xff;
+
+    data[8] = 0x00;  // SSRC of media source (unused)
+    data[9] = 0x00;
+    data[10] = 0x00;
+    data[11] = 0x00;
+
+    data[12] = mID >> 24;
+    data[13] = (mID >> 16) & 0xff;
+    data[14] = (mID >> 8) & 0xff;
+    data[15] = mID & 0xff;
+
+    data[16] = mNextFIRSeqNo++;  // Seq Nr.
+
+    data[17] = 0x00;  // Reserved
+    data[18] = 0x00;
+    data[19] = 0x00;
+
+    buffer->setRange(buffer->offset(), buffer->size() + 20);
+
+    ALOGV("Added FIR request.");
+!!!703628.cpp!!!	queuePacket(in buffer : sp<ABuffer>) : bool
+    uint32_t seqNum = (uint32_t)buffer->int32Data();
+
+    if (mNumBuffersReceived++ == 0) {
+        mHighestSeqNumber = seqNum;
+        mQueue.push_back(buffer);
+        return true;
+    }
+
+    // Only the lower 16-bit of the sequence numbers are transmitted,
+    // derive the high-order bits by choosing the candidate closest
+    // to the highest sequence number (extended to 32 bits) received so far.
+
+    uint32_t seq1 = seqNum | (mHighestSeqNumber & 0xffff0000);
+    uint32_t seq2 = seqNum | ((mHighestSeqNumber & 0xffff0000) + 0x10000);
+    uint32_t seq3 = seqNum | ((mHighestSeqNumber & 0xffff0000) - 0x10000);
+    uint32_t diff1 = AbsDiff(seq1, mHighestSeqNumber);
+    uint32_t diff2 = AbsDiff(seq2, mHighestSeqNumber);
+    uint32_t diff3 = AbsDiff(seq3, mHighestSeqNumber);
+
+    if (diff1 < diff2) {
+        if (diff1 < diff3) {
+            // diff1 < diff2 ^ diff1 < diff3
+            seqNum = seq1;
+        } else {
+            // diff3 <= diff1 < diff2
+            seqNum = seq3;
+        }
+    } else if (diff2 < diff3) {
+        // diff2 <= diff1 ^ diff2 < diff3
+        seqNum = seq2;
+    } else {
+        // diff3 <= diff2 <= diff1
+        seqNum = seq3;
+    }
+
+    if (seqNum > mHighestSeqNumber) {
+        mHighestSeqNumber = seqNum;
+    }
+
+    buffer->setInt32Data(seqNum);
+
+    List<sp<ABuffer> >::iterator it = mQueue.begin();
+    while (it != mQueue.end() && (uint32_t)(*it)->int32Data() < seqNum) {
+        ++it;
+    }
+
+    if (it != mQueue.end() && (uint32_t)(*it)->int32Data() == seqNum) {
+        ALOGW("Discarding duplicate buffer");
+        return false;
+    }
+
+    mQueue.insert(it, buffer);
+
+    return true;

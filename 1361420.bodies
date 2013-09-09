@@ -1,0 +1,267 @@
+class NativeDaemonConnector
+!!!8214028.java!!!	NativeDaemonConnector(inout callbacks : INativeDaemonConnectorCallbacks, in socket : String, in responseQueueSize : int, in logTag : String, in maxLogSize : int)
+        mCallbacks = callbacks;
+        mSocket = socket;
+        mResponseQueue = new ResponseQueue(responseQueueSize);
+        mSequenceNumber = new AtomicInteger(0);
+        TAG = logTag != null ? logTag : "NativeDaemonConnector";
+        mLocalLog = new LocalLog(maxLogSize);
+!!!8214156.java!!!	run() : void
+        HandlerThread thread = new HandlerThread(TAG + ".CallbackHandler");
+        thread.start();
+        mCallbackHandler = new Handler(thread.getLooper(), this);
+
+        while (true) {
+            try {
+                listenToSocket();
+            } catch (Exception e) {
+                loge("Error in NativeDaemonConnector: " + e);
+                SystemClock.sleep(5000);
+            }
+        }
+!!!8214284.java!!!	handleMessage(inout msg : Message) : boolean
+        String event = (String) msg.obj;
+        try {
+            if (!mCallbacks.onEvent(msg.what, event, NativeDaemonEvent.unescapeArgs(event))) {
+                log(String.format("Unhandled event '%s'", event));
+            }
+        } catch (Exception e) {
+            loge("Error handling '" + event + "': " + e);
+        }
+        return true;
+!!!8214412.java!!!	listenToSocket() : void
+        LocalSocket socket = null;
+
+        try {
+            socket = new LocalSocket();
+            LocalSocketAddress address = new LocalSocketAddress(mSocket,
+                    LocalSocketAddress.Namespace.RESERVED);
+
+            socket.connect(address);
+
+            InputStream inputStream = socket.getInputStream();
+            synchronized (mDaemonLock) {
+                mOutputStream = socket.getOutputStream();
+            }
+
+            mCallbacks.onDaemonConnected();
+
+            byte[] buffer = new byte[BUFFER_SIZE];
+            int start = 0;
+
+            while (true) {
+                int count = inputStream.read(buffer, start, BUFFER_SIZE - start);
+                if (count < 0) {
+                    loge("got " + count + " reading with start = " + start);
+                    break;
+                }
+
+                // Add our starting point to the count and reset the start.
+                count += start;
+                start = 0;
+
+                for (int i = 0; i < count; i++) {
+                    if (buffer[i] == 0) {
+                        final String rawEvent = new String(
+                                buffer, start, i - start, Charsets.UTF_8);
+                        log("RCV <- {" + rawEvent + "}");
+
+                        try {
+                            final NativeDaemonEvent event = NativeDaemonEvent.parseRawEvent(
+                                    rawEvent);
+                            if (event.isClassUnsolicited()) {
+                                // TODO: migrate to sending NativeDaemonEvent instances
+                                mCallbackHandler.sendMessage(mCallbackHandler.obtainMessage(
+                                        event.getCode(), event.getRawEvent()));
+                            } else {
+                                mResponseQueue.add(event.getCmdNumber(), event);
+                            }
+                        } catch (IllegalArgumentException e) {
+                            log("Problem parsing message: " + rawEvent + " - " + e);
+                        }
+
+                        start = i + 1;
+                    }
+                }
+                if (start == 0) {
+                    final String rawEvent = new String(buffer, start, count, Charsets.UTF_8);
+                    log("RCV incomplete <- {" + rawEvent + "}");
+                }
+
+                // We should end at the amount we read. If not, compact then
+                // buffer and read again.
+                if (start != count) {
+                    final int remaining = BUFFER_SIZE - start;
+                    System.arraycopy(buffer, start, buffer, 0, remaining);
+                    start = remaining;
+                } else {
+                    start = 0;
+                }
+            }
+        } catch (IOException ex) {
+            loge("Communications error: " + ex);
+            throw ex;
+        } finally {
+            synchronized (mDaemonLock) {
+                if (mOutputStream != null) {
+                    try {
+                        loge("closing stream for " + mSocket);
+                        mOutputStream.close();
+                    } catch (IOException e) {
+                        loge("Failed closing output stream: " + e);
+                    }
+                    mOutputStream = null;
+                }
+            }
+
+            try {
+                if (socket != null) {
+                    socket.close();
+                }
+            } catch (IOException ex) {
+                loge("Failed closing socket: " + ex);
+            }
+        }
+!!!8214540.java!!!	makeCommand(inout builder : StringBuilder, in cmd : String, inout  : Object...args) : void
+        // TODO: eventually enforce that cmd doesn't contain arguments
+        if (cmd.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("unexpected command: " + cmd);
+        }
+
+        builder.append(cmd);
+        for (Object arg : args) {
+            final String argString = String.valueOf(arg);
+            if (argString.indexOf('\0') >= 0) {
+                throw new IllegalArgumentException("unexpected argument: " + arg);
+            }
+
+            builder.append(' ');
+            appendEscaped(builder, argString);
+        }
+!!!8214668.java!!!	execute(inout cmd : Command) : NativeDaemonEvent
+        return execute(cmd.mCmd, cmd.mArguments.toArray());
+!!!8214796.java!!!	execute(in cmd : String, inout  : Object...args) : NativeDaemonEvent
+        final NativeDaemonEvent[] events = executeForList(cmd, args);
+        if (events.length != 1) {
+            throw new NativeDaemonConnectorException(
+                    "Expected exactly one response, but received " + events.length);
+        }
+        return events[0];
+!!!8214924.java!!!	executeForList(inout cmd : Command) : NativeDaemonEvent
+        return executeForList(cmd.mCmd, cmd.mArguments.toArray());
+!!!8215052.java!!!	executeForList(in cmd : String, inout  : Object...args) : NativeDaemonEvent
+            return execute(DEFAULT_TIMEOUT, cmd, args);
+!!!8215180.java!!!	execute(in timeout : int, in cmd : String, inout  : Object...args) : NativeDaemonEvent
+        final ArrayList<NativeDaemonEvent> events = Lists.newArrayList();
+
+        final int sequenceNumber = mSequenceNumber.incrementAndGet();
+        final StringBuilder cmdBuilder =
+                new StringBuilder(Integer.toString(sequenceNumber)).append(' ');
+        final long startTime = SystemClock.elapsedRealtime();
+
+        makeCommand(cmdBuilder, cmd, args);
+
+        final String logCmd = cmdBuilder.toString(); /* includes cmdNum, cmd, args */
+        log("SND -> {" + logCmd + "}");
+
+        cmdBuilder.append('\0');
+        final String sentCmd = cmdBuilder.toString(); /* logCmd + \0 */
+
+        synchronized (mDaemonLock) {
+            if (mOutputStream == null) {
+                throw new NativeDaemonConnectorException("missing output stream");
+            } else {
+                try {
+                    mOutputStream.write(sentCmd.getBytes(Charsets.UTF_8));
+                } catch (IOException e) {
+                    throw new NativeDaemonConnectorException("problem sending command", e);
+                }
+            }
+        }
+
+        NativeDaemonEvent event = null;
+        do {
+            event = mResponseQueue.remove(sequenceNumber, timeout, sentCmd);
+            if (event == null) {
+                loge("timed-out waiting for response to " + logCmd);
+                throw new NativeDaemonFailureException(logCmd, event);
+            }
+            log("RMV <- {" + event + "}");
+            events.add(event);
+        } while (event.isClassContinue());
+
+        final long endTime = SystemClock.elapsedRealtime();
+        if (endTime - startTime > WARN_EXECUTE_DELAY_MS) {
+            loge("NDC Command {" + logCmd + "} took too long (" + (endTime - startTime) + "ms)");
+        }
+
+        if (event.isClassClientError()) {
+            throw new NativeDaemonArgumentException(logCmd, event);
+        }
+        if (event.isClassServerError()) {
+            throw new NativeDaemonFailureException(logCmd, event);
+        }
+
+        return events.toArray(new NativeDaemonEvent[events.size()]);
+!!!8215308.java!!!	doCommand(in cmd : String) : ArrayList<String>
+        final ArrayList<String> rawEvents = Lists.newArrayList();
+        final NativeDaemonEvent[] events = executeForList(cmd);
+        for (NativeDaemonEvent event : events) {
+            rawEvents.add(event.getRawEvent());
+        }
+        return rawEvents;
+!!!8215436.java!!!	doListCommand(in cmd : String, in expectedCode : int) : String
+        final ArrayList<String> list = Lists.newArrayList();
+
+        final NativeDaemonEvent[] events = executeForList(cmd);
+        for (int i = 0; i < events.length - 1; i++) {
+            final NativeDaemonEvent event = events[i];
+            final int code = event.getCode();
+            if (code == expectedCode) {
+                list.add(event.getMessage());
+            } else {
+                throw new NativeDaemonConnectorException(
+                        "unexpected list response " + code + " instead of " + expectedCode);
+            }
+        }
+
+        final NativeDaemonEvent finalEvent = events[events.length - 1];
+        if (!finalEvent.isClassOk()) {
+            throw new NativeDaemonConnectorException("unexpected final event: " + finalEvent);
+        }
+
+        return list.toArray(new String[list.size()]);
+!!!8215564.java!!!	appendEscaped(inout builder : StringBuilder, in arg : String) : void
+        final boolean hasSpaces = arg.indexOf(' ') >= 0;
+        if (hasSpaces) {
+            builder.append('"');
+        }
+
+        final int length = arg.length();
+        for (int i = 0; i < length; i++) {
+            final char c = arg.charAt(i);
+
+            if (c == '"') {
+                builder.append("\\\"");
+            } else if (c == '\\') {
+                builder.append("\\\\");
+            } else {
+                builder.append(c);
+            }
+        }
+
+        if (hasSpaces) {
+            builder.append('"');
+        }
+!!!8217100.java!!!	monitor() : void
+        synchronized (mDaemonLock) { }
+!!!8217228.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        mLocalLog.dump(fd, pw, args);
+        pw.println();
+        mResponseQueue.dump(fd, pw, args);
+!!!8217356.java!!!	log(in logstring : String) : void
+        if (LOGD) Slog.d(TAG, logstring);
+        mLocalLog.log(logstring);
+!!!8217484.java!!!	loge(in logstring : String) : void
+        Slog.e(TAG, logstring);
+        mLocalLog.log(logstring);

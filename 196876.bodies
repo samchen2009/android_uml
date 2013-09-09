@@ -1,0 +1,120 @@
+class AudioResampler
+!!!869388.cpp!!!	create(in bitDepth : int, in inChannelCount : int, in sampleRate : int32_t, in quality : src_quality = DEFAULT_QUALITY) : AudioResampler
+
+    bool atFinalQuality;
+    if (quality == DEFAULT_QUALITY) {
+        // read the resampler default quality property the first time it is needed
+        int ok = pthread_once(&once_control, init_routine);
+        if (ok != 0) {
+            ALOGE("%s pthread_once failed: %d", __func__, ok);
+        }
+        quality = defaultQuality;
+        atFinalQuality = false;
+    } else {
+        atFinalQuality = true;
+    }
+
+    // naive implementation of CPU load throttling doesn't account for whether resampler is active
+    pthread_mutex_lock(&mutex);
+    for (;;) {
+        uint32_t deltaMHz = qualityMHz(quality);
+        uint32_t newMHz = currentMHz + deltaMHz;
+        if ((qualityIsSupported(quality) && newMHz <= maxMHz) || atFinalQuality) {
+            ALOGV("resampler load %u -> %u MHz due to delta +%u MHz from quality %d",
+                    currentMHz, newMHz, deltaMHz, quality);
+            currentMHz = newMHz;
+            break;
+        }
+        // not enough CPU available for proposed quality level, so try next lowest level
+        switch (quality) {
+        default:
+        case DEFAULT_QUALITY:
+        case LOW_QUALITY:
+            atFinalQuality = true;
+            break;
+        case MED_QUALITY:
+            quality = LOW_QUALITY;
+            break;
+        case HIGH_QUALITY:
+            quality = MED_QUALITY;
+            break;
+        case VERY_HIGH_QUALITY:
+            quality = HIGH_QUALITY;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mutex);
+
+    AudioResampler* resampler;
+
+    switch (quality) {
+    default:
+    case DEFAULT_QUALITY:
+    case LOW_QUALITY:
+        ALOGV("Create linear Resampler");
+        resampler = new AudioResamplerOrder1(bitDepth, inChannelCount, sampleRate);
+        break;
+    case MED_QUALITY:
+        ALOGV("Create cubic Resampler");
+        resampler = new AudioResamplerCubic(bitDepth, inChannelCount, sampleRate);
+        break;
+    case HIGH_QUALITY:
+        ALOGV("Create HIGH_QUALITY sinc Resampler");
+        resampler = new AudioResamplerSinc(bitDepth, inChannelCount, sampleRate);
+        break;
+    case VERY_HIGH_QUALITY:
+        ALOGV("Create VERY_HIGH_QUALITY sinc Resampler = %d", quality);
+        resampler = new AudioResamplerSinc(bitDepth, inChannelCount, sampleRate, quality);
+        break;
+    }
+
+    // initialize resampler
+    resampler->init();
+    return resampler;
+!!!869516.cpp!!!	~AudioResampler()
+    pthread_mutex_lock(&mutex);
+    src_quality quality = getQuality();
+    uint32_t deltaMHz = qualityMHz(quality);
+    int32_t newMHz = currentMHz - deltaMHz;
+    ALOGV("resampler load %u -> %d MHz due to delta -%u MHz from quality %d",
+            currentMHz, newMHz, deltaMHz, quality);
+    LOG_ALWAYS_FATAL_IF(newMHz < 0, "negative resampler load %d MHz", newMHz);
+    currentMHz = newMHz;
+    pthread_mutex_unlock(&mutex);
+!!!869772.cpp!!!	setSampleRate(in inSampleRate : int32_t) : void
+    mInSampleRate = inSampleRate;
+    mPhaseIncrement = (uint32_t)((kPhaseMultiplier * inSampleRate) / mSampleRate);
+!!!869900.cpp!!!	setVolume(in left : int16_t, in right : int16_t) : void
+    // TODO: Implement anti-zipper filter
+    mVolume[0] = left;
+    mVolume[1] = right;
+!!!870028.cpp!!!	setLocalTimeFreq(in freq : uint64_t) : void
+    mLocalTimeFreq = freq;
+!!!870156.cpp!!!	setPTS(in pts : int64_t) : void
+    mPTS = pts;
+!!!870412.cpp!!!	reset() : void
+    mInputIndex = 0;
+    mPhaseFraction = 0;
+    mBuffer.frameCount = 0;
+!!!870796.cpp!!!	AudioResampler(in bitDepth : int, in inChannelCount : int, in sampleRate : int32_t, in quality : src_quality)
+    // sanity check on format
+    if ((bitDepth != 16) ||(inChannelCount < 1) || (inChannelCount > 2)) {
+        ALOGE("Unsupported sample format, %d bits, %d channels", bitDepth,
+                inChannelCount);
+        // ALOG_ASSERT(0);
+    }
+    if (sampleRate <= 0) {
+        ALOGE("Unsupported sample rate %d Hz", sampleRate);
+    }
+
+    // initialize common members
+    mVolume[0] = mVolume[1] = 0;
+    mBuffer.frameCount = 0;
+
+!!!871180.cpp!!!	calculateOutputPTS(in outputFrameIndex : int) : int64_t
+
+    if (mPTS == AudioBufferProvider::kInvalidPTS) {
+        return AudioBufferProvider::kInvalidPTS;
+    } else {
+        return mPTS + ((outputFrameIndex * mLocalTimeFreq) / mSampleRate);
+    }

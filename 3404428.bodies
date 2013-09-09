@@ -1,0 +1,354 @@
+class MakeState
+!!!14559884.java!!!	MakeState(in initialSize : int)
+            result = new ArrayList<Entry>(initialSize);
+            nullResultCount = 0;
+            regs = null;
+            endIndices = null;
+            lastAddress = 0;
+!!!14560012.java!!!	aboutToProcess(in address : int, in reg : int) : void
+            boolean first = (endIndices == null);
+
+            if ((address == lastAddress) && !first) {
+                return;
+            }
+
+            if (address < lastAddress) {
+                throw new RuntimeException("shouldn't happen");
+            }
+
+            if (first || (reg >= endIndices.length)) {
+                /*
+                 * This is the first allocation of the state set and
+                 * index array, or we need to grow. (The latter doesn't
+                 * happen much; in fact, we have only ever observed
+                 * it happening in test cases, never in "real" code.)
+                 */
+                int newSz = reg + 1;
+                RegisterSpecSet newRegs = new RegisterSpecSet(newSz);
+                int[] newEnds = new int[newSz];
+                Arrays.fill(newEnds, -1);
+
+                if (!first) {
+                    newRegs.putAll(regs);
+                    System.arraycopy(endIndices, 0, newEnds, 0,
+                            endIndices.length);
+                }
+
+                regs = newRegs;
+                endIndices = newEnds;
+            }
+!!!14560140.java!!!	snapshot(in address : int, inout specs : RegisterSpecSet) : void
+            if (DEBUG) {
+                System.err.printf("%04x snapshot %s\n", address, specs);
+            }
+
+            int sz = specs.getMaxSize();
+            aboutToProcess(address, sz - 1);
+
+            for (int i = 0; i < sz; i++) {
+                RegisterSpec oldSpec = regs.get(i);
+                RegisterSpec newSpec = filterSpec(specs.get(i));
+
+                if (oldSpec == null) {
+                    if (newSpec != null) {
+                        startLocal(address, newSpec);
+                    }
+                } else if (newSpec == null) {
+                    endLocal(address, oldSpec);
+                } else if (! newSpec.equalsUsingSimpleType(oldSpec)) {
+                    endLocal(address, oldSpec);
+                    startLocal(address, newSpec);
+                }
+            }
+
+            if (DEBUG) {
+                System.err.printf("%04x snapshot done\n", address);
+            }
+!!!14560268.java!!!	startLocal(in address : int, inout startedLocal : RegisterSpec) : void
+            if (DEBUG) {
+                System.err.printf("%04x start %s\n", address, startedLocal);
+            }
+
+            int regNum = startedLocal.getReg();
+
+            startedLocal = filterSpec(startedLocal);
+            aboutToProcess(address, regNum);
+
+            RegisterSpec existingLocal = regs.get(regNum);
+
+            if (startedLocal.equalsUsingSimpleType(existingLocal)) {
+                // Silently ignore a redundant start.
+                return;
+            }
+
+            RegisterSpec movedLocal = regs.findMatchingLocal(startedLocal);
+            if (movedLocal != null) {
+                /*
+                 * The same variable was moved from one register to another.
+                 * So add an end for its old location.
+                 */
+                addOrUpdateEnd(address, Disposition.END_MOVED, movedLocal);
+            }
+
+            int endAt = endIndices[regNum];
+
+            if (existingLocal != null) {
+                /*
+                 * There is an existing (but non-matching) local.
+                 * Add an explicit end for it.
+                 */
+                add(address, Disposition.END_REPLACED, existingLocal);
+            } else if (endAt >= 0) {
+                /*
+                 * Look for an end local for the same register at the
+                 * same address. If found, then update it or delete
+                 * it, depending on whether or not it represents the
+                 * same variable as the one being started.
+                 */
+                Entry endEntry = result.get(endAt);
+                if (endEntry.getAddress() == address) {
+                    if (endEntry.matches(startedLocal)) {
+                        /*
+                         * There was already an end local for the same
+                         * variable at the same address. This turns
+                         * out to be superfluous, as we are starting
+                         * up the exact same local. This situation can
+                         * happen when a single local variable got
+                         * somehow "split up" during intermediate
+                         * processing. In any case, rather than represent
+                         * the end-then-start, just remove the old end.
+                         */
+                        result.set(endAt, null);
+                        nullResultCount++;
+                        regs.put(startedLocal);
+                        endIndices[regNum] = -1;
+                        return;
+                    } else {
+                        /*
+                         * There was a different variable ended at the
+                         * same address. Update it to indicate that
+                         * it was ended due to a replacement (rather than
+                         * ending for no particular reason).
+                         */
+                        endEntry = endEntry.withDisposition(
+                                Disposition.END_REPLACED);
+                        result.set(endAt, endEntry);
+                    }
+                }
+            }
+
+            /*
+             * The code above didn't find and remove an unnecessary
+             * local end, so we now have to add one or more entries to
+             * the output to capture the transition.
+             */
+
+            /*
+             * If the local just below (in the register set at reg-1)
+             * is of category-2, then it is ended by this new start.
+             */
+            if (regNum > 0) {
+                RegisterSpec justBelow = regs.get(regNum - 1);
+                if ((justBelow != null) && justBelow.isCategory2()) {
+                    addOrUpdateEnd(address,
+                            Disposition.END_CLOBBERED_BY_NEXT,
+                            justBelow);
+                }
+            }
+
+            /*
+             * Similarly, if this local is category-2, then the local
+             * just above (if any) is ended by the start now being
+             * emitted.
+             */
+            if (startedLocal.isCategory2()) {
+                RegisterSpec justAbove = regs.get(regNum + 1);
+                if (justAbove != null) {
+                    addOrUpdateEnd(address,
+                            Disposition.END_CLOBBERED_BY_PREV,
+                            justAbove);
+                }
+            }
+
+            /*
+             * TODO: Add an end for the same local in a different reg,
+             * if any (that is, if the local migrates from vX to vY,
+             * we should note that as a local end in vX).
+             */
+
+            add(address, Disposition.START, startedLocal);
+!!!14560396.java!!!	endLocal(in address : int, inout endedLocal : RegisterSpec) : void
+            endLocal(address, endedLocal, Disposition.END_SIMPLY);
+!!!14560524.java!!!	endLocal(in address : int, inout endedLocal : RegisterSpec, inout disposition : Disposition) : void
+            if (DEBUG) {
+                System.err.printf("%04x end %s\n", address, endedLocal);
+            }
+
+            int regNum = endedLocal.getReg();
+
+            endedLocal = filterSpec(endedLocal);
+            aboutToProcess(address, regNum);
+
+            int endAt = endIndices[regNum];
+
+            if (endAt >= 0) {
+                /*
+                 * The local in the given register is already ended.
+                 * Silently return without adding anything to the result.
+                 */
+                return;
+            }
+
+            // Check for start and end at the same address.
+            if (checkForEmptyRange(address, endedLocal)) {
+                return;
+            }
+
+            add(address, disposition, endedLocal);
+!!!14560652.java!!!	checkForEmptyRange(in address : int, inout endedLocal : RegisterSpec) : boolean
+            int at = result.size() - 1;
+            Entry entry;
+
+            // Look for a previous entry at the same address.
+            for (/*at*/; at >= 0; at--) {
+                entry = result.get(at);
+
+                if (entry == null) {
+                    continue;
+                }
+
+                if (entry.getAddress() != address) {
+                    // We didn't find any match at the same address.
+                    return false;
+                }
+
+                if (entry.matches(endedLocal)) {
+                    break;
+                }
+            }
+
+            /*
+             * In fact, we found that the endedLocal had started at the
+             * same address, so do all the requisite cleanup.
+             */
+
+            regs.remove(endedLocal);
+            result.set(at, null);
+            nullResultCount++;
+
+            int regNum = endedLocal.getReg();
+            boolean found = false;
+            entry = null;
+
+            // Now look back further to update where the register ended.
+            for (at--; at >= 0; at--) {
+                entry = result.get(at);
+
+                if (entry == null) {
+                    continue;
+                }
+
+                if (entry.getRegisterSpec().getReg() == regNum) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) {
+                // We found an end for the same register.
+                endIndices[regNum] = at;
+
+                if (entry.getAddress() == address) {
+                    /*
+                     * It's still the same address, so update the
+                     * disposition.
+                     */
+                    result.set(at,
+                            entry.withDisposition(Disposition.END_SIMPLY));
+                }
+            }
+
+            return true;
+!!!14560780.java!!!	filterSpec(inout orig : RegisterSpec) : RegisterSpec
+            if ((orig != null) && (orig.getType() == Type.KNOWN_NULL)) {
+                return orig.withType(Type.OBJECT);
+            }
+
+            return orig;
+!!!14560908.java!!!	add(in address : int, inout disposition : Disposition, inout spec : RegisterSpec) : void
+            int regNum = spec.getReg();
+
+            result.add(new Entry(address, disposition, spec));
+
+            if (disposition == Disposition.START) {
+                regs.put(spec);
+                endIndices[regNum] = -1;
+            } else {
+                regs.remove(spec);
+                endIndices[regNum] = result.size() - 1;
+            }
+!!!14561036.java!!!	addOrUpdateEnd(in address : int, inout disposition : Disposition, inout spec : RegisterSpec) : void
+            if (disposition == Disposition.START) {
+                throw new RuntimeException("shouldn't happen");
+            }
+
+            int regNum = spec.getReg();
+            int endAt = endIndices[regNum];
+
+            if (endAt >= 0) {
+                // There is a previous end.
+                Entry endEntry = result.get(endAt);
+                if ((endEntry.getAddress() == address) &&
+                        endEntry.getRegisterSpec().equals(spec)) {
+                    /*
+                     * The end is for the right address and variable, so
+                     * update it.
+                     */
+                    result.set(endAt, endEntry.withDisposition(disposition));
+                    regs.remove(spec); // TODO: Is this line superfluous?
+                    return;
+                }
+            }
+
+            endLocal(address, spec, disposition);
+!!!14561164.java!!!	finish() : LocalList
+            aboutToProcess(Integer.MAX_VALUE, 0);
+
+            int resultSz = result.size();
+            int finalSz = resultSz - nullResultCount;
+
+            if (finalSz == 0) {
+                return EMPTY;
+            }
+
+            /*
+             * Collect an array of only the non-null entries, and then
+             * sort it to get a consistent order for everything: Local
+             * ends and starts for a given address could come in any
+             * order, but we want ends before starts as well as
+             * registers in order (within ends or starts).
+             */
+
+            Entry[] resultArr = new Entry[finalSz];
+
+            if (resultSz == finalSz) {
+                result.toArray(resultArr);
+            } else {
+                int at = 0;
+                for (Entry e : result) {
+                    if (e != null) {
+                        resultArr[at++] = e;
+                    }
+                }
+            }
+
+            Arrays.sort(resultArr);
+
+            LocalList resultList = new LocalList(finalSz);
+
+            for (int i = 0; i < finalSz; i++) {
+                resultList.set(i, resultArr[i]);
+            }
+
+            resultList.setImmutable();
+            return resultList;

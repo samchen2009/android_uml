@@ -1,0 +1,520 @@
+class AlarmManagerService
+!!!8015116.java!!!	AlarmManagerService(inout context : Context)
+        mContext = context;
+        mDescriptor = init();
+
+        // We have to set current TimeZone info to kernel
+        // because kernel doesn't keep this after reboot
+        String tz = SystemProperties.get(TIMEZONE_PROPERTY);
+        if (tz != null) {
+            setTimeZone(tz);
+        }
+
+        PowerManager pm = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+        
+        mTimeTickSender = PendingIntent.getBroadcastAsUser(context, 0,
+                new Intent(Intent.ACTION_TIME_TICK).addFlags(
+                        Intent.FLAG_RECEIVER_REGISTERED_ONLY), 0,
+                        UserHandle.ALL);
+        Intent intent = new Intent(Intent.ACTION_DATE_CHANGED);
+        intent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING);
+        mDateChangeSender = PendingIntent.getBroadcastAsUser(context, 0, intent,
+                Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT, UserHandle.ALL);
+        
+        // now that we have initied the driver schedule the alarm
+        mClockReceiver= new ClockReceiver();
+        mClockReceiver.scheduleTimeTickEvent();
+        mClockReceiver.scheduleDateChangedEvent();
+        mUninstallReceiver = new UninstallReceiver();
+        
+        if (mDescriptor != -1) {
+            mWaitThread.start();
+        } else {
+            Slog.w(TAG, "Failed to open alarm driver. Falling back to a handler.");
+        }
+!!!8015244.java!!!	finalize() : void
+        try {
+            close(mDescriptor);
+        } finally {
+            super.finalize();
+        }
+!!!8015372.java!!!	set(in type : int, in triggerAtTime : long, inout operation : PendingIntent) : void
+        setRepeating(type, triggerAtTime, 0, operation);
+!!!8015500.java!!!	setRepeating(in type : int, in triggerAtTime : long, in interval : long, inout operation : PendingIntent) : void
+        if (operation == null) {
+            Slog.w(TAG, "set/setRepeating ignored because there is no intent");
+            return;
+        }
+        synchronized (mLock) {
+            Alarm alarm = new Alarm();
+            alarm.type = type;
+            alarm.when = triggerAtTime;
+            alarm.repeatInterval = interval;
+            alarm.operation = operation;
+
+            // Remove this alarm if already scheduled.
+            removeLocked(operation);
+
+            if (localLOGV) Slog.v(TAG, "set: " + alarm);
+
+            int index = addAlarmLocked(alarm);
+            if (index == 0) {
+                setLocked(alarm);
+            }
+        }
+!!!8015628.java!!!	setInexactRepeating(in type : int, in triggerAtTime : long, in interval : long, inout operation : PendingIntent) : void
+        if (operation == null) {
+            Slog.w(TAG, "setInexactRepeating ignored because there is no intent");
+            return;
+        }
+
+        if (interval <= 0) {
+            Slog.w(TAG, "setInexactRepeating ignored because interval " + interval
+                    + " is invalid");
+            return;
+        }
+
+        // If the requested interval isn't a multiple of 15 minutes, just treat it as exact
+        if (interval % QUANTUM != 0) {
+            if (localLOGV) Slog.v(TAG, "Interval " + interval + " not a quantum multiple");
+            setRepeating(type, triggerAtTime, interval, operation);
+            return;
+        }
+
+        // Translate times into the ELAPSED timebase for alignment purposes so that
+        // alignment never tries to match against wall clock times.
+        final boolean isRtc = (type == AlarmManager.RTC || type == AlarmManager.RTC_WAKEUP);
+        final long skew = (isRtc)
+                ? System.currentTimeMillis() - SystemClock.elapsedRealtime()
+                : 0;
+
+        // Slip forward to the next ELAPSED-timebase quantum after the stated time.  If
+        // we're *at* a quantum point, leave it alone.
+        final long adjustedTriggerTime;
+        long offset = (triggerAtTime - skew) % QUANTUM;
+        if (offset != 0) {
+            adjustedTriggerTime = triggerAtTime - offset + QUANTUM;
+        } else {
+            adjustedTriggerTime = triggerAtTime;
+        }
+
+        // Set the alarm based on the quantum-aligned start time
+        if (localLOGV) Slog.v(TAG, "setInexactRepeating: type=" + type + " interval=" + interval
+                + " trigger=" + adjustedTriggerTime + " orig=" + triggerAtTime);
+        setRepeating(type, adjustedTriggerTime, interval, operation);
+!!!8015756.java!!!	setTime(in millis : long) : void
+        mContext.enforceCallingOrSelfPermission(
+                "android.permission.SET_TIME",
+                "setTime");
+
+        SystemClock.setCurrentTimeMillis(millis);
+!!!8015884.java!!!	setTimeZone(in tz : String) : void
+        mContext.enforceCallingOrSelfPermission(
+                "android.permission.SET_TIME_ZONE",
+                "setTimeZone");
+
+        long oldId = Binder.clearCallingIdentity();
+        try {
+            if (TextUtils.isEmpty(tz)) return;
+            TimeZone zone = TimeZone.getTimeZone(tz);
+            // Prevent reentrant calls from stepping on each other when writing
+            // the time zone property
+            boolean timeZoneWasChanged = false;
+            synchronized (this) {
+                String current = SystemProperties.get(TIMEZONE_PROPERTY);
+                if (current == null || !current.equals(zone.getID())) {
+                    if (localLOGV) {
+                        Slog.v(TAG, "timezone changed: " + current + ", new=" + zone.getID());
+                    }
+                    timeZoneWasChanged = true;
+                    SystemProperties.set(TIMEZONE_PROPERTY, zone.getID());
+                }
+
+                // Update the kernel timezone information
+                // Kernel tracks time offsets as 'minutes west of GMT'
+                int gmtOffset = zone.getOffset(System.currentTimeMillis());
+                setKernelTimezone(mDescriptor, -(gmtOffset / 60000));
+            }
+
+            TimeZone.setDefault(null);
+
+            if (timeZoneWasChanged) {
+                Intent intent = new Intent(Intent.ACTION_TIMEZONE_CHANGED);
+                intent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING);
+                intent.putExtra("time-zone", zone.getID());
+                mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+            }
+        } finally {
+            Binder.restoreCallingIdentity(oldId);
+        }
+!!!8016012.java!!!	remove(inout operation : PendingIntent) : void
+        if (operation == null) {
+            return;
+        }
+        synchronized (mLock) {
+            removeLocked(operation);
+        }
+!!!8016140.java!!!	removeLocked(inout operation : PendingIntent) : void
+        removeLocked(mRtcWakeupAlarms, operation);
+        removeLocked(mRtcAlarms, operation);
+        removeLocked(mElapsedRealtimeWakeupAlarms, operation);
+        removeLocked(mElapsedRealtimeAlarms, operation);
+!!!8016268.java!!!	removeLocked(inout alarmList : ArrayList<Alarm>, inout operation : PendingIntent) : void
+        if (alarmList.size() <= 0) {
+            return;
+        }
+
+        // iterator over the list removing any it where the intent match
+        Iterator<Alarm> it = alarmList.iterator();
+        
+        while (it.hasNext()) {
+            Alarm alarm = it.next();
+            if (alarm.operation.equals(operation)) {
+                it.remove();
+            }
+        }
+!!!8016396.java!!!	removeLocked(in packageName : String) : void
+        removeLocked(mRtcWakeupAlarms, packageName);
+        removeLocked(mRtcAlarms, packageName);
+        removeLocked(mElapsedRealtimeWakeupAlarms, packageName);
+        removeLocked(mElapsedRealtimeAlarms, packageName);
+!!!8016524.java!!!	removeLocked(inout alarmList : ArrayList<Alarm>, in packageName : String) : void
+        if (alarmList.size() <= 0) {
+            return;
+        }
+
+        // iterator over the list removing any it where the intent match
+        Iterator<Alarm> it = alarmList.iterator();
+        
+        while (it.hasNext()) {
+            Alarm alarm = it.next();
+            if (alarm.operation.getTargetPackage().equals(packageName)) {
+                it.remove();
+            }
+        }
+!!!8016652.java!!!	removeUserLocked(in userHandle : int) : void
+        removeUserLocked(mRtcWakeupAlarms, userHandle);
+        removeUserLocked(mRtcAlarms, userHandle);
+        removeUserLocked(mElapsedRealtimeWakeupAlarms, userHandle);
+        removeUserLocked(mElapsedRealtimeAlarms, userHandle);
+!!!8016780.java!!!	removeUserLocked(inout alarmList : ArrayList<Alarm>, in userHandle : int) : void
+        if (alarmList.size() <= 0) {
+            return;
+        }
+
+        // iterator over the list removing any it where the intent match
+        Iterator<Alarm> it = alarmList.iterator();
+
+        while (it.hasNext()) {
+            Alarm alarm = it.next();
+            if (UserHandle.getUserId(alarm.operation.getCreatorUid()) == userHandle) {
+                it.remove();
+            }
+        }
+!!!8016908.java!!!	lookForPackageLocked(in packageName : String) : boolean
+        return lookForPackageLocked(mRtcWakeupAlarms, packageName)
+                || lookForPackageLocked(mRtcAlarms, packageName)
+                || lookForPackageLocked(mElapsedRealtimeWakeupAlarms, packageName)
+                || lookForPackageLocked(mElapsedRealtimeAlarms, packageName);
+!!!8017036.java!!!	lookForPackageLocked(inout alarmList : ArrayList<Alarm>, in packageName : String) : boolean
+        for (int i=alarmList.size()-1; i>=0; i--) {
+            if (alarmList.get(i).operation.getTargetPackage().equals(packageName)) {
+                return true;
+            }
+        }
+        return false;
+!!!8017164.java!!!	getAlarmList(in type : int) : Alarm
+        switch (type) {
+            case AlarmManager.RTC_WAKEUP:              return mRtcWakeupAlarms;
+            case AlarmManager.RTC:                     return mRtcAlarms;
+            case AlarmManager.ELAPSED_REALTIME_WAKEUP: return mElapsedRealtimeWakeupAlarms;
+            case AlarmManager.ELAPSED_REALTIME:        return mElapsedRealtimeAlarms;
+        }
+        
+        return null;
+!!!8017292.java!!!	addAlarmLocked(inout alarm : Alarm) : int
+        ArrayList<Alarm> alarmList = getAlarmList(alarm.type);
+        
+        int index = Collections.binarySearch(alarmList, alarm, mIncreasingTimeOrder);
+        if (index < 0) {
+            index = 0 - index - 1;
+        }
+        if (localLOGV) Slog.v(TAG, "Adding alarm " + alarm + " at " + index);
+        alarmList.add(index, alarm);
+
+        if (localLOGV) {
+            // Display the list of alarms for this alarm type
+            Slog.v(TAG, "alarms: " + alarmList.size() + " type: " + alarm.type);
+            int position = 0;
+            for (Alarm a : alarmList) {
+                Time time = new Time();
+                time.set(a.when);
+                String timeStr = time.format("%b %d %I:%M:%S %p");
+                Slog.v(TAG, position + ": " + timeStr
+                        + " " + a.operation.getTargetPackage());
+                position += 1;
+            }
+        }
+        
+        return index;
+!!!8017420.java!!!	timeToNextAlarm() : long
+        long nextAlarm = Long.MAX_VALUE;
+        synchronized (mLock) {
+            for (int i=AlarmManager.RTC_WAKEUP;
+                    i<=AlarmManager.ELAPSED_REALTIME; i++) {
+                ArrayList<Alarm> alarmList = getAlarmList(i);
+                if (alarmList.size() > 0) {
+                    Alarm a = alarmList.get(0);
+                    if (a.when < nextAlarm) {
+                        nextAlarm = a.when;
+                    }
+                }
+            }
+        }
+        return nextAlarm;
+!!!8017548.java!!!	setLocked(inout alarm : Alarm) : void
+        if (mDescriptor != -1)
+        {
+            // The kernel never triggers alarms with negative wakeup times
+            // so we ensure they are positive.
+            long alarmSeconds, alarmNanoseconds;
+            if (alarm.when < 0) {
+                alarmSeconds = 0;
+                alarmNanoseconds = 0;
+            } else {
+                alarmSeconds = alarm.when / 1000;
+                alarmNanoseconds = (alarm.when % 1000) * 1000 * 1000;
+            }
+            
+            set(mDescriptor, alarm.type, alarmSeconds, alarmNanoseconds);
+        }
+        else
+        {
+            Message msg = Message.obtain();
+            msg.what = ALARM_EVENT;
+            
+            mHandler.removeMessages(ALARM_EVENT);
+            mHandler.sendMessageAtTime(msg, alarm.when);
+        }
+!!!8017676.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump AlarmManager from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+        
+        synchronized (mLock) {
+            pw.println("Current Alarm Manager state:");
+            if (mRtcWakeupAlarms.size() > 0 || mRtcAlarms.size() > 0) {
+                final long now = System.currentTimeMillis();
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                pw.println(" ");
+                pw.print("  Realtime wakeup (now=");
+                        pw.print(sdf.format(new Date(now))); pw.println("):");
+                if (mRtcWakeupAlarms.size() > 0) {
+                    dumpAlarmList(pw, mRtcWakeupAlarms, "  ", "RTC_WAKEUP", now);
+                }
+                if (mRtcAlarms.size() > 0) {
+                    dumpAlarmList(pw, mRtcAlarms, "  ", "RTC", now);
+                }
+            }
+            if (mElapsedRealtimeWakeupAlarms.size() > 0 || mElapsedRealtimeAlarms.size() > 0) {
+                final long now = SystemClock.elapsedRealtime();
+                pw.println(" ");
+                pw.print("  Elapsed realtime wakeup (now=");
+                        TimeUtils.formatDuration(now, pw); pw.println("):");
+                if (mElapsedRealtimeWakeupAlarms.size() > 0) {
+                    dumpAlarmList(pw, mElapsedRealtimeWakeupAlarms, "  ", "ELAPSED_WAKEUP", now);
+                }
+                if (mElapsedRealtimeAlarms.size() > 0) {
+                    dumpAlarmList(pw, mElapsedRealtimeAlarms, "  ", "ELAPSED", now);
+                }
+            }
+
+            pw.println();
+            pw.print("  Broadcast ref count: "); pw.println(mBroadcastRefCount);
+            pw.println();
+
+            if (mLog.dump(pw, "  Recent problems", "    ")) {
+                pw.println();
+            }
+
+            final FilterStats[] topFilters = new FilterStats[10];
+            final Comparator<FilterStats> comparator = new Comparator<FilterStats>() {
+                @Override
+                public int compare(FilterStats lhs, FilterStats rhs) {
+                    if (lhs.aggregateTime < rhs.aggregateTime) {
+                        return 1;
+                    } else if (lhs.aggregateTime > rhs.aggregateTime) {
+                        return -1;
+                    }
+                    return 0;
+                }
+            };
+            int len = 0;
+            for (Map.Entry<String, BroadcastStats> be : mBroadcastStats.entrySet()) {
+                BroadcastStats bs = be.getValue();
+                for (Map.Entry<Pair<String, ComponentName>, FilterStats> fe
+                        : bs.filterStats.entrySet()) {
+                    FilterStats fs = fe.getValue();
+                    int pos = len > 0
+                            ? Arrays.binarySearch(topFilters, 0, len, fs, comparator) : 0;
+                    if (pos < 0) {
+                        pos = -pos - 1;
+                    }
+                    if (pos < topFilters.length) {
+                        int copylen = topFilters.length - pos - 1;
+                        if (copylen > 0) {
+                            System.arraycopy(topFilters, pos, topFilters, pos+1, copylen);
+                        }
+                        topFilters[pos] = fs;
+                        if (len < topFilters.length) {
+                            len++;
+                        }
+                    }
+                }
+            }
+            if (len > 0) {
+                pw.println("  Top Alarms:");
+                for (int i=0; i<len; i++) {
+                    FilterStats fs = topFilters[i];
+                    pw.print("    ");
+                    if (fs.nesting > 0) pw.print("*ACTIVE* ");
+                    TimeUtils.formatDuration(fs.aggregateTime, pw);
+                    pw.print(" running, "); pw.print(fs.numWakeup);
+                    pw.print(" wakeups, "); pw.print(fs.count);
+                    pw.print(" alarms: "); pw.print(fs.mBroadcastStats.mPackageName);
+                    pw.println();
+                    pw.print("      ");
+                    if (fs.mTarget.first != null) {
+                        pw.print(" act="); pw.print(fs.mTarget.first);
+                    }
+                    if (fs.mTarget.second != null) {
+                        pw.print(" cmp="); pw.print(fs.mTarget.second.toShortString());
+                    }
+                    pw.println();
+                }
+            }
+
+            pw.println(" ");
+            pw.println("  Alarm Stats:");
+            final ArrayList<FilterStats> tmpFilters = new ArrayList<FilterStats>();
+            for (Map.Entry<String, BroadcastStats> be : mBroadcastStats.entrySet()) {
+                BroadcastStats bs = be.getValue();
+                pw.print("  ");
+                if (bs.nesting > 0) pw.print("*ACTIVE* ");
+                pw.print(be.getKey());
+                pw.print(" "); TimeUtils.formatDuration(bs.aggregateTime, pw);
+                        pw.print(" running, "); pw.print(bs.numWakeup);
+                        pw.println(" wakeups:");
+                tmpFilters.clear();
+                for (Map.Entry<Pair<String, ComponentName>, FilterStats> fe
+                        : bs.filterStats.entrySet()) {
+                    tmpFilters.add(fe.getValue());
+                }
+                Collections.sort(tmpFilters, comparator);
+                for (int i=0; i<tmpFilters.size(); i++) {
+                    FilterStats fs = tmpFilters.get(i);
+                    pw.print("    ");
+                            if (fs.nesting > 0) pw.print("*ACTIVE* ");
+                            TimeUtils.formatDuration(fs.aggregateTime, pw);
+                            pw.print(" "); pw.print(fs.numWakeup);
+                            pw.print(" wakes " ); pw.print(fs.count);
+                            pw.print(" alarms:");
+                            if (fs.mTarget.first != null) {
+                                pw.print(" act="); pw.print(fs.mTarget.first);
+                            }
+                            if (fs.mTarget.second != null) {
+                                pw.print(" cmp="); pw.print(fs.mTarget.second.toShortString());
+                            }
+                            pw.println();
+                }
+            }
+        }
+!!!8017804.java!!!	dumpAlarmList(inout pw : PrintWriter, inout list : ArrayList<Alarm>, in prefix : String, in label : String, in now : long) : void
+        for (int i=list.size()-1; i>=0; i--) {
+            Alarm a = list.get(i);
+            pw.print(prefix); pw.print(label); pw.print(" #"); pw.print(i);
+                    pw.print(": "); pw.println(a);
+            a.dump(pw, prefix + "  ", now);
+        }
+!!!8018572.java!!!	triggerAlarmsLocked(inout alarmList : ArrayList<Alarm>, inout triggerList : ArrayList<Alarm>, in now : long) : void
+        Iterator<Alarm> it = alarmList.iterator();
+        ArrayList<Alarm> repeats = new ArrayList<Alarm>();
+        
+        while (it.hasNext())
+        {
+            Alarm alarm = it.next();
+
+            if (localLOGV) Slog.v(TAG, "Checking active alarm when=" + alarm.when + " " + alarm);
+
+            if (alarm.when > now) {
+                // don't fire alarms in the future
+                break;
+            }
+            
+            // If the alarm is late, then print a warning message.
+            // Note that this can happen if the user creates a new event on
+            // the Calendar app with a reminder that is in the past. In that
+            // case, the reminder alarm will fire immediately.
+            if (localLOGV && now - alarm.when > LATE_ALARM_THRESHOLD) {
+                Slog.v(TAG, "alarm is late! alarm time: " + alarm.when
+                        + " now: " + now + " delay (in seconds): "
+                        + (now - alarm.when) / 1000);
+            }
+
+            // Recurring alarms may have passed several alarm intervals while the
+            // phone was asleep or off, so pass a trigger count when sending them.
+            if (localLOGV) Slog.v(TAG, "Alarm triggering: " + alarm);
+            alarm.count = 1;
+            if (alarm.repeatInterval > 0) {
+                // this adjustment will be zero if we're late by
+                // less than one full repeat interval
+                alarm.count += (now - alarm.when) / alarm.repeatInterval;
+            }
+            triggerList.add(alarm);
+            
+            // remove the alarm from the list
+            it.remove();
+            
+            // if it repeats queue it up to be read-added to the list
+            if (alarm.repeatInterval > 0) {
+                repeats.add(alarm);
+            }
+        }
+
+        // reset any repeating alarms.
+        it = repeats.iterator();
+        while (it.hasNext()) {
+            Alarm alarm = it.next();
+            alarm.when += alarm.count * alarm.repeatInterval;
+            addAlarmLocked(alarm);
+        }
+        
+        if (alarmList.size() > 0) {
+            setLocked(alarmList.get(0));
+        }
+!!!8019468.java!!!	setWakelockWorkSource(inout pi : PendingIntent) : void
+        try {
+            final int uid = ActivityManagerNative.getDefault()
+                    .getUidForIntentSender(pi.getTarget());
+            if (uid >= 0) {
+                mWakeLock.setWorkSource(new WorkSource(uid));
+                return;
+            }
+        } catch (Exception e) {
+        }
+
+        // Something went wrong; fall back to attributing the lock to the OS
+        mWakeLock.setWorkSource(null);
+!!!8020620.java!!!	getStatsLocked(inout pi : PendingIntent) : BroadcastStats
+        String pkg = pi.getTargetPackage();
+        BroadcastStats bs = mBroadcastStats.get(pkg);
+        if (bs == null) {
+            bs = new BroadcastStats(pkg);
+            mBroadcastStats.put(pkg, bs);
+        }
+        return bs;

@@ -1,0 +1,136 @@
+class InactiveState
+!!!9793676.java!!!	enter() : void
+            if (DBG) logd(getName());
+            //Start listening every time we get inactive
+            //TODO: Fix listen after driver behavior is fixed
+            //mWifiNative.p2pListen();
+!!!9793804.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) logd(getName() + message.toString());
+            switch (message.what) {
+                case WifiP2pManager.CONNECT:
+                    if (DBG) logd(getName() + " sending connect");
+                    WifiP2pConfig config = (WifiP2pConfig) message.obj;
+                    mAutonomousGroup = false;
+
+                    /* Update group capability before connect */
+                    int gc = mWifiNative.getGroupCapability(config.deviceAddress);
+                    mPeers.updateGroupCapability(config.deviceAddress, gc);
+                    int connectRet = connect(config, TRY_REINVOCATION);
+                    if (connectRet == CONNECT_FAILURE) {
+                        replyToMessage(message, WifiP2pManager.CONNECT_FAILED);
+                        break;
+                    }
+                    mPeers.updateStatus(mSavedPeerConfig.deviceAddress, WifiP2pDevice.INVITED);
+                    sendP2pPeersChangedBroadcast();
+                    replyToMessage(message, WifiP2pManager.CONNECT_SUCCEEDED);
+                    if (connectRet == NEEDS_PROVISION_REQ) {
+                        if (DBG) logd("Sending prov disc");
+                        transitionTo(mProvisionDiscoveryState);
+                        break;
+                    }
+                    transitionTo(mGroupNegotiationState);
+                    break;
+                case WifiP2pManager.STOP_DISCOVERY:
+                    if (mWifiNative.p2pStopFind()) {
+                        // When discovery stops in inactive state, flush to clear
+                        // state peer data
+                        mWifiNative.p2pFlush();
+                        mServiceDiscReqId = null;
+                        replyToMessage(message, WifiP2pManager.STOP_DISCOVERY_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.STOP_DISCOVERY_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                case WifiMonitor.P2P_GO_NEGOTIATION_REQUEST_EVENT:
+                    mSavedPeerConfig = (WifiP2pConfig) message.obj;
+                    mAutonomousGroup = false;
+                    mJoinExistingGroup = false;
+                    if (!sendConnectNoticeToApp(mPeers.get(mSavedPeerConfig.deviceAddress),
+                            mSavedPeerConfig)) {
+                        transitionTo(mUserAuthorizingInvitationState);
+                    }
+                    break;
+                case WifiMonitor.P2P_INVITATION_RECEIVED_EVENT:
+                    WifiP2pGroup group = (WifiP2pGroup) message.obj;
+                    WifiP2pDevice owner = group.getOwner();
+
+                    if (owner == null) {
+                        if (DBG) loge("Ignored invitation from null owner");
+                        break;
+                    }
+
+                    mSavedPeerConfig = new WifiP2pConfig();
+                    mSavedPeerConfig.deviceAddress = group.getOwner().deviceAddress;
+
+                    //Check if we have the owner in peer list and use appropriate
+                    //wps method. Default is to use PBC.
+                    if ((owner = mPeers.get(owner.deviceAddress)) != null) {
+                        if (owner.wpsPbcSupported()) {
+                            mSavedPeerConfig.wps.setup = WpsInfo.PBC;
+                        } else if (owner.wpsKeypadSupported()) {
+                            mSavedPeerConfig.wps.setup = WpsInfo.KEYPAD;
+                        } else if (owner.wpsDisplaySupported()) {
+                            mSavedPeerConfig.wps.setup = WpsInfo.DISPLAY;
+                        }
+                    }
+
+                    mAutonomousGroup = false;
+                    mJoinExistingGroup = true;
+                    //TODO In the p2p client case, we should set source address correctly.
+                    if (!sendConnectNoticeToApp(mPeers.get(mSavedPeerConfig.deviceAddress),
+                            mSavedPeerConfig)) {
+                        transitionTo(mUserAuthorizingInvitationState);
+                    }
+                    break;
+                case WifiMonitor.P2P_PROV_DISC_PBC_REQ_EVENT:
+                case WifiMonitor.P2P_PROV_DISC_ENTER_PIN_EVENT:
+                case WifiMonitor.P2P_PROV_DISC_SHOW_PIN_EVENT:
+                    //We let the supplicant handle the provision discovery response
+                    //and wait instead for the GO_NEGOTIATION_REQUEST_EVENT.
+                    //Handling provision discovery and issuing a p2p_connect before
+                    //group negotiation comes through causes issues
+                   break;
+                case WifiP2pManager.CREATE_GROUP:
+                   mAutonomousGroup = true;
+                   int netId = message.arg1;
+                   boolean ret = false;
+                   if (netId == WifiP2pGroup.PERSISTENT_NET_ID) {
+                       // check if the go persistent group is present.
+                       netId = mGroups.getNetworkId(mThisDevice.deviceAddress);
+                       if (netId != -1) {
+                           ret = mWifiNative.p2pGroupAdd(netId);
+                       } else {
+                           ret = mWifiNative.p2pGroupAdd(true);
+                       }
+                   } else {
+                       ret = mWifiNative.p2pGroupAdd(false);
+                   }
+
+                   if (ret) {
+                       replyToMessage(message, WifiP2pManager.CREATE_GROUP_SUCCEEDED);
+                       transitionTo(mGroupNegotiationState);
+                   } else {
+                       replyToMessage(message, WifiP2pManager.CREATE_GROUP_FAILED,
+                               WifiP2pManager.ERROR);
+                       // remain at this state.
+                   }
+                   break;
+                case WifiMonitor.P2P_GROUP_STARTED_EVENT:
+                   mGroup = (WifiP2pGroup) message.obj;
+                   if (DBG) logd(getName() + " group started");
+
+                    // We hit this scenario when a persistent group is reinvoked
+                   if (mGroup.getNetworkId() == WifiP2pGroup.PERSISTENT_NET_ID) {
+                       mAutonomousGroup = false;
+                       deferMessage(message);
+                       transitionTo(mGroupNegotiationState);
+                   } else {
+                       loge("Unexpected group creation, remove " + mGroup);
+                       mWifiNative.p2pGroupRemove(mGroup.getInterface());
+                   }
+                   break;
+                default:
+                   return NOT_HANDLED;
+            }
+            return HANDLED;

@@ -1,0 +1,258 @@
+class DdmHandleViewDebug
+!!!15783052.java!!!	register() : void
+        DdmServer.registerHandler(CHUNK_VUGL, sInstance);
+        DdmServer.registerHandler(CHUNK_VULW, sInstance);
+        DdmServer.registerHandler(CHUNK_VURT, sInstance);
+        DdmServer.registerHandler(CHUNK_VUOP, sInstance);
+!!!15783436.java!!!	handleChunk(inout request : Chunk) : Chunk
+        int type = request.type;
+
+        if (type == CHUNK_VUGL) {
+            return handleOpenGlTrace(request);
+        } else if (type == CHUNK_VULW) {
+            return listWindows();
+        }
+
+        ByteBuffer in = wrapChunk(request);
+        int op = in.getInt();
+
+        View rootView = getRootView(in);
+        if (rootView == null) {
+            return createFailChunk(ERR_INVALID_PARAM, "Invalid View Root");
+        }
+
+        if (type == CHUNK_VURT) {
+            if (op == VURT_DUMP_HIERARCHY)
+                return dumpHierarchy(rootView, in);
+            else if (op == VURT_CAPTURE_LAYERS)
+                return captureLayers(rootView);
+            else
+                return createFailChunk(ERR_INVALID_OP, "Unknown view root operation: " + op);
+        }
+
+        final View targetView = getTargetView(rootView, in);
+        if (targetView == null) {
+            return createFailChunk(ERR_INVALID_PARAM, "Invalid target view");
+        }
+
+        if (type == CHUNK_VUOP) {
+            switch (op) {
+                case VUOP_CAPTURE_VIEW:
+                    return captureView(rootView, targetView);
+                case VUOP_DUMP_DISPLAYLIST:
+                    return dumpDisplayLists(rootView, targetView);
+                case VUOP_PROFILE_VIEW:
+                    return profileView(rootView, targetView);
+                case VUOP_INVOKE_VIEW_METHOD:
+                    return invokeViewMethod(rootView, targetView, in);
+                case VUOP_SET_LAYOUT_PARAMETER:
+                    return setLayoutParameter(rootView, targetView, in);
+                default:
+                    return createFailChunk(ERR_INVALID_OP, "Unknown view operation: " + op);
+            }
+        } else {
+            throw new RuntimeException("Unknown packet " + ChunkHandler.name(type));
+        }
+!!!15783564.java!!!	handleOpenGlTrace(inout request : Chunk) : Chunk
+        ByteBuffer in = wrapChunk(request);
+        GLUtils.setTracingLevel(in.getInt());
+        return null;    // empty response
+!!!15783692.java!!!	listWindows() : Chunk
+        String[] windowNames = WindowManagerGlobal.getInstance().getViewRootNames();
+
+        int responseLength = 4;                     // # of windows
+        for (String name : windowNames) {
+            responseLength += 4;                    // length of next window name
+            responseLength += name.length() * 2;    // window name
+        }
+
+        ByteBuffer out = ByteBuffer.allocate(responseLength);
+        out.order(ChunkHandler.CHUNK_ORDER);
+
+        out.putInt(windowNames.length);
+        for (String name : windowNames) {
+            out.putInt(name.length());
+            putString(out, name);
+        }
+
+        return new Chunk(CHUNK_VULW, out);
+!!!15783820.java!!!	getRootView(inout in : ByteBuffer) : View
+        try {
+            int viewRootNameLength = in.getInt();
+            String viewRootName = getString(in, viewRootNameLength);
+            return WindowManagerGlobal.getInstance().getRootView(viewRootName);
+        } catch (BufferUnderflowException e) {
+            return null;
+        }
+!!!15783948.java!!!	getTargetView(inout root : View, inout in : ByteBuffer) : View
+        int viewLength;
+        String viewName;
+
+        try {
+            viewLength = in.getInt();
+            viewName = getString(in, viewLength);
+        } catch (BufferUnderflowException e) {
+            return null;
+        }
+
+        return ViewDebug.findView(root, viewName);
+!!!15784076.java!!!	dumpHierarchy(inout rootView : View, inout in : ByteBuffer) : Chunk
+        boolean skipChildren = in.getInt() > 0;
+        boolean includeProperties = in.getInt() > 0;
+
+        ByteArrayOutputStream b = new ByteArrayOutputStream(1024);
+        try {
+            ViewDebug.dump(rootView, skipChildren, includeProperties, b);
+        } catch (IOException e) {
+            return createFailChunk(1, "Unexpected error while obtaining view hierarchy: "
+                    + e.getMessage());
+        }
+
+        byte[] data = b.toByteArray();
+        return new Chunk(CHUNK_VURT, data, 0, data.length);
+!!!15784204.java!!!	captureLayers(inout rootView : View) : Chunk
+        ByteArrayOutputStream b = new ByteArrayOutputStream(1024);
+        DataOutputStream dos = new DataOutputStream(b);
+        try {
+            ViewDebug.captureLayers(rootView, dos);
+        } catch (IOException e) {
+            return createFailChunk(1, "Unexpected error while obtaining view hierarchy: "
+                    + e.getMessage());
+        } finally {
+            try {
+                dos.close();
+            } catch (IOException e) {
+                // ignore
+            }
+        }
+
+        byte[] data = b.toByteArray();
+        return new Chunk(CHUNK_VURT, data, 0, data.length);
+!!!15784332.java!!!	captureView(inout rootView : View, inout targetView : View) : Chunk
+        ByteArrayOutputStream b = new ByteArrayOutputStream(1024);
+        try {
+            ViewDebug.capture(rootView, b, targetView);
+        } catch (IOException e) {
+            return createFailChunk(1, "Unexpected error while capturing view: "
+                    + e.getMessage());
+        }
+
+        byte[] data = b.toByteArray();
+        return new Chunk(CHUNK_VUOP, data, 0, data.length);
+!!!15784460.java!!!	dumpDisplayLists(in rootView : View, in targetView : View) : Chunk
+        rootView.post(new Runnable() {
+            @Override
+            public void run() {
+                ViewDebug.outputDisplayList(rootView, targetView);
+            }
+        });
+        return null;
+!!!15784588.java!!!	invokeViewMethod(in rootView : View, in targetView : View, inout in : ByteBuffer) : Chunk
+        int l = in.getInt();
+        String methodName = getString(in, l);
+
+        Class<?>[] argTypes;
+        Object[] args;
+        if (!in.hasRemaining()) {
+            argTypes = new Class<?>[0];
+            args = new Object[0];
+        } else {
+            int nArgs = in.getInt();
+
+            argTypes = new Class<?>[nArgs];
+            args = new Object[nArgs];
+
+            for (int i = 0; i < nArgs; i++) {
+                char c = in.getChar();
+                switch (c) {
+                    case 'Z':
+                        argTypes[i] = boolean.class;
+                        args[i] = in.get() == 0 ? false : true;
+                        break;
+                    case 'B':
+                        argTypes[i] = byte.class;
+                        args[i] = in.get();
+                        break;
+                    case 'C':
+                        argTypes[i] = char.class;
+                        args[i] = in.getChar();
+                        break;
+                    case 'S':
+                        argTypes[i] = short.class;
+                        args[i] = in.getShort();
+                        break;
+                    case 'I':
+                        argTypes[i] = int.class;
+                        args[i] = in.getInt();
+                        break;
+                    case 'J':
+                        argTypes[i] = long.class;
+                        args[i] = in.getLong();
+                        break;
+                    case 'F':
+                        argTypes[i] = float.class;
+                        args[i] = in.getFloat();
+                        break;
+                    case 'D':
+                        argTypes[i] = double.class;
+                        args[i] = in.getDouble();
+                        break;
+                    default:
+                        Log.e(TAG, "arg " + i + ", unrecognized type: " + c);
+                        return createFailChunk(ERR_INVALID_PARAM,
+                                "Unsupported parameter type (" + c + ") to invoke view method.");
+                }
+            }
+        }
+
+        Method method = null;
+        try {
+            method = targetView.getClass().getMethod(methodName, argTypes);
+        } catch (NoSuchMethodException e) {
+            Log.e(TAG, "No such method: " + e.getMessage());
+            return createFailChunk(ERR_INVALID_PARAM,
+                    "No such method: " + e.getMessage());
+        }
+
+        try {
+            ViewDebug.invokeViewMethod(targetView, method, args);
+        } catch (Exception e) {
+            Log.e(TAG, "Exception while invoking method: " + e.getCause().getMessage());
+            String msg = e.getCause().getMessage();
+            if (msg == null) {
+                msg = e.getCause().toString();
+            }
+            return createFailChunk(ERR_EXCEPTION, msg);
+        }
+
+        return null;
+!!!15784716.java!!!	setLayoutParameter(in rootView : View, in targetView : View, inout in : ByteBuffer) : Chunk
+        int l = in.getInt();
+        String param = getString(in, l);
+        int value = in.getInt();
+        try {
+            ViewDebug.setLayoutParameter(targetView, param, value);
+        } catch (Exception e) {
+            Log.e(TAG, "Exception setting layout parameter: " + e);
+            return createFailChunk(ERR_EXCEPTION, "Error accessing field "
+                        + param + ":" + e.getMessage());
+        }
+
+        return null;
+!!!15784844.java!!!	profileView(inout rootView : View, in targetView : View) : Chunk
+        ByteArrayOutputStream b = new ByteArrayOutputStream(32 * 1024);
+        BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(b), 32 * 1024);
+        try {
+            ViewDebug.profileViewAndChildren(targetView, bw);
+        } catch (IOException e) {
+            return createFailChunk(1, "Unexpected error while profiling view: " + e.getMessage());
+        } finally {
+            try {
+                bw.close();
+            } catch (IOException e) {
+                // ignore
+            }
+        }
+
+        byte[] data = b.toByteArray();
+        return new Chunk(CHUNK_VUOP, data, 0, data.length);

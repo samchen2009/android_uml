@@ -1,0 +1,426 @@
+class StreamUtils
+!!!13248396.java!!!	getMatchingStreamsWithStreamType(inout resolver : ContentResolver, inout constraint : CharSequence, in streamType : int, in deviceId : String) : Cursor
+        if (!TextUtils.isEmpty(constraint)
+                && !TvUriUtils.TV_SCHEME_QUALIFIED.equalsIgnoreCase(
+                        constraint.toString())) {
+            StringBuilder builder = new StringBuilder();
+            String constraintString = constraint.toString();
+            String name = constraintString;
+            boolean appendOr = false;
+            if (constraintString.startsWith(TvUriUtils.TV_SCHEME_QUALIFIED)) {
+                // Strip out the authority and use that as the name, e.g. "cnn"
+                // for "tv://cnn".
+                Uri tvUri = Uri.parse(constraintString);
+                name = tvUri.getAuthority();
+                // Add URI search.
+                buildLikeQuery(builder, StreamsColumns.URI, tvUri.toString(),
+                        appendOr, false);
+                appendOr = true;
+            }
+            if (ChannelNumber.isValidStringRepresentation(name)) {
+                // Add channel number search.
+                buildLikeQuery(builder, StreamsColumns.CHANNEL_NUMBER, name,
+                        appendOr, false);
+                appendOr = true;
+            }
+            // Basic name search.
+            buildLikeQuery(builder, StreamsColumns.NAME, name, appendOr, true);
+            if (streamType != Streams.STREAM_TYPE_ANY) {
+                builder.append(" AND " + StreamsColumns.STREAM_TYPE + " = "
+                        + streamType);
+            }
+            if (deviceId != null) {
+                builder.append(" AND " + StreamsColumns.DEVICE_ID + " = ");
+                DatabaseUtils.appendEscapedSQLString(builder, deviceId);
+            }
+            return getMatchingStreamsWithSqlSelector(resolver,
+                    builder.toString(),
+                    null);
+        }
+        // Return an empty cursor by default.
+        return new MatrixCursor(Streams.STREAMS_PROJECTION);
+!!!13248524.java!!!	getMatchingStreamsWithStreamType(inout resolver : ContentResolver, inout constraint : CharSequence, in streamType : int) : Cursor
+        return getMatchingStreamsWithStreamType(resolver, constraint,
+                streamType, null);
+!!!13248652.java!!!	getMatchingStreams(inout resolver : ContentResolver, inout constraint : CharSequence) : Cursor
+        return getMatchingStreamsWithStreamType(resolver, constraint,
+                Streams.STREAM_TYPE_ANY);
+!!!13248780.java!!!	getMatchingStreamsWithSqlSelector(inout resolver : ContentResolver, in selector : String, inout selectorArgs : String) : Cursor
+        return getMatchingStreams(resolver, null, selector, selectorArgs, null);
+!!!13248908.java!!!	getMatchingStreams(inout resolver : ContentResolver, inout projection : String, in selector : String, inout selectorArgs : String, in sortOrder : String) : Cursor
+        if (projection == null) {
+            // by default return all columns in STREAMS_PROJECTION.
+            projection = Streams.STREAMS_PROJECTION;
+        }
+        if (sortOrder == null) {
+            // by default sort by name, then channel.
+            sortOrder = StreamsColumns.NAME + " ASC,"
+                    + StreamsColumns.CHANNEL_NUMBER + " DESC";
+        }
+        return resolver.query(Streams.STREAMS_URI, projection, selector,
+                selectorArgs, sortOrder);
+!!!13249036.java!!!	buildLikeQuery(inout builder : StringBuilder, in columnName : String, in stem : String, inout appendOr : boolean, inout appendDeepPrefixMatch : boolean) : void
+        if (appendOr) {
+            builder.append(" OR ");
+        }
+        builder.append("(");
+
+        // "bill" matches "billy mayes"
+        builder.append(columnName);
+        builder.append(" LIKE ");
+        DatabaseUtils.appendEscapedSQLString(builder, stem + "%");
+
+        if (appendDeepPrefixMatch) {
+            // "bill" matches "real time with bill maher"
+            builder.append(" OR ");
+
+            builder.append(columnName);
+            builder.append(" LIKE ");
+            DatabaseUtils.appendEscapedSQLString(builder, "% " + stem + "%");
+        }
+
+        builder.append(")");
+!!!13249164.java!!!	processListResults(inout resolver : ContentResolver, in deviceId : String, in streamType : int, inout streams : List<? extends IStream>) : void
+        processListResults(resolver, deviceId, streamType, streams,
+                new StreamActionPolicy() {
+                    @Override
+                    public boolean isActionAllowed(
+                            StreamActionPolicy.StreamAction action,
+                            String tvUrl) {
+                        return true;
+                    }
+        });
+!!!13249292.java!!!	processListResults(inout resolver : ContentResolver, in deviceId : String, in streamType : int, inout streams : List<? extends IStream>, inout actionPolicy : StreamActionPolicy) : void
+        // First get current list of streams for this box into a hashset.
+        HashSet<String> currentStreams = getCurrentStreamUrls(resolver,
+                deviceId, streamType);
+        // Now loop through the new list and see if they're new.
+        HashSet<String> newStreams = new HashSet<String>();
+        ArrayList<ContentValues> newValues = new ArrayList<ContentValues>();
+        ArrayList<ContentValues> updatedValues = new ArrayList<ContentValues>();
+        for (IStream stream : streams) {
+            String tvUrl = stream.getTvUrl();
+            if (currentStreams.contains(tvUrl)) {
+                updatedValues.add(stream.asContentValues());
+            } else {
+                if (actionPolicy.isActionAllowed(
+                        StreamActionPolicy.StreamAction.INSERT, tvUrl)) {
+                    newValues.add(stream.asContentValues());
+                }
+            }
+            // Always add the new streams to the new streams hashset.
+            newStreams.add(tvUrl);
+        }
+
+        // Now bulk insert new streams.
+        resolver.bulkInsert(Streams.STREAMS_URI, newValues.toArray(
+                new ContentValues[] {}));
+
+        // Now bulk update existing streams.
+        updateExistingStreams(resolver, streamType, updatedValues,
+                actionPolicy);
+
+        // Now delete old streams.
+        deleteOldStreams(resolver, streamType, currentStreams, newStreams,
+                actionPolicy);
+!!!13249420.java!!!	getCurrentStreamUrls(inout resolver : ContentResolver, in deviceId : String, in streamType : int) : HashSet<String>
+        HashSet<String> recordings = new HashSet<String>();
+        Cursor c = null;
+        String selection = StreamsColumns.DEVICE_ID + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ?";
+        String[] selArgs = new String[] {
+                deviceId, String.valueOf(streamType)
+        };
+        try {
+            c = resolver.query(Streams.STREAMS_URI,
+                    Streams.STREAMS_PROJECTION, selection, selArgs, null);
+            while (c.moveToNext()) {
+                String url = c.getString(Streams.URI_INDEX);
+                recordings.add(url);
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return recordings;
+!!!13249548.java!!!	updateExistingStreams(inout resolver : ContentResolver, in streamType : int, inout newStreamValues : List<ContentValues>, inout actionPolicy : StreamActionPolicy) : void
+        String selection = StreamsColumns.URI + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ?";
+        for (ContentValues values : newStreamValues) {
+            String tvUrl = values.getAsString(StreamsColumns.URI);
+            if (actionPolicy.isActionAllowed(
+                    StreamActionPolicy.StreamAction.UPDATE, tvUrl)) {
+                String[] selectionArgs = new String[] {
+                        tvUrl, String.valueOf(streamType)
+                };
+                resolver.update(Streams.STREAMS_URI, values, selection,
+                        selectionArgs);
+            }
+        }
+!!!13249676.java!!!	deleteOldStreams(inout resolver : ContentResolver, in streamType : int, inout currentStreams : HashSet<String>, inout newStreams : HashSet<String>, inout actionPolicy : StreamActionPolicy) : void
+        String selection = StreamsColumns.URI + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ?";
+        for (String tvUrl : currentStreams) {
+            if (!newStreams.contains(tvUrl)) {
+                if (actionPolicy.isActionAllowed(
+                        StreamActionPolicy.StreamAction.DELETE, tvUrl)) {
+                    String[] selectionArgs = new String[] {
+                            tvUrl, String.valueOf(streamType)
+                    };
+                    resolver.delete(Streams.STREAMS_URI, selection,
+                            selectionArgs);
+                }
+            }
+        }
+!!!13249804.java!!!	deleteDeviceStreams(inout resolver : ContentResolver, in deviceId : String) : void
+        String selection = StreamsColumns.DEVICE_ID + " = ?";
+        String[] selectionArgs = new String[] {
+                deviceId
+        };
+        resolver.delete(Streams.STREAMS_URI, selection, selectionArgs);
+!!!13249932.java!!!	countDeviceStreams(inout resolver : ContentResolver, in deviceId : String, in streamType : int) : int
+        int count = 0;
+        Cursor c = null;
+        String selection = StreamsColumns.DEVICE_ID + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ?";
+        String[] selectionArgs = new String[] { deviceId,
+                                                String.valueOf(streamType) };
+
+        try {
+            c = resolver.query(Streams.STREAMS_URI, null, selection,
+                    selectionArgs, null);
+            count = c.getCount();
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+
+        return count;
+!!!13250060.java!!!	countDisabledDeviceStreams(inout resolver : ContentResolver, in deviceId : String, in streamType : int) : int
+        int count = 0;
+        Cursor c = null;
+        String selection = StreamsColumns.DEVICE_ID + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ? AND "
+                + StreamsColumns.IS_DISABLED + " = 1";
+        String[] selectionArgs = new String[] { deviceId,
+                                                String.valueOf(streamType) };
+
+        try {
+            c = resolver.query(Streams.STREAMS_URI, null, selection,
+                    selectionArgs, null);
+            count = c.getCount();
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+
+        return count;
+!!!13250188.java!!!	getStreamLabels(inout context : Context, inout uris : List<Uri>) : List<String>
+        final GtvResources res = new GtvResources(context);
+        final ContentResolver resolver = context.getContentResolver();
+        ArrayList<String> labels = new ArrayList<String>(uris.size());
+        for (Uri uri : uris) {
+            String streamUri = uri.toString();
+            boolean isEpgUri = false;
+            if (uri.getQueryParameter(Streams.QUERY_STREAM_URI) != null) {
+                streamUri = uri.getQueryParameter(Streams.QUERY_STREAM_URI);
+                isEpgUri = true;
+            }
+            Cursor c = null;
+            String label = streamUri;
+            try {
+                c = resolver.query(Streams.STREAMS_URI, Streams.STREAMS_PROJECTION,
+                        StreamsColumns.URI + " = ?",
+                        new String[] { streamUri }, null);
+                if (c.moveToNext()) {
+                    String streamName = c.getString(
+                            Streams.NAME_INDEX);
+                    String channelNumber = c.getString(
+                            Streams.CHANNEL_NUMBER_INDEX);
+                    if (!TextUtils.isEmpty(channelNumber)) {
+                        streamName = res.getResources().getString(
+                                R.string.tv_disambiguation_stream_name,
+                                streamName, channelNumber);
+                    }
+                    label = res.getResources().getString(R.string.tv_disambiguation_watch_now,
+                            streamName);
+                    if (isEpgUri) {
+                        String eventName = uri.getQueryParameter(Streams.QUERY_EVENT_NAME);
+                        if (TextUtils.isEmpty(eventName)) {
+                            eventName = res.getResources().getString(
+                                    R.string.tv_disambiguation_unknown_event);
+                        }
+                        label = res.getResources().getString(R.string.tv_disambiguation_record,
+                                eventName, streamName);
+                    }
+                }
+            } finally {
+                if (c != null) {
+                    c.close();
+                }
+            }
+            labels.add(label);
+        }
+        return labels;
+!!!13250316.java!!!	getChannelNumber(inout resolver : ContentResolver, inout tvUri : Uri) : ChannelNumber
+        ChannelNumber channelNumber = null;
+
+        // URI already includes the device id, so no need to check it.
+        String selection = StreamsColumns.URI + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ?";
+        String[] selectionArgs = new String[] {
+                tvUri.toString(),
+                String.valueOf(Streams.STREAM_TYPE_CHANNEL)
+        };
+        Cursor c = null;
+        try {
+            c = resolver.query(Streams.STREAMS_URI,
+                    new String[] {
+                        StreamsColumns.CHANNEL_NUMBER
+                    }, selection, selectionArgs, null);
+            if (c.moveToNext()) {
+                try {
+                    channelNumber = new ChannelNumber(c.getString(0));
+                } catch (IllegalArgumentException ex) { }
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return channelNumber;
+!!!13250444.java!!!	getStreamByUrl(inout resolver : ContentResolver, inout tvUri : Uri) : Cursor
+        String selection = StreamsColumns.URI + " = ?";
+        String[] selectionArgs = new String[] {
+                tvUri.toString(),
+        };
+        return resolver.query(Streams.STREAMS_URI, Streams.STREAMS_PROJECTION,
+                selection, selectionArgs, null);
+!!!13250700.java!!!	getChannelForUri(inout resolver : ContentResolver, inout tvUri : Uri, inout includeIcon : boolean) : Channel
+        if (!TvUriUtils.isChannel(tvUri)) {
+            return null;
+        }
+
+        String deviceId = TvUriUtils.getDeviceId(tvUri);
+        if (deviceId == null) {
+            return null;
+        }
+
+        String callsign = TvUriUtils.getChannelName(tvUri);
+        String number = TvUriUtils.getChannelNumberAsString(tvUri);
+
+        boolean hasCallsign = !TextUtils.isEmpty(callsign);
+        boolean hasNumber = !TextUtils.isEmpty(number);
+
+        if (!hasCallsign && !hasNumber) {
+            return null;
+        }
+
+        SqlQueryBuilder where = new SqlQueryBuilder(100);
+        if (hasCallsign) {
+            where.append(StreamsColumns.SUB_NAME, " = ")
+                    .appendQuoted(callsign);
+        }
+        if (hasNumber) {
+            if (hasCallsign) {
+                where.append(" AND ");
+            }
+            where.append(StreamsColumns.CHANNEL_NUMBER, " = ")
+                    .appendQuoted(number);
+        }
+
+        Cursor c = null;
+        Channel channel = null;
+        try {
+            c = resolver.query(Streams.STREAMS_URI, Streams.STREAMS_PROJECTION,
+                    where.build(), null, null);
+            if (c.moveToNext()) {
+                channel = buildChannelFromCursor(c, includeIcon);
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+
+        return channel;
+!!!13250828.java!!!	buildChannelFromCursor(inout cursor : Cursor, inout includeIcon : boolean) : Channel
+        String channelNumber = cursor.getString(
+                Streams.CHANNEL_NUMBER_INDEX);
+        if (TextUtils.isEmpty(channelNumber)) {
+            return null;
+        }
+
+        Bitmap icon = null;
+        if (includeIcon) {
+            byte[] iconData = cursor.getBlob(Streams.ICON_INDEX);
+            if (iconData != null) {
+                ByteArrayInputStream inStream = new ByteArrayInputStream(iconData);
+                icon = BitmapFactory.decodeStream(inStream);
+            }
+        }
+
+        Channel channel = new Channel.Builder(
+                cursor.getLong(Streams._ID_INDEX),
+                new ChannelNumber(channelNumber))
+                .setName(cursor.getString(Streams.NAME_INDEX))
+                .setCallSign(cursor.getString(Streams.SUB_NAME_INDEX))
+                .setSource(cursor.isNull(Streams.SOURCE_INDEX) ? Channel.NO_SOURCE
+                        : cursor.getInt(Streams.SOURCE_INDEX))
+                .setTier(Channel.TmsChannelTier.BASIC)
+                .setUri(cursor.getString(Streams.URI_INDEX))
+                .setIcon(icon)
+                .setEnabled(cursor.getInt(Streams.IS_DISABLED_INDEX) == 0)
+                .build();
+
+        return channel;
+!!!13250956.java!!!	buildContentValuesFromChannel(in channel : Channel, in deviceId : String) : ContentValues
+        ContentValues values = new ContentValues();
+        values.put(StreamsColumns.DEVICE_ID, deviceId);
+        values.put(StreamsColumns.CHANNEL_NUMBER, channel.getChannelNumber().toString());
+        values.put(StreamsColumns.NAME, channel.getName());
+        if (!TextUtils.isEmpty(channel.getCallSign())) {
+            values.put(StreamsColumns.SUB_NAME, channel.getCallSign());
+        } else if (!TextUtils.isEmpty(channel.getAffiliateCallSign())) {
+            values.put(StreamsColumns.SUB_NAME, channel.getAffiliateCallSign());
+        }
+
+        // If the channel has a URI, use that; otherwise construct a standard one
+        // from the device ID and callsign.
+        String uri = channel.getUri();
+        if (uri == null) {
+            uri = TvUriUtils.getChannelTvUri(deviceId,
+                    channel.getCallSign(), channel.getChannelNumber().toString()).toString();
+        }
+        values.put(StreamsColumns.URI, uri);
+        values.put(StreamsColumns.STREAM_TYPE, Streams.STREAM_TYPE_CHANNEL);
+        values.put(StreamsColumns.IS_DISABLED, channel.isEnabled() ? 0 : 1);
+
+        int source = channel.getSource();
+        if (source != Channel.NO_SOURCE) {
+            values.put(StreamsColumns.SOURCE, source);
+        } else {
+            values.putNull(StreamsColumns.SOURCE);
+        }
+
+        values.put(StreamsColumns.DATA_SOURCE, channel.getDataSource());
+
+        // If the channel has an icon, serialize it to PNG and store it as a
+        // blob.
+        Bitmap icon = channel.getIcon();
+        if (icon != null) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream(DEFAULT_ICON_BUFFER_SIZE);
+            if (icon.compress(Bitmap.CompressFormat.PNG, 0, out)) {
+                byte[] rawData = out.toByteArray();
+                if (rawData.length <= MAX_ICON_DATA_SIZE) {
+                    values.put(StreamsColumns.ICON, rawData);
+                } else {
+                    Log.w(LOG_TAG, "Icon image too large; rejecting.");
+                }
+            }
+        }
+
+        return values;

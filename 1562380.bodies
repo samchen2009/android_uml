@@ -1,0 +1,353 @@
+class SipService
+!!!9665932.java!!!	start(inout context : Context) : void
+        if (SipManager.isApiSupported(context)) {
+            ServiceManager.addService("sip", new SipService(context));
+            context.sendBroadcast(new Intent(SipManager.ACTION_SIP_SERVICE_UP));
+            if (DEBUG) Log.d(TAG, "SIP service started");
+        }
+!!!9666060.java!!!	SipService(inout context : Context)
+        if (DEBUG) Log.d(TAG, " service started!");
+        mContext = context;
+        mConnectivityReceiver = new ConnectivityReceiver();
+
+        mWifiLock = ((WifiManager)
+                context.getSystemService(Context.WIFI_SERVICE))
+                .createWifiLock(WifiManager.WIFI_MODE_FULL, TAG);
+        mWifiLock.setReferenceCounted(false);
+        mSipOnWifiOnly = SipManager.isSipWifiOnly(context);
+
+        mMyWakeLock = new SipWakeLock((PowerManager)
+                context.getSystemService(Context.POWER_SERVICE));
+
+        mTimer = new SipWakeupTimer(context, mExecutor);
+!!!9666188.java!!!	getListOfProfiles() : SipProfile
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        boolean isCallerRadio = isCallerRadio();
+        ArrayList<SipProfile> profiles = new ArrayList<SipProfile>();
+        for (SipSessionGroupExt group : mSipGroups.values()) {
+            if (isCallerRadio || isCallerCreator(group)) {
+                profiles.add(group.getLocalProfile());
+            }
+        }
+        return profiles.toArray(new SipProfile[profiles.size()]);
+!!!9666316.java!!!	open(inout localProfile : SipProfile) : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        localProfile.setCallingUid(Binder.getCallingUid());
+        try {
+            createGroup(localProfile);
+        } catch (SipException e) {
+            Log.e(TAG, "openToMakeCalls()", e);
+            // TODO: how to send the exception back
+        }
+!!!9666444.java!!!	open3(inout localProfile : SipProfile, inout incomingCallPendingIntent : PendingIntent, inout listener : ISipSessionListener) : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        localProfile.setCallingUid(Binder.getCallingUid());
+        if (incomingCallPendingIntent == null) {
+            Log.w(TAG, "incomingCallPendingIntent cannot be null; "
+                    + "the profile is not opened");
+            return;
+        }
+        if (DEBUG) Log.d(TAG, "open3: " + localProfile.getUriString() + ": "
+                + incomingCallPendingIntent + ": " + listener);
+        try {
+            SipSessionGroupExt group = createGroup(localProfile,
+                    incomingCallPendingIntent, listener);
+            if (localProfile.getAutoRegistration()) {
+                group.openToReceiveCalls();
+                updateWakeLocks();
+            }
+        } catch (SipException e) {
+            Log.e(TAG, "openToReceiveCalls()", e);
+            // TODO: how to send the exception back
+        }
+!!!9666572.java!!!	isCallerCreator(inout group : SipSessionGroupExt) : boolean
+        SipProfile profile = group.getLocalProfile();
+        return (profile.getCallingUid() == Binder.getCallingUid());
+!!!9666700.java!!!	isCallerCreatorOrRadio(inout group : SipSessionGroupExt) : boolean
+        return (isCallerRadio() || isCallerCreator(group));
+!!!9666828.java!!!	isCallerRadio() : boolean
+        return (Binder.getCallingUid() == Process.PHONE_UID);
+!!!9666956.java!!!	close(in localProfileUri : String) : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        SipSessionGroupExt group = mSipGroups.get(localProfileUri);
+        if (group == null) return;
+        if (!isCallerCreatorOrRadio(group)) {
+            Log.w(TAG, "only creator or radio can close this profile");
+            return;
+        }
+
+        group = mSipGroups.remove(localProfileUri);
+        notifyProfileRemoved(group.getLocalProfile());
+        group.close();
+
+        updateWakeLocks();
+!!!9667084.java!!!	isOpened(in localProfileUri : String) : boolean
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        SipSessionGroupExt group = mSipGroups.get(localProfileUri);
+        if (group == null) return false;
+        if (isCallerCreatorOrRadio(group)) {
+            return true;
+        } else {
+            Log.w(TAG, "only creator or radio can query on the profile");
+            return false;
+        }
+!!!9667212.java!!!	isRegistered(in localProfileUri : String) : boolean
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        SipSessionGroupExt group = mSipGroups.get(localProfileUri);
+        if (group == null) return false;
+        if (isCallerCreatorOrRadio(group)) {
+            return group.isRegistered();
+        } else {
+            Log.w(TAG, "only creator or radio can query on the profile");
+            return false;
+        }
+!!!9667340.java!!!	setRegistrationListener(in localProfileUri : String, inout listener : ISipSessionListener) : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        SipSessionGroupExt group = mSipGroups.get(localProfileUri);
+        if (group == null) return;
+        if (isCallerCreator(group)) {
+            group.setListener(listener);
+        } else {
+            Log.w(TAG, "only creator can set listener on the profile");
+        }
+!!!9667468.java!!!	createSession(inout localProfile : SipProfile, inout listener : ISipSessionListener) : ISipSession
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        localProfile.setCallingUid(Binder.getCallingUid());
+        if (mNetworkType == -1) return null;
+        try {
+            SipSessionGroupExt group = createGroup(localProfile);
+            return group.createSession(listener);
+        } catch (SipException e) {
+            if (DEBUG) Log.d(TAG, "createSession()", e);
+            return null;
+        }
+!!!9667596.java!!!	getPendingSession(in callId : String) : ISipSession
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.USE_SIP, null);
+        if (callId == null) return null;
+        return mPendingSessions.get(callId);
+!!!9667724.java!!!	determineLocalIp() : String
+        try {
+            DatagramSocket s = new DatagramSocket();
+            s.connect(InetAddress.getByName("192.168.1.1"), 80);
+            return s.getLocalAddress().getHostAddress();
+        } catch (IOException e) {
+            if (DEBUG) Log.d(TAG, "determineLocalIp()", e);
+            // dont do anything; there should be a connectivity change going
+            return null;
+        }
+!!!9667852.java!!!	createGroup(inout localProfile : SipProfile) : SipSessionGroupExt
+        String key = localProfile.getUriString();
+        SipSessionGroupExt group = mSipGroups.get(key);
+        if (group == null) {
+            group = new SipSessionGroupExt(localProfile, null, null);
+            mSipGroups.put(key, group);
+            notifyProfileAdded(localProfile);
+        } else if (!isCallerCreator(group)) {
+            throw new SipException("only creator can access the profile");
+        }
+        return group;
+!!!9667980.java!!!	createGroup(inout localProfile : SipProfile, inout incomingCallPendingIntent : PendingIntent, inout listener : ISipSessionListener) : SipSessionGroupExt
+        String key = localProfile.getUriString();
+        SipSessionGroupExt group = mSipGroups.get(key);
+        if (group != null) {
+            if (!isCallerCreator(group)) {
+                throw new SipException("only creator can access the profile");
+            }
+            group.setIncomingCallPendingIntent(incomingCallPendingIntent);
+            group.setListener(listener);
+        } else {
+            group = new SipSessionGroupExt(localProfile,
+                    incomingCallPendingIntent, listener);
+            mSipGroups.put(key, group);
+            notifyProfileAdded(localProfile);
+        }
+        return group;
+!!!9668108.java!!!	notifyProfileAdded(inout localProfile : SipProfile) : void
+        if (DEBUG) Log.d(TAG, "notify: profile added: " + localProfile);
+        Intent intent = new Intent(SipManager.ACTION_SIP_ADD_PHONE);
+        intent.putExtra(SipManager.EXTRA_LOCAL_URI, localProfile.getUriString());
+        mContext.sendBroadcast(intent);
+        if (mSipGroups.size() == 1) {
+            registerReceivers();
+        }
+!!!9668236.java!!!	notifyProfileRemoved(inout localProfile : SipProfile) : void
+        if (DEBUG) Log.d(TAG, "notify: profile removed: " + localProfile);
+        Intent intent = new Intent(SipManager.ACTION_SIP_REMOVE_PHONE);
+        intent.putExtra(SipManager.EXTRA_LOCAL_URI, localProfile.getUriString());
+        mContext.sendBroadcast(intent);
+        if (mSipGroups.size() == 0) {
+            unregisterReceivers();
+        }
+!!!9668364.java!!!	stopPortMappingMeasurement() : void
+        if (mIntervalMeasurementProcess != null) {
+            mIntervalMeasurementProcess.stop();
+            mIntervalMeasurementProcess = null;
+        }
+!!!9668492.java!!!	startPortMappingLifetimeMeasurement(inout localProfile : SipProfile) : void
+        startPortMappingLifetimeMeasurement(localProfile,
+                DEFAULT_MAX_KEEPALIVE_INTERVAL);
+!!!9668620.java!!!	startPortMappingLifetimeMeasurement(inout localProfile : SipProfile, in maxInterval : int) : void
+        if ((mIntervalMeasurementProcess == null)
+                && (mKeepAliveInterval == -1)
+                && isBehindNAT(mLocalIp)) {
+            Log.d(TAG, "start NAT port mapping timeout measurement on "
+                    + localProfile.getUriString());
+
+            int minInterval = mLastGoodKeepAliveInterval;
+            if (minInterval >= maxInterval) {
+                // If mLastGoodKeepAliveInterval also does not work, reset it
+                // to the default min
+                minInterval = mLastGoodKeepAliveInterval
+                        = DEFAULT_KEEPALIVE_INTERVAL;
+                Log.d(TAG, "  reset min interval to " + minInterval);
+            }
+            mIntervalMeasurementProcess = new IntervalMeasurementProcess(
+                    localProfile, minInterval, maxInterval);
+            mIntervalMeasurementProcess.start();
+        }
+!!!9668748.java!!!	restartPortMappingLifetimeMeasurement(inout localProfile : SipProfile, in maxInterval : int) : void
+        stopPortMappingMeasurement();
+        mKeepAliveInterval = -1;
+        startPortMappingLifetimeMeasurement(localProfile, maxInterval);
+!!!9668876.java!!!	addPendingSession(inout session : ISipSession) : void
+        try {
+            cleanUpPendingSessions();
+            mPendingSessions.put(session.getCallId(), session);
+            if (DEBUG) Log.d(TAG, "#pending sess=" + mPendingSessions.size());
+        } catch (RemoteException e) {
+            // should not happen with a local call
+            Log.e(TAG, "addPendingSession()", e);
+        }
+!!!9669004.java!!!	cleanUpPendingSessions() : void
+        Map.Entry<String, ISipSession>[] entries =
+                mPendingSessions.entrySet().toArray(
+                new Map.Entry[mPendingSessions.size()]);
+        for (Map.Entry<String, ISipSession> entry : entries) {
+            if (entry.getValue().getState() != SipSession.State.INCOMING_CALL) {
+                mPendingSessions.remove(entry.getKey());
+            }
+        }
+!!!9669132.java!!!	callingSelf(inout ringingGroup : SipSessionGroupExt, inout ringingSession : SipSessionImpl) : boolean
+        String callId = ringingSession.getCallId();
+        for (SipSessionGroupExt group : mSipGroups.values()) {
+            if ((group != ringingGroup) && group.containsSession(callId)) {
+                if (DEBUG) Log.d(TAG, "call self: "
+                        + ringingSession.getLocalProfile().getUriString()
+                        + " -> " + group.getLocalProfile().getUriString());
+                return true;
+            }
+        }
+        return false;
+!!!9669260.java!!!	onKeepAliveIntervalChanged() : void
+        for (SipSessionGroupExt group : mSipGroups.values()) {
+            group.onKeepAliveIntervalChanged();
+        }
+!!!9669388.java!!!	getKeepAliveInterval() : int
+        return (mKeepAliveInterval < 0)
+                ? mLastGoodKeepAliveInterval
+                : mKeepAliveInterval;
+!!!9669516.java!!!	isBehindNAT(in address : String) : boolean
+        try {
+            byte[] d = InetAddress.getByName(address).getAddress();
+            if ((d[0] == 10) ||
+                    (((0x000000FF & ((int)d[0])) == 172) &&
+                    ((0x000000F0 & ((int)d[1])) == 16)) ||
+                    (((0x000000FF & ((int)d[0])) == 192) &&
+                    ((0x000000FF & ((int)d[1])) == 168))) {
+                return true;
+            }
+        } catch (UnknownHostException e) {
+            Log.e(TAG, "isBehindAT()" + address, e);
+        }
+        return false;
+!!!9692172.java!!!	registerReceivers() : void
+        mContext.registerReceiver(mConnectivityReceiver,
+                new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+        if (DEBUG) Log.d(TAG, " +++ register receivers");
+!!!9692300.java!!!	unregisterReceivers() : void
+        mContext.unregisterReceiver(mConnectivityReceiver);
+        if (DEBUG) Log.d(TAG, " --- unregister receivers");
+
+        // Reset variables maintained by ConnectivityReceiver.
+        mWifiLock.release();
+        mNetworkType = -1;
+!!!9692428.java!!!	updateWakeLocks() : void
+        for (SipSessionGroupExt group : mSipGroups.values()) {
+            if (group.isOpenedToReceiveCalls()) {
+                // Also grab the WifiLock when we are disconnected, so the
+                // system will keep trying to reconnect. It will be released
+                // when the system eventually connects to something else.
+                if (mNetworkType == ConnectivityManager.TYPE_WIFI || mNetworkType == -1) {
+                    mWifiLock.acquire();
+                } else {
+                    mWifiLock.release();
+                }
+                return;
+            }
+        }
+        mWifiLock.release();
+        mMyWakeLock.reset(); // in case there's a leak
+!!!9692556.java!!!	onConnectivityChanged(inout info : NetworkInfo) : void
+        // We only care about the default network, and getActiveNetworkInfo()
+        // is the only way to distinguish them. However, as broadcasts are
+        // delivered asynchronously, we might miss DISCONNECTED events from
+        // getActiveNetworkInfo(), which is critical to our SIP stack. To
+        // solve this, if it is a DISCONNECTED event to our current network,
+        // respect it. Otherwise get a new one from getActiveNetworkInfo().
+        if (info == null || info.isConnected() || info.getType() != mNetworkType) {
+            ConnectivityManager cm = (ConnectivityManager)
+                    mContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+            info = cm.getActiveNetworkInfo();
+        }
+
+        // Some devices limit SIP on Wi-Fi. In this case, if we are not on
+        // Wi-Fi, treat it as a DISCONNECTED event.
+        int networkType = (info != null && info.isConnected()) ? info.getType() : -1;
+        if (mSipOnWifiOnly && networkType != ConnectivityManager.TYPE_WIFI) {
+            networkType = -1;
+        }
+
+        // Ignore the event if the current active network is not changed.
+        if (mNetworkType == networkType) {
+            return;
+        }
+        if (DEBUG) {
+            Log.d(TAG, "onConnectivityChanged(): " + mNetworkType +
+                    " -> " + networkType);
+        }
+
+        try {
+            if (mNetworkType != -1) {
+                mLocalIp = null;
+                stopPortMappingMeasurement();
+                for (SipSessionGroupExt group : mSipGroups.values()) {
+                    group.onConnectivityChanged(false);
+                }
+            }
+            mNetworkType = networkType;
+
+            if (mNetworkType != -1) {
+                mLocalIp = determineLocalIp();
+                mKeepAliveInterval = -1;
+                mLastGoodKeepAliveInterval = DEFAULT_KEEPALIVE_INTERVAL;
+                for (SipSessionGroupExt group : mSipGroups.values()) {
+                    group.onConnectivityChanged(true);
+                }
+            }
+            updateWakeLocks();
+        } catch (SipException e) {
+            Log.e(TAG, "onConnectivityChanged()", e);
+        }
+!!!9692684.java!!!	createLooper() : Looper
+        HandlerThread thread = new HandlerThread("SipService.Executor");
+        thread.start();
+        return thread.getLooper();

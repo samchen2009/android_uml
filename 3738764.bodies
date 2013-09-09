@@ -1,0 +1,1089 @@
+class SyncManager
+!!!15945100.java!!!	getAllUsers() : List
+        return mUserManager.getUsers();
+!!!15945228.java!!!	containsAccountAndUser(inout accounts : AccountAndUser, inout account : Account, in userId : int) : boolean
+        boolean found = false;
+        for (int i = 0; i < accounts.length; i++) {
+            if (accounts[i].userId == userId
+                    && accounts[i].account.equals(account)) {
+                found = true;
+                break;
+            }
+        }
+        return found;
+!!!15945356.java!!!	updateRunningAccounts() : void
+        mRunningAccounts = AccountManagerService.getSingleton().getRunningAccounts();
+
+        if (mBootCompleted) {
+            doDatabaseCleanup();
+        }
+
+        for (ActiveSyncContext currentSyncContext : mActiveSyncContexts) {
+            if (!containsAccountAndUser(mRunningAccounts,
+                    currentSyncContext.mSyncOperation.account,
+                    currentSyncContext.mSyncOperation.userId)) {
+                Log.d(TAG, "canceling sync since the account is no longer running");
+                sendSyncFinishedOrCanceledMessage(currentSyncContext,
+                        null /* no result since this is a cancel */);
+            }
+        }
+
+        // we must do this since we don't bother scheduling alarms when
+        // the accounts are not set yet
+        sendCheckAlarmsMessage();
+!!!15945484.java!!!	doDatabaseCleanup() : void
+        for (UserInfo user : mUserManager.getUsers(true)) {
+            // Skip any partially created/removed users
+            if (user.partial) continue;
+            Account[] accountsForUser = AccountManagerService.getSingleton().getAccounts(user.id);
+            mSyncStorageEngine.doDatabaseCleanup(accountsForUser, user.id);
+        }
+!!!15945612.java!!!	readDataConnectionState() : boolean
+        NetworkInfo networkInfo = getConnectivityManager().getActiveNetworkInfo();
+        return (networkInfo != null) && networkInfo.isConnected();
+!!!15945740.java!!!	getConnectivityManager() : ConnectivityManager
+        synchronized (this) {
+            if (mConnManagerDoNotUseDirectly == null) {
+                mConnManagerDoNotUseDirectly = (ConnectivityManager)mContext.getSystemService(
+                        Context.CONNECTIVITY_SERVICE);
+            }
+            return mConnManagerDoNotUseDirectly;
+        }
+!!!15945868.java!!!	SyncManager(inout context : Context, inout factoryTest : boolean)
+        // Initialize the SyncStorageEngine first, before registering observers
+        // and creating threads and so on; it may fail if the disk is full.
+        mContext = context;
+
+        SyncStorageEngine.init(context);
+        mSyncStorageEngine = SyncStorageEngine.getSingleton();
+        mSyncStorageEngine.setOnSyncRequestListener(new OnSyncRequestListener() {
+            public void onSyncRequest(Account account, int userId, int reason, String authority,
+                    Bundle extras) {
+                scheduleSync(account, userId, reason, authority, extras, 0, false);
+            }
+        });
+
+        mSyncAdapters = new SyncAdaptersCache(mContext);
+        mSyncQueue = new SyncQueue(mContext.getPackageManager(), mSyncStorageEngine, mSyncAdapters);
+
+        HandlerThread syncThread = new HandlerThread("SyncHandlerThread",
+                Process.THREAD_PRIORITY_BACKGROUND);
+        syncThread.start();
+        mSyncHandler = new SyncHandler(syncThread.getLooper());
+
+        mSyncAdapters.setListener(new RegisteredServicesCacheListener<SyncAdapterType>() {
+            @Override
+            public void onServiceChanged(SyncAdapterType type, int userId, boolean removed) {
+                if (!removed) {
+                    scheduleSync(null, UserHandle.USER_ALL,
+                            SyncOperation.REASON_SERVICE_CHANGED,
+                            type.authority, null, 0 /* no delay */,
+                            false /* onlyThoseWithUnkownSyncableState */);
+                }
+            }
+        }, mSyncHandler);
+
+        mSyncAlarmIntent = PendingIntent.getBroadcast(
+                mContext, 0 /* ignored */, new Intent(ACTION_SYNC_ALARM), 0);
+
+        IntentFilter intentFilter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
+        context.registerReceiver(mConnectivityIntentReceiver, intentFilter);
+
+        if (!factoryTest) {
+            intentFilter = new IntentFilter(Intent.ACTION_BOOT_COMPLETED);
+            context.registerReceiver(mBootCompletedReceiver, intentFilter);
+        }
+
+        intentFilter = new IntentFilter(ConnectivityManager.ACTION_BACKGROUND_DATA_SETTING_CHANGED);
+        context.registerReceiver(mBackgroundDataSettingChanged, intentFilter);
+
+        intentFilter = new IntentFilter(Intent.ACTION_DEVICE_STORAGE_LOW);
+        intentFilter.addAction(Intent.ACTION_DEVICE_STORAGE_OK);
+        context.registerReceiver(mStorageIntentReceiver, intentFilter);
+
+        intentFilter = new IntentFilter(Intent.ACTION_SHUTDOWN);
+        intentFilter.setPriority(100);
+        context.registerReceiver(mShutdownIntentReceiver, intentFilter);
+
+        intentFilter = new IntentFilter();
+        intentFilter.addAction(Intent.ACTION_USER_REMOVED);
+        intentFilter.addAction(Intent.ACTION_USER_STARTING);
+        intentFilter.addAction(Intent.ACTION_USER_STOPPING);
+        mContext.registerReceiverAsUser(
+                mUserIntentReceiver, UserHandle.ALL, intentFilter, null, null);
+
+        if (!factoryTest) {
+            mNotificationMgr = (NotificationManager)
+                context.getSystemService(Context.NOTIFICATION_SERVICE);
+            context.registerReceiver(new SyncAlarmIntentReceiver(),
+                    new IntentFilter(ACTION_SYNC_ALARM));
+        } else {
+            mNotificationMgr = null;
+        }
+        mPowerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mUserManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
+
+        // This WakeLock is used to ensure that we stay awake between the time that we receive
+        // a sync alarm notification and when we finish processing it. We need to do this
+        // because we don't do the work in the alarm handler, rather we do it in a message
+        // handler.
+        mHandleAlarmWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                HANDLE_SYNC_ALARM_WAKE_LOCK);
+        mHandleAlarmWakeLock.setReferenceCounted(false);
+
+        // This WakeLock is used to ensure that we stay awake while running the sync loop
+        // message handler. Normally we will hold a sync adapter wake lock while it is being
+        // synced but during the execution of the sync loop it might finish a sync for
+        // one sync adapter before starting the sync for the other sync adapter and we
+        // don't want the device to go to sleep during that window.
+        mSyncManagerWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                SYNC_LOOP_WAKE_LOCK);
+        mSyncManagerWakeLock.setReferenceCounted(false);
+
+        mSyncStorageEngine.addStatusChangeListener(
+                ContentResolver.SYNC_OBSERVER_TYPE_SETTINGS, new ISyncStatusObserver.Stub() {
+            public void onStatusChanged(int which) {
+                // force the sync loop to run if the settings change
+                sendCheckAlarmsMessage();
+            }
+        });
+
+        if (!factoryTest) {
+            // Register for account list updates for all users
+            mContext.registerReceiverAsUser(mAccountsUpdatedReceiver,
+                    UserHandle.ALL,
+                    new IntentFilter(AccountManager.LOGIN_ACCOUNTS_CHANGED_ACTION),
+                    null, null);
+        }
+
+        // Pick a random second in a day to seed all periodic syncs
+        mSyncRandomOffsetMillis = mSyncStorageEngine.getSyncRandomOffset() * 1000;
+!!!15945996.java!!!	jitterize(in minValue : long, in maxValue : long) : long
+        Random random = new Random(SystemClock.elapsedRealtime());
+        long spread = maxValue - minValue;
+        if (spread > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("the difference between the maxValue and the "
+                    + "minValue must be less than " + Integer.MAX_VALUE);
+        }
+        return minValue + random.nextInt((int)spread);
+!!!15946124.java!!!	getSyncStorageEngine() : SyncStorageEngine
+        return mSyncStorageEngine;
+!!!15946252.java!!!	getIsSyncable(inout account : Account, in userId : int, inout providerName : String) : int
+        int isSyncable = mSyncStorageEngine.getIsSyncable(account, userId, providerName);
+        UserInfo userInfo = UserManager.get(mContext).getUserInfo(userId);
+
+        // If it's not a restricted user, return isSyncable
+        if (userInfo == null || !userInfo.isRestricted()) return isSyncable;
+
+        // Else check if the sync adapter has opted-in or not
+        RegisteredServicesCache.ServiceInfo<SyncAdapterType> syncAdapterInfo =
+                mSyncAdapters.getServiceInfo(
+                SyncAdapterType.newKey(providerName, account.type), userId);
+        if (syncAdapterInfo == null) return isSyncable;
+
+        PackageInfo pInfo = null;
+        try {
+            pInfo = AppGlobals.getPackageManager().getPackageInfo(
+                syncAdapterInfo.componentName.getPackageName(), 0, userId);
+            if (pInfo == null) return isSyncable;
+        } catch (RemoteException re) {
+            // Shouldn't happen
+            return isSyncable;
+        }
+        if (pInfo.restrictedAccountType != null
+                && pInfo.restrictedAccountType.equals(account.type)) {
+            return isSyncable;
+        } else {
+            return 0;
+        }
+!!!15946380.java!!!	ensureAlarmService() : void
+        if (mAlarmService == null) {
+            mAlarmService = (AlarmManager)mContext.getSystemService(Context.ALARM_SERVICE);
+        }
+!!!15946508.java!!!	scheduleSync(inout requestedAccount : Account, in userId : int, in reason : int, inout requestedAuthority : String, inout extras : Bundle, in delay : long, inout onlyThoseWithUnkownSyncableState : boolean) : void
+        boolean isLoggable = Log.isLoggable(TAG, Log.VERBOSE);
+
+        final boolean backgroundDataUsageAllowed = !mBootCompleted ||
+                getConnectivityManager().getBackgroundDataSetting();
+
+        if (extras == null) extras = new Bundle();
+
+        Boolean expedited = extras.getBoolean(ContentResolver.SYNC_EXTRAS_EXPEDITED, false);
+        if (expedited) {
+            delay = -1; // this means schedule at the front of the queue
+        }
+
+        AccountAndUser[] accounts;
+        if (requestedAccount != null && userId != UserHandle.USER_ALL) {
+            accounts = new AccountAndUser[] { new AccountAndUser(requestedAccount, userId) };
+        } else {
+            // if the accounts aren't configured yet then we can't support an account-less
+            // sync request
+            accounts = mRunningAccounts;
+            if (accounts.length == 0) {
+                if (isLoggable) {
+                    Log.v(TAG, "scheduleSync: no accounts configured, dropping");
+                }
+                return;
+            }
+        }
+
+        final boolean uploadOnly = extras.getBoolean(ContentResolver.SYNC_EXTRAS_UPLOAD, false);
+        final boolean manualSync = extras.getBoolean(ContentResolver.SYNC_EXTRAS_MANUAL, false);
+        if (manualSync) {
+            extras.putBoolean(ContentResolver.SYNC_EXTRAS_IGNORE_BACKOFF, true);
+            extras.putBoolean(ContentResolver.SYNC_EXTRAS_IGNORE_SETTINGS, true);
+        }
+        final boolean ignoreSettings =
+                extras.getBoolean(ContentResolver.SYNC_EXTRAS_IGNORE_SETTINGS, false);
+
+        int source;
+        if (uploadOnly) {
+            source = SyncStorageEngine.SOURCE_LOCAL;
+        } else if (manualSync) {
+            source = SyncStorageEngine.SOURCE_USER;
+        } else if (requestedAuthority == null) {
+            source = SyncStorageEngine.SOURCE_POLL;
+        } else {
+            // this isn't strictly server, since arbitrary callers can (and do) request
+            // a non-forced two-way sync on a specific url
+            source = SyncStorageEngine.SOURCE_SERVER;
+        }
+
+        for (AccountAndUser account : accounts) {
+            // Compile a list of authorities that have sync adapters.
+            // For each authority sync each account that matches a sync adapter.
+            final HashSet<String> syncableAuthorities = new HashSet<String>();
+            for (RegisteredServicesCache.ServiceInfo<SyncAdapterType> syncAdapter :
+                    mSyncAdapters.getAllServices(account.userId)) {
+                syncableAuthorities.add(syncAdapter.type.authority);
+            }
+
+            // if the url was specified then replace the list of authorities
+            // with just this authority or clear it if this authority isn't
+            // syncable
+            if (requestedAuthority != null) {
+                final boolean hasSyncAdapter = syncableAuthorities.contains(requestedAuthority);
+                syncableAuthorities.clear();
+                if (hasSyncAdapter) syncableAuthorities.add(requestedAuthority);
+            }
+
+            for (String authority : syncableAuthorities) {
+                int isSyncable = getIsSyncable(account.account, account.userId,
+                        authority);
+                if (isSyncable == 0) {
+                    continue;
+                }
+                final RegisteredServicesCache.ServiceInfo<SyncAdapterType> syncAdapterInfo;
+                syncAdapterInfo = mSyncAdapters.getServiceInfo(
+                        SyncAdapterType.newKey(authority, account.account.type), account.userId);
+                if (syncAdapterInfo == null) {
+                    continue;
+                }
+                final boolean allowParallelSyncs = syncAdapterInfo.type.allowParallelSyncs();
+                final boolean isAlwaysSyncable = syncAdapterInfo.type.isAlwaysSyncable();
+                if (isSyncable < 0 && isAlwaysSyncable) {
+                    mSyncStorageEngine.setIsSyncable(account.account, account.userId, authority, 1);
+                    isSyncable = 1;
+                }
+                if (onlyThoseWithUnkownSyncableState && isSyncable >= 0) {
+                    continue;
+                }
+                if (!syncAdapterInfo.type.supportsUploading() && uploadOnly) {
+                    continue;
+                }
+
+                // always allow if the isSyncable state is unknown
+                boolean syncAllowed =
+                        (isSyncable < 0)
+                        || ignoreSettings
+                        || (backgroundDataUsageAllowed
+                                && mSyncStorageEngine.getMasterSyncAutomatically(account.userId)
+                                && mSyncStorageEngine.getSyncAutomatically(account.account,
+                                        account.userId, authority));
+                if (!syncAllowed) {
+                    if (isLoggable) {
+                        Log.d(TAG, "scheduleSync: sync of " + account + ", " + authority
+                                + " is not allowed, dropping request");
+                    }
+                    continue;
+                }
+
+                Pair<Long, Long> backoff = mSyncStorageEngine
+                        .getBackoff(account.account, account.userId, authority);
+                long delayUntil = mSyncStorageEngine.getDelayUntilTime(account.account,
+                        account.userId, authority);
+                final long backoffTime = backoff != null ? backoff.first : 0;
+                if (isSyncable < 0) {
+                    Bundle newExtras = new Bundle();
+                    newExtras.putBoolean(ContentResolver.SYNC_EXTRAS_INITIALIZE, true);
+                    if (isLoggable) {
+                        Log.v(TAG, "scheduleSync:"
+                                + " delay " + delay
+                                + ", source " + source
+                                + ", account " + account
+                                + ", authority " + authority
+                                + ", extras " + newExtras);
+                    }
+                    scheduleSyncOperation(
+                            new SyncOperation(account.account, account.userId, reason, source,
+                                    authority, newExtras, 0, backoffTime, delayUntil,
+                                    allowParallelSyncs));
+                }
+                if (!onlyThoseWithUnkownSyncableState) {
+                    if (isLoggable) {
+                        Log.v(TAG, "scheduleSync:"
+                                + " delay " + delay
+                                + ", source " + source
+                                + ", account " + account
+                                + ", authority " + authority
+                                + ", extras " + extras);
+                    }
+                    scheduleSyncOperation(
+                            new SyncOperation(account.account, account.userId, reason, source,
+                                    authority, extras, delay, backoffTime, delayUntil,
+                                    allowParallelSyncs));
+                }
+            }
+        }
+!!!15946636.java!!!	scheduleLocalSync(inout account : Account, in userId : int, in reason : int, inout authority : String) : void
+        final Bundle extras = new Bundle();
+        extras.putBoolean(ContentResolver.SYNC_EXTRAS_UPLOAD, true);
+        scheduleSync(account, userId, reason, authority, extras, LOCAL_SYNC_DELAY,
+                false /* onlyThoseWithUnkownSyncableState */);
+!!!15946764.java!!!	getSyncAdapterTypes(in userId : int) : SyncAdapterType
+        final Collection<RegisteredServicesCache.ServiceInfo<SyncAdapterType>> serviceInfos;
+        serviceInfos = mSyncAdapters.getAllServices(userId);
+        SyncAdapterType[] types = new SyncAdapterType[serviceInfos.size()];
+        int i = 0;
+        for (RegisteredServicesCache.ServiceInfo<SyncAdapterType> serviceInfo : serviceInfos) {
+            types[i] = serviceInfo.type;
+            ++i;
+        }
+        return types;
+!!!15946892.java!!!	sendSyncAlarmMessage() : void
+        if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "sending MESSAGE_SYNC_ALARM");
+        mSyncHandler.sendEmptyMessage(SyncHandler.MESSAGE_SYNC_ALARM);
+!!!15947020.java!!!	sendCheckAlarmsMessage() : void
+        if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "sending MESSAGE_CHECK_ALARMS");
+        mSyncHandler.removeMessages(SyncHandler.MESSAGE_CHECK_ALARMS);
+        mSyncHandler.sendEmptyMessage(SyncHandler.MESSAGE_CHECK_ALARMS);
+!!!15947148.java!!!	sendSyncFinishedOrCanceledMessage(inout syncContext : ActiveSyncContext, inout syncResult : SyncResult) : void
+        if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "sending MESSAGE_SYNC_FINISHED");
+        Message msg = mSyncHandler.obtainMessage();
+        msg.what = SyncHandler.MESSAGE_SYNC_FINISHED;
+        msg.obj = new SyncHandlerMessagePayload(syncContext, syncResult);
+        mSyncHandler.sendMessage(msg);
+!!!15947276.java!!!	sendCancelSyncsMessage(in account : Account, in userId : int, in authority : String) : void
+        if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, "sending MESSAGE_CANCEL");
+        Message msg = mSyncHandler.obtainMessage();
+        msg.what = SyncHandler.MESSAGE_CANCEL;
+        msg.obj = Pair.create(account, authority);
+        msg.arg1 = userId;
+        mSyncHandler.sendMessage(msg);
+!!!15947660.java!!!	clearBackoffSetting(inout op : SyncOperation) : void
+        mSyncStorageEngine.setBackoff(op.account, op.userId, op.authority,
+                SyncStorageEngine.NOT_IN_BACKOFF_MODE, SyncStorageEngine.NOT_IN_BACKOFF_MODE);
+        synchronized (mSyncQueue) {
+            mSyncQueue.onBackoffChanged(op.account, op.userId, op.authority, 0);
+        }
+!!!15947788.java!!!	increaseBackoffSetting(inout op : SyncOperation) : void
+        // TODO: Use this function to align it to an already scheduled sync
+        //       operation in the specified window
+        final long now = SystemClock.elapsedRealtime();
+
+        final Pair<Long, Long> previousSettings =
+                mSyncStorageEngine.getBackoff(op.account, op.userId, op.authority);
+        long newDelayInMs = -1;
+        if (previousSettings != null) {
+            // don't increase backoff before current backoff is expired. This will happen for op's
+            // with ignoreBackoff set.
+            if (now < previousSettings.first) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "Still in backoff, do not increase it. "
+                        + "Remaining: " + ((previousSettings.first - now) / 1000) + " seconds.");
+                }
+                return;
+            }
+            // Subsequent delays are the double of the previous delay
+            newDelayInMs = previousSettings.second * 2;
+        }
+        if (newDelayInMs <= 0) {
+            // The initial delay is the jitterized INITIAL_SYNC_RETRY_TIME_IN_MS
+            newDelayInMs = jitterize(INITIAL_SYNC_RETRY_TIME_IN_MS,
+                    (long)(INITIAL_SYNC_RETRY_TIME_IN_MS * 1.1));
+        }
+
+        // Cap the delay
+        long maxSyncRetryTimeInSeconds = Settings.Global.getLong(mContext.getContentResolver(),
+                Settings.Global.SYNC_MAX_RETRY_DELAY_IN_SECONDS,
+                DEFAULT_MAX_SYNC_RETRY_TIME_IN_SECONDS);
+        if (newDelayInMs > maxSyncRetryTimeInSeconds * 1000) {
+            newDelayInMs = maxSyncRetryTimeInSeconds * 1000;
+        }
+
+        final long backoff = now + newDelayInMs;
+
+        mSyncStorageEngine.setBackoff(op.account, op.userId, op.authority,
+                backoff, newDelayInMs);
+
+        op.backoff = backoff;
+        op.updateEffectiveRunTime();
+
+        synchronized (mSyncQueue) {
+            mSyncQueue.onBackoffChanged(op.account, op.userId, op.authority, backoff);
+        }
+!!!15947916.java!!!	setDelayUntilTime(inout op : SyncOperation, in delayUntilSeconds : long) : void
+        final long delayUntil = delayUntilSeconds * 1000;
+        final long absoluteNow = System.currentTimeMillis();
+        long newDelayUntilTime;
+        if (delayUntil > absoluteNow) {
+            newDelayUntilTime = SystemClock.elapsedRealtime() + (delayUntil - absoluteNow);
+        } else {
+            newDelayUntilTime = 0;
+        }
+        mSyncStorageEngine
+                .setDelayUntilTime(op.account, op.userId, op.authority, newDelayUntilTime);
+        synchronized (mSyncQueue) {
+            mSyncQueue.onDelayUntilTimeChanged(op.account, op.authority, newDelayUntilTime);
+        }
+!!!15948044.java!!!	cancelActiveSync(inout account : Account, in userId : int, inout authority : String) : void
+        sendCancelSyncsMessage(account, userId, authority);
+!!!15948172.java!!!	scheduleSyncOperation(inout syncOperation : SyncOperation) : void
+        boolean queueChanged;
+        synchronized (mSyncQueue) {
+            queueChanged = mSyncQueue.add(syncOperation);
+        }
+
+        if (queueChanged) {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "scheduleSyncOperation: enqueued " + syncOperation);
+            }
+            sendCheckAlarmsMessage();
+        } else {
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "scheduleSyncOperation: dropping duplicate sync operation "
+                        + syncOperation);
+            }
+        }
+!!!15948300.java!!!	clearScheduledSyncOperations(inout account : Account, in userId : int, inout authority : String) : void
+        synchronized (mSyncQueue) {
+            mSyncQueue.remove(account, userId, authority);
+        }
+        mSyncStorageEngine.setBackoff(account, userId, authority,
+                SyncStorageEngine.NOT_IN_BACKOFF_MODE, SyncStorageEngine.NOT_IN_BACKOFF_MODE);
+!!!15948428.java!!!	maybeRescheduleSync(inout syncResult : SyncResult, inout operation : SyncOperation) : void
+        boolean isLoggable = Log.isLoggable(TAG, Log.DEBUG);
+        if (isLoggable) {
+            Log.d(TAG, "encountered error(s) during the sync: " + syncResult + ", " + operation);
+        }
+
+        operation = new SyncOperation(operation);
+
+        // The SYNC_EXTRAS_IGNORE_BACKOFF only applies to the first attempt to sync a given
+        // request. Retries of the request will always honor the backoff, so clear the
+        // flag in case we retry this request.
+        if (operation.extras.getBoolean(ContentResolver.SYNC_EXTRAS_IGNORE_BACKOFF, false)) {
+            operation.extras.remove(ContentResolver.SYNC_EXTRAS_IGNORE_BACKOFF);
+        }
+
+        // If this sync aborted because the internal sync loop retried too many times then
+        //   don't reschedule. Otherwise we risk getting into a retry loop.
+        // If the operation succeeded to some extent then retry immediately.
+        // If this was a two-way sync then retry soft errors with an exponential backoff.
+        // If this was an upward sync then schedule a two-way sync immediately.
+        // Otherwise do not reschedule.
+        if (operation.extras.getBoolean(ContentResolver.SYNC_EXTRAS_DO_NOT_RETRY, false)) {
+            Log.d(TAG, "not retrying sync operation because SYNC_EXTRAS_DO_NOT_RETRY was specified "
+                    + operation);
+        } else if (operation.extras.getBoolean(ContentResolver.SYNC_EXTRAS_UPLOAD, false)
+                && !syncResult.syncAlreadyInProgress) {
+            operation.extras.remove(ContentResolver.SYNC_EXTRAS_UPLOAD);
+            Log.d(TAG, "retrying sync operation as a two-way sync because an upload-only sync "
+                    + "encountered an error: " + operation);
+            scheduleSyncOperation(operation);
+        } else if (syncResult.tooManyRetries) {
+            Log.d(TAG, "not retrying sync operation because it retried too many times: "
+                    + operation);
+        } else if (syncResult.madeSomeProgress()) {
+            if (isLoggable) {
+                Log.d(TAG, "retrying sync operation because even though it had an error "
+                        + "it achieved some success");
+            }
+            scheduleSyncOperation(operation);
+        } else if (syncResult.syncAlreadyInProgress) {
+            if (isLoggable) {
+                Log.d(TAG, "retrying sync operation that failed because there was already a "
+                        + "sync in progress: " + operation);
+            }
+            scheduleSyncOperation(new SyncOperation(operation.account, operation.userId,
+                    operation.reason,
+                    operation.syncSource,
+                    operation.authority, operation.extras,
+                    DELAY_RETRY_SYNC_IN_PROGRESS_IN_SECONDS * 1000,
+                    operation.backoff, operation.delayUntil, operation.allowParallelSyncs));
+        } else if (syncResult.hasSoftError()) {
+            if (isLoggable) {
+                Log.d(TAG, "retrying sync operation because it encountered a soft error: "
+                        + operation);
+            }
+            scheduleSyncOperation(operation);
+        } else {
+            Log.d(TAG, "not retrying sync operation because the error is a hard error: "
+                    + operation);
+        }
+!!!15948556.java!!!	onUserStarting(in userId : int) : void
+        // Make sure that accounts we're about to use are valid
+        AccountManagerService.getSingleton().validateAccounts(userId);
+
+        mSyncAdapters.invalidateCache(userId);
+
+        updateRunningAccounts();
+
+        synchronized (mSyncQueue) {
+            mSyncQueue.addPendingOperations(userId);
+        }
+
+        // Schedule sync for any accounts under started user
+        final Account[] accounts = AccountManagerService.getSingleton().getAccounts(userId);
+        for (Account account : accounts) {
+            scheduleSync(account, userId, SyncOperation.REASON_USER_START, null, null,
+                    0 /* no delay */, true /* onlyThoseWithUnknownSyncableState */);
+        }
+
+        sendCheckAlarmsMessage();
+!!!15948684.java!!!	onUserStopping(in userId : int) : void
+        updateRunningAccounts();
+
+        cancelActiveSync(
+                null /* any account */,
+                userId,
+                null /* any authority */);
+!!!15948812.java!!!	onUserRemoved(in userId : int) : void
+        updateRunningAccounts();
+
+        // Clean up the storage engine database
+        mSyncStorageEngine.doDatabaseCleanup(new Account[0], userId);
+        synchronized (mSyncQueue) {
+            mSyncQueue.removeUser(userId);
+        }
+!!!15950220.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter) : void
+        final IndentingPrintWriter ipw = new IndentingPrintWriter(pw, "  ");
+        dumpSyncState(ipw);
+        dumpSyncHistory(ipw);
+        dumpSyncAdapters(ipw);
+!!!15950348.java!!!	formatTime(in time : long) : String
+        Time tobj = new Time();
+        tobj.set(time);
+        return tobj.format("%Y-%m-%d %H:%M:%S");
+!!!15950476.java!!!	dumpSyncState(inout pw : PrintWriter) : void
+        pw.print("data connected: "); pw.println(mDataConnectionIsConnected);
+        pw.print("auto sync: ");
+        List<UserInfo> users = getAllUsers();
+        if (users != null) {
+            for (UserInfo user : users) {
+                pw.print("u" + user.id + "="
+                        + mSyncStorageEngine.getMasterSyncAutomatically(user.id) + " ");
+            }
+            pw.println();
+        }
+        pw.print("memory low: "); pw.println(mStorageIsLow);
+
+        final AccountAndUser[] accounts = AccountManagerService.getSingleton().getAllAccounts();
+
+        pw.print("accounts: ");
+        if (accounts != INITIAL_ACCOUNTS_ARRAY) {
+            pw.println(accounts.length);
+        } else {
+            pw.println("not known yet");
+        }
+        final long now = SystemClock.elapsedRealtime();
+        pw.print("now: "); pw.print(now);
+        pw.println(" (" + formatTime(System.currentTimeMillis()) + ")");
+        pw.print("offset: "); pw.print(DateUtils.formatElapsedTime(mSyncRandomOffsetMillis/1000));
+        pw.println(" (HH:MM:SS)");
+        pw.print("uptime: "); pw.print(DateUtils.formatElapsedTime(now/1000));
+                pw.println(" (HH:MM:SS)");
+        pw.print("time spent syncing: ");
+                pw.print(DateUtils.formatElapsedTime(
+                        mSyncHandler.mSyncTimeTracker.timeSpentSyncing() / 1000));
+                pw.print(" (HH:MM:SS), sync ");
+                pw.print(mSyncHandler.mSyncTimeTracker.mLastWasSyncing ? "" : "not ");
+                pw.println("in progress");
+        if (mSyncHandler.mAlarmScheduleTime != null) {
+            pw.print("next alarm time: "); pw.print(mSyncHandler.mAlarmScheduleTime);
+                    pw.print(" (");
+                    pw.print(DateUtils.formatElapsedTime((mSyncHandler.mAlarmScheduleTime-now)/1000));
+                    pw.println(" (HH:MM:SS) from now)");
+        } else {
+            pw.println("no alarm is scheduled (there had better not be any pending syncs)");
+        }
+
+        pw.print("notification info: ");
+        final StringBuilder sb = new StringBuilder();
+        mSyncHandler.mSyncNotificationInfo.toString(sb);
+        pw.println(sb.toString());
+
+        pw.println();
+        pw.println("Active Syncs: " + mActiveSyncContexts.size());
+        final PackageManager pm = mContext.getPackageManager();
+        for (SyncManager.ActiveSyncContext activeSyncContext : mActiveSyncContexts) {
+            final long durationInSeconds = (now - activeSyncContext.mStartTime) / 1000;
+            pw.print("  ");
+            pw.print(DateUtils.formatElapsedTime(durationInSeconds));
+            pw.print(" - ");
+            pw.print(activeSyncContext.mSyncOperation.dump(pm, false));
+            pw.println();
+        }
+
+        synchronized (mSyncQueue) {
+            sb.setLength(0);
+            mSyncQueue.dump(sb);
+        }
+        pw.println();
+        pw.print(sb.toString());
+
+        // join the installed sync adapter with the accounts list and emit for everything
+        pw.println();
+        pw.println("Sync Status");
+        for (AccountAndUser account : accounts) {
+            pw.printf("Account %s u%d %s\n",
+                    account.account.name, account.userId, account.account.type);
+
+            pw.println("=======================================================================");
+            final PrintTable table = new PrintTable(13);
+            table.set(0, 0,
+                    "Authority", // 0
+                    "Syncable",  // 1
+                    "Enabled",   // 2
+                    "Delay",     // 3
+                    "Loc",       // 4
+                    "Poll",      // 5
+                    "Per",       // 6
+                    "Serv",      // 7
+                    "User",      // 8
+                    "Tot",       // 9
+                    "Time",      // 10
+                    "Last Sync", // 11
+                    "Periodic"   // 12
+            );
+
+            final List<RegisteredServicesCache.ServiceInfo<SyncAdapterType>> sorted =
+                    Lists.newArrayList();
+            sorted.addAll(mSyncAdapters.getAllServices(account.userId));
+            Collections.sort(sorted,
+                    new Comparator<RegisteredServicesCache.ServiceInfo<SyncAdapterType>>() {
+                @Override
+                public int compare(RegisteredServicesCache.ServiceInfo<SyncAdapterType> lhs,
+                        RegisteredServicesCache.ServiceInfo<SyncAdapterType> rhs) {
+                    return lhs.type.authority.compareTo(rhs.type.authority);
+                }
+            });
+            for (RegisteredServicesCache.ServiceInfo<SyncAdapterType> syncAdapterType : sorted) {
+                if (!syncAdapterType.type.accountType.equals(account.account.type)) {
+                    continue;
+                }
+                int row = table.getNumRows();
+                SyncStorageEngine.AuthorityInfo settings =
+                        mSyncStorageEngine.getOrCreateAuthority(
+                                account.account, account.userId, syncAdapterType.type.authority);
+                SyncStatusInfo status = mSyncStorageEngine.getOrCreateSyncStatus(settings);
+
+                String authority = settings.authority;
+                if (authority.length() > 50) {
+                    authority = authority.substring(authority.length() - 50);
+                }
+                table.set(row, 0, authority, settings.syncable, settings.enabled);
+                table.set(row, 4,
+                        status.numSourceLocal,
+                        status.numSourcePoll,
+                        status.numSourcePeriodic,
+                        status.numSourceServer,
+                        status.numSourceUser,
+                        status.numSyncs,
+                        DateUtils.formatElapsedTime(status.totalElapsedTime / 1000));
+
+
+                for (int i = 0; i < settings.periodicSyncs.size(); i++) {
+                    final Pair<Bundle, Long> pair = settings.periodicSyncs.get(0);
+                    final String period = String.valueOf(pair.second);
+                    final String extras = pair.first.size() > 0 ? pair.first.toString() : "";
+                    final String next = formatTime(status.getPeriodicSyncTime(0)
+                            + pair.second * 1000);
+                    table.set(row + i * 2, 12, period + extras);
+                    table.set(row + i * 2 + 1, 12, next);
+                }
+
+                int row1 = row;
+                if (settings.delayUntil > now) {
+                    table.set(row1++, 12, "D: " + (settings.delayUntil - now) / 1000);
+                    if (settings.backoffTime > now) {
+                        table.set(row1++, 12, "B: " + (settings.backoffTime - now) / 1000);
+                        table.set(row1++, 12, settings.backoffDelay / 1000);
+                    }
+                }
+
+                if (status.lastSuccessTime != 0) {
+                    table.set(row1++, 11, SyncStorageEngine.SOURCES[status.lastSuccessSource]
+                            + " " + "SUCCESS");
+                    table.set(row1++, 11, formatTime(status.lastSuccessTime));
+                }
+                if (status.lastFailureTime != 0) {
+                    table.set(row1++, 11, SyncStorageEngine.SOURCES[status.lastFailureSource]
+                            + " " + "FAILURE");
+                    table.set(row1++, 11, formatTime(status.lastFailureTime));
+                    //noinspection UnusedAssignment
+                    table.set(row1++, 11, status.lastFailureMesg);
+                }
+            }
+            table.writeTo(pw);
+        }
+!!!15950604.java!!!	getLastFailureMessage(in code : int) : String
+        switch (code) {
+            case ContentResolver.SYNC_ERROR_SYNC_ALREADY_IN_PROGRESS:
+                return "sync already in progress";
+
+            case ContentResolver.SYNC_ERROR_AUTHENTICATION:
+                return "authentication error";
+
+            case ContentResolver.SYNC_ERROR_IO:
+                return "I/O error";
+
+            case ContentResolver.SYNC_ERROR_PARSE:
+                return "parse error";
+
+            case ContentResolver.SYNC_ERROR_CONFLICT:
+                return "conflict error";
+
+            case ContentResolver.SYNC_ERROR_TOO_MANY_DELETIONS:
+                return "too many deletions error";
+
+            case ContentResolver.SYNC_ERROR_TOO_MANY_RETRIES:
+                return "too many retries error";
+
+            case ContentResolver.SYNC_ERROR_INTERNAL:
+                return "internal error";
+
+            default:
+                return "unknown";
+        }
+!!!15950732.java!!!	dumpTimeSec(inout pw : PrintWriter, in time : long) : void
+        pw.print(time/1000); pw.print('.'); pw.print((time/100)%10);
+        pw.print('s');
+!!!15950860.java!!!	dumpDayStatistic(inout pw : PrintWriter, inout ds : DayStats) : void
+        pw.print("Success ("); pw.print(ds.successCount);
+        if (ds.successCount > 0) {
+            pw.print(" for "); dumpTimeSec(pw, ds.successTime);
+            pw.print(" avg="); dumpTimeSec(pw, ds.successTime/ds.successCount);
+        }
+        pw.print(") Failure ("); pw.print(ds.failureCount);
+        if (ds.failureCount > 0) {
+            pw.print(" for "); dumpTimeSec(pw, ds.failureTime);
+            pw.print(" avg="); dumpTimeSec(pw, ds.failureTime/ds.failureCount);
+        }
+        pw.println(")");
+!!!15950988.java!!!	dumpSyncHistory(inout pw : PrintWriter) : void
+        dumpRecentHistory(pw);
+        dumpDayStatistics(pw);
+!!!15951116.java!!!	dumpRecentHistory(inout pw : PrintWriter) : void
+        final ArrayList<SyncStorageEngine.SyncHistoryItem> items
+                = mSyncStorageEngine.getSyncHistory();
+        if (items != null && items.size() > 0) {
+            final Map<String, AuthoritySyncStats> authorityMap = Maps.newHashMap();
+            long totalElapsedTime = 0;
+            long totalTimes = 0;
+            final int N = items.size();
+
+            int maxAuthority = 0;
+            int maxAccount = 0;
+            for (SyncStorageEngine.SyncHistoryItem item : items) {
+                SyncStorageEngine.AuthorityInfo authority
+                        = mSyncStorageEngine.getAuthority(item.authorityId);
+                final String authorityName;
+                final String accountKey;
+                if (authority != null) {
+                    authorityName = authority.authority;
+                    accountKey = authority.account.name + "/" + authority.account.type
+                            + " u" + authority.userId;
+                } else {
+                    authorityName = "Unknown";
+                    accountKey = "Unknown";
+                }
+
+                int length = authorityName.length();
+                if (length > maxAuthority) {
+                    maxAuthority = length;
+                }
+                length = accountKey.length();
+                if (length > maxAccount) {
+                    maxAccount = length;
+                }
+
+                final long elapsedTime = item.elapsedTime;
+                totalElapsedTime += elapsedTime;
+                totalTimes++;
+                AuthoritySyncStats authoritySyncStats = authorityMap.get(authorityName);
+                if (authoritySyncStats == null) {
+                    authoritySyncStats = new AuthoritySyncStats(authorityName);
+                    authorityMap.put(authorityName, authoritySyncStats);
+                }
+                authoritySyncStats.elapsedTime += elapsedTime;
+                authoritySyncStats.times++;
+                final Map<String, AccountSyncStats> accountMap = authoritySyncStats.accountMap;
+                AccountSyncStats accountSyncStats = accountMap.get(accountKey);
+                if (accountSyncStats == null) {
+                    accountSyncStats = new AccountSyncStats(accountKey);
+                    accountMap.put(accountKey, accountSyncStats);
+                }
+                accountSyncStats.elapsedTime += elapsedTime;
+                accountSyncStats.times++;
+
+            }
+
+            if (totalElapsedTime > 0) {
+                pw.println();
+                pw.printf("Detailed Statistics (Recent history):  "
+                        + "%d (# of times) %ds (sync time)\n",
+                        totalTimes, totalElapsedTime / 1000);
+
+                final List<AuthoritySyncStats> sortedAuthorities =
+                        new ArrayList<AuthoritySyncStats>(authorityMap.values());
+                Collections.sort(sortedAuthorities, new Comparator<AuthoritySyncStats>() {
+                    @Override
+                    public int compare(AuthoritySyncStats lhs, AuthoritySyncStats rhs) {
+                        // reverse order
+                        int compare = Integer.compare(rhs.times, lhs.times);
+                        if (compare == 0) {
+                            compare = Long.compare(rhs.elapsedTime, lhs.elapsedTime);
+                        }
+                        return compare;
+                    }
+                });
+
+                final int maxLength = Math.max(maxAuthority, maxAccount + 3);
+                final int padLength = 2 + 2 + maxLength + 2 + 10 + 11;
+                final char chars[] = new char[padLength];
+                Arrays.fill(chars, '-');
+                final String separator = new String(chars);
+
+                final String authorityFormat =
+                        String.format("  %%-%ds: %%-9s  %%-11s\n", maxLength + 2);
+                final String accountFormat =
+                        String.format("    %%-%ds:   %%-9s  %%-11s\n", maxLength);
+
+                pw.println(separator);
+                for (AuthoritySyncStats authoritySyncStats : sortedAuthorities) {
+                    String name = authoritySyncStats.name;
+                    long elapsedTime;
+                    int times;
+                    String timeStr;
+                    String timesStr;
+
+                    elapsedTime = authoritySyncStats.elapsedTime;
+                    times = authoritySyncStats.times;
+                    timeStr = String.format("%ds/%d%%",
+                            elapsedTime / 1000,
+                            elapsedTime * 100 / totalElapsedTime);
+                    timesStr = String.format("%d/%d%%",
+                            times,
+                            times * 100 / totalTimes);
+                    pw.printf(authorityFormat, name, timesStr, timeStr);
+
+                    final List<AccountSyncStats> sortedAccounts =
+                            new ArrayList<AccountSyncStats>(
+                                    authoritySyncStats.accountMap.values());
+                    Collections.sort(sortedAccounts, new Comparator<AccountSyncStats>() {
+                        @Override
+                        public int compare(AccountSyncStats lhs, AccountSyncStats rhs) {
+                            // reverse order
+                            int compare = Integer.compare(rhs.times, lhs.times);
+                            if (compare == 0) {
+                                compare = Long.compare(rhs.elapsedTime, lhs.elapsedTime);
+                            }
+                            return compare;
+                        }
+                    });
+                    for (AccountSyncStats stats: sortedAccounts) {
+                        elapsedTime = stats.elapsedTime;
+                        times = stats.times;
+                        timeStr = String.format("%ds/%d%%",
+                                elapsedTime / 1000,
+                                elapsedTime * 100 / totalElapsedTime);
+                        timesStr = String.format("%d/%d%%",
+                                times,
+                                times * 100 / totalTimes);
+                        pw.printf(accountFormat, stats.name, timesStr, timeStr);
+                    }
+                    pw.println(separator);
+                }
+            }
+
+            pw.println();
+            pw.println("Recent Sync History");
+            final String format = "  %-" + maxAccount + "s  %-" + maxAuthority + "s %s\n";
+            final Map<String, Long> lastTimeMap = Maps.newHashMap();
+            final PackageManager pm = mContext.getPackageManager();
+            for (int i = 0; i < N; i++) {
+                SyncStorageEngine.SyncHistoryItem item = items.get(i);
+                SyncStorageEngine.AuthorityInfo authority
+                        = mSyncStorageEngine.getAuthority(item.authorityId);
+                final String authorityName;
+                final String accountKey;
+                if (authority != null) {
+                    authorityName = authority.authority;
+                    accountKey = authority.account.name + "/" + authority.account.type
+                            + " u" + authority.userId;
+                } else {
+                    authorityName = "Unknown";
+                    accountKey = "Unknown";
+                }
+                final long elapsedTime = item.elapsedTime;
+                final Time time = new Time();
+                final long eventTime = item.eventTime;
+                time.set(eventTime);
+
+                final String key = authorityName + "/" + accountKey;
+                final Long lastEventTime = lastTimeMap.get(key);
+                final String diffString;
+                if (lastEventTime == null) {
+                    diffString = "";
+                } else {
+                    final long diff = (lastEventTime - eventTime) / 1000;
+                    if (diff < 60) {
+                        diffString = String.valueOf(diff);
+                    } else if (diff < 3600) {
+                        diffString = String.format("%02d:%02d", diff / 60, diff % 60);
+                    } else {
+                        final long sec = diff % 3600;
+                        diffString = String.format("%02d:%02d:%02d",
+                                diff / 3600, sec / 60, sec % 60);
+                    }
+                }
+                lastTimeMap.put(key, eventTime);
+
+                pw.printf("  #%-3d: %s %8s  %5.1fs  %8s",
+                        i + 1,
+                        formatTime(eventTime),
+                        SyncStorageEngine.SOURCES[item.source],
+                        ((float) elapsedTime) / 1000,
+                        diffString);
+                pw.printf(format, accountKey, authorityName,
+                        SyncOperation.reasonToString(pm, item.reason));
+
+                if (item.event != SyncStorageEngine.EVENT_STOP
+                        || item.upstreamActivity != 0
+                        || item.downstreamActivity != 0) {
+                    pw.printf("    event=%d upstreamActivity=%d downstreamActivity=%d\n",
+                            item.event,
+                            item.upstreamActivity,
+                            item.downstreamActivity);
+                }
+                if (item.mesg != null
+                        && !SyncStorageEngine.MESG_SUCCESS.equals(item.mesg)) {
+                    pw.printf("    mesg=%s\n", item.mesg);
+                }
+            }
+            pw.println();
+            pw.println("Recent Sync History Extras");
+            for (int i = 0; i < N; i++) {
+                final SyncStorageEngine.SyncHistoryItem item = items.get(i);
+                final Bundle extras = item.extras;
+                if (extras == null || extras.size() == 0) {
+                    continue;
+                }
+                final SyncStorageEngine.AuthorityInfo authority
+                        = mSyncStorageEngine.getAuthority(item.authorityId);
+                final String authorityName;
+                final String accountKey;
+                if (authority != null) {
+                    authorityName = authority.authority;
+                    accountKey = authority.account.name + "/" + authority.account.type
+                            + " u" + authority.userId;
+                } else {
+                    authorityName = "Unknown";
+                    accountKey = "Unknown";
+                }
+                final Time time = new Time();
+                final long eventTime = item.eventTime;
+                time.set(eventTime);
+
+                pw.printf("  #%-3d: %s %8s ",
+                        i + 1,
+                        formatTime(eventTime),
+                        SyncStorageEngine.SOURCES[item.source]);
+
+                pw.printf(format, accountKey, authorityName, extras);
+            }
+        }
+!!!15951244.java!!!	dumpDayStatistics(inout pw : PrintWriter) : void
+        SyncStorageEngine.DayStats dses[] = mSyncStorageEngine.getDayStatistics();
+        if (dses != null && dses[0] != null) {
+            pw.println();
+            pw.println("Sync Statistics");
+            pw.print("  Today:  "); dumpDayStatistic(pw, dses[0]);
+            int today = dses[0].day;
+            int i;
+            SyncStorageEngine.DayStats ds;
+
+            // Print each day in the current week.
+            for (i=1; i<=6 && i < dses.length; i++) {
+                ds = dses[i];
+                if (ds == null) break;
+                int delta = today-ds.day;
+                if (delta > 6) break;
+
+                pw.print("  Day-"); pw.print(delta); pw.print(":  ");
+                dumpDayStatistic(pw, ds);
+            }
+
+            // Aggregate all following days into weeks and print totals.
+            int weekDay = today;
+            while (i < dses.length) {
+                SyncStorageEngine.DayStats aggr = null;
+                weekDay -= 7;
+                while (i < dses.length) {
+                    ds = dses[i];
+                    if (ds == null) {
+                        i = dses.length;
+                        break;
+                    }
+                    int delta = weekDay-ds.day;
+                    if (delta > 6) break;
+                    i++;
+
+                    if (aggr == null) {
+                        aggr = new SyncStorageEngine.DayStats(weekDay);
+                    }
+                    aggr.successCount += ds.successCount;
+                    aggr.successTime += ds.successTime;
+                    aggr.failureCount += ds.failureCount;
+                    aggr.failureTime += ds.failureTime;
+                }
+                if (aggr != null) {
+                    pw.print("  Week-"); pw.print((today-weekDay)/7); pw.print(": ");
+                    dumpDayStatistic(pw, aggr);
+                }
+            }
+        }
+!!!15951372.java!!!	dumpSyncAdapters(inout pw : IndentingPrintWriter) : void
+        pw.println();
+        final List<UserInfo> users = getAllUsers();
+        if (users != null) {
+            for (UserInfo user : users) {
+                pw.println("Sync adapters for " + user + ":");
+                pw.increaseIndent();
+                for (RegisteredServicesCache.ServiceInfo<?> info :
+                        mSyncAdapters.getAllServices(user.id)) {
+                    pw.println(info);
+                }
+                pw.decreaseIndent();
+                pw.println();
+            }
+        }
+!!!15954956.java!!!	isSyncStillActive(inout activeSyncContext : ActiveSyncContext) : boolean
+        for (ActiveSyncContext sync : mActiveSyncContexts) {
+            if (sync == activeSyncContext) {
+                return true;
+            }
+        }
+        return false;

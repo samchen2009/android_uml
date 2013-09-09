@@ -1,0 +1,180 @@
+class ZipFile
+!!!1682331.java!!!	ZipFile(inout file : File)
+        this(file, OPEN_READ);
+!!!1682459.java!!!	ZipFile(inout name : String)
+        this(new File(name), OPEN_READ);
+!!!1682587.java!!!	ZipFile(inout file : File, in mode : int)
+        filename = file.getPath();
+        if (mode != OPEN_READ && mode != (OPEN_READ | OPEN_DELETE)) {
+            throw new IllegalArgumentException("Bad mode: " + mode);
+        }
+
+        if ((mode & OPEN_DELETE) != 0) {
+            fileToDeleteOnClose = file;
+            fileToDeleteOnClose.deleteOnExit();
+        } else {
+            fileToDeleteOnClose = null;
+        }
+
+        raf = new RandomAccessFile(filename, "r");
+
+        readCentralDir();
+        guard.open("close");
+!!!1682715.java!!!	finalize() : void
+        try {
+            if (guard != null) {
+                guard.warnIfOpen();
+            }
+        } finally {
+            try {
+                super.finalize();
+            } catch (Throwable t) {
+                throw new AssertionError(t);
+            }
+        }
+!!!1682843.java!!!	close() : void
+        guard.close();
+
+        RandomAccessFile localRaf = raf;
+        if (localRaf != null) { // Only close initialized instances
+            synchronized (localRaf) {
+                raf = null;
+                localRaf.close();
+            }
+            if (fileToDeleteOnClose != null) {
+                fileToDeleteOnClose.delete();
+                fileToDeleteOnClose = null;
+            }
+        }
+!!!1682971.java!!!	checkNotClosed() : void
+        if (raf == null) {
+            throw new IllegalStateException("Zip file closed");
+        }
+!!!1683099.java!!!	entries() : Enumeration
+        checkNotClosed();
+        final Iterator<ZipEntry> iterator = entries.values().iterator();
+
+        return new Enumeration<ZipEntry>() {
+            public boolean hasMoreElements() {
+                checkNotClosed();
+                return iterator.hasNext();
+            }
+
+            public ZipEntry nextElement() {
+                checkNotClosed();
+                return iterator.next();
+            }
+        };
+!!!1683227.java!!!	getEntry(inout entryName : String) : ZipEntry
+        checkNotClosed();
+        if (entryName == null) {
+            throw new NullPointerException("entryName == null");
+        }
+
+        ZipEntry ze = entries.get(entryName);
+        if (ze == null) {
+            ze = entries.get(entryName + "/");
+        }
+        return ze;
+!!!1683355.java!!!	getInputStream(inout entry : ZipEntry) : InputStream
+        // Make sure this ZipEntry is in this Zip file.  We run it through the name lookup.
+        entry = getEntry(entry.getName());
+        if (entry == null) {
+            return null;
+        }
+
+        // Create an InputStream at the right part of the file.
+        RandomAccessFile localRaf = raf;
+        synchronized (localRaf) {
+            // We don't know the entry data's start position. All we have is the
+            // position of the entry's local header. At position 6 we find the
+            // General Purpose Bit Flag.
+            // http://www.pkware.com/documents/casestudies/APPNOTE.TXT
+            RAFStream rafStream= new RAFStream(localRaf, entry.localHeaderRelOffset + 6);
+            DataInputStream is = new DataInputStream(rafStream);
+            int gpbf = Short.reverseBytes(is.readShort()) & 0xffff;
+            if ((gpbf & ZipFile.GPBF_UNSUPPORTED_MASK) != 0) {
+                throw new ZipException("Invalid General Purpose Bit Flag: " + gpbf);
+            }
+
+            // At position 28 we find the length of the extra data. In some cases
+            // this length differs from the one coming in the central header.
+            is.skipBytes(20);
+            int localExtraLenOrWhatever = Short.reverseBytes(is.readShort()) & 0xffff;
+            is.close();
+
+            // Skip the name and this "extra" data or whatever it is:
+            rafStream.skip(entry.nameLength + localExtraLenOrWhatever);
+            rafStream.length = rafStream.offset + entry.compressedSize;
+            if (entry.compressionMethod == ZipEntry.DEFLATED) {
+                int bufSize = Math.max(1024, (int)Math.min(entry.getSize(), 65535L));
+                return new ZipInflaterInputStream(rafStream, new Inflater(true), bufSize, entry);
+            } else {
+                return rafStream;
+            }
+        }
+!!!1683483.java!!!	getName() : String
+        return filename;
+!!!1683611.java!!!	size() : int
+        checkNotClosed();
+        return entries.size();
+!!!1683739.java!!!	readCentralDir() : void
+        // Scan back, looking for the End Of Central Directory field. If the zip file doesn't
+        // have an overall comment (unrelated to any per-entry comments), we'll hit the EOCD
+        // on the first try.
+        // No need to synchronize raf here -- we only do this when we first open the zip file.
+        long scanOffset = raf.length() - ENDHDR;
+        if (scanOffset < 0) {
+            throw new ZipException("File too short to be a zip file: " + raf.length());
+        }
+
+        long stopOffset = scanOffset - 65536;
+        if (stopOffset < 0) {
+            stopOffset = 0;
+        }
+
+        final int ENDHEADERMAGIC = 0x06054b50;
+        while (true) {
+            raf.seek(scanOffset);
+            if (Integer.reverseBytes(raf.readInt()) == ENDHEADERMAGIC) {
+                break;
+            }
+
+            scanOffset--;
+            if (scanOffset < stopOffset) {
+                throw new ZipException("EOCD not found; not a zip file?");
+            }
+        }
+
+        // Read the End Of Central Directory. We could use ENDHDR instead of the magic number 18,
+        // but we don't actually need all the header.
+        byte[] eocd = new byte[18];
+        raf.readFully(eocd);
+
+        // Pull out the information we need.
+        BufferIterator it = HeapBufferIterator.iterator(eocd, 0, eocd.length, ByteOrder.LITTLE_ENDIAN);
+        int diskNumber = it.readShort() & 0xffff;
+        int diskWithCentralDir = it.readShort() & 0xffff;
+        int numEntries = it.readShort() & 0xffff;
+        int totalNumEntries = it.readShort() & 0xffff;
+        it.skip(4); // Ignore centralDirSize.
+        long centralDirOffset = ((long) it.readInt()) & 0xffffffffL;
+
+        if (numEntries != totalNumEntries || diskNumber != 0 || diskWithCentralDir != 0) {
+            throw new ZipException("spanned archives not supported");
+        }
+
+        // Seek to the first CDE and read all entries.
+        // We have to do this now (from the constructor) rather than lazily because the
+        // public API doesn't allow us to throw IOException except from the constructor
+        // or from getInputStream.
+        RAFStream rafStream = new RAFStream(raf, centralDirOffset);
+        BufferedInputStream bufferedStream = new BufferedInputStream(rafStream, 4096);
+        byte[] hdrBuf = new byte[CENHDR]; // Reuse the same buffer for each entry.
+        for (int i = 0; i < numEntries; ++i) {
+            ZipEntry newEntry = new ZipEntry(hdrBuf, bufferedStream);
+            String entryName = newEntry.getName();
+            if (entries.put(entryName, newEntry) != null) {
+                throw new ZipException("Duplicate entry name: " + entryName);
+            }
+        }

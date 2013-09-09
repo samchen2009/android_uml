@@ -1,0 +1,804 @@
+class BerlinVideoOutput
+!!!10945676.cpp!!!	BerlinVideoOutput(in display : AMP_DISP, in av_settings : sp<AVSettings>)
+    AVS_FUNC_ENTER
+
+    hdmi_vout_config_.bit_depth = AMP_DISP_OUT_BIT_DPE_8;
+    hdmi_vout_config_.color_format = AMP_DISP_OUT_CLR_FMT_YCBCR422;
+    hdmi_vout_config_.pixel_repetition = 1;
+    output_stereo_mode_ = marvell::kStereoNone;
+
+    disp_handle_ = display;
+    CHECK(disp_handle_ != NULL);
+    av_settings_handle_ = (BerlinAVSettings*)(av_settings.get());
+    CHECK(av_settings_handle_ != NULL);
+
+    pq_setting_ = av_settings_handle_->GetVideoSetting();
+    fac_setting_ = av_settings_handle_->GetFactorySetting();
+
+    apply_bypass_ = 0;
+
+    // Initialize customized fail safe output format from makefile flags
+    char* default_output_mode_str = new char[20];
+    if (NULL != default_output_mode_str) {
+        snprintf(default_output_mode_str, 20, "%s@%s",
+                DEFAULT_DISPLAY_RESOLUTION != NULL ?
+                DEFAULT_DISPLAY_RESOLUTION : "1920x1080p",
+                DEFAULT_DISPLAY_FRAME_RATE != NULL ?
+                DEFAULT_DISPLAY_FRAME_RATE : "60");
+        ALOGI("Fail safe display mode %s", default_output_mode_str);
+        if (!DisplayMode::FromString(
+                default_output_mode_str, &default_output_mode_)) {
+            ALOGE("Fail to parse mode from string %s", default_output_mode_str);
+        }
+        DisplayModeToVOutFormat(&default_output_mode_,
+                &fail_safe_output_format_);
+        ALOGD("fail_safe_output_format_ %d", fail_safe_output_format_);
+        delete default_output_mode_str;
+    }
+
+    // Initialize display mode string mapping
+    InitDisplayModeMapping();
+
+    // Select a video mode and turn it on.
+    SetDisplayMode(VIDEO_OUTPUT_HDMI, default_output_mode_, false);
+    // Write the screen density on first boot only
+    double density;
+    char property[PROPERTY_VALUE_MAX];
+    if (property_get("ro.sf.ui_xres", property, NULL) > 0) {
+        density = (atoi(property) * 320.0f) / 1920.0f;
+    } else {
+        density = (default_output_mode_.width * 320.0f) / 1920.0f;
+    }
+    snprintf(property, sizeof(property), "%f", density);
+    property_set("qemu.sf.lcd_density", property);
+    property_set("ro.sf.lcd_density", property);
+
+    //Start AutoAdjust thread
+    quit_work_thread_ = false;
+    adjust_done_ = true;
+    work_thread_id_ = kInvalidThreadID;
+    startWorkThread();
+
+    AVS_FUNC_LEAVE
+!!!10945804.cpp!!!	~BerlinVideoOutput()
+    shutdownWorkThread();
+!!!10945932.cpp!!!	getPhyVideoProperty(in type : VideoPropType) : int32_t
+    ALOGV("getPhyVideoProperty, type %d", type);
+    int32_t phy = 0x0a000000 + type - marvell::VIDEO_PROP_OFFSET;
+    ALOGV("getPhyVideoProperty, phy %d", phy);
+    return phy;
+!!!10946060.cpp!!!	SetDisplayMode(in vout_type : VideoOutputType, in target_mode : DisplayMode, in notify : bool = true) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    uint8_t vout_format = fail_safe_output_format_;
+    AVSettingValue value;
+    String8 key;
+    if (vout_type != marvell::VIDEO_OUTPUT_HDMI) {
+        ALOGW("%s unknown video output type", __FUNCTION__);
+        return android::BAD_VALUE;
+    }
+
+    // set to default output mode
+    DisplayMode display_mode;
+    display_mode.SetTo(default_output_mode_);
+
+    hdmi_vout_config_.bit_depth = AMP_DISP_OUT_BIT_DPE_8;
+    hdmi_vout_config_.color_format = AMP_DISP_OUT_CLR_FMT_YCBCR422;
+    hdmi_vout_config_.pixel_repetition = 1;
+
+    DisplayModeToVOutFormat(&display_mode, &vout_format);
+    ALOGD("Set display mode to %s", display_mode.ToString().string());
+    AMP_RPC(ret, AMP_DISP_OUT_SetMute, disp_handle_, AMP_DISP_OUT_HDMI, 1);
+    AVS_CHECK(ret, "AMP_DISP_OUT_SetMute");
+
+    // There is latency when sending GCP packet to sink device, add waiting time.
+    MV_OSAL_Task_Sleep(100);
+
+    AMP_RPC(ret, AMP_DISP_OUT_SetResolution,
+            disp_handle_, AMP_DISP_TG_PRI,
+            vout_format, hdmi_vout_config_.bit_depth);
+    AVS_CHECK(ret, "AMP_DISP_OUT_SetResolution");
+
+    // There is latency when sending GCP packet to sink device, add waiting time.
+    ALOGD("SetHDMIVOutFormat");
+    SetHDMIVOutFormat(hdmi_vout_config_);
+
+    AMP_RPC(ret, AMP_DISP_OUT_SetMute, disp_handle_, AMP_DISP_OUT_HDMI, 0);
+    AVS_CHECK(ret, "AMP_DISP_OUT_SetMute");
+
+    // TODO: configure input?
+
+    output_stereo_mode_ = marvell::kStereoNone;
+    AMP_RPC(ret, AMP_DISP_OUT_3D_SetConvertMode, disp_handle_, 0);
+    AVS_CHECK(ret, "AMP_DISP_OUT_3D_SetConvertMode");
+    AMP_RPC(ret, AMP_DISP_OUT_3D_SetSSType, disp_handle_,
+            AMP_DISP_PLANE_MAIN, 0);
+    AVS_CHECK(ret, "AMP_DISP_OUT_3D_SetSSType");
+
+    if (notify) {
+        // Check if notify is required
+        // We have already notified observers if call from ApplySetting
+        value.setString(display_mode.ToString());
+        key = AVSettingsHelper::GetFullKey(
+                marvell::kVideoOutputSettingsPrefix,
+                marvell::kHDMIDisplayMode);
+        av_settings_handle_->NotifyValue(key.string(), value);
+    }
+
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10946188.cpp!!!	SetPQProfile(in profile_num : uint32_t) : status_t
+    AVS_FUNC_ENTER
+    ALOGD("SetPQProfile, profile_num %d", profile_num);
+    HRESULT ret = SUCCESS;
+    // TODO: use MV_PQC_PICTURE_PROFILE if definition available
+#ifdef AVS_PQ_ENABLE
+    ret = MV_PQC_SetPictureProperty(0, profile_num);
+    AVS_CHECK(ret, "MV_PQC_SetPictureProperty");
+#endif
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10946316.cpp!!!	SetVideoProperty(in type : VideoPropType, in prop_value : uint32_t) : status_t
+    AVS_FUNC_ENTER
+    int prop_id = getPhyVideoProperty(type);
+    // FIXME: video prop
+    prop_value = video_prop_larger_range_enabled_ ?
+            prop_value * 10 : prop_value;
+    ALOGD("SetVideoProperty, prop_id 0x%x, prop_value : %d",
+            prop_id, prop_value);
+    HRESULT ret = SUCCESS;
+    AMP_RPC(ret, AMP_DISP_PQ_SetProperty,
+            disp_handle_, prop_id, prop_value);
+    AVS_CHECK(ret, "AMP_DISP_PQ_SetProperty");
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10946444.cpp!!!	SetScale(in channel_id : int32_t, in src : android::Rect, in dst : android::Rect) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    AMP_DISP_WIN src_win, dst_win;
+    ALOGD("SetScale, plane id %d, src %d %d %d %d, dst %d %d %d %d",
+            channel_id,
+            src.left, src.top, src.right, src.bottom,
+            dst.left, dst.top, dst.right, dst.bottom);
+    src_win.iX = src.left;
+    src_win.iY = src.top;
+    src_win.iWidth = src.right - src.left;
+    src_win.iHeight = src.bottom - src.top;
+    dst_win.iX = dst.left;
+    dst_win.iY = dst.top;
+    dst_win.iWidth = dst.right - dst.left;
+    dst_win.iHeight = dst.bottom - dst.top;
+    AMP_RPC(ret, AMP_DISP_SetScale, disp_handle_,
+            channel_id, &src_win, &dst_win);
+    AVS_CHECK(ret, "AMP_DISP_SetScale");
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10946572.cpp!!!	GetEDIDManufacturerName(in vout_type : VideoOutputType, inout id : int32_t) : status_t
+    if (vout_type != marvell::VIDEO_OUTPUT_HDMI) {
+        ALOGW("%s unknown video output type", __FUNCTION__);
+        return android::BAD_VALUE;
+    }
+    *id = edid_manufacturer_name_;
+    return android::OK;
+!!!10946700.cpp!!!	GetEDIDProductCode(in vout_type : VideoOutputType, inout id : int32_t) : status_t
+    if (vout_type != marvell::VIDEO_OUTPUT_HDMI) {
+        ALOGW("%s unknown video output type", __FUNCTION__);
+        return android::BAD_VALUE;
+    }
+    *id = edid_product_code_;
+    return android::OK;
+!!!10946828.cpp!!!	GetDisplayMode(inout cur_mode : DisplayMode) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    AMP_DISP_OUT_RES resId;
+    AMP_RPC(ret, AMP_DISP_OUT_GetResolution,
+            disp_handle_, AMP_DISP_TG_PRI, &resId);
+    AVS_CHECK(ret, "AMP_DISP_OUT_GetResolution");
+    ALOGV("Return resolution id: %d", resId);
+    VOutFormatToDisplayMode(resId, cur_mode);
+    cur_mode->stereo_mode = output_stereo_mode_;
+    CHECK(cur_mode != NULL);
+    ALOGD("GetDisplayMode return: %s", cur_mode->ToString().string());
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10946956.cpp!!!	GetTvSupportedModes(in vout_type : VideoOutputType, inout supported_modes : Vector<DisplayMode>) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    if (vout_type != marvell::VIDEO_OUTPUT_HDMI) {
+        ALOGW("%s unknown video output type", __FUNCTION__);
+        return android::BAD_VALUE;
+    }
+
+    // We should call native since the sink_caps_ cache only updated by hotplug event
+    // Some equipments may adjust their caps dynamically (without hotplug)
+    AMP_RPC(ret, AMP_DISP_OUT_HDMI_GetSinkCaps,
+            disp_handle_, &hdmi_sink_caps_);
+    AVS_CHECK(ret, "AMP_DISP_OUT_HDMI_GetSinkCaps");
+
+    if (!hdmi_sink_caps_.bValidEdid) {
+        AVSLOGW("Fail to detect HDMI sink caps, is TV connected?");
+        goto bailout;
+    }
+
+    supported_modes->clear();
+    // We only consider 2D here
+    for (int i = kLowest2DVoutFormatIndex; i <= kHighest2DVoutFormatIndex; ++i) {
+        if (CheckSinkSupportedStatus(i)) {
+            DisplayMode mode;
+            VOutFormatToDisplayMode(i, &mode);
+            ALOGV("Supported 2D: format %d, mode %s", i, mode.ToString().string());
+            // TODO: hardcode value
+            mode.color_space = marvell::kColorSpaceBT709;
+            mode.stereo_mode = marvell::kStereoNone;
+            supported_modes->push(mode);
+        }
+    }
+    // Dump 3D capability for debug usage
+    for (int i = kLowest3DVoutFormatIndex; i <= kHighest3DVoutFormatIndex; ++i) {
+        if (CheckSinkSupportedStatus(i)) {
+            DisplayMode mode_3D;
+            VOutFormatToDisplayMode(i, &mode_3D);
+            ALOGD("Supported 3D: format %d, mode %s", i, mode_3D.ToString().string());
+        }
+    }
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10947084.cpp!!!	GetVideoProperty(in type : VideoPropType, inout prop_value : uint32_t) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    // TODO: header file for PIC_GROUP_BASE
+    int prop_id = getPhyVideoProperty(type);
+    AMP_RPC(ret, AMP_DISP_PQ_GetProperties,
+            disp_handle_, prop_id, 1, prop_value);
+    AVS_CHECK(ret, "AMP_DISP_PQ_GetProperties");
+    ALOGD("GetVideoProperty, prop_id 0x%x, prop_value : %d",
+            prop_id, *prop_value);
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10947212.cpp!!!	SelectTargetMode(inout target_mode : DisplayMode) : void
+    AVS_FUNC_ENTER
+
+    AVSettingValue pref_mode_value;
+    String8 key;
+
+    // Return default mode if no valid edid detected
+    // It will be applied when device boot up without tv connected
+    if (!hdmi_sink_caps_.bValidEdid) {
+        ALOGD("No TV connected, use default mode");
+        target_mode->SetTo(default_output_mode_);
+        goto out;
+    }
+
+    //  Select target mode according user pref and device/tv capability
+    key = AVSettingsHelper::GetFullKey(
+            marvell::kVideoOutputSettingsPrefix,
+            marvell::kHDMIPrefDisplayMode);
+    if (android::OK != av_settings_handle_->ReadSetting(
+            key.string(), &pref_mode_value)) {
+        ALOGW("SelectTargetMode, read user pref mode fail");
+        SelectBestMode(target_mode);
+        goto out;
+    }
+
+    if (pref_mode_value.getType() == AVSettingValue::TYPE_NO_VALUE) {
+        // No user preferred mode: 'Auto' is selected
+        SelectBestMode(target_mode);
+        goto out;
+    } else {
+        // There's user preferred mode
+        CHECK(pref_mode_value.isString());
+        String8 pref_mode_str = pref_mode_value.getString();
+        ALOGD("SelectTargetMode, user pref %s", pref_mode_str.string());
+        DisplayMode pref_mode;
+        uint8_t vout_format = fail_safe_output_format_;
+        DisplayMode::FromString(pref_mode_str.string(), &pref_mode);
+        if (IsSupportedByDevice(&pref_mode) && IsSupportedByTv(&pref_mode)) {
+            // Return user pref mode if it's supported by both device and tv
+            target_mode->SetTo(pref_mode);
+            goto out;
+        } else {
+            // Return best mode if it's not supported
+            ALOGW("SelectTargetMode, user pref %s not supported",
+                    pref_mode_str.string());
+            SelectBestMode(target_mode);
+            goto out;
+        }
+    }
+
+out:
+    ALOGD("SelectTargetMode, return %s", target_mode->ToString().string());
+    AVS_FUNC_LEAVE
+!!!10947340.cpp!!!	SelectBestMode(inout best_mode : DisplayMode, in is_3D : bool = false) : void
+    AVS_FUNC_ENTER
+
+    // Current policy:
+    // 1. If there's user defined best mode from config file, select it;
+    // 2. If not, pick max resolution, and select max matched frame rate.
+    if (!pref_best_mode_str_.isEmpty()) {
+        ALOGD("SelectBestMode, return config defined best mode %s",
+                pref_best_mode_str_.string());
+        DisplayMode::FromString(pref_best_mode_str_.string(), best_mode);
+        goto out;
+    } else {
+        // Initilize as fail safe mode
+        VOutFormatToDisplayMode(fail_safe_output_format_, best_mode);
+        // Compare every supported mode
+        int8_t first = is_3D ?
+                kLowest3DVoutFormatIndex :
+                kLowest2DVoutFormatIndex;
+        int8_t max = is_3D ?
+                kHighest3DVoutFormatIndex:
+                kHighest2DVoutFormatIndex;
+        int8_t format_index = max;
+        for (; format_index >= first; --format_index) {
+            if (!CheckSinkSupportedStatus(format_index)) {
+                ALOGV("Sink not support vout format %d", format_index);
+                continue;
+            }
+            DisplayMode display_mode;
+            VOutFormatToDisplayMode(format_index, &display_mode);
+            if (!IsSupportedByDevice(&display_mode)) {
+                ALOGV("Device not support vout format %d", format_index);
+                continue;
+            }
+
+            // Pick max resolution / frame rate
+            if (display_mode > *best_mode) {
+                best_mode->SetTo(display_mode);
+            }
+        }
+        // Check whether we could apply a better mode: more accurate
+        CheckBetterMode(best_mode);
+    }
+
+out:
+    // TODO: 3D stereo policy
+    best_mode->stereo_mode = marvell::kStereoNone;
+    ALOGD("SelectBestMode, return %s", best_mode->ToString().string());
+    AVS_FUNC_LEAVE
+!!!10947596.cpp!!!	UpdateHDMISinkCaps() : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+
+    edid_manufacturer_name_ = 0;
+    edid_product_code_ = 0;
+    hdmi_plugged_ = false;
+    memset(&hdmi_sink_caps_, 0, sizeof(hdmi_sink_caps_));
+
+    AMP_RPC(ret, AMP_DISP_OUT_HDMI_GetSinkCaps,
+            disp_handle_, &hdmi_sink_caps_);
+    AVS_CHECK(ret, "AMP_DISP_OUT_HDMI_GetSinkCaps");
+
+    // The assumption here is that if we cannot detect the capabilities of
+    // HDMI sink or it has invalid EDID infomation, we can safely consider
+    // it as disconnected.
+    hdmi_plugged_ = hdmi_sink_caps_.bValidEdid;
+
+    if (hdmi_plugged_) {
+        uint8_t byte_low, byte_high;
+        // Convert manufacturer name to the original form.
+        byte_low = ((hdmi_sink_caps_.uiMnfrName[0] - 'A') & 0x1F) << 2;
+        byte_low |= ((hdmi_sink_caps_.uiMnfrName[1] - 'A') & 0x18) >> 3;
+        byte_high = ((hdmi_sink_caps_.uiMnfrName[1] - 'A') & 0x07) << 5;
+        byte_high |= ((hdmi_sink_caps_.uiMnfrName[2] - 'A') & 0x1F);
+        edid_manufacturer_name_ = (byte_low << 8) | byte_high;
+
+        // Convert product code to the original form.
+        byte_low = (ATOI_(hdmi_sink_caps_.uiProductCode[0]) << 4) |
+                ATOI_(hdmi_sink_caps_.uiProductCode[1]);
+        byte_high = (ATOI_(hdmi_sink_caps_.uiProductCode[2]) << 4) |
+                ATOI_(hdmi_sink_caps_.uiProductCode[3]);
+        edid_product_code_ = (byte_low << 8) | byte_high;
+    }
+
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10947724.cpp!!!	EnableHDCP(in enable : bool) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+
+    ALOGD("EnableHDCP %d", enable);
+    AMP_RPC(ret, AMP_DISP_OUT_HDCP_Enable, disp_handle_, enable ? 1 : 0);
+    AVS_CHECK(ret, "AMP_DISP_OUT_HDCP_Enable");
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10947980.cpp!!!	CheckBetterMode(inout mode : DisplayMode) : void
+    ALOGV("CheckBetterMode, in: %s", mode->ToString().string());
+    uint8_t original_format;
+    DisplayModeToVOutFormat(mode, &original_format);
+    if (mode->refresh_rate == 60000) {
+        mode->refresh_rate = 59940;
+    } else if (mode->refresh_rate == 30000) {
+        mode->refresh_rate = 29970;
+    } else if (mode->refresh_rate == 24000) {
+        if (IS_3D_FORMAT(original_format)) {
+            mode->refresh_rate = 23976;
+        } else {
+            mode->refresh_rate = 23980;
+        }
+    } else {
+        ALOGV("CheckBetterMode, no frame rate adjustment");
+        return;
+    }
+    uint8_t better_format;
+    DisplayModeToVOutFormat(mode, &better_format);
+    if (!CheckSinkSupportedStatus(better_format)) {
+        // Better output format is not supported
+        VOutFormatToDisplayMode(original_format, mode);
+    } else {
+        ALOGD("Better output format supported %d -> %d",
+                original_format, better_format);
+    }
+    ALOGV("CheckBetterMode, out: %s", mode->ToString().string());
+!!!10948108.cpp!!!	CheckSinkSupportedStatus(in output_format : uint8_t) : bool
+    return IS_3D_FORMAT(output_format) ?
+        IS_SUPPORTED_BY_SINK_3D(output_format) :
+        IS_SUPPORTED_BY_SINK_2D(output_format);
+!!!10948236.cpp!!!	InitDisplayModeMapping() : void
+    AVS_FUNC_ENTER
+    // 2D
+    display_mode_strings_.add(AMP_DISP_OUT_RES_NTSC_M,
+    String8("720x480i@29.97M"));      // Index 0
+    display_mode_strings_.add(AMP_DISP_OUT_RES_NTSC_J, String8("720x480i@29.97M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_PAL_M, String8("720x480i@59.94M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_PAL_BGH, String8("720x576i@25.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_525I60, String8("720x480i@60.00M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_525I5994,
+        String8("720x480i@59.94M"));    // Index 5
+    display_mode_strings_.add(AMP_DISP_OUT_RES_625I50, String8("720x576i@50.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_525P60, String8("720x480p@60.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_525P5994, String8("720x480p@59.94M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_625P50, String8("720x576p@50.00M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_720P30,
+        String8("1280x720p@30.00M"));     // Index 10
+    display_mode_strings_.add(AMP_DISP_OUT_RES_720P2997, String8("1280x720p@29.97M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_720P25, String8("1280x720p@25.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_720P60, String8("1280x720p@60.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_720P5994, String8("1280x720p@59.94M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_720P50,
+        String8("1280x720p@50.00M"));     // Index 15
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080I60, String8("1920x1080i@60.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080I5994, String8("1920x1080i@59.94M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080I50, String8("1920x1080i@50.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P30, String8("1920x1080p@30.00M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P2997,
+        String8("1920x1080p@29.97M")); // Index 20
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P25, String8("1920x1080p@25.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P24, String8("1920x1080p@24.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P2398, String8("1920x1080p@23.98M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P60, String8("1920x1080p@60.00M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P5994,
+        String8("1920x1080p@59.94M")); // Index 25
+    display_mode_strings_.add(AMP_DISP_OUT_RES_1080P50, String8("1920x1080p@50.00M"));
+
+    // VGA
+    display_mode_strings_.add(AMP_DISP_OUT_RES_480P60, String8("640x480p@60.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_480P5994, String8("640x480p@59.94M"));
+
+    // 3D
+    // TODO: 3D stereo mode
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_720P50, String8("1280x720p@50.00M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_720P60,
+        String8("1280x720p@50.00M"));  // Index 30
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_720P5994, String8("1280x720p@59.94M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080P24, String8("1920x1080p@24.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080P2398, String8("1920x1080p@23.98M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080P30, String8("1920x1080p@30.00M"));
+
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080P2997,
+        String8("1920x1080p@29.97M"));  // Index 35
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080P25, String8("1920x1080p@25.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080I60, String8("1920x1080i@60.00M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080I5994, String8("1920x1080i@59.94M"));
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1080I50, String8("1920x1080i@50.00M"));
+
+    // Use fail safe mode as default, so should call this after init default fail safe mode
+    // TODO: 3D 1920X540 LVDS mapping
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1920X540P60,
+        default_output_mode_.ToString());  // Index 40
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1920X540P30,
+        default_output_mode_.ToString());
+    display_mode_strings_.add(AMP_DISP_OUT_RES_3D_1920X540P24,
+        default_output_mode_.ToString());
+    display_mode_strings_.add(AMP_DISP_OUT_RES_RESET, default_output_mode_.ToString());
+    CHECK(display_mode_strings_.size() == AMP_DISP_OUT_RES_MAX);
+    AVS_FUNC_LEAVE
+!!!10948364.cpp!!!	InitDeviceSupportedModes() : void
+  AVS_FUNC_ENTER
+  // Parse device supported display resolution/frame rate from our
+  // configuration file /system/etc/avsettings.xml
+  xmlXPathContextPtr context = NULL;
+  xmlXPathObjectPtr result = NULL;
+  xmlDocPtr doc = xmlParseFile(kAVSettingsConfig);
+  android::String8 category;
+  if (doc == NULL) {
+    ALOGE("invalid config file: %s", kAVSettingsConfig);
+    // Use default device capability
+    // Resolution: 720p/1080i/1080p
+    // Frame rate: 24/50/60
+    device_supported_resolutions_.push(android::String8("720p"));
+    device_supported_resolutions_.push(android::String8("1080i"));
+    device_supported_resolutions_.push(android::String8("1080p"));
+    device_supported_framerates_.push(android::String8("24"));
+    device_supported_framerates_.push(android::String8("50"));
+    device_supported_framerates_.push(android::String8("60"));
+    goto bail;
+  }
+  context = xmlXPathNewContext(doc);
+  if (context == NULL) {
+    ALOGE("fail to create context");
+    goto bail;
+  }
+
+  result = xmlXPathEvalExpression(BAD_CAST"//category", context);
+  if (result == NULL) {
+    ALOGE("invalid xpath expression");
+    goto bail;
+  }
+
+  if (xmlXPathNodeSetIsEmpty(result->nodesetval)) {
+    ALOGE("no category node found");
+    goto bail;
+  }
+
+  for (int i = 0; i < result->nodesetval->nodeNr; i++) {
+    xmlNodePtr node = result->nodesetval->nodeTab[i];
+    category.setTo(reinterpret_cast<char *>(
+        xmlGetProp(node, BAD_CAST"name")));
+    if (!strcmp(category.string(), "resolution")) {
+        xmlNodePtr item = node->children;
+        while (NULL != item) {
+          if (!xmlStrcmp(item->name, BAD_CAST"item")) {
+            device_supported_resolutions_.push(android::String8(
+                reinterpret_cast<char *>(xmlNodeGetContent(item))));
+          }
+          item = item->next;
+        }
+    } else if (!strcmp(category.string(), "frame_rate")) {
+        xmlNodePtr item = node->children;
+        while (NULL != item) {
+          if (!xmlStrcmp(item->name, BAD_CAST"item")) {
+            device_supported_framerates_.push(android::String8(
+                reinterpret_cast<char *>(xmlNodeGetContent(item))));
+          }
+          item = item->next;
+        }
+    } else {
+        ALOGE("unknown category %s", category.string());
+        continue;
+    }
+  }
+
+  result = xmlXPathEvalExpression(BAD_CAST"//pref_best_mode", context);
+  if (result == NULL) {
+    ALOGE("invalid xpath expression");
+    goto bail;
+  }
+
+  if (xmlXPathNodeSetIsEmpty(result->nodesetval)) {
+    ALOGE("no pref_best_mode node found");
+    goto bail;
+  }
+
+  if (1 == result->nodesetval->nodeNr) {
+    xmlNodePtr node = result->nodesetval->nodeTab[0];
+    pref_best_mode_str_.setTo(reinterpret_cast<char *>(
+        xmlGetProp(node, BAD_CAST"encoded_str")));
+    ALOGD("Preferred best mode set to %s", pref_best_mode_str_.string());
+  } else {
+    ALOGD("PrefBestMode entry count %d", result->nodesetval->nodeNr);
+  }
+
+bail:
+  if (NULL != result) xmlXPathFreeObject(result);
+  if (NULL != context) xmlXPathFreeContext(context);
+  if (NULL != doc) xmlFreeDoc(doc);
+
+  for (unsigned int i = 0; i < device_supported_resolutions_.size(); i++)
+  {
+    ALOGV("Support resolution: %s",
+        device_supported_resolutions_.itemAt(i).string());
+  }
+  for (unsigned int i = 0; i < device_supported_framerates_.size(); i++)
+  {
+    ALOGV("Support frame rate: %s",
+        device_supported_framerates_.itemAt(i).string());
+  }
+  AVS_FUNC_LEAVE
+!!!10948492.cpp!!!	IsSupportedByDevice(in mode : DisplayMode) : bool
+    // There's a rule: supported one of 60/59.94 will be considered as support 60
+    // Similar for 30/29.97, 24/23.98/23.976
+    float frame_rate = static_cast<float>(mode->refresh_rate) / 1000.0f;
+    if (frame_rate > 23 && frame_rate < 24) {
+        frame_rate = 24;
+    } else if (frame_rate > 29 && frame_rate < 30) {
+        frame_rate = 30;
+    } else if (frame_rate > 59 && frame_rate < 60) {
+        frame_rate = 60;
+    }
+
+    char str[10];
+    snprintf(str, 10, "%d%c", mode->height, mode->is_interlaced ? 'i' : 'p');
+    android::String8 resolution_str(str);
+    snprintf(str, 10, "%d", static_cast<int>(frame_rate));
+    android::String8 frame_rate_str(str);
+    bool resolution_supported = false;
+    bool frame_rate_supported = false;
+    for (unsigned int i = 0; i < device_supported_resolutions_.size(); i++) {
+        if (!strcmp(device_supported_resolutions_.itemAt(i).string(),
+                resolution_str.string())) {
+            resolution_supported = true;
+            break;
+        }
+    }
+
+    for (unsigned int i = 0; i < device_supported_framerates_.size(); i++) {
+        if (!strcmp(device_supported_framerates_.itemAt(i).string(),
+                frame_rate_str.string())) {
+            frame_rate_supported = true;
+            break;
+        }
+    }
+    ALOGV("IsSupportedByDevice, resolution(%s) %d, frame_rate(%d) %d",
+        resolution_str.string(), resolution_supported,
+        mode->refresh_rate, frame_rate_supported);
+    return resolution_supported && frame_rate_supported;
+!!!10948620.cpp!!!	IsSupportedByTv(in mode : DisplayMode) : bool
+    uint8_t vout_format;
+    DisplayModeToVOutFormat(mode, &vout_format);
+    return CheckSinkSupportedStatus(vout_format);
+!!!10948748.cpp!!!	SelectBestBitDepth(in video_output_format : uint8_t, in pref_bit_depth : uint8_t) : uint8_t
+    // Check user preferred deep color mode (auto|8bit)
+    String8 key = AVSettingsHelper::GetFullKey(
+            marvell::kVideoOutputSettingsPrefix,
+            marvell::kDeepColor);
+    AVSettingValue value;
+    status_t ret = av_settings_handle_->ReadSetting(key.string(), &value);
+    if (android::OK == ret) {
+        CHECK(value.isString());
+        ALOGD("SelectBestBitDepth, preferred deep color %s",
+                value.getString().string());
+        if (!strcmp(value.getString().string(), marvell::vDeepColorFixed8Bit)) {
+            ALOGD("SelectBestBitDepth, use fixed 8-bit deep color mode");
+            return AMP_DISP_OUT_BIT_DPE_8;
+        }
+    } else {
+        ALOGE("SelectBestBitDepth, fail to read pref, 8bit as default");
+        return AMP_DISP_OUT_BIT_DPE_8;
+    }
+
+    ALOGV("SelectBestBitDepth, calculate best bit depth");
+    if (!hdmi_sink_caps_.bValidEdid) {
+        // Just return default 8bit
+        ALOGW("SelectBestBitDepth, sink edid not available");
+        return AMP_DISP_OUT_BIT_DPE_8;
+    }
+
+    uint32_t pixelclock = VOutFormatToClockFrequency(video_output_format);
+    //uint32_t max_pixelclock = hdmi_sink_caps_.maxPixelClock * 1000;
+    uint32_t max_pixelclock = hdmi_sink_caps_.uiMaxTMDSClock * 1000;
+
+    if(max_pixelclock != 0) {
+        switch (pref_bit_depth) {
+            case AMP_DISP_OUT_BIT_DPE_12:
+                if (pixelclock * 12 / 8 <= max_pixelclock &&
+                        hdmi_sink_caps_.uiDC36bitSprt) {
+                  return AMP_DISP_OUT_BIT_DPE_12;
+                }
+                // Fall through.
+            case AMP_DISP_OUT_BIT_DPE_10:
+                if (pixelclock * 10 / 8 <= max_pixelclock &&
+                        hdmi_sink_caps_.uiDC30bitSprt) {
+                  return AMP_DISP_OUT_BIT_DPE_10;
+                }
+                // Fall through.
+            default:
+                return AMP_DISP_OUT_BIT_DPE_8;
+        }
+    } else {
+        switch (pref_bit_depth) {
+            case AMP_DISP_OUT_BIT_DPE_12:
+                if (hdmi_sink_caps_.uiDC36bitSprt) {
+                  return AMP_DISP_OUT_BIT_DPE_12;
+                }
+                // Fall through.
+            case AMP_DISP_OUT_BIT_DPE_10:
+                if (hdmi_sink_caps_.uiDC30bitSprt) {
+                  return AMP_DISP_OUT_BIT_DPE_10;
+                }
+                // Fall through.
+            default:
+                return AMP_DISP_OUT_BIT_DPE_8;
+        }
+    }
+!!!10948876.cpp!!!	SelectBestPixelFormat(in format : uint8_t) : uint8_t
+    // The input format is decided by our internal policy
+    // Also check user preference here if have
+    ALOGD("SelectBestPixelFormat, input %d", format);
+    String8 key = AVSettingsHelper::GetFullKey(
+            marvell::kVideoOutputSettingsPrefix,
+            marvell::kHDMIPixelFormat);
+    AVSettingValue value;
+    status_t ret = av_settings_handle_->ReadSetting(key.string(), &value);
+    if (android::OK == ret) {
+        CHECK(value.isString());
+        ALOGD("SelectBestPixelFormat, user pref pixel format %s",
+                value.getString().string());
+        if (!strcmp(value.getString().string(),
+                marvell::vHDMIPixelFormatYUV444) && hdmi_sink_caps_.uiYCbCr444Sprt) {
+            ALOGD("SelectBestPixelFormat, YCbCr444 supported");
+            return AMP_DISP_OUT_CLR_FMT_YCBCR444;
+        } else if (!strcmp(value.getString().string(),
+                marvell::vHDMIPixelFormatYUV422) && hdmi_sink_caps_.uiYCbCr422Sprt) {
+            ALOGD("SelectBestPixelFormat, YCbCr422 supported");
+            return AMP_DISP_OUT_CLR_FMT_YCBCR422;
+        } else if (!strcmp(value.getString().string(), marvell::vHDMIPixelFormatRGB)) {
+            return AMP_DISP_OUT_CLR_FMT_RGB888;
+        }
+    }
+    ALOGD("SelectBestPixelFormat, output %d", format);
+    return format;
+!!!10949004.cpp!!!	SetHDMIVOutFormat(in vout_config : HdmiVoutConfig) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    ALOGD("vout_config.color_format %d", vout_config.color_format);
+    AMP_RPC(ret, AMP_DISP_OUT_HDMI_SetVidFmt,
+            disp_handle_,
+            vout_config.color_format,
+            vout_config.bit_depth,
+            vout_config.pixel_repetition);
+    AVS_CHECK(ret, "AMP_DISP_OUT_HDMI_SetVidFmt");
+    // TODO: update audio format ?
+    AVS_FUNC_LEAVE
+    return android::OK;
+
+bailout:
+    return android::UNKNOWN_ERROR;
+!!!10949132.cpp!!!	VOutFormatToDisplayMode(in video_output_format : uint8_t, inout display_mode : DisplayMode) : void
+    ALOGV("VOutFormatToDisplayMode, in: %d", video_output_format);
+    String8 display_mode_str = display_mode_strings_.valueFor(
+            video_output_format);
+    if (display_mode_str.isEmpty()) {
+        ALOGE("Fail to get display mode for vout format %d",
+                video_output_format);
+        // Return fail safe mode
+        ALOGD("VOutFormatToDisplayMode, out: %s",
+                default_output_mode_.ToString().string());
+        display_mode->SetTo(default_output_mode_);
+        return;
+    }
+    ALOGV("VOutFormatToDisplayMode, out: %s", display_mode_str.string());
+    DisplayMode::FromString(display_mode_str.string(), display_mode);

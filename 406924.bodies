@@ -1,0 +1,542 @@
+class TextLayoutShaper
+!!!951692.cpp!!!	TextLayoutShaper()
+    init();
+
+    mFontRec.klass = &harfbuzzSkiaClass;
+    mFontRec.userData = 0;
+
+    // Note that the scaling values (x_ and y_ppem, x_ and y_scale) will be set
+    // below, when the paint transform and em unit of the actual shaping font
+    // are known.
+
+    memset(&mShaperItem, 0, sizeof(mShaperItem));
+
+    mShaperItem.font = &mFontRec;
+    mShaperItem.font->userData = &mShapingPaint;
+!!!951820.cpp!!!	~TextLayoutShaper()
+    unrefTypefaces();
+    deleteShaperItemGlyphArrays();
+!!!951948.cpp!!!	computeValues(inout value : TextLayoutValue, in paint : SkPaint, in chars : UChar, in start : size_t, in count : size_t, in contextCount : size_t, in dirFlags : int) : void
+
+    computeValues(paint, chars, start, count, contextCount, dirFlags,
+            &value->mAdvances, &value->mTotalAdvance, &value->mGlyphs, &value->mPos);
+#if DEBUG_ADVANCES
+    ALOGD("Advances - start = %d, count = %d, contextCount = %d, totalAdvance = %f", start, count,
+            contextCount, value->mTotalAdvance);
+#endif
+!!!952076.cpp!!!	purgeCaches() : void
+    size_t cacheSize = mCachedHBFaces.size();
+    for (size_t i = 0; i < cacheSize; i++) {
+        HB_FreeFace(mCachedHBFaces.valueAt(i));
+    }
+    mCachedHBFaces.clear();
+    unrefTypefaces();
+    init();
+!!!952204.cpp!!!	init() : void
+    mDefaultTypeface = SkFontHost::CreateTypeface(NULL, NULL, NULL, 0, SkTypeface::kNormal);
+!!!952332.cpp!!!	unrefTypefaces() : void
+    SkSafeUnref(mDefaultTypeface);
+!!!952460.cpp!!!	typefaceForScript(in paint : SkPaint, inout typeface : SkTypeface, in script : HB_Script) : SkTypeface
+    SkTypeface::Style currentStyle = SkTypeface::kNormal;
+    if (typeface) {
+        currentStyle = typeface->style();
+    }
+    typeface = SkCreateTypefaceForScript(script, currentStyle);
+#if DEBUG_GLYPHS
+    ALOGD("Using Harfbuzz Script %d, Style %d", script, currentStyle);
+#endif
+    return typeface;
+!!!952588.cpp!!!	shapeFontRun(in paint : SkPaint, in isRTL : bool) : size_t
+    // Reset kerning
+    mShaperItem.kerning_applied = false;
+
+    // Update Harfbuzz Shaper
+    mShaperItem.item.bidiLevel = isRTL;
+
+    SkTypeface* typeface = paint->getTypeface();
+
+    // Get the glyphs base count for offsetting the glyphIDs returned by Harfbuzz
+    // This is needed as the Typeface used for shaping can be not the default one
+    // when we are shaping any script that needs to use a fallback Font.
+    // If we are a "common" script we dont need to shift
+    size_t baseGlyphCount = 0;
+    SkUnichar firstUnichar = 0;
+    if (isComplexScript(mShaperItem.item.script)) {
+        const uint16_t* text16 = (const uint16_t*) (mShaperItem.string + mShaperItem.item.pos);
+        const uint16_t* text16End = text16 + mShaperItem.item.length;
+        firstUnichar = SkUTF16_NextUnichar(&text16);
+        while (firstUnichar == ' ' && text16 < text16End) {
+            firstUnichar = SkUTF16_NextUnichar(&text16);
+        }
+        baseGlyphCount = paint->getBaseGlyphCount(firstUnichar);
+    }
+
+    if (baseGlyphCount != 0) {
+        typeface = typefaceForScript(paint, typeface, mShaperItem.item.script);
+        if (!typeface) {
+            typeface = mDefaultTypeface;
+            SkSafeRef(typeface);
+#if DEBUG_GLYPHS
+            ALOGD("Using Default Typeface");
+#endif
+        }
+    } else {
+        if (!typeface) {
+            typeface = mDefaultTypeface;
+#if DEBUG_GLYPHS
+            ALOGD("Using Default Typeface");
+#endif
+        }
+        SkSafeRef(typeface);
+    }
+
+    mShapingPaint.setTypeface(typeface);
+    mShaperItem.face = getCachedHBFace(typeface);
+
+    int textSize = paint->getTextSize();
+    float scaleX = paint->getTextScaleX();
+    mFontRec.x_ppem = floor(scaleX * textSize + 0.5);
+    mFontRec.y_ppem = textSize;
+    uint32_t unitsPerEm = SkFontHost::GetUnitsPerEm(typeface->uniqueID());
+    // x_ and y_scale are the conversion factors from font design space
+    // (unitsPerEm) to 1/64th of device pixels in 16.16 format.
+    const int kDevicePixelFraction = 64;
+    const int kMultiplyFor16Dot16 = 1 << 16;
+    float emScale = kDevicePixelFraction * kMultiplyFor16Dot16 / (float)unitsPerEm;
+    mFontRec.x_scale = emScale * scaleX * textSize;
+    mFontRec.y_scale = emScale * textSize;
+
+#if DEBUG_GLYPHS
+    ALOGD("Run typeface = %p, uniqueID = %d, hb_face = %p",
+            typeface, typeface->uniqueID(), mShaperItem.face);
+#endif
+    SkSafeUnref(typeface);
+
+    // Shape
+    assert(mShaperItem.item.length > 0); // Harfbuzz will overwrite other memory if length is 0.
+    size_t size = mShaperItem.item.length * 3 / 2;
+    while (!doShaping(size)) {
+        // We overflowed our glyph arrays. Resize and retry.
+        // HB_ShapeItem fills in shaperItem.num_glyphs with the needed size.
+        size = mShaperItem.num_glyphs * 2;
+    }
+    return baseGlyphCount;
+!!!952716.cpp!!!	computeValues(in paint : SkPaint, in chars : UChar, in start : size_t, in count : size_t, in contextCount : size_t, in dirFlags : int, inout outAdvances : Vector<jfloat>, inout outTotalAdvance : jfloat, inout outGlyphs : Vector<jchar>, inout outPos : Vector<jfloat>) : void
+        *outTotalAdvance = 0;
+        if (!count) {
+            return;
+        }
+
+        UBiDiLevel bidiReq = 0;
+        bool forceLTR = false;
+        bool forceRTL = false;
+
+        switch (dirFlags) {
+            case kBidi_LTR: bidiReq = 0; break; // no ICU constant, canonical LTR level
+            case kBidi_RTL: bidiReq = 1; break; // no ICU constant, canonical RTL level
+            case kBidi_Default_LTR: bidiReq = UBIDI_DEFAULT_LTR; break;
+            case kBidi_Default_RTL: bidiReq = UBIDI_DEFAULT_RTL; break;
+            case kBidi_Force_LTR: forceLTR = true; break; // every char is LTR
+            case kBidi_Force_RTL: forceRTL = true; break; // every char is RTL
+        }
+
+        bool useSingleRun = false;
+        bool isRTL = forceRTL;
+        if (forceLTR || forceRTL) {
+            useSingleRun = true;
+        } else {
+            UBiDi* bidi = ubidi_open();
+            if (bidi) {
+                UErrorCode status = U_ZERO_ERROR;
+#if DEBUG_GLYPHS
+                ALOGD("******** ComputeValues -- start");
+                ALOGD("      -- string = '%s'", String8(chars + start, count).string());
+                ALOGD("      -- start = %d", start);
+                ALOGD("      -- count = %d", count);
+                ALOGD("      -- contextCount = %d", contextCount);
+                ALOGD("      -- bidiReq = %d", bidiReq);
+#endif
+                ubidi_setPara(bidi, chars, contextCount, bidiReq, NULL, &status);
+                if (U_SUCCESS(status)) {
+                    int paraDir = ubidi_getParaLevel(bidi) & kDirection_Mask; // 0 if ltr, 1 if rtl
+                    ssize_t rc = ubidi_countRuns(bidi, &status);
+#if DEBUG_GLYPHS
+                    ALOGD("      -- dirFlags = %d", dirFlags);
+                    ALOGD("      -- paraDir = %d", paraDir);
+                    ALOGD("      -- run-count = %d", int(rc));
+#endif
+                    if (U_SUCCESS(status) && rc == 1) {
+                        // Normal case: one run, status is ok
+                        isRTL = (paraDir == 1);
+                        useSingleRun = true;
+                    } else if (!U_SUCCESS(status) || rc < 1) {
+                        ALOGW("Need to force to single run -- string = '%s',"
+                                " status = %d, rc = %d",
+                                String8(chars + start, count).string(), status, int(rc));
+                        isRTL = (paraDir == 1);
+                        useSingleRun = true;
+                    } else {
+                        int32_t end = start + count;
+                        for (size_t i = 0; i < size_t(rc); ++i) {
+                            int32_t startRun = -1;
+                            int32_t lengthRun = -1;
+                            UBiDiDirection runDir = ubidi_getVisualRun(bidi, i, &startRun, &lengthRun);
+
+                            if (startRun == -1 || lengthRun == -1) {
+                                // Something went wrong when getting the visual run, need to clear
+                                // already computed data before doing a single run pass
+                                ALOGW("Visual run is not valid");
+                                outGlyphs->clear();
+                                outAdvances->clear();
+                                outPos->clear();
+                                *outTotalAdvance = 0;
+                                isRTL = (paraDir == 1);
+                                useSingleRun = true;
+                                break;
+                            }
+
+                            if (startRun >= end) {
+                                continue;
+                            }
+                            int32_t endRun = startRun + lengthRun;
+                            if (endRun <= int32_t(start)) {
+                                continue;
+                            }
+                            if (startRun < int32_t(start)) {
+                                startRun = int32_t(start);
+                            }
+                            if (endRun > end) {
+                                endRun = end;
+                            }
+
+                            lengthRun = endRun - startRun;
+                            isRTL = (runDir == UBIDI_RTL);
+#if DEBUG_GLYPHS
+                            ALOGD("Processing Bidi Run = %d -- run-start = %d, run-len = %d, isRTL = %d",
+                                    i, startRun, lengthRun, isRTL);
+#endif
+                            computeRunValues(paint, chars + startRun, lengthRun, isRTL,
+                                    outAdvances, outTotalAdvance, outGlyphs, outPos);
+
+                        }
+                    }
+                } else {
+                    ALOGW("Cannot set Para");
+                    useSingleRun = true;
+                    isRTL = (bidiReq = 1) || (bidiReq = UBIDI_DEFAULT_RTL);
+                }
+                ubidi_close(bidi);
+            } else {
+                ALOGW("Cannot ubidi_open()");
+                useSingleRun = true;
+                isRTL = (bidiReq = 1) || (bidiReq = UBIDI_DEFAULT_RTL);
+            }
+        }
+
+        // Default single run case
+        if (useSingleRun){
+#if DEBUG_GLYPHS
+            ALOGD("Using a SINGLE BiDi Run "
+                    "-- run-start = %d, run-len = %d, isRTL = %d", start, count, isRTL);
+#endif
+            computeRunValues(paint, chars + start, count, isRTL,
+                    outAdvances, outTotalAdvance, outGlyphs, outPos);
+        }
+
+#if DEBUG_GLYPHS
+        ALOGD("      -- Total returned glyphs-count = %d", outGlyphs->size());
+        ALOGD("******** ComputeValues -- end");
+#endif
+!!!952844.cpp!!!	computeRunValues(in paint : SkPaint, in chars : UChar, in count : size_t, in isRTL : bool, inout outAdvances : Vector<jfloat>, inout outTotalAdvance : jfloat, inout outGlyphs : Vector<jchar>, inout outPos : Vector<jfloat>) : void
+    if (!count) {
+        // We cannot shape an empty run.
+        return;
+    }
+
+    // To be filled in later
+    for (size_t i = 0; i < count; i++) {
+        outAdvances->add(0);
+    }
+    UErrorCode error = U_ZERO_ERROR;
+    bool useNormalizedString = false;
+    for (ssize_t i = count - 1; i >= 0; --i) {
+        UChar ch1 = chars[i];
+        if (::ublock_getCode(ch1) == UBLOCK_COMBINING_DIACRITICAL_MARKS) {
+            // So we have found a diacritic, let's get now the main code point which is paired
+            // with it. As we can have several diacritics in a row, we need to iterate back again
+#if DEBUG_GLYPHS
+            ALOGD("The BiDi run '%s' is containing a Diacritic at position %d",
+                    String8(chars, count).string(), int(i));
+#endif
+            ssize_t j = i - 1;
+            for (; j >= 0;  --j) {
+                UChar ch2 = chars[j];
+                if (::ublock_getCode(ch2) != UBLOCK_COMBINING_DIACRITICAL_MARKS) {
+                    break;
+                }
+            }
+
+            // We could not found the main code point, so we will just use the initial chars
+            if (j < 0) {
+                break;
+            }
+
+#if DEBUG_GLYPHS
+            ALOGD("Found main code point at index %d", int(j));
+#endif
+            // We found the main code point, so we can normalize the "chunk" and fill
+            // the remaining with ZWSP so that the Paint.getTextWidth() APIs will still be able
+            // to get one advance per char
+            mBuffer.remove();
+            Normalizer::normalize(UnicodeString(chars + j, i - j + 1),
+                    UNORM_NFC, 0 /* no options */, mBuffer, error);
+            if (U_SUCCESS(error)) {
+                if (!useNormalizedString) {
+                    useNormalizedString = true;
+                    mNormalizedString.setTo(false /* not terminated*/, chars, count);
+                }
+                // Set the normalized chars
+                for (ssize_t k = j; k < j + mBuffer.length(); ++k) {
+                    mNormalizedString.setCharAt(k, mBuffer.charAt(k - j));
+                }
+                // Fill the remain part with ZWSP (ZWNJ and ZWJ would lead to weird results
+                // because some fonts are missing those glyphs)
+                for (ssize_t k = j + mBuffer.length(); k <= i; ++k) {
+                    mNormalizedString.setCharAt(k, UNICODE_ZWSP);
+                }
+            }
+            i = j - 1;
+        }
+    }
+
+    // Reverse "BiDi mirrored chars" in RTL mode only
+    // See: http://www.unicode.org/Public/6.0.0/ucd/extracted/DerivedBinaryProperties.txt
+    // This is a workaround because Harfbuzz is not able to do mirroring in all cases and
+    // script-run splitting with Harfbuzz is splitting on parenthesis
+    if (isRTL) {
+        for (ssize_t i = 0; i < ssize_t(count); i++) {
+            UChar32 ch = chars[i];
+            if (!u_isMirrored(ch)) continue;
+            if (!useNormalizedString) {
+                useNormalizedString = true;
+                mNormalizedString.setTo(false /* not terminated*/, chars, count);
+            }
+            UChar result =  (UChar) u_charMirror(ch);
+            mNormalizedString.setCharAt(i, result);
+#if DEBUG_GLYPHS
+            ALOGD("Rewriting codepoint '%d' to '%d' at position %d",
+                    ch, mNormalizedString[i], int(i));
+#endif
+        }
+    }
+
+#if DEBUG_GLYPHS
+    if (useNormalizedString) {
+        ALOGD("Will use normalized string '%s', length = %d",
+                    String8(mNormalizedString.getTerminatedBuffer(),
+                            mNormalizedString.length()).string(),
+                    mNormalizedString.length());
+    } else {
+        ALOGD("Normalization is not needed or cannot be done, using initial string");
+    }
+#endif
+
+    assert(mNormalizedString.length() == count);
+
+    // Set the string properties
+    mShaperItem.string = useNormalizedString ? mNormalizedString.getTerminatedBuffer() : chars;
+    mShaperItem.stringLength = count;
+
+    // Define shaping paint properties
+    mShapingPaint.setTextSize(paint->getTextSize());
+    float skewX = paint->getTextSkewX();
+    mShapingPaint.setTextSkewX(skewX);
+    mShapingPaint.setTextScaleX(paint->getTextScaleX());
+    mShapingPaint.setFlags(paint->getFlags());
+    mShapingPaint.setHinting(paint->getHinting());
+    mShapingPaint.setFontVariant(paint->getFontVariant());
+    mShapingPaint.setLanguage(paint->getLanguage());
+
+    // Split the BiDi run into Script runs. Harfbuzz will populate the pos, length and script
+    // into the shaperItem
+    ssize_t indexFontRun = isRTL ? mShaperItem.stringLength - 1 : 0;
+    unsigned numCodePoints = 0;
+    jfloat totalAdvance = *outTotalAdvance;
+    while ((isRTL) ?
+            hb_utf16_script_run_prev(&numCodePoints, &mShaperItem.item, mShaperItem.string,
+                    mShaperItem.stringLength, &indexFontRun):
+            hb_utf16_script_run_next(&numCodePoints, &mShaperItem.item, mShaperItem.string,
+                    mShaperItem.stringLength, &indexFontRun)) {
+
+        ssize_t startScriptRun = mShaperItem.item.pos;
+        size_t countScriptRun = mShaperItem.item.length;
+        ssize_t endScriptRun = startScriptRun + countScriptRun;
+
+#if DEBUG_GLYPHS
+        ALOGD("-------- Start of Script Run --------");
+        ALOGD("Shaping Script Run with");
+        ALOGD("         -- isRTL = %d", isRTL);
+        ALOGD("         -- HB script = %d", mShaperItem.item.script);
+        ALOGD("         -- startFontRun = %d", int(startScriptRun));
+        ALOGD("         -- endFontRun = %d", int(endScriptRun));
+        ALOGD("         -- countFontRun = %d", countScriptRun);
+        ALOGD("         -- run = '%s'", String8(chars + startScriptRun, countScriptRun).string());
+        ALOGD("         -- string = '%s'", String8(chars, count).string());
+#endif
+
+        // Initialize Harfbuzz Shaper and get the base glyph count for offsetting the glyphIDs
+        // and shape the Font run
+        size_t glyphBaseCount = shapeFontRun(paint, isRTL);
+
+#if DEBUG_GLYPHS
+        ALOGD("Got from Harfbuzz");
+        ALOGD("         -- glyphBaseCount = %d", glyphBaseCount);
+        ALOGD("         -- num_glypth = %d", mShaperItem.num_glyphs);
+        ALOGD("         -- kerning_applied = %d", mShaperItem.kerning_applied);
+        ALOGD("         -- isDevKernText = %d", paint->isDevKernText());
+
+        logGlyphs(mShaperItem);
+#endif
+
+        if (mShaperItem.advances == NULL || mShaperItem.num_glyphs == 0) {
+#if DEBUG_GLYPHS
+            ALOGD("Advances array is empty or num_glypth = 0");
+#endif
+            continue;
+        }
+
+#if DEBUG_GLYPHS
+        ALOGD("Returned logclusters");
+        for (size_t i = 0; i < mShaperItem.num_glyphs; i++) {
+            ALOGD("         -- lc[%d] = %d, hb-adv[%d] = %0.2f", i, mShaperItem.log_clusters[i],
+                    i, HBFixedToFloat(mShaperItem.advances[i]));
+        }
+#endif
+        jfloat totalFontRunAdvance = 0;
+        size_t clusterStart = 0;
+        for (size_t i = 0; i < countScriptRun; i++) {
+            size_t cluster = mShaperItem.log_clusters[i];
+            size_t clusterNext = i == countScriptRun - 1 ? mShaperItem.num_glyphs :
+                mShaperItem.log_clusters[i + 1];
+            if (cluster != clusterNext) {
+                jfloat advance = 0;
+                // The advance for the cluster is the sum of the advances of all glyphs within
+                // the cluster.
+                for (size_t j = cluster; j < clusterNext; j++) {
+                    advance += HBFixedToFloat(mShaperItem.advances[j]);
+                }
+                totalFontRunAdvance += advance;
+                outAdvances->replaceAt(advance, startScriptRun + clusterStart);
+                clusterStart = i + 1;
+            }
+        }
+
+#if DEBUG_ADVANCES
+        ALOGD("Returned advances");
+        for (size_t i = 0; i < countScriptRun; i++) {
+            ALOGD("         -- hb-adv[%d] = %0.2f, log_clusters = %d, total = %0.2f", i,
+                    (*outAdvances)[i], mShaperItem.log_clusters[i], totalFontRunAdvance);
+        }
+#endif
+
+        // Get Glyphs and reverse them in place if RTL
+        if (outGlyphs) {
+            size_t countGlyphs = mShaperItem.num_glyphs;
+#if DEBUG_GLYPHS
+            ALOGD("Returned script run glyphs -- count = %d", countGlyphs);
+#endif
+            for (size_t i = 0; i < countGlyphs; i++) {
+                jchar glyph = glyphBaseCount +
+                        (jchar) mShaperItem.glyphs[(!isRTL) ? i : countGlyphs - 1 - i];
+#if DEBUG_GLYPHS
+                ALOGD("         -- glyph[%d] = %d", i, glyph);
+#endif
+                outGlyphs->add(glyph);
+            }
+        }
+
+        // Get glyph positions (and reverse them in place if RTL)
+        if (outPos) {
+            size_t countGlyphs = mShaperItem.num_glyphs;
+            jfloat x = totalAdvance;
+            for (size_t i = 0; i < countGlyphs; i++) {
+                size_t index = (!isRTL) ? i : countGlyphs - 1 - i;
+                float xo = HBFixedToFloat(mShaperItem.offsets[index].x);
+                float yo = HBFixedToFloat(mShaperItem.offsets[index].y);
+                // Apply skewX component of transform to position offsets. Note
+                // that scale has already been applied through x_ and y_scale
+                // set in the mFontRec.
+                outPos->add(x + xo + yo * skewX);
+                outPos->add(yo);
+#if DEBUG_GLYPHS
+                ALOGD("         -- hb adv[%d] = %f, log_cluster[%d] = %d",
+                        index, HBFixedToFloat(mShaperItem.advances[index]),
+                        index, mShaperItem.log_clusters[index]);
+#endif
+                x += HBFixedToFloat(mShaperItem.advances[index]);
+            }
+        }
+
+        totalAdvance += totalFontRunAdvance;
+    }
+
+    *outTotalAdvance = totalAdvance;
+
+#if DEBUG_GLYPHS
+    ALOGD("-------- End of Script Run --------");
+#endif
+!!!953100.cpp!!!	getCachedHBFace(inout typeface : SkTypeface) : HB_Face
+    SkFontID fontId = typeface->uniqueID();
+    ssize_t index = mCachedHBFaces.indexOfKey(fontId);
+    if (index >= 0) {
+        return mCachedHBFaces.valueAt(index);
+    }
+    HB_Face face = HB_NewFace(typeface, harfbuzzSkiaGetTable);
+    if (face) {
+#if DEBUG_GLYPHS
+        ALOGD("Created HB_NewFace %p from paint typeface = %p", face, typeface);
+#endif
+        mCachedHBFaces.add(fontId, face);
+    }
+    return face;
+!!!953228.cpp!!!	doShaping(in size : size_t) : bool
+    if (size > mShaperItemGlyphArraySize) {
+        deleteShaperItemGlyphArrays();
+        createShaperItemGlyphArrays(size);
+    }
+    mShaperItem.num_glyphs = mShaperItemGlyphArraySize;
+    memset(mShaperItem.offsets, 0, mShaperItem.num_glyphs * sizeof(HB_FixedPoint));
+    return HB_ShapeItem(&mShaperItem);
+!!!953356.cpp!!!	createShaperItemGlyphArrays(in size : size_t) : void
+#if DEBUG_GLYPHS
+    ALOGD("Creating Glyph Arrays with size = %d", size);
+#endif
+    mShaperItemGlyphArraySize = size;
+
+    // These arrays are all indexed by glyph.
+    mShaperItem.glyphs = new HB_Glyph[size];
+    mShaperItem.attributes = new HB_GlyphAttributes[size];
+    mShaperItem.advances = new HB_Fixed[size];
+    mShaperItem.offsets = new HB_FixedPoint[size];
+
+    // Although the log_clusters array is indexed by character, Harfbuzz expects that
+    // it is big enough to hold one element per glyph.  So we allocate log_clusters along
+    // with the other glyph arrays above.
+    mShaperItem.log_clusters = new unsigned short[size];
+!!!953484.cpp!!!	deleteShaperItemGlyphArrays() : void
+    delete[] mShaperItem.glyphs;
+    delete[] mShaperItem.attributes;
+    delete[] mShaperItem.advances;
+    delete[] mShaperItem.offsets;
+    delete[] mShaperItem.log_clusters;
+!!!953612.cpp!!!	isComplexScript(in script : HB_Script) : bool
+    switch (script) {
+    case HB_Script_Common:
+    case HB_Script_Greek:
+    case HB_Script_Cyrillic:
+    case HB_Script_Hangul:
+    case HB_Script_Inherited:
+        return false;
+    default:
+        return true;
+    }

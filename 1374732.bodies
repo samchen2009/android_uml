@@ -1,0 +1,1004 @@
+class WifiStateMachine
+!!!9744652.java!!!	WifiStateMachine(inout context : Context, in wlanInterface : String)
+        super(TAG);
+
+        mContext = context;
+        mInterfaceName = wlanInterface;
+
+        mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_WIFI, 0, NETWORKTYPE, "");
+        mBatteryStats = IBatteryStats.Stub.asInterface(ServiceManager.getService("batteryinfo"));
+
+        IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
+        mNwService = INetworkManagementService.Stub.asInterface(b);
+
+        mP2pSupported = mContext.getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_WIFI_DIRECT);
+
+        mWifiNative = new WifiNative(mInterfaceName);
+        mWifiConfigStore = new WifiConfigStore(context, mWifiNative);
+        mWifiMonitor = new WifiMonitor(this, mWifiNative);
+        mDhcpInfoInternal = new DhcpInfoInternal();
+        mWifiInfo = new WifiInfo();
+        mSupplicantStateTracker = new SupplicantStateTracker(context, this, mWifiConfigStore,
+                getHandler());
+        mLinkProperties = new LinkProperties();
+
+        WifiApConfigStore wifiApConfigStore = WifiApConfigStore.makeWifiApConfigStore(
+                context, getHandler());
+        wifiApConfigStore.loadApConfiguration();
+        mWifiApConfigChannel.connectSync(mContext, getHandler(), wifiApConfigStore.getMessenger());
+
+        mNetworkInfo.setIsAvailable(false);
+        mLinkProperties.clear();
+        mLastBssid = null;
+        mLastNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
+        mLastSignalLevel = -1;
+
+        mAlarmManager = (AlarmManager)mContext.getSystemService(Context.ALARM_SERVICE);
+        Intent scanIntent = new Intent(ACTION_START_SCAN, null);
+        mScanIntent = PendingIntent.getBroadcast(mContext, SCAN_REQUEST, scanIntent, 0);
+
+        mDefaultFrameworkScanIntervalMs = mContext.getResources().getInteger(
+                R.integer.config_wifi_framework_scan_interval);
+
+        mDriverStopDelayMs = mContext.getResources().getInteger(
+                R.integer.config_wifi_driver_stop_delay);
+
+        mBackgroundScanSupported = mContext.getResources().getBoolean(
+                R.bool.config_wifi_background_scan_support);
+
+        mPrimaryDeviceType = mContext.getResources().getString(
+                R.string.config_wifi_p2p_device_type);
+
+        mUserWantsSuspendOpt.set(Settings.Global.getInt(mContext.getContentResolver(),
+                    Settings.Global.WIFI_SUSPEND_OPTIMIZATIONS_ENABLED, 1) == 1);
+
+        mContext.registerReceiver(
+            new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    ArrayList<String> available = intent.getStringArrayListExtra(
+                            ConnectivityManager.EXTRA_AVAILABLE_TETHER);
+                    ArrayList<String> active = intent.getStringArrayListExtra(
+                            ConnectivityManager.EXTRA_ACTIVE_TETHER);
+                    sendMessage(CMD_TETHER_STATE_CHANGE, new TetherStateChange(available, active));
+                }
+            },new IntentFilter(ConnectivityManager.ACTION_TETHER_STATE_CHANGED));
+
+        mContext.registerReceiver(
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        startScan(false);
+                    }
+                },
+                new IntentFilter(ACTION_START_SCAN));
+
+        IntentFilter screenFilter = new IntentFilter();
+        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
+        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
+        BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+
+                if (action.equals(Intent.ACTION_SCREEN_ON)) {
+                    handleScreenStateChanged(true);
+                } else if (action.equals(Intent.ACTION_SCREEN_OFF)) {
+                    handleScreenStateChanged(false);
+                }
+            }
+        };
+        mContext.registerReceiver(screenReceiver, screenFilter);
+
+        mContext.registerReceiver(
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                       int counter = intent.getIntExtra(DELAYED_STOP_COUNTER, 0);
+                       sendMessage(obtainMessage(CMD_DELAYED_STOP_DRIVER, counter, 0));
+                    }
+                },
+                new IntentFilter(ACTION_DELAYED_DRIVER_STOP));
+
+        mContext.getContentResolver().registerContentObserver(Settings.Global.getUriFor(
+                Settings.Global.WIFI_SUSPEND_OPTIMIZATIONS_ENABLED), false,
+                new ContentObserver(getHandler()) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        mUserWantsSuspendOpt.set(Settings.Global.getInt(mContext.getContentResolver(),
+                                Settings.Global.WIFI_SUSPEND_OPTIMIZATIONS_ENABLED, 1) == 1);
+                    }
+                });
+
+        mScanResultCache = new LruCache<String, ScanResult>(SCAN_RESULT_CACHE_SIZE);
+
+        PowerManager powerManager = (PowerManager)mContext.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+
+        mSuspendWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WifiSuspend");
+        mSuspendWakeLock.setReferenceCounted(false);
+
+        addState(mDefaultState);
+            addState(mInitialState, mDefaultState);
+            addState(mDriverUnloadingState, mDefaultState);
+            addState(mDriverUnloadedState, mDefaultState);
+                addState(mDriverFailedState, mDriverUnloadedState);
+            addState(mDriverLoadingState, mDefaultState);
+            addState(mDriverLoadedState, mDefaultState);
+            addState(mSupplicantStartingState, mDefaultState);
+            addState(mSupplicantStartedState, mDefaultState);
+                addState(mDriverStartingState, mSupplicantStartedState);
+                addState(mDriverStartedState, mSupplicantStartedState);
+                    addState(mScanModeState, mDriverStartedState);
+                    addState(mConnectModeState, mDriverStartedState);
+                        addState(mL2ConnectedState, mConnectModeState);
+                            addState(mObtainingIpState, mL2ConnectedState);
+                            addState(mVerifyingLinkState, mL2ConnectedState);
+                            addState(mCaptivePortalCheckState, mL2ConnectedState);
+                            addState(mConnectedState, mL2ConnectedState);
+                        addState(mDisconnectingState, mConnectModeState);
+                        addState(mDisconnectedState, mConnectModeState);
+                        addState(mWpsRunningState, mConnectModeState);
+                addState(mWaitForP2pDisableState, mSupplicantStartedState);
+                addState(mDriverStoppingState, mSupplicantStartedState);
+                addState(mDriverStoppedState, mSupplicantStartedState);
+            addState(mSupplicantStoppingState, mDefaultState);
+            addState(mSoftApStartingState, mDefaultState);
+            addState(mSoftApStartedState, mDefaultState);
+                addState(mTetheringState, mSoftApStartedState);
+                addState(mTetheredState, mSoftApStartedState);
+            addState(mSoftApStoppingState, mDefaultState);
+
+        setInitialState(mInitialState);
+
+        setLogRecSize(100);
+        if (DBG) setDbg(true);
+
+        //start the state machine
+        start();
+!!!9744780.java!!!	getMessenger() : Messenger
+        return new Messenger(getHandler());
+!!!9744908.java!!!	syncPingSupplicant(inout channel : AsyncChannel) : boolean
+        Message resultMsg = channel.sendMessageSynchronously(CMD_PING_SUPPLICANT);
+        boolean result = (resultMsg.arg1 != FAILURE);
+        resultMsg.recycle();
+        return result;
+!!!9745036.java!!!	startScan(inout forceActive : boolean) : void
+        sendMessage(obtainMessage(CMD_START_SCAN, forceActive ?
+                SCAN_ACTIVE : SCAN_PASSIVE, 0));
+!!!9745164.java!!!	setWifiEnabled(inout enable : boolean) : void
+        mLastEnableUid.set(Binder.getCallingUid());
+        if (enable) {
+            /* Argument is the state that is entered prior to load */
+            sendMessage(obtainMessage(CMD_LOAD_DRIVER, WIFI_STATE_ENABLING, 0));
+            sendMessage(CMD_START_SUPPLICANT);
+        } else {
+            sendMessage(CMD_STOP_SUPPLICANT);
+            /* Argument is the state that is entered upon success */
+            sendMessage(obtainMessage(CMD_UNLOAD_DRIVER, WIFI_STATE_DISABLED, 0));
+        }
+!!!9745292.java!!!	setWifiApEnabled(inout wifiConfig : WifiConfiguration, inout enable : boolean) : void
+        mLastApEnableUid.set(Binder.getCallingUid());
+        if (enable) {
+            /* Argument is the state that is entered prior to load */
+            sendMessage(obtainMessage(CMD_LOAD_DRIVER, WIFI_AP_STATE_ENABLING, 0));
+            sendMessage(obtainMessage(CMD_START_AP, wifiConfig));
+        } else {
+            sendMessage(CMD_STOP_AP);
+            /* Argument is the state that is entered upon success */
+            sendMessage(obtainMessage(CMD_UNLOAD_DRIVER, WIFI_AP_STATE_DISABLED, 0));
+        }
+!!!9745420.java!!!	setWifiApConfiguration(inout config : WifiConfiguration) : void
+        mWifiApConfigChannel.sendMessage(CMD_SET_AP_CONFIG, config);
+!!!9745548.java!!!	syncGetWifiApConfiguration() : WifiConfiguration
+        Message resultMsg = mWifiApConfigChannel.sendMessageSynchronously(CMD_REQUEST_AP_CONFIG);
+        WifiConfiguration ret = (WifiConfiguration) resultMsg.obj;
+        resultMsg.recycle();
+        return ret;
+!!!9745676.java!!!	syncGetWifiState() : int
+        return mWifiState.get();
+!!!9745804.java!!!	syncGetWifiStateByName() : String
+        switch (mWifiState.get()) {
+            case WIFI_STATE_DISABLING:
+                return "disabling";
+            case WIFI_STATE_DISABLED:
+                return "disabled";
+            case WIFI_STATE_ENABLING:
+                return "enabling";
+            case WIFI_STATE_ENABLED:
+                return "enabled";
+            case WIFI_STATE_UNKNOWN:
+                return "unknown state";
+            default:
+                return "[invalid state]";
+        }
+!!!9745932.java!!!	syncGetWifiApState() : int
+        return mWifiApState.get();
+!!!9746060.java!!!	syncGetWifiApStateByName() : String
+        switch (mWifiApState.get()) {
+            case WIFI_AP_STATE_DISABLING:
+                return "disabling";
+            case WIFI_AP_STATE_DISABLED:
+                return "disabled";
+            case WIFI_AP_STATE_ENABLING:
+                return "enabling";
+            case WIFI_AP_STATE_ENABLED:
+                return "enabled";
+            case WIFI_AP_STATE_FAILED:
+                return "failed";
+            default:
+                return "[invalid state]";
+        }
+!!!9746188.java!!!	syncRequestConnectionInfo() : WifiInfo
+        return mWifiInfo;
+!!!9746316.java!!!	syncGetDhcpInfo() : DhcpInfo
+        synchronized (mDhcpInfoInternal) {
+            return mDhcpInfoInternal.makeDhcpInfo();
+        }
+!!!9746444.java!!!	setDriverStart(inout enable : boolean, inout ecm : boolean) : void
+        if (enable) {
+            sendMessage(CMD_START_DRIVER);
+        } else {
+            sendMessage(obtainMessage(CMD_STOP_DRIVER, ecm ? IN_ECM_STATE : NOT_IN_ECM_STATE, 0));
+        }
+!!!9746572.java!!!	captivePortalCheckComplete() : void
+        sendMessage(obtainMessage(CMD_CAPTIVE_CHECK_COMPLETE));
+!!!9746700.java!!!	setScanOnlyMode(inout enable : boolean) : void
+      if (enable) {
+          sendMessage(obtainMessage(CMD_SET_SCAN_MODE, SCAN_ONLY_MODE, 0));
+      } else {
+          sendMessage(obtainMessage(CMD_SET_SCAN_MODE, CONNECT_MODE, 0));
+      }
+!!!9746828.java!!!	setScanType(inout active : boolean) : void
+      if (active) {
+          sendMessage(obtainMessage(CMD_SET_SCAN_TYPE, SCAN_ACTIVE, 0));
+      } else {
+          sendMessage(obtainMessage(CMD_SET_SCAN_TYPE, SCAN_PASSIVE, 0));
+      }
+!!!9746956.java!!!	syncGetScanResultsList() : ScanResult
+        synchronized (mScanResultCache) {
+            List<ScanResult> scanList = new ArrayList<ScanResult>();
+            for(ScanResult result: mScanResults) {
+                scanList.add(new ScanResult(result));
+            }
+            return scanList;
+        }
+!!!9747084.java!!!	disconnectCommand() : void
+        sendMessage(CMD_DISCONNECT);
+!!!9747212.java!!!	reconnectCommand() : void
+        sendMessage(CMD_RECONNECT);
+!!!9747340.java!!!	reassociateCommand() : void
+        sendMessage(CMD_REASSOCIATE);
+!!!9747468.java!!!	syncAddOrUpdateNetwork(inout channel : AsyncChannel, inout config : WifiConfiguration) : int
+        Message resultMsg = channel.sendMessageSynchronously(CMD_ADD_OR_UPDATE_NETWORK, config);
+        int result = resultMsg.arg1;
+        resultMsg.recycle();
+        return result;
+!!!9747596.java!!!	syncGetConfiguredNetworks(inout channel : AsyncChannel) : WifiConfiguration
+        Message resultMsg = channel.sendMessageSynchronously(CMD_GET_CONFIGURED_NETWORKS);
+        List<WifiConfiguration> result = (List<WifiConfiguration>) resultMsg.obj;
+        resultMsg.recycle();
+        return result;
+!!!9747724.java!!!	syncRemoveNetwork(inout channel : AsyncChannel, in networkId : int) : boolean
+        Message resultMsg = channel.sendMessageSynchronously(CMD_REMOVE_NETWORK, networkId);
+        boolean result = (resultMsg.arg1 != FAILURE);
+        resultMsg.recycle();
+        return result;
+!!!9747852.java!!!	syncEnableNetwork(inout channel : AsyncChannel, in netId : int, inout disableOthers : boolean) : boolean
+        Message resultMsg = channel.sendMessageSynchronously(CMD_ENABLE_NETWORK, netId,
+                disableOthers ? 1 : 0);
+        boolean result = (resultMsg.arg1 != FAILURE);
+        resultMsg.recycle();
+        return result;
+!!!9747980.java!!!	syncDisableNetwork(inout channel : AsyncChannel, in netId : int) : boolean
+        Message resultMsg = channel.sendMessageSynchronously(WifiManager.DISABLE_NETWORK, netId);
+        boolean result = (resultMsg.arg1 != WifiManager.DISABLE_NETWORK_FAILED);
+        resultMsg.recycle();
+        return result;
+!!!9748108.java!!!	addToBlacklist(in bssid : String) : void
+        sendMessage(obtainMessage(CMD_BLACKLIST_NETWORK, bssid));
+!!!9748236.java!!!	clearBlacklist() : void
+        sendMessage(obtainMessage(CMD_CLEAR_BLACKLIST));
+!!!9748364.java!!!	enableRssiPolling(inout enabled : boolean) : void
+       sendMessage(obtainMessage(CMD_ENABLE_RSSI_POLL, enabled ? 1 : 0, 0));
+!!!9748492.java!!!	enableBackgroundScanCommand(inout enabled : boolean) : void
+       sendMessage(obtainMessage(CMD_ENABLE_BACKGROUND_SCAN, enabled ? 1 : 0, 0));
+!!!9748620.java!!!	enableAllNetworks() : void
+        sendMessage(CMD_ENABLE_ALL_NETWORKS);
+!!!9748748.java!!!	startFilteringMulticastV4Packets() : void
+        mFilteringMulticastV4Packets.set(true);
+        sendMessage(obtainMessage(CMD_START_PACKET_FILTERING, MULTICAST_V4, 0));
+!!!9748876.java!!!	stopFilteringMulticastV4Packets() : void
+        mFilteringMulticastV4Packets.set(false);
+        sendMessage(obtainMessage(CMD_STOP_PACKET_FILTERING, MULTICAST_V4, 0));
+!!!9749004.java!!!	startFilteringMulticastV6Packets() : void
+        sendMessage(obtainMessage(CMD_START_PACKET_FILTERING, MULTICAST_V6, 0));
+!!!9749132.java!!!	stopFilteringMulticastV6Packets() : void
+        sendMessage(obtainMessage(CMD_STOP_PACKET_FILTERING, MULTICAST_V6, 0));
+!!!9749260.java!!!	setHighPerfModeEnabled(inout enable : boolean) : void
+        sendMessage(obtainMessage(CMD_SET_HIGH_PERF_MODE, enable ? 1 : 0, 0));
+!!!9749388.java!!!	setCountryCode(in countryCode : String, inout persist : boolean) : void
+        if (persist) {
+            Settings.Global.putString(mContext.getContentResolver(),
+                    Settings.Global.WIFI_COUNTRY_CODE,
+                    countryCode);
+        }
+        sendMessage(obtainMessage(CMD_SET_COUNTRY_CODE, countryCode));
+!!!9749516.java!!!	setFrequencyBand(in band : int, inout persist : boolean) : void
+        if (persist) {
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    Settings.Global.WIFI_FREQUENCY_BAND,
+                    band);
+        }
+        sendMessage(obtainMessage(CMD_SET_FREQUENCY_BAND, band, 0));
+!!!9749644.java!!!	getFrequencyBand() : int
+        return mFrequencyBand.get();
+!!!9749772.java!!!	getConfigFile() : String
+        return mWifiConfigStore.getConfigFile();
+!!!9749900.java!!!	sendBluetoothAdapterStateChange(in state : int) : void
+        sendMessage(obtainMessage(CMD_BLUETOOTH_ADAPTER_STATE_CHANGE, state, 0));
+!!!9750028.java!!!	syncSaveConfig(inout channel : AsyncChannel) : boolean
+        Message resultMsg = channel.sendMessageSynchronously(CMD_SAVE_CONFIG);
+        boolean result = (resultMsg.arg1 != FAILURE);
+        resultMsg.recycle();
+        return result;
+!!!9750156.java!!!	updateBatteryWorkSource(inout newSource : WorkSource) : void
+        synchronized (mRunningWifiUids) {
+            try {
+                if (newSource != null) {
+                    mRunningWifiUids.set(newSource);
+                }
+                if (mIsRunning) {
+                    if (mReportedRunning) {
+                        // If the work source has changed since last time, need
+                        // to remove old work from battery stats.
+                        if (mLastRunningWifiUids.diff(mRunningWifiUids)) {
+                            mBatteryStats.noteWifiRunningChanged(mLastRunningWifiUids,
+                                    mRunningWifiUids);
+                            mLastRunningWifiUids.set(mRunningWifiUids);
+                        }
+                    } else {
+                        // Now being started, report it.
+                        mBatteryStats.noteWifiRunning(mRunningWifiUids);
+                        mLastRunningWifiUids.set(mRunningWifiUids);
+                        mReportedRunning = true;
+                    }
+                } else {
+                    if (mReportedRunning) {
+                        // Last reported we were running, time to stop.
+                        mBatteryStats.noteWifiStopped(mLastRunningWifiUids);
+                        mLastRunningWifiUids.clear();
+                        mReportedRunning = false;
+                    }
+                }
+                mWakeLock.setWorkSource(newSource);
+            } catch (RemoteException ignore) {
+            }
+        }
+!!!9750284.java!!!	toString() : String
+        StringBuffer sb = new StringBuffer();
+        String LS = System.getProperty("line.separator");
+        sb.append("current HSM state: ").append(getCurrentState().getName()).append(LS);
+        sb.append("mLinkProperties ").append(mLinkProperties).append(LS);
+        sb.append("mWifiInfo ").append(mWifiInfo).append(LS);
+        sb.append("mDhcpInfoInternal ").append(mDhcpInfoInternal).append(LS);
+        sb.append("mNetworkInfo ").append(mNetworkInfo).append(LS);
+        sb.append("mLastSignalLevel ").append(mLastSignalLevel).append(LS);
+        sb.append("mLastBssid ").append(mLastBssid).append(LS);
+        sb.append("mLastNetworkId ").append(mLastNetworkId).append(LS);
+        sb.append("mReconnectCount ").append(mReconnectCount).append(LS);
+        sb.append("mIsScanMode ").append(mIsScanMode).append(LS);
+        sb.append("mUserWantsSuspendOpt ").append(mUserWantsSuspendOpt).append(LS);
+        sb.append("mSuspendOptNeedsDisabled ").append(mSuspendOptNeedsDisabled).append(LS);
+        sb.append("Supplicant status").append(LS)
+                .append(mWifiNative.status()).append(LS).append(LS);
+
+        sb.append(mWifiConfigStore.dump());
+        return sb.toString();
+!!!9750412.java!!!	recordLogRec(inout msg : Message) : boolean
+        //Ignore screen on/off & common messages when driver has started
+        if (getCurrentState() == mConnectedState || getCurrentState() == mDisconnectedState) {
+            switch (msg.what) {
+                case CMD_LOAD_DRIVER:
+                case CMD_START_SUPPLICANT:
+                case CMD_START_DRIVER:
+                case CMD_SET_SCAN_MODE:
+                case CMD_SET_HIGH_PERF_MODE:
+                case CMD_SET_SUSPEND_OPT_ENABLED:
+                case CMD_ENABLE_BACKGROUND_SCAN:
+                case CMD_ENABLE_ALL_NETWORKS:
+                return false;
+            }
+        }
+
+        switch (msg.what) {
+            case CMD_START_SCAN:
+            case CMD_ENABLE_RSSI_POLL:
+            case CMD_RSSI_POLL:
+            case CMD_DELAYED_STOP_DRIVER:
+            case WifiMonitor.SCAN_RESULTS_EVENT:
+            case WifiManager.RSSI_PKTCNT_FETCH:
+                return false;
+            default:
+                return true;
+        }
+!!!9750540.java!!!	handleScreenStateChanged(inout screenOn : boolean) : void
+        if (DBG) log("handleScreenStateChanged: " + screenOn);
+        enableRssiPolling(screenOn);
+        if (mBackgroundScanSupported) {
+            enableBackgroundScanCommand(screenOn == false);
+        }
+
+        if (screenOn) enableAllNetworks();
+        if (mUserWantsSuspendOpt.get()) {
+            if (screenOn) {
+                sendMessage(obtainMessage(CMD_SET_SUSPEND_OPT_ENABLED, 0, 0));
+            } else {
+                //Allow 2s for suspend optimizations to be set
+                mSuspendWakeLock.acquire(2000);
+                sendMessage(obtainMessage(CMD_SET_SUSPEND_OPT_ENABLED, 1, 0));
+            }
+        }
+        mScreenBroadcastReceived.set(true);
+!!!9750668.java!!!	checkAndSetConnectivityInstance() : void
+        if (mCm == null) {
+            mCm = (ConnectivityManager) mContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+        }
+!!!9750796.java!!!	startTethering(inout available : ArrayList<String>) : boolean
+
+        boolean wifiAvailable = false;
+
+        checkAndSetConnectivityInstance();
+
+        String[] wifiRegexs = mCm.getTetherableWifiRegexs();
+
+        for (String intf : available) {
+            for (String regex : wifiRegexs) {
+                if (intf.matches(regex)) {
+
+                    InterfaceConfiguration ifcg = null;
+                    try {
+                        ifcg = mNwService.getInterfaceConfig(intf);
+                        if (ifcg != null) {
+                            /* IP/netmask: 192.168.43.1/255.255.255.0 */
+                            ifcg.setLinkAddress(new LinkAddress(
+                                    NetworkUtils.numericToInetAddress("192.168.43.1"), 24));
+                            ifcg.setInterfaceUp();
+
+                            mNwService.setInterfaceConfig(intf, ifcg);
+                        }
+                    } catch (Exception e) {
+                        loge("Error configuring interface " + intf + ", :" + e);
+                        return false;
+                    }
+
+                    if(mCm.tether(intf) != ConnectivityManager.TETHER_ERROR_NO_ERROR) {
+                        loge("Error tethering on " + intf);
+                        return false;
+                    }
+                    mTetherInterfaceName = intf;
+                    return true;
+                }
+            }
+        }
+        // We found no interfaces to tether
+        return false;
+!!!9750924.java!!!	stopTethering() : void
+
+        checkAndSetConnectivityInstance();
+
+        /* Clear the interface config to allow dhcp correctly configure new
+           ip settings */
+        InterfaceConfiguration ifcg = null;
+        try {
+            ifcg = mNwService.getInterfaceConfig(mTetherInterfaceName);
+            if (ifcg != null) {
+                ifcg.setLinkAddress(
+                        new LinkAddress(NetworkUtils.numericToInetAddress("0.0.0.0"), 0));
+                mNwService.setInterfaceConfig(mTetherInterfaceName, ifcg);
+            }
+        } catch (Exception e) {
+            loge("Error resetting interface " + mTetherInterfaceName + ", :" + e);
+        }
+
+        if (mCm.untether(mTetherInterfaceName) != ConnectivityManager.TETHER_ERROR_NO_ERROR) {
+            loge("Untether initiate failed!");
+        }
+!!!9751052.java!!!	isWifiTethered(inout active : ArrayList<String>) : boolean
+
+        checkAndSetConnectivityInstance();
+
+        String[] wifiRegexs = mCm.getTetherableWifiRegexs();
+        for (String intf : active) {
+            for (String regex : wifiRegexs) {
+                if (intf.matches(regex)) {
+                    return true;
+                }
+            }
+        }
+        // We found no interfaces that are tethered
+        return false;
+!!!9751180.java!!!	setCountryCode() : void
+        String countryCode = Settings.Global.getString(mContext.getContentResolver(),
+                Settings.Global.WIFI_COUNTRY_CODE);
+        if (countryCode != null && !countryCode.isEmpty()) {
+            setCountryCode(countryCode, false);
+        } else {
+            //use driver default
+        }
+!!!9751308.java!!!	setFrequencyBand() : void
+        int band = Settings.Global.getInt(mContext.getContentResolver(),
+                Settings.Global.WIFI_FREQUENCY_BAND, WifiManager.WIFI_FREQUENCY_BAND_AUTO);
+        setFrequencyBand(band, false);
+!!!9751436.java!!!	setSuspendOptimizationsNative(in reason : int, inout enabled : boolean) : void
+        if (DBG) log("setSuspendOptimizationsNative: " + reason + " " + enabled);
+        if (enabled) {
+            mSuspendOptNeedsDisabled &= ~reason;
+            /* None of dhcp, screen or highperf need it disabled and user wants it enabled */
+            if (mSuspendOptNeedsDisabled == 0 && mUserWantsSuspendOpt.get()) {
+                mWifiNative.setSuspendOptimizations(true);
+            }
+        } else {
+            mSuspendOptNeedsDisabled |= reason;
+            mWifiNative.setSuspendOptimizations(false);
+        }
+!!!9751564.java!!!	setSuspendOptimizations(in reason : int, inout enabled : boolean) : void
+        if (DBG) log("setSuspendOptimizations: " + reason + " " + enabled);
+        if (enabled) {
+            mSuspendOptNeedsDisabled &= ~reason;
+        } else {
+            mSuspendOptNeedsDisabled |= reason;
+        }
+        if (DBG) log("mSuspendOptNeedsDisabled " + mSuspendOptNeedsDisabled);
+!!!9751692.java!!!	setWifiState(in wifiState : int) : void
+        final int previousWifiState = mWifiState.get();
+
+        try {
+            if (wifiState == WIFI_STATE_ENABLED) {
+                mBatteryStats.noteWifiOn();
+            } else if (wifiState == WIFI_STATE_DISABLED) {
+                mBatteryStats.noteWifiOff();
+            }
+        } catch (RemoteException e) {
+            loge("Failed to note battery stats in wifi");
+        }
+
+        mWifiState.set(wifiState);
+
+        if (DBG) log("setWifiState: " + syncGetWifiStateByName());
+
+        final Intent intent = new Intent(WifiManager.WIFI_STATE_CHANGED_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(WifiManager.EXTRA_WIFI_STATE, wifiState);
+        intent.putExtra(WifiManager.EXTRA_PREVIOUS_WIFI_STATE, previousWifiState);
+        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+!!!9751820.java!!!	setWifiApState(in wifiApState : int) : void
+        final int previousWifiApState = mWifiApState.get();
+
+        try {
+            if (wifiApState == WIFI_AP_STATE_ENABLED) {
+                mBatteryStats.noteWifiOn();
+            } else if (wifiApState == WIFI_AP_STATE_DISABLED) {
+                mBatteryStats.noteWifiOff();
+            }
+        } catch (RemoteException e) {
+            loge("Failed to note battery stats in wifi");
+        }
+
+        // Update state
+        mWifiApState.set(wifiApState);
+
+        if (DBG) log("setWifiApState: " + syncGetWifiApStateByName());
+
+        final Intent intent = new Intent(WifiManager.WIFI_AP_STATE_CHANGED_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(WifiManager.EXTRA_WIFI_AP_STATE, wifiApState);
+        intent.putExtra(WifiManager.EXTRA_PREVIOUS_WIFI_AP_STATE, previousWifiApState);
+        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+!!!9751948.java!!!	setScanResults(in scanResults : String) : void
+        String bssid = "";
+        int level = 0;
+        int freq = 0;
+        long tsf = 0;
+        String flags = "";
+        WifiSsid wifiSsid = null;
+
+        if (scanResults == null) {
+            return;
+        }
+
+        synchronized(mScanResultCache) {
+            mScanResults = new ArrayList<ScanResult>();
+            String[] lines = scanResults.split("\n");
+
+            for (String line : lines) {
+                if (line.startsWith(BSSID_STR)) {
+                    bssid = line.substring(BSSID_STR.length());
+                } else if (line.startsWith(FREQ_STR)) {
+                    try {
+                        freq = Integer.parseInt(line.substring(FREQ_STR.length()));
+                    } catch (NumberFormatException e) {
+                        freq = 0;
+                    }
+                } else if (line.startsWith(LEVEL_STR)) {
+                    try {
+                        level = Integer.parseInt(line.substring(LEVEL_STR.length()));
+                        /* some implementations avoid negative values by adding 256
+                         * so we need to adjust for that here.
+                         */
+                        if (level > 0) level -= 256;
+                    } catch(NumberFormatException e) {
+                        level = 0;
+                    }
+                } else if (line.startsWith(TSF_STR)) {
+                    try {
+                        tsf = Long.parseLong(line.substring(TSF_STR.length()));
+                    } catch (NumberFormatException e) {
+                        tsf = 0;
+                    }
+                } else if (line.startsWith(FLAGS_STR)) {
+                    flags = line.substring(FLAGS_STR.length());
+                } else if (line.startsWith(SSID_STR)) {
+                    wifiSsid = WifiSsid.createFromAsciiEncoded(
+                            line.substring(SSID_STR.length()));
+                } else if (line.startsWith(DELIMITER_STR)) {
+                    if (bssid != null) {
+                        String ssid = (wifiSsid != null) ? wifiSsid.toString() : WifiSsid.NONE;
+                        String key = bssid + ssid;
+                        ScanResult scanResult = mScanResultCache.get(key);
+                        if (scanResult != null) {
+                            scanResult.level = level;
+                            scanResult.wifiSsid = wifiSsid;
+                            // Keep existing API
+                            scanResult.SSID = (wifiSsid != null) ? wifiSsid.toString() :
+                                    WifiSsid.NONE;
+                            scanResult.capabilities = flags;
+                            scanResult.frequency = freq;
+                            scanResult.timestamp = tsf;
+                        } else {
+                            scanResult =
+                                new ScanResult(
+                                        wifiSsid, bssid, flags, level, freq, tsf);
+                            mScanResultCache.put(key, scanResult);
+                        }
+                        mScanResults.add(scanResult);
+                    }
+                    bssid = null;
+                    level = 0;
+                    freq = 0;
+                    tsf = 0;
+                    flags = "";
+                    wifiSsid = null;
+                }
+            }
+        }
+!!!9752076.java!!!	fetchRssiAndLinkSpeedNative() : void
+        int newRssi = -1;
+        int newLinkSpeed = -1;
+
+        String signalPoll = mWifiNative.signalPoll();
+
+        if (signalPoll != null) {
+            String[] lines = signalPoll.split("\n");
+            for (String line : lines) {
+                String[] prop = line.split("=");
+                if (prop.length < 2) continue;
+                try {
+                    if (prop[0].equals("RSSI")) {
+                        newRssi = Integer.parseInt(prop[1]);
+                    } else if (prop[0].equals("LINKSPEED")) {
+                        newLinkSpeed = Integer.parseInt(prop[1]);
+                    }
+                } catch (NumberFormatException e) {
+                    //Ignore, defaults on rssi and linkspeed are assigned
+                }
+            }
+        }
+
+        if (newRssi != -1 && MIN_RSSI < newRssi && newRssi < MAX_RSSI) { // screen out invalid values
+            /* some implementations avoid negative values by adding 256
+             * so we need to adjust for that here.
+             */
+            if (newRssi > 0) newRssi -= 256;
+            mWifiInfo.setRssi(newRssi);
+            /*
+             * Rather then sending the raw RSSI out every time it
+             * changes, we precalculate the signal level that would
+             * be displayed in the status bar, and only send the
+             * broadcast if that much more coarse-grained number
+             * changes. This cuts down greatly on the number of
+             * broadcasts, at the cost of not informing others
+             * interested in RSSI of all the changes in signal
+             * level.
+             */
+            int newSignalLevel = WifiManager.calculateSignalLevel(newRssi, WifiManager.RSSI_LEVELS);
+            if (newSignalLevel != mLastSignalLevel) {
+                sendRssiChangeBroadcast(newRssi);
+            }
+            mLastSignalLevel = newSignalLevel;
+        } else {
+            mWifiInfo.setRssi(MIN_RSSI);
+        }
+
+        if (newLinkSpeed != -1) {
+            mWifiInfo.setLinkSpeed(newLinkSpeed);
+        }
+!!!9752204.java!!!	fetchPktcntNative(inout info : RssiPacketCountInfo) : void
+        String pktcntPoll = mWifiNative.pktcntPoll();
+
+        if (pktcntPoll != null) {
+            String[] lines = pktcntPoll.split("\n");
+            for (String line : lines) {
+                String[] prop = line.split("=");
+                if (prop.length < 2) continue;
+                try {
+                    if (prop[0].equals("TXGOOD")) {
+                        info.txgood = Integer.parseInt(prop[1]);
+                    } else if (prop[0].equals("TXBAD")) {
+                        info.txbad = Integer.parseInt(prop[1]);
+                    }
+                } catch (NumberFormatException e) {
+                    //Ignore
+                }
+            }
+        }
+!!!9752332.java!!!	configureLinkProperties() : void
+        if (mWifiConfigStore.isUsingStaticIp(mLastNetworkId)) {
+            mLinkProperties = mWifiConfigStore.getLinkProperties(mLastNetworkId);
+        } else {
+            synchronized (mDhcpInfoInternal) {
+                mLinkProperties = mDhcpInfoInternal.makeLinkProperties();
+            }
+            mLinkProperties.setHttpProxy(mWifiConfigStore.getProxyProperties(mLastNetworkId));
+        }
+        mLinkProperties.setInterfaceName(mInterfaceName);
+        if (DBG) {
+            log("netId=" + mLastNetworkId  + " Link configured: " +
+                    mLinkProperties.toString());
+        }
+!!!9752460.java!!!	getMaxDhcpRetries() : int
+        return Settings.Global.getInt(mContext.getContentResolver(),
+                                      Settings.Global.WIFI_MAX_DHCP_RETRY_COUNT,
+                                      DEFAULT_MAX_DHCP_RETRIES);
+!!!9752588.java!!!	sendScanResultsAvailableBroadcast() : void
+        Intent intent = new Intent(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+!!!9752716.java!!!	sendRssiChangeBroadcast(in newRssi : int) : void
+        Intent intent = new Intent(WifiManager.RSSI_CHANGED_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(WifiManager.EXTRA_NEW_RSSI, newRssi);
+        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+!!!9752844.java!!!	sendNetworkStateChangeBroadcast(in bssid : String) : void
+        Intent intent = new Intent(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(WifiManager.EXTRA_NETWORK_INFO, new NetworkInfo(mNetworkInfo));
+        intent.putExtra(WifiManager.EXTRA_LINK_PROPERTIES, new LinkProperties (mLinkProperties));
+        if (bssid != null)
+            intent.putExtra(WifiManager.EXTRA_BSSID, bssid);
+        if (mNetworkInfo.getDetailedState() == DetailedState.VERIFYING_POOR_LINK ||
+                mNetworkInfo.getDetailedState() == DetailedState.CONNECTED) {
+            intent.putExtra(WifiManager.EXTRA_WIFI_INFO, new WifiInfo(mWifiInfo));
+        }
+        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+!!!9752972.java!!!	sendLinkConfigurationChangedBroadcast() : void
+        Intent intent = new Intent(WifiManager.LINK_CONFIGURATION_CHANGED_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(WifiManager.EXTRA_LINK_PROPERTIES, new LinkProperties(mLinkProperties));
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+!!!9753100.java!!!	sendSupplicantConnectionChangedBroadcast(inout connected : boolean) : void
+        Intent intent = new Intent(WifiManager.SUPPLICANT_CONNECTION_CHANGE_ACTION);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        intent.putExtra(WifiManager.EXTRA_SUPPLICANT_CONNECTED, connected);
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+!!!9753228.java!!!	setNetworkDetailedState(inout state : DetailedState) : void
+        if (DBG) {
+            log("setDetailed state, old ="
+                    + mNetworkInfo.getDetailedState() + " and new state=" + state);
+        }
+
+        if (state != mNetworkInfo.getDetailedState()) {
+            mNetworkInfo.setDetailedState(state, null, mWifiInfo.getSSID());
+        }
+!!!9753356.java!!!	getNetworkDetailedState() : DetailedState
+        return mNetworkInfo.getDetailedState();
+!!!9753484.java!!!	handleSupplicantStateChange(inout message : Message) : SupplicantState
+        StateChangeResult stateChangeResult = (StateChangeResult) message.obj;
+        SupplicantState state = stateChangeResult.state;
+        // Supplicant state change
+        // [31-13] Reserved for future use
+        // [8 - 0] Supplicant state (as defined in SupplicantState.java)
+        // 50023 supplicant_state_changed (custom|1|5)
+        EventLog.writeEvent(EVENTLOG_SUPPLICANT_STATE_CHANGED, state.ordinal());
+        mWifiInfo.setSupplicantState(state);
+        // Network id is only valid when we start connecting
+        if (SupplicantState.isConnecting(state)) {
+            mWifiInfo.setNetworkId(stateChangeResult.networkId);
+        } else {
+            mWifiInfo.setNetworkId(WifiConfiguration.INVALID_NETWORK_ID);
+        }
+
+        mWifiInfo.setBSSID(stateChangeResult.BSSID);
+        mWifiInfo.setSSID(stateChangeResult.wifiSsid);
+
+        mSupplicantStateTracker.sendMessage(Message.obtain(message));
+
+        return state;
+!!!9753612.java!!!	handleNetworkDisconnect() : void
+        if (DBG) log("Stopping DHCP and clearing IP");
+
+        /*
+         * stop DHCP
+         */
+        if (mDhcpStateMachine != null) {
+            /* In case we were in middle of DHCP operation
+               restore back powermode */
+            handlePostDhcpSetup();
+            mDhcpStateMachine.sendMessage(DhcpStateMachine.CMD_STOP_DHCP);
+        }
+
+        try {
+            mNwService.clearInterfaceAddresses(mInterfaceName);
+            mNwService.disableIpv6(mInterfaceName);
+        } catch (Exception e) {
+            loge("Failed to clear addresses or disable ipv6" + e);
+        }
+
+        /* Reset data structures */
+        mWifiInfo.setInetAddress(null);
+        mWifiInfo.setBSSID(null);
+        mWifiInfo.setSSID(null);
+        mWifiInfo.setNetworkId(WifiConfiguration.INVALID_NETWORK_ID);
+        mWifiInfo.setRssi(MIN_RSSI);
+        mWifiInfo.setLinkSpeed(-1);
+        mWifiInfo.setMeteredHint(false);
+
+        setNetworkDetailedState(DetailedState.DISCONNECTED);
+        mWifiConfigStore.updateStatus(mLastNetworkId, DetailedState.DISCONNECTED);
+
+        /* send event to CM & network change broadcast */
+        sendNetworkStateChangeBroadcast(mLastBssid);
+
+        /* Clear network properties */
+        mLinkProperties.clear();
+        /* Clear IP settings if the network used DHCP */
+        if (!mWifiConfigStore.isUsingStaticIp(mLastNetworkId)) {
+            mWifiConfigStore.clearIpConfiguration(mLastNetworkId);
+        }
+
+        mLastBssid= null;
+        mLastNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
+!!!9753740.java!!!	handlePreDhcpSetup() : void
+        if (!mBluetoothConnectionActive) {
+            /*
+             * There are problems setting the Wi-Fi driver's power
+             * mode to active when bluetooth coexistence mode is
+             * enabled or sense.
+             * <p>
+             * We set Wi-Fi to active mode when
+             * obtaining an IP address because we've found
+             * compatibility issues with some routers with low power
+             * mode.
+             * <p>
+             * In order for this active power mode to properly be set,
+             * we disable coexistence mode until we're done with
+             * obtaining an IP address.  One exception is if we
+             * are currently connected to a headset, since disabling
+             * coexistence would interrupt that connection.
+             */
+            // Disable the coexistence mode
+            mWifiNative.setBluetoothCoexistenceMode(
+                    mWifiNative.BLUETOOTH_COEXISTENCE_MODE_DISABLED);
+        }
+
+        /* Disable power save and suspend optimizations during DHCP */
+        // Note: The order here is important for now. Brcm driver changes
+        // power settings when we control suspend mode optimizations.
+        // TODO: Remove this comment when the driver is fixed.
+        setSuspendOptimizationsNative(SUSPEND_DUE_TO_DHCP, false);
+        mWifiNative.setPowerSave(false);
+!!!9753868.java!!!	handlePostDhcpSetup() : void
+        /* Restore power save and suspend optimizations */
+        setSuspendOptimizationsNative(SUSPEND_DUE_TO_DHCP, true);
+        mWifiNative.setPowerSave(true);
+
+        // Set the coexistence mode back to its default value
+        mWifiNative.setBluetoothCoexistenceMode(
+                mWifiNative.BLUETOOTH_COEXISTENCE_MODE_SENSE);
+!!!9753996.java!!!	handleSuccessfulIpConfiguration(inout dhcpInfoInternal : DhcpInfoInternal) : void
+        synchronized (mDhcpInfoInternal) {
+            mDhcpInfoInternal = dhcpInfoInternal;
+        }
+        mLastSignalLevel = -1; // force update of signal strength
+        mReconnectCount = 0; //Reset IP failure tracking
+        mWifiConfigStore.setIpConfiguration(mLastNetworkId, dhcpInfoInternal);
+        InetAddress addr = NetworkUtils.numericToInetAddress(dhcpInfoInternal.ipAddress);
+        mWifiInfo.setInetAddress(addr);
+        mWifiInfo.setMeteredHint(dhcpInfoInternal.hasMeteredHint());
+        if (getNetworkDetailedState() == DetailedState.CONNECTED) {
+            //DHCP renewal in connected state
+            LinkProperties linkProperties = dhcpInfoInternal.makeLinkProperties();
+            linkProperties.setHttpProxy(mWifiConfigStore.getProxyProperties(mLastNetworkId));
+            linkProperties.setInterfaceName(mInterfaceName);
+            if (!linkProperties.equals(mLinkProperties)) {
+                if (DBG) {
+                    log("Link configuration changed for netId: " + mLastNetworkId
+                            + " old: " + mLinkProperties + "new: " + linkProperties);
+                }
+                mLinkProperties = linkProperties;
+                sendLinkConfigurationChangedBroadcast();
+            }
+        } else {
+            configureLinkProperties();
+        }
+!!!9754124.java!!!	handleFailedIpConfiguration() : void
+        loge("IP configuration failed");
+
+        mWifiInfo.setInetAddress(null);
+        mWifiInfo.setMeteredHint(false);
+        /**
+         * If we've exceeded the maximum number of retries for DHCP
+         * to a given network, disable the network
+         */
+        int maxRetries = getMaxDhcpRetries();
+        // maxRetries == 0 means keep trying forever
+        if (maxRetries > 0 && ++mReconnectCount > maxRetries) {
+            loge("Failed " +
+                    mReconnectCount + " times, Disabling " + mLastNetworkId);
+            mWifiConfigStore.disableNetwork(mLastNetworkId,
+                    WifiConfiguration.DISABLED_DHCP_FAILURE);
+            mReconnectCount = 0;
+        }
+
+        /* DHCP times out after about 30 seconds, we do a
+         * disconnect and an immediate reconnect to try again
+         */
+        mWifiNative.disconnect();
+        mWifiNative.reconnect();
+!!!9754252.java!!!	startSoftApWithConfig(in config : WifiConfiguration) : void
+        // start hostapd on a seperate thread
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    mNwService.startAccessPoint(config, mInterfaceName);
+                } catch (Exception e) {
+                    loge("Exception in softap start " + e);
+                    try {
+                        mNwService.stopAccessPoint(mInterfaceName);
+                        mNwService.startAccessPoint(config, mInterfaceName);
+                    } catch (Exception e1) {
+                        loge("Exception in softap re-start " + e1);
+                        sendMessage(CMD_START_AP_FAILURE);
+                        return;
+                    }
+                }
+                if (DBG) log("Soft AP start successful");
+                sendMessage(CMD_START_AP_SUCCESS);
+            }
+        }).start();
+!!!9762828.java!!!	replyToMessage(inout msg : Message, in what : int) : void
+        if (msg.replyTo == null) return;
+        Message dstMsg = obtainMessageWithArg2(msg);
+        dstMsg.what = what;
+        mReplyChannel.replyToMessage(msg, dstMsg);
+!!!9762956.java!!!	replyToMessage(inout msg : Message, in what : int, in arg1 : int) : void
+        if (msg.replyTo == null) return;
+        Message dstMsg = obtainMessageWithArg2(msg);
+        dstMsg.what = what;
+        dstMsg.arg1 = arg1;
+        mReplyChannel.replyToMessage(msg, dstMsg);
+!!!9763084.java!!!	replyToMessage(inout msg : Message, in what : int, inout obj : Object) : void
+        if (msg.replyTo == null) return;
+        Message dstMsg = obtainMessageWithArg2(msg);
+        dstMsg.what = what;
+        dstMsg.obj = obj;
+        mReplyChannel.replyToMessage(msg, dstMsg);
+!!!9763212.java!!!	obtainMessageWithArg2(inout srcMsg : Message) : Message
+        Message msg = Message.obtain();
+        msg.arg2 = srcMsg.arg2;
+        return msg;
+!!!9763340.java!!!	log(in s : String) : void
+        Log.d(TAG, s);
+!!!9763468.java!!!	loge(in s : String) : void
+        Log.e(TAG, s);

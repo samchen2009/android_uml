@@ -1,0 +1,249 @@
+class SmoothStreamingSource
+!!!12702988.java!!!	SmoothStreamingSource(in url : String, inout context : Context)
+        mContext = context;
+        mUrl = url;
+
+        mHandlerLock = new ReentrantLock();
+        mFetcher = new SmoothStreamingDataFetcher();
+!!!12703116.java!!!	buildPath(in path : String) : String
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+            return path;
+        }
+
+        String basePath = mUrl;
+        if (basePath.endsWith("/")) {
+            basePath = mUrl.substring(0, mUrl.length() - 1);
+        }
+
+        String additional = path;
+        if (additional.startsWith("/")) {
+            additional = path.substring(1, path.length());
+        }
+
+        return basePath + "/" + additional;
+!!!12703500.java!!!	onStart(inout mediaInfo : MediaInfo) : void
+        resetHandlerThread();
+        resetIsmParser();
+        resetSessions();
+
+        String path = buildPath("/Manifest");
+
+        ByteBuffer buffer = mFetcher.getData(path);
+        if (buffer == null) {
+            // Failed.
+            Log.e(TAG, "Failed to get data from " + path);
+            return;
+        }
+        String data = SmoothStreamingUtil.decode(buffer);
+        try {
+            mMedia = mIsmParser.parse(data);
+        } catch (XmlPullParserException e) {
+            Log.e(TAG, "XmlPullParserException while parsing the manifest file");
+            return;
+        } catch (IOException e) {
+            Log.e(TAG, "IOException while parsing the manifest file");
+            return;
+        }
+
+        if (mMedia != null) {
+            handleIsm(mMedia, mediaInfo);
+        }
+
+        Message msg = mHandlerThread.mSourceHandler.obtainMessage(
+                SmoothStreamingConstants.SS_START);
+        mHandlerThread.mSourceHandler.sendMessage(msg);
+!!!12703628.java!!!	resetSessions() : void
+        mSessionManager.clearSessions();
+!!!12703756.java!!!	resetHandlerThread() : void
+        if (mHandlerThread != null) {
+            mHandlerThread.mSourceLooper.quit();
+            mHandlerThread = null;
+        }
+
+        mHandlerThread = new StreamFetcherThread();
+        mHandlerThread.setDaemon(true);
+
+        mFetcherHandlerReady = mHandlerLock.newCondition();
+        mHandlerThread.start();
+        mHandlerLock.lock();
+        try {
+            mFetcherHandlerReady.await();
+        } catch (InterruptedException e) {
+            Log.w("SmoothStreamingSource", e.getMessage());
+        } finally {
+            mHandlerLock.unlock();
+        }
+
+        mSessionManager = new SmoothStreamingSessionManager(mHandlerThread.mSourceHandler);
+        mFetcher.setBandwidthObserver(mSessionManager);
+!!!12703884.java!!!	resetIsmParser() : void
+        if (mIsmParser != null) {
+            mIsmParser = null;
+        }
+
+        mIsmParser = new SmoothStreamingIsmParser();
+!!!12704012.java!!!	handleIsm(inout media : SmoothStreamingMedia, inout mediaInfo : MediaInfo) : void
+        mediaInfo.setDuration((int) media.getDuration() / 1000);
+        mediaInfo.setSeekable(false);
+
+        for (StreamElement e : media.getStreamElements()) {
+            String mime = getMimeType(e);
+
+            assert(!SmoothStreamingUtil.isNullOrEmptyString(mime));
+            TrackMetadata track = null;
+            switch (e.getType()) {
+                case STREAM_AUDIO: {
+                    track = mediaInfo.addTrack(TrackMetadata.TRACK_TYPE_AUDIO, e.getName());
+                    track.setInteger(TrackMetadata.KEY_CHANNEL_COUNT,
+                                          e.getTracks().get(0).getChannels());
+                    track.setInteger(TrackMetadata.KEY_SAMPLE_RATE,
+                                          e.getTracks().get(0).getSamplingRate());
+                    track.setInteger(TrackMetadata.KEY_BITRATE,
+                                          e.getTracks().get(0).getBitrate());
+                    if (media.getProtectionElement() != null) {
+                        track.setBoolean(TrackMetadata.KEY_IS_DRM, true);
+                    }
+                    break;
+                }
+                case STREAM_VIDEO: {
+                    track = mediaInfo.addTrack(TrackMetadata.TRACK_TYPE_VIDEO, e.getName());
+                    int displayHeight = e.getDisplayHeight();
+                    if (displayHeight <= 0) {
+                        for (TrackElement t : e.getTracks()) {
+                            if (displayHeight < t.getMaxHeight()) {
+                                displayHeight = t.getMaxHeight();
+                            }
+                        }
+                    }
+                    track.setInteger(TrackMetadata.KEY_HEIGHT, displayHeight);
+                    int displayWidth = e.getDisplayWidth();
+                    if (displayWidth <= 0) {
+                        for (TrackElement t : e.getTracks()) {
+                            if (displayWidth < t.getMaxWidth()) {
+                                displayWidth = t.getMaxWidth();
+                            }
+                        }
+                    }
+                    track.setInteger(TrackMetadata.KEY_WIDTH, displayWidth);
+                    if (media.getProtectionElement() != null) {
+                        track.setBoolean(TrackMetadata.KEY_IS_DRM, true);
+                    }
+                    break;
+                }
+                case STREAM_TEXT: {
+                    track = mediaInfo.addTrack(TrackMetadata.TRACK_TYPE_TEXT, e.getName());
+                    break;
+                }
+                default: {
+                    break;
+                }
+            }
+            track.setString(TrackMetadata.KEY_MIME_TYPE, mime);
+
+            int trackId = track.getInteger(TrackMetadata.KEY_TRACK_ID);
+            e.setTrackId(trackId);
+            mSessionManager.addNewSession(trackId, e);
+        }
+
+        if (media.getProtectionElement() != null) {
+            ProtectionHeaderElement protectionHeader =
+                    media.getProtectionElement().getProtectionHeader();
+            if (protectionHeader != null && protectionHeader.getSystemId() != null) {
+                UUID uuid = UUID.fromString(protectionHeader.getSystemId());
+                ByteBuffer buffer = ByteBuffer.allocate(16);
+                buffer.putLong(uuid.getMostSignificantBits());
+                buffer.putLong(uuid.getLeastSignificantBits());
+                mediaInfo.setDrmUuid(buffer.array());
+
+                final UUID playReadyUuid = UUID.fromString("9a04f079-9840-4286-ab92-e65be0885f95");
+                if (uuid != null && playReadyUuid.compareTo(uuid) == 0) {
+                    mediaInfo.setDrmSessionId(mUrl.getBytes());
+                    setupPlayReadyDrm(protectionHeader);
+                } else {
+                    Log.e(TAG, "Non-PR UUID is not supported.");
+                }
+            }
+        }
+!!!12704140.java!!!	setupPlayReadyDrm(inout protectionHeader : ProtectionHeaderElement) : void
+        mDrmManagerClient = new DrmManagerClient(mContext);
+        DrmInfoRequest registerRequest = new DrmInfoRequest(
+                DrmInfoRequest.TYPE_REGISTRATION_INFO, sMimeTypePlayReady);
+        registerRequest.put(sPRKeyContentsPath, mUrl);
+        registerRequest.put(sPRKeyPlayReadyObject, protectionHeader.getHeaderContent());
+        DrmInfo drmInfo = mDrmManagerClient.acquireDrmInfo(registerRequest);
+        if (drmInfo == null) {
+            Log.e("TAG", "PR DRM registeration is failed.");
+            return;
+        }
+
+        int status = mDrmManagerClient.checkRightsStatus(mUrl, Action.PLAY);
+        if (status != RightsStatus.RIGHTS_VALID && status != RightsStatus.RIGHTS_NOT_ACQUIRED) {
+            Log.e("TAG", "DRM status is invaild.");
+            return;
+        }
+!!!12704268.java!!!	setUrl(in url : String) : void
+        this.mUrl = url;
+!!!12704396.java!!!	getMimeType(inout e : StreamElement) : String
+        List<TrackElement> tracks = e.getTracks();
+        if (tracks.isEmpty()) {
+            return "";
+        }
+
+        String fourCC = tracks.get(0).getFourCC();
+        SmoothStreamingConstants.SourceType type =
+                SmoothStreamingConstants.SourceType.fromFourcc(fourCC);
+        if (type == SmoothStreamingConstants.SourceType.UNSUPPORTED) {
+            return "";
+        }
+
+        return type.getMimiType();
+!!!12704524.java!!!	onDequeueAccessUnit(in trackId : int) : AccessUnit
+        if (mSessionManager.wouldBlock()) {
+            return AccessUnit.createWillBlock(sWaitTimeMsForPreparingSeesion);
+        }
+
+        SmoothStreamSample sample = mSessionManager.dequeueSample(trackId);
+
+        if (sample == null) {
+            return AccessUnit.createWillBlock(sDefaultWouldBlockMs);
+        }
+
+        AccessUnitMetadata auMeta = new AccessUnitMetadata();
+        auMeta.setLong(AccessUnitMetadata.PTS_TIME_US, sample.startTime);
+        if (sample.cryptoInfo != null) {
+            auMeta.setByteArray(AccessUnitMetadata.CRYPTO_INFO, sample.cryptoInfo.toByteArray());
+        }
+        if (sample.isCodecSpecificData) {
+            auMeta.setBoolean(AccessUnitMetadata.IS_CODEC_SPECIFIC_DATA, true);
+        }
+        AccessUnit accessUnit = AccessUnit.createAccessUnit(sample.buffer, auMeta);
+        return accessUnit;
+!!!12704652.java!!!	onHandleDiscontinuity(inout track : TrackMetadata) : void
+        // TODO: implement this
+!!!12704780.java!!!	onSeekTo(in arg0 : long) : void
+        // TODO: implement this
+!!!12704908.java!!!	onDeselectTrack(inout track : TrackMetadata) : void
+        Message msg = mHandlerThread.mSourceHandler.obtainMessage(
+                SmoothStreamingConstants.SS_UNUSE_TRACK);
+        msg.arg1 = track.getTrackId();
+        mHandlerThread.mSourceHandler.sendMessage(msg);
+!!!12705036.java!!!	onSelectTrack(inout track : TrackMetadata) : void
+        Message msg = mHandlerThread.mSourceHandler.obtainMessage(
+                SmoothStreamingConstants.SS_USE_TRACK);
+        msg.arg1 = track.getTrackId();
+        mHandlerThread.mSourceHandler.sendMessage(msg);
+!!!12705164.java!!!	onRelease() : void
+        if (mDrmManagerClient != null) {
+            DrmInfoRequest registerRequest = new DrmInfoRequest(
+                    DrmInfoRequest.TYPE_UNREGISTRATION_INFO, sMimeTypePlayReady);
+            registerRequest.put(sPRKeyContentsPath, mUrl);
+            DrmInfo drmInfo = mDrmManagerClient.acquireDrmInfo(registerRequest);
+            if (drmInfo == null) {
+                Log.e("TAG", "PR DRM unregisteration is failed.");
+            }
+        }
+        if (mHandlerThread != null) {
+            mHandlerThread.mSourceLooper.quit();
+            mHandlerThread = null;
+        }
+        mFetcher = null;

@@ -1,0 +1,129 @@
+class STOR
+!!!13398540.java!!!	execute(in session : FtpIoSession, in context : FtpServerContext, in request : FtpRequest) : void
+        try {
+            // check free size of the storage
+            if (!Util.hasEnoughStorage()) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_552_REQUESTED_FILE_ACTION_ABORTED_EXCEEDED_STORAGE,
+                        "STOR: Disk is not enough or read-only."));
+                return;
+            }
+
+            // get state variable
+            long skipLen = session.getFileOffset();
+
+            // argument check
+            String fileName = request.getArgument();
+            if (fileName == null) {
+                session.write(new DefaultFtpReply(
+                                FtpReply.REPLY_501_SYNTAX_ERROR_IN_PARAMETERS_OR_ARGUMENTS,
+                                "STOR: syntax error in parameters or arguments."));
+                return;
+            }
+
+            // 24-10-2007 - added check if PORT or PASV is issued, see
+            // https://issues.apache.org/jira/browse/FTPSERVER-110
+            DataConnectionFactory connFactory = session.getDataConnection();
+            if (connFactory instanceof IODataConnectionFactory) {
+                InetAddress address = ((IODataConnectionFactory) connFactory)
+                        .getInetAddress();
+                if (address == null) {
+                    session.write(new DefaultFtpReply(
+                            FtpReply.REPLY_503_BAD_SEQUENCE_OF_COMMANDS,
+                            "PORT or PASV must be issued first"));
+                    return;
+                }
+            }
+
+            // get filename
+            FtpFile file = null;
+            try {
+                file = session.getFileSystemView().getFile(fileName);
+            } catch (Exception ex) {
+                LOG.debug("Exception getting file object", ex);
+            }
+            if (file == null) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_550_REQUESTED_ACTION_NOT_TAKEN,
+                        "STOR: invalid file " + fileName + "."));
+                return;
+            }
+            fileName = file.getAbsolutePath();
+
+            // get permission
+            if (!file.isWritable()) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_550_REQUESTED_ACTION_NOT_TAKEN,
+                        "STOR: " + fileName + " file permission error."));
+                return;
+            }
+
+            // get data connection
+            session.write(new DefaultFtpReply(FtpReply.REPLY_150_FILE_STATUS_OKAY,
+                    "STOR: " + fileName + "."));
+            DataConnection dataConnection;
+            try {
+                dataConnection = session.getDataConnection().openConnection();
+            } catch (Exception e) {
+                LOG.debug("Exception getting the input data stream", e);
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_425_CANT_OPEN_DATA_CONNECTION,
+                        "STOR: cannot open data connection for " + fileName + "."));
+                return;
+            }
+
+            // transfer data
+            boolean failure = false;
+            OutputStream outStream = null;
+            long transSz = 0L;
+            try {
+                outStream = file.createOutputStream(skipLen);
+                transSz = dataConnection.transferFromClient(session.getFtpletSession(),
+                        new FreeSpaceControlledOutputStream(outStream));
+
+                // attempt to close the output stream so that errors in
+                // closing it will return an error to the client (FTPSERVER-119)
+                if(outStream != null) {
+                    outStream.close();
+                }
+
+                LOG.info("File uploaded {}", fileName);
+
+                // notify the statistics component
+                ServerFtpStatistics ftpStat = (ServerFtpStatistics) context
+                        .getFtpStatistics();
+                ftpStat.setUpload(session, file, transSz);
+
+            } catch (SocketException ex) {
+                LOG.debug("Socket exception during data transfer", ex);
+                failure = true;
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_426_CONNECTION_CLOSED_TRANSFER_ABORTED,
+                        "STOR: socket exception during data transfer of " + fileName + "."));
+            } catch (LowStorageSpaceException ex) {
+                LOG.debug("LowStorageSpaceException during data transfer", ex);
+                failure = true;
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_552_REQUESTED_FILE_ACTION_ABORTED_EXCEEDED_STORAGE,
+                        "STOR: " + ex.toString()));
+            } catch (IOException ex) {
+                LOG.debug("IOException during data transfer", ex);
+                failure = true;
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_551_REQUESTED_ACTION_ABORTED_PAGE_TYPE_UNKNOWN,
+                        "STOR: " + ex.toString()));
+            } finally {
+                // make sure we really close the output stream
+                IoUtils.close(outStream);
+            }
+
+            // if data transfer ok - send transfer complete message
+            if (!failure) {
+                session.write(new DefaultFtpReply(
+                        FtpReply.REPLY_226_CLOSING_DATA_CONNECTION,
+                        "STOR: " + fileName + " was transferred."));
+            }
+        } finally {
+            session.resetState();
+            session.getDataConnection().closeDataConnection();
+        }

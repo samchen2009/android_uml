@@ -1,0 +1,212 @@
+class EffectHandle
+!!!848268.cpp!!!	EffectHandle(in effect : sp<EffectModule>, in client : sp<AudioFlinger::Client>, in effectClient : sp<IEffectClient>, in priority : int32_t)
+    ALOGV("constructor %p", this);
+
+    if (client == 0) {
+        return;
+    }
+    int bufOffset = ((sizeof(effect_param_cblk_t) - 1) / sizeof(int) + 1) * sizeof(int);
+    mCblkMemory = client->heap()->allocate(EFFECT_PARAM_BUFFER_SIZE + bufOffset);
+    if (mCblkMemory != 0) {
+        mCblk = static_cast<effect_param_cblk_t *>(mCblkMemory->pointer());
+
+        if (mCblk != NULL) {
+            new(mCblk) effect_param_cblk_t();
+            mBuffer = (uint8_t *)mCblk + bufOffset;
+        }
+    } else {
+        ALOGE("not enough memory for Effect size=%u", EFFECT_PARAM_BUFFER_SIZE + sizeof(effect_param_cblk_t));
+        return;
+    }
+!!!848396.cpp!!!	~EffectHandle()
+    ALOGV("Destructor %p", this);
+
+    if (mEffect == 0) {
+        mDestroyed = true;
+        return;
+    }
+    mEffect->lock();
+    mDestroyed = true;
+    mEffect->unlock();
+    disconnect(false);
+!!!848524.cpp!!!	enable() : status_t
+    ALOGV("enable %p", this);
+    if (!mHasControl) return INVALID_OPERATION;
+    if (mEffect == 0) return DEAD_OBJECT;
+
+    if (mEnabled) {
+        return NO_ERROR;
+    }
+
+    mEnabled = true;
+
+    sp<ThreadBase> thread = mEffect->thread().promote();
+    if (thread != 0) {
+        thread->checkSuspendOnEffectEnabled(mEffect, true, mEffect->sessionId());
+    }
+
+    // checkSuspendOnEffectEnabled() can suspend this same effect when enabled
+    if (mEffect->suspended()) {
+        return NO_ERROR;
+    }
+
+    status_t status = mEffect->setEnabled(true);
+    if (status != NO_ERROR) {
+        if (thread != 0) {
+            thread->checkSuspendOnEffectEnabled(mEffect, false, mEffect->sessionId());
+        }
+        mEnabled = false;
+    }
+    return status;
+!!!848652.cpp!!!	disable() : status_t
+    ALOGV("disable %p", this);
+    if (!mHasControl) return INVALID_OPERATION;
+    if (mEffect == 0) return DEAD_OBJECT;
+
+    if (!mEnabled) {
+        return NO_ERROR;
+    }
+    mEnabled = false;
+
+    if (mEffect->suspended()) {
+        return NO_ERROR;
+    }
+
+    status_t status = mEffect->setEnabled(false);
+
+    sp<ThreadBase> thread = mEffect->thread().promote();
+    if (thread != 0) {
+        thread->checkSuspendOnEffectEnabled(mEffect, false, mEffect->sessionId());
+    }
+
+    return status;
+!!!848780.cpp!!!	command(in cmdCode : uint32_t, in cmdSize : uint32_t, inout pCmdData : void, inout replySize : uint32_t, inout pReplyData : void) : status_t
+//    ALOGV("command(), cmdCode: %d, mHasControl: %d, mEffect: %p",
+//              cmdCode, mHasControl, (mEffect == 0) ? 0 : mEffect.get());
+
+    // only get parameter command is permitted for applications not controlling the effect
+    if (!mHasControl && cmdCode != EFFECT_CMD_GET_PARAM) {
+        return INVALID_OPERATION;
+    }
+    if (mEffect == 0) return DEAD_OBJECT;
+    if (mClient == 0) return INVALID_OPERATION;
+
+    // handle commands that are not forwarded transparently to effect engine
+    if (cmdCode == EFFECT_CMD_SET_PARAM_COMMIT) {
+        // No need to trylock() here as this function is executed in the binder thread serving a particular client process:
+        // no risk to block the whole media server process or mixer threads is we are stuck here
+        Mutex::Autolock _l(mCblk->lock);
+        if (mCblk->clientIndex > EFFECT_PARAM_BUFFER_SIZE ||
+            mCblk->serverIndex > EFFECT_PARAM_BUFFER_SIZE) {
+            mCblk->serverIndex = 0;
+            mCblk->clientIndex = 0;
+            return BAD_VALUE;
+        }
+        status_t status = NO_ERROR;
+        while (mCblk->serverIndex < mCblk->clientIndex) {
+            int reply;
+            uint32_t rsize = sizeof(int);
+            int *p = (int *)(mBuffer + mCblk->serverIndex);
+            int size = *p++;
+            if (((uint8_t *)p + size) > mBuffer + mCblk->clientIndex) {
+                ALOGW("command(): invalid parameter block size");
+                break;
+            }
+            effect_param_t *param = (effect_param_t *)p;
+            if (param->psize == 0 || param->vsize == 0) {
+                ALOGW("command(): null parameter or value size");
+                mCblk->serverIndex += size;
+                continue;
+            }
+            uint32_t psize = sizeof(effect_param_t) +
+                             ((param->psize - 1) / sizeof(int) + 1) * sizeof(int) +
+                             param->vsize;
+            status_t ret = mEffect->command(EFFECT_CMD_SET_PARAM,
+                                            psize,
+                                            p,
+                                            &rsize,
+                                            &reply);
+            // stop at first error encountered
+            if (ret != NO_ERROR) {
+                status = ret;
+                *(int *)pReplyData = reply;
+                break;
+            } else if (reply != NO_ERROR) {
+                *(int *)pReplyData = reply;
+                break;
+            }
+            mCblk->serverIndex += size;
+        }
+        mCblk->serverIndex = 0;
+        mCblk->clientIndex = 0;
+        return status;
+    } else if (cmdCode == EFFECT_CMD_ENABLE) {
+        *(int *)pReplyData = NO_ERROR;
+        return enable();
+    } else if (cmdCode == EFFECT_CMD_DISABLE) {
+        *(int *)pReplyData = NO_ERROR;
+        return disable();
+    }
+
+    return mEffect->command(cmdCode, cmdSize, pCmdData, replySize, pReplyData);
+!!!848908.cpp!!!	disconnect() : void
+    disconnect(true);
+!!!849036.cpp!!!	disconnect(in unpinIfLast : bool) : void
+    ALOGV("disconnect(%s)", unpinIfLast ? "true" : "false");
+    if (mEffect == 0) {
+        return;
+    }
+    // restore suspended effects if the disconnected handle was enabled and the last one.
+    if ((mEffect->disconnect(this, unpinIfLast) == 0) && mEnabled) {
+        sp<ThreadBase> thread = mEffect->thread().promote();
+        if (thread != 0) {
+            thread->checkSuspendOnEffectEnabled(mEffect, false, mEffect->sessionId());
+        }
+    }
+
+    // release sp on module => module destructor can be called now
+    mEffect.clear();
+    if (mClient != 0) {
+        if (mCblk != NULL) {
+            // unlike ~TrackBase(), mCblk is never a local new, so don't delete
+            mCblk->~effect_param_cblk_t();   // destroy our shared-structure.
+        }
+        mCblkMemory.clear();    // free the shared memory before releasing the heap it belongs to
+        // Client destructor must run with AudioFlinger mutex locked
+        Mutex::Autolock _l(mClient->audioFlinger()->mLock);
+        mClient.clear();
+    }
+!!!849292.cpp!!!	onTransact(in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t) : status_t
+    return BnEffect::onTransact(code, data, reply, flags);
+!!!849420.cpp!!!	setControl(in hasControl : bool, in signal : bool, in enabled : bool) : void
+    ALOGV("setControl %p control %d", this, hasControl);
+
+    mHasControl = hasControl;
+    mEnabled = enabled;
+
+    if (signal && mEffectClient != 0) {
+        mEffectClient->controlStatusChanged(hasControl);
+    }
+!!!849548.cpp!!!	commandExecuted(in cmdCode : uint32_t, in cmdSize : uint32_t, inout pCmdData : void, in replySize : uint32_t, inout pReplyData : void) : void
+    if (mEffectClient != 0) {
+        mEffectClient->commandExecuted(cmdCode, cmdSize, pCmdData, replySize, pReplyData);
+    }
+!!!849676.cpp!!!	setEnabled(in enabled : bool) : void
+    if (mEffectClient != 0) {
+        mEffectClient->enableStatusChanged(enabled);
+    }
+!!!850572.cpp!!!	dump(inout buffer : char, in size : size_t) : void
+    bool locked = mCblk != NULL && tryLock(mCblk->lock);
+
+    snprintf(buffer, size, "\t\t\t%05d %05d    %01u    %01u      %05u  %05u\n",
+            (mClient == 0) ? getpid_cached : mClient->pid(),
+            mPriority,
+            mHasControl,
+            !locked,
+            mCblk ? mCblk->clientIndex : 0,
+            mCblk ? mCblk->serverIndex : 0
+            );
+
+    if (locked) {
+        mCblk->lock.unlock();
+    }

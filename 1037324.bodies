@@ -1,0 +1,236 @@
+class FileRotator
+!!!5556492.java!!!	FileRotator(inout basePath : File, in prefix : String, in rotateAgeMillis : long, in deleteAgeMillis : long)
+        mBasePath = Preconditions.checkNotNull(basePath);
+        mPrefix = Preconditions.checkNotNull(prefix);
+        mRotateAgeMillis = rotateAgeMillis;
+        mDeleteAgeMillis = deleteAgeMillis;
+
+        // ensure that base path exists
+        mBasePath.mkdirs();
+
+        // recover any backup files
+        for (String name : mBasePath.list()) {
+            if (!name.startsWith(mPrefix)) continue;
+
+            if (name.endsWith(SUFFIX_BACKUP)) {
+                if (LOGD) Slog.d(TAG, "recovering " + name);
+
+                final File backupFile = new File(mBasePath, name);
+                final File file = new File(
+                        mBasePath, name.substring(0, name.length() - SUFFIX_BACKUP.length()));
+
+                // write failed with backup; recover last file
+                backupFile.renameTo(file);
+
+            } else if (name.endsWith(SUFFIX_NO_BACKUP)) {
+                if (LOGD) Slog.d(TAG, "recovering " + name);
+
+                final File noBackupFile = new File(mBasePath, name);
+                final File file = new File(
+                        mBasePath, name.substring(0, name.length() - SUFFIX_NO_BACKUP.length()));
+
+                // write failed without backup; delete both
+                noBackupFile.delete();
+                file.delete();
+            }
+        }
+!!!5556620.java!!!	deleteAll() : void
+        final FileInfo info = new FileInfo(mPrefix);
+        for (String name : mBasePath.list()) {
+            if (info.parse(name)) {
+                // delete each file that matches parser
+                new File(mBasePath, name).delete();
+            }
+        }
+!!!5556748.java!!!	dumpAll(inout os : OutputStream) : void
+        final ZipOutputStream zos = new ZipOutputStream(os);
+        try {
+            final FileInfo info = new FileInfo(mPrefix);
+            for (String name : mBasePath.list()) {
+                if (info.parse(name)) {
+                    final ZipEntry entry = new ZipEntry(name);
+                    zos.putNextEntry(entry);
+
+                    final File file = new File(mBasePath, name);
+                    final FileInputStream is = new FileInputStream(file);
+                    try {
+                        Streams.copy(is, zos);
+                    } finally {
+                        IoUtils.closeQuietly(is);
+                    }
+
+                    zos.closeEntry();
+                }
+            }
+        } finally {
+            IoUtils.closeQuietly(zos);
+        }
+!!!5556876.java!!!	rewriteActive(inout rewriter : Rewriter, in currentTimeMillis : long) : void
+        final String activeName = getActiveName(currentTimeMillis);
+        rewriteSingle(rewriter, activeName);
+!!!5557004.java!!!	combineActive(in reader : Reader, in writer : Writer, in currentTimeMillis : long) : void
+        rewriteActive(new Rewriter() {
+            @Override
+            public void reset() {
+                // ignored
+            }
+
+            @Override
+            public void read(InputStream in) throws IOException {
+                reader.read(in);
+            }
+
+            @Override
+            public boolean shouldWrite() {
+                return true;
+            }
+
+            @Override
+            public void write(OutputStream out) throws IOException {
+                writer.write(out);
+            }
+        }, currentTimeMillis);
+!!!5557132.java!!!	rewriteAll(inout rewriter : Rewriter) : void
+        final FileInfo info = new FileInfo(mPrefix);
+        for (String name : mBasePath.list()) {
+            if (!info.parse(name)) continue;
+
+            // process each file that matches parser
+            rewriteSingle(rewriter, name);
+        }
+!!!5557260.java!!!	rewriteSingle(inout rewriter : Rewriter, in name : String) : void
+        if (LOGD) Slog.d(TAG, "rewriting " + name);
+
+        final File file = new File(mBasePath, name);
+        final File backupFile;
+
+        rewriter.reset();
+
+        if (file.exists()) {
+            // read existing data
+            readFile(file, rewriter);
+
+            // skip when rewriter has nothing to write
+            if (!rewriter.shouldWrite()) return;
+
+            // backup existing data during write
+            backupFile = new File(mBasePath, name + SUFFIX_BACKUP);
+            file.renameTo(backupFile);
+
+            try {
+                writeFile(file, rewriter);
+
+                // write success, delete backup
+                backupFile.delete();
+            } catch (Throwable t) {
+                // write failed, delete file and restore backup
+                file.delete();
+                backupFile.renameTo(file);
+                throw rethrowAsIoException(t);
+            }
+
+        } else {
+            // create empty backup during write
+            backupFile = new File(mBasePath, name + SUFFIX_NO_BACKUP);
+            backupFile.createNewFile();
+
+            try {
+                writeFile(file, rewriter);
+
+                // write success, delete empty backup
+                backupFile.delete();
+            } catch (Throwable t) {
+                // write failed, delete file and empty backup
+                file.delete();
+                backupFile.delete();
+                throw rethrowAsIoException(t);
+            }
+        }
+!!!5557388.java!!!	readMatching(inout reader : Reader, in matchStartMillis : long, in matchEndMillis : long) : void
+        final FileInfo info = new FileInfo(mPrefix);
+        for (String name : mBasePath.list()) {
+            if (!info.parse(name)) continue;
+
+            // read file when it overlaps
+            if (info.startMillis <= matchEndMillis && matchStartMillis <= info.endMillis) {
+                if (LOGD) Slog.d(TAG, "reading matching " + name);
+
+                final File file = new File(mBasePath, name);
+                readFile(file, reader);
+            }
+        }
+!!!5557516.java!!!	getActiveName(in currentTimeMillis : long) : String
+        String oldestActiveName = null;
+        long oldestActiveStart = Long.MAX_VALUE;
+
+        final FileInfo info = new FileInfo(mPrefix);
+        for (String name : mBasePath.list()) {
+            if (!info.parse(name)) continue;
+
+            // pick the oldest active file which covers current time
+            if (info.isActive() && info.startMillis < currentTimeMillis
+                    && info.startMillis < oldestActiveStart) {
+                oldestActiveName = name;
+                oldestActiveStart = info.startMillis;
+            }
+        }
+
+        if (oldestActiveName != null) {
+            return oldestActiveName;
+        } else {
+            // no active file found above; create one starting now
+            info.startMillis = currentTimeMillis;
+            info.endMillis = Long.MAX_VALUE;
+            return info.build();
+        }
+!!!5557644.java!!!	maybeRotate(in currentTimeMillis : long) : void
+        final long rotateBefore = currentTimeMillis - mRotateAgeMillis;
+        final long deleteBefore = currentTimeMillis - mDeleteAgeMillis;
+
+        final FileInfo info = new FileInfo(mPrefix);
+        for (String name : mBasePath.list()) {
+            if (!info.parse(name)) continue;
+
+            if (info.isActive()) {
+                if (info.startMillis <= rotateBefore) {
+                    // found active file; rotate if old enough
+                    if (LOGD) Slog.d(TAG, "rotating " + name);
+
+                    info.endMillis = currentTimeMillis;
+
+                    final File file = new File(mBasePath, name);
+                    final File destFile = new File(mBasePath, info.build());
+                    file.renameTo(destFile);
+                }
+            } else if (info.endMillis <= deleteBefore) {
+                // found rotated file; delete if old enough
+                if (LOGD) Slog.d(TAG, "deleting " + name);
+
+                final File file = new File(mBasePath, name);
+                file.delete();
+            }
+        }
+!!!5557772.java!!!	readFile(inout file : File, inout reader : Reader) : void
+        final FileInputStream fis = new FileInputStream(file);
+        final BufferedInputStream bis = new BufferedInputStream(fis);
+        try {
+            reader.read(bis);
+        } finally {
+            IoUtils.closeQuietly(bis);
+        }
+!!!5557900.java!!!	writeFile(inout file : File, inout writer : Writer) : void
+        final FileOutputStream fos = new FileOutputStream(file);
+        final BufferedOutputStream bos = new BufferedOutputStream(fos);
+        try {
+            writer.write(bos);
+            bos.flush();
+        } finally {
+            FileUtils.sync(fos);
+            IoUtils.closeQuietly(bos);
+        }
+!!!5558028.java!!!	rethrowAsIoException(inout t : Throwable) : IOException
+        if (t instanceof IOException) {
+            throw (IOException) t;
+        } else {
+            throw new IOException(t.getMessage(), t);
+        }

@@ -1,0 +1,912 @@
+class InputManagerService
+!!!8309260.java!!!	InputManagerService(inout context : Context, inout handler : Handler)
+        this.mContext = context;
+        this.mHandler = new InputManagerHandler(handler.getLooper());
+
+        mUseDevInputEventForAudioJack =
+                context.getResources().getBoolean(R.bool.config_useDevInputEventForAudioJack);
+        Slog.i(TAG, "Initializing input manager, mUseDevInputEventForAudioJack="
+                + mUseDevInputEventForAudioJack);
+        mPtr = nativeInit(this, mContext, mHandler.getLooper().getQueue());
+!!!8309388.java!!!	setWindowManagerCallbacks(inout callbacks : WindowManagerCallbacks) : void
+        mWindowManagerCallbacks = callbacks;
+!!!8309516.java!!!	setWiredAccessoryCallbacks(inout callbacks : WiredAccessoryCallbacks) : void
+        mWiredAccessoryCallbacks = callbacks;
+!!!8309644.java!!!	start() : void
+        Slog.i(TAG, "Starting input manager");
+        nativeStart(mPtr);
+
+        // Add ourself to the Watchdog monitors.
+        Watchdog.getInstance().addMonitor(this);
+
+        registerPointerSpeedSettingObserver();
+        registerShowTouchesSettingObserver();
+
+        mContext.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                updatePointerSpeedFromSettings();
+                updateShowTouchesFromSettings();
+            }
+        }, new IntentFilter(Intent.ACTION_USER_SWITCHED), null, mHandler);
+
+        updatePointerSpeedFromSettings();
+        updateShowTouchesFromSettings();
+!!!8309772.java!!!	systemReady() : void
+        if (DEBUG) {
+            Slog.d(TAG, "System ready.");
+        }
+        mNotificationManager = (NotificationManager)mContext.getSystemService(
+                Context.NOTIFICATION_SERVICE);
+        mSystemReady = true;
+
+        IntentFilter filter = new IntentFilter(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        filter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        filter.addDataScheme("package");
+        mContext.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                updateKeyboardLayouts();
+            }
+        }, filter, null, mHandler);
+
+        filter = new IntentFilter(BluetoothDevice.ACTION_ALIAS_CHANGED);
+        mContext.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                reloadDeviceAliases();
+            }
+        }, filter, null, mHandler);
+
+        mHandler.sendEmptyMessage(MSG_RELOAD_DEVICE_ALIASES);
+        mHandler.sendEmptyMessage(MSG_UPDATE_KEYBOARD_LAYOUTS);
+!!!8309900.java!!!	reloadKeyboardLayouts() : void
+        if (DEBUG) {
+            Slog.d(TAG, "Reloading keyboard layouts.");
+        }
+        nativeReloadKeyboardLayouts(mPtr);
+!!!8310028.java!!!	reloadDeviceAliases() : void
+        if (DEBUG) {
+            Slog.d(TAG, "Reloading device names.");
+        }
+        nativeReloadDeviceAliases(mPtr);
+!!!8310156.java!!!	setDisplayViewports(inout defaultViewport : DisplayViewport, inout externalTouchViewport : DisplayViewport) : void
+        if (defaultViewport.valid) {
+            setDisplayViewport(false, defaultViewport);
+        }
+
+        if (externalTouchViewport.valid) {
+            setDisplayViewport(true, externalTouchViewport);
+        } else if (defaultViewport.valid) {
+            setDisplayViewport(true, defaultViewport);
+        }
+!!!8310284.java!!!	setDisplayViewport(inout external : boolean, inout viewport : DisplayViewport) : void
+        nativeSetDisplayViewport(mPtr, external,
+                viewport.displayId, viewport.orientation,
+                viewport.logicalFrame.left, viewport.logicalFrame.top,
+                viewport.logicalFrame.right, viewport.logicalFrame.bottom,
+                viewport.physicalFrame.left, viewport.physicalFrame.top,
+                viewport.physicalFrame.right, viewport.physicalFrame.bottom,
+                viewport.deviceWidth, viewport.deviceHeight);
+!!!8310412.java!!!	getKeyCodeState(in deviceId : int, in sourceMask : int, in keyCode : int) : int
+        return nativeGetKeyCodeState(mPtr, deviceId, sourceMask, keyCode);
+!!!8310540.java!!!	getScanCodeState(in deviceId : int, in sourceMask : int, in scanCode : int) : int
+        return nativeGetScanCodeState(mPtr, deviceId, sourceMask, scanCode);
+!!!8310668.java!!!	getSwitchState(in deviceId : int, in sourceMask : int, in switchCode : int) : int
+        return nativeGetSwitchState(mPtr, deviceId, sourceMask, switchCode);
+!!!8310796.java!!!	hasKeys(in deviceId : int, in sourceMask : int, inout keyCodes : int, inout keyExists : boolean) : boolean
+        if (keyCodes == null) {
+            throw new IllegalArgumentException("keyCodes must not be null.");
+        }
+        if (keyExists == null || keyExists.length < keyCodes.length) {
+            throw new IllegalArgumentException("keyExists must not be null and must be at "
+                    + "least as large as keyCodes.");
+        }
+        
+        return nativeHasKeys(mPtr, deviceId, sourceMask, keyCodes, keyExists);
+!!!8310924.java!!!	monitorInput(in inputChannelName : String) : InputChannel
+        if (inputChannelName == null) {
+            throw new IllegalArgumentException("inputChannelName must not be null.");
+        }
+        
+        InputChannel[] inputChannels = InputChannel.openInputChannelPair(inputChannelName);
+        nativeRegisterInputChannel(mPtr, inputChannels[0], null, true);
+        inputChannels[0].dispose(); // don't need to retain the Java object reference
+        return inputChannels[1];
+!!!8311052.java!!!	registerInputChannel(inout inputChannel : InputChannel, inout inputWindowHandle : InputWindowHandle) : void
+        if (inputChannel == null) {
+            throw new IllegalArgumentException("inputChannel must not be null.");
+        }
+        
+        nativeRegisterInputChannel(mPtr, inputChannel, inputWindowHandle, false);
+!!!8311180.java!!!	unregisterInputChannel(inout inputChannel : InputChannel) : void
+        if (inputChannel == null) {
+            throw new IllegalArgumentException("inputChannel must not be null.");
+        }
+        
+        nativeUnregisterInputChannel(mPtr, inputChannel);
+!!!8311308.java!!!	setInputFilter(inout filter : IInputFilter) : void
+        synchronized (mInputFilterLock) {
+            final IInputFilter oldFilter = mInputFilter;
+            if (oldFilter == filter) {
+                return; // nothing to do
+            }
+
+            if (oldFilter != null) {
+                mInputFilter = null;
+                mInputFilterHost.disconnectLocked();
+                mInputFilterHost = null;
+                try {
+                    oldFilter.uninstall();
+                } catch (RemoteException re) {
+                    /* ignore */
+                }
+            }
+
+            if (filter != null) {
+                mInputFilter = filter;
+                mInputFilterHost = new InputFilterHost();
+                try {
+                    filter.install(mInputFilterHost);
+                } catch (RemoteException re) {
+                    /* ignore */
+                }
+            }
+
+            nativeSetInputFilterEnabled(mPtr, filter != null);
+        }
+!!!8311436.java!!!	injectInputEvent(inout event : InputEvent, in mode : int) : boolean
+        if (event == null) {
+            throw new IllegalArgumentException("event must not be null");
+        }
+        if (mode != InputManager.INJECT_INPUT_EVENT_MODE_ASYNC
+                && mode != InputManager.INJECT_INPUT_EVENT_MODE_WAIT_FOR_FINISH
+                && mode != InputManager.INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT) {
+            throw new IllegalArgumentException("mode is invalid");
+        }
+
+        final int pid = Binder.getCallingPid();
+        final int uid = Binder.getCallingUid();
+        final long ident = Binder.clearCallingIdentity();
+        final int result;
+        try {
+            result = nativeInjectInputEvent(mPtr, event, pid, uid, mode,
+                    INJECTION_TIMEOUT_MILLIS, WindowManagerPolicy.FLAG_DISABLE_KEY_REPEAT);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+        switch (result) {
+            case INPUT_EVENT_INJECTION_PERMISSION_DENIED:
+                Slog.w(TAG, "Input event injection from pid " + pid + " permission denied.");
+                throw new SecurityException(
+                        "Injecting to another application requires INJECT_EVENTS permission");
+            case INPUT_EVENT_INJECTION_SUCCEEDED:
+                return true;
+            case INPUT_EVENT_INJECTION_TIMED_OUT:
+                Slog.w(TAG, "Input event injection from pid " + pid + " timed out.");
+                return false;
+            case INPUT_EVENT_INJECTION_FAILED:
+            default:
+                Slog.w(TAG, "Input event injection from pid " + pid + " failed.");
+                return false;
+        }
+!!!8311564.java!!!	getInputDevice(in deviceId : int) : InputDevice
+        synchronized (mInputDevicesLock) {
+            final int count = mInputDevices.length;
+            for (int i = 0; i < count; i++) {
+                final InputDevice inputDevice = mInputDevices[i];
+                if (inputDevice.getId() == deviceId) {
+                    return inputDevice;
+                }
+            }
+        }
+        return null;
+!!!8311692.java!!!	getInputDeviceIds() : int
+        synchronized (mInputDevicesLock) {
+            final int count = mInputDevices.length;
+            int[] ids = new int[count];
+            for (int i = 0; i < count; i++) {
+                ids[i] = mInputDevices[i].getId();
+            }
+            return ids;
+        }
+!!!8311820.java!!!	getInputDevices() : InputDevice
+        synchronized (mInputDevicesLock) {
+            return mInputDevices;
+        }
+!!!8311948.java!!!	registerInputDevicesChangedListener(inout listener : IInputDevicesChangedListener) : void
+        if (listener == null) {
+            throw new IllegalArgumentException("listener must not be null");
+        }
+
+        synchronized (mInputDevicesLock) {
+            int callingPid = Binder.getCallingPid();
+            if (mInputDevicesChangedListeners.get(callingPid) != null) {
+                throw new SecurityException("The calling process has already "
+                        + "registered an InputDevicesChangedListener.");
+            }
+
+            InputDevicesChangedListenerRecord record =
+                    new InputDevicesChangedListenerRecord(callingPid, listener);
+            try {
+                IBinder binder = listener.asBinder();
+                binder.linkToDeath(record, 0);
+            } catch (RemoteException ex) {
+                // give up
+                throw new RuntimeException(ex);
+            }
+
+            mInputDevicesChangedListeners.put(callingPid, record);
+        }
+!!!8312076.java!!!	onInputDevicesChangedListenerDied(in pid : int) : void
+        synchronized (mInputDevicesLock) {
+            mInputDevicesChangedListeners.remove(pid);
+        }
+!!!8312204.java!!!	deliverInputDevicesChanged(inout oldInputDevices : InputDevice) : void
+        // Scan for changes.
+        int numFullKeyboardsAdded = 0;
+        mTempInputDevicesChangedListenersToNotify.clear();
+        mTempFullKeyboards.clear();
+        final int numListeners;
+        final int[] deviceIdAndGeneration;
+        synchronized (mInputDevicesLock) {
+            if (!mInputDevicesChangedPending) {
+                return;
+            }
+            mInputDevicesChangedPending = false;
+
+            numListeners = mInputDevicesChangedListeners.size();
+            for (int i = 0; i < numListeners; i++) {
+                mTempInputDevicesChangedListenersToNotify.add(
+                        mInputDevicesChangedListeners.valueAt(i));
+            }
+
+            final int numDevices = mInputDevices.length;
+            deviceIdAndGeneration = new int[numDevices * 2];
+            for (int i = 0; i < numDevices; i++) {
+                final InputDevice inputDevice = mInputDevices[i];
+                deviceIdAndGeneration[i * 2] = inputDevice.getId();
+                deviceIdAndGeneration[i * 2 + 1] = inputDevice.getGeneration();
+
+                if (!inputDevice.isVirtual() && inputDevice.isFullKeyboard()) {
+                    if (!containsInputDeviceWithDescriptor(oldInputDevices,
+                            inputDevice.getDescriptor())) {
+                        mTempFullKeyboards.add(numFullKeyboardsAdded++, inputDevice);
+                    } else {
+                        mTempFullKeyboards.add(inputDevice);
+                    }
+                }
+            }
+        }
+
+        // Notify listeners.
+        for (int i = 0; i < numListeners; i++) {
+            mTempInputDevicesChangedListenersToNotify.get(i).notifyInputDevicesChanged(
+                    deviceIdAndGeneration);
+        }
+        mTempInputDevicesChangedListenersToNotify.clear();
+
+        // Check for missing keyboard layouts.
+        if (mNotificationManager != null) {
+            final int numFullKeyboards = mTempFullKeyboards.size();
+            boolean missingLayoutForExternalKeyboard = false;
+            boolean missingLayoutForExternalKeyboardAdded = false;
+            synchronized (mDataStore) {
+                for (int i = 0; i < numFullKeyboards; i++) {
+                    final InputDevice inputDevice = mTempFullKeyboards.get(i);
+                    if (mDataStore.getCurrentKeyboardLayout(inputDevice.getDescriptor()) == null) {
+                        missingLayoutForExternalKeyboard = true;
+                        if (i < numFullKeyboardsAdded) {
+                            missingLayoutForExternalKeyboardAdded = true;
+                        }
+                    }
+                }
+            }
+            if (missingLayoutForExternalKeyboard) {
+                if (missingLayoutForExternalKeyboardAdded) {
+                    showMissingKeyboardLayoutNotification();
+                }
+            } else if (mKeyboardLayoutNotificationShown) {
+                hideMissingKeyboardLayoutNotification();
+            }
+        }
+        mTempFullKeyboards.clear();
+!!!8312332.java!!!	showMissingKeyboardLayoutNotification() : void
+        if (!mKeyboardLayoutNotificationShown) {
+            if (mKeyboardLayoutIntent == null) {
+                final Intent intent = new Intent("android.settings.INPUT_METHOD_SETTINGS");
+                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                        | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                mKeyboardLayoutIntent = PendingIntent.getActivityAsUser(mContext, 0,
+                        intent, 0, null, UserHandle.CURRENT);
+            }
+
+            Resources r = mContext.getResources();
+            Notification notification = new Notification.Builder(mContext)
+                    .setContentTitle(r.getString(
+                            R.string.select_keyboard_layout_notification_title))
+                    .setContentText(r.getString(
+                            R.string.select_keyboard_layout_notification_message))
+                    .setContentIntent(mKeyboardLayoutIntent)
+                    .setSmallIcon(R.drawable.ic_settings_language)
+                    .setPriority(Notification.PRIORITY_LOW)
+                    .build();
+            mNotificationManager.notifyAsUser(null,
+                    R.string.select_keyboard_layout_notification_title,
+                    notification, UserHandle.ALL);
+            mKeyboardLayoutNotificationShown = true;
+        }
+!!!8312460.java!!!	hideMissingKeyboardLayoutNotification() : void
+        if (mKeyboardLayoutNotificationShown) {
+            mKeyboardLayoutNotificationShown = false;
+            mNotificationManager.cancelAsUser(null,
+                    R.string.select_keyboard_layout_notification_title,
+                    UserHandle.ALL);
+        }
+!!!8312588.java!!!	updateKeyboardLayouts() : void
+        // Scan all input devices state for keyboard layouts that have been uninstalled.
+        final HashSet<String> availableKeyboardLayouts = new HashSet<String>();
+        visitAllKeyboardLayouts(new KeyboardLayoutVisitor() {
+            @Override
+            public void visitKeyboardLayout(Resources resources,
+                    String descriptor, String label, String collection, int keyboardLayoutResId) {
+                availableKeyboardLayouts.add(descriptor);
+            }
+        });
+        synchronized (mDataStore) {
+            try {
+                mDataStore.removeUninstalledKeyboardLayouts(availableKeyboardLayouts);
+            } finally {
+                mDataStore.saveIfNeeded();
+            }
+        }
+
+        // Reload keyboard layouts.
+        reloadKeyboardLayouts();
+!!!8312716.java!!!	containsInputDeviceWithDescriptor(inout inputDevices : InputDevice, in descriptor : String) : boolean
+        final int numDevices = inputDevices.length;
+        for (int i = 0; i < numDevices; i++) {
+            final InputDevice inputDevice = inputDevices[i];
+            if (inputDevice.getDescriptor().equals(descriptor)) {
+                return true;
+            }
+        }
+        return false;
+!!!8312844.java!!!	getKeyboardLayouts() : KeyboardLayout
+        final ArrayList<KeyboardLayout> list = new ArrayList<KeyboardLayout>();
+        visitAllKeyboardLayouts(new KeyboardLayoutVisitor() {
+            @Override
+            public void visitKeyboardLayout(Resources resources,
+                    String descriptor, String label, String collection, int keyboardLayoutResId) {
+                list.add(new KeyboardLayout(descriptor, label, collection));
+            }
+        });
+        return list.toArray(new KeyboardLayout[list.size()]);
+!!!8312972.java!!!	getKeyboardLayout(in keyboardLayoutDescriptor : String) : KeyboardLayout
+        if (keyboardLayoutDescriptor == null) {
+            throw new IllegalArgumentException("keyboardLayoutDescriptor must not be null");
+        }
+
+        final KeyboardLayout[] result = new KeyboardLayout[1];
+        visitKeyboardLayout(keyboardLayoutDescriptor, new KeyboardLayoutVisitor() {
+            @Override
+            public void visitKeyboardLayout(Resources resources,
+                    String descriptor, String label, String collection, int keyboardLayoutResId) {
+                result[0] = new KeyboardLayout(descriptor, label, collection);
+            }
+        });
+        if (result[0] == null) {
+            Log.w(TAG, "Could not get keyboard layout with descriptor '"
+                    + keyboardLayoutDescriptor + "'.");
+        }
+        return result[0];
+!!!8313100.java!!!	visitAllKeyboardLayouts(inout visitor : KeyboardLayoutVisitor) : void
+        final PackageManager pm = mContext.getPackageManager();
+        Intent intent = new Intent(InputManager.ACTION_QUERY_KEYBOARD_LAYOUTS);
+        for (ResolveInfo resolveInfo : pm.queryBroadcastReceivers(intent,
+                PackageManager.GET_META_DATA)) {
+            visitKeyboardLayoutsInPackage(pm, resolveInfo.activityInfo, null, visitor);
+        }
+!!!8313228.java!!!	visitKeyboardLayout(in keyboardLayoutDescriptor : String, inout visitor : KeyboardLayoutVisitor) : void
+        KeyboardLayoutDescriptor d = KeyboardLayoutDescriptor.parse(keyboardLayoutDescriptor);
+        if (d != null) {
+            final PackageManager pm = mContext.getPackageManager();
+            try {
+                ActivityInfo receiver = pm.getReceiverInfo(
+                        new ComponentName(d.packageName, d.receiverName),
+                        PackageManager.GET_META_DATA);
+                visitKeyboardLayoutsInPackage(pm, receiver, d.keyboardLayoutName, visitor);
+            } catch (NameNotFoundException ex) {
+            }
+        }
+!!!8313356.java!!!	visitKeyboardLayoutsInPackage(inout pm : PackageManager, inout receiver : ActivityInfo, in keyboardName : String, inout visitor : KeyboardLayoutVisitor) : void
+        Bundle metaData = receiver.metaData;
+        if (metaData == null) {
+            return;
+        }
+
+        int configResId = metaData.getInt(InputManager.META_DATA_KEYBOARD_LAYOUTS);
+        if (configResId == 0) {
+            Log.w(TAG, "Missing meta-data '" + InputManager.META_DATA_KEYBOARD_LAYOUTS
+                    + "' on receiver " + receiver.packageName + "/" + receiver.name);
+            return;
+        }
+
+        CharSequence receiverLabel = receiver.loadLabel(pm);
+        String collection = receiverLabel != null ? receiverLabel.toString() : "";
+
+        try {
+            Resources resources = pm.getResourcesForApplication(receiver.applicationInfo);
+            XmlResourceParser parser = resources.getXml(configResId);
+            try {
+                XmlUtils.beginDocument(parser, "keyboard-layouts");
+
+                for (;;) {
+                    XmlUtils.nextElement(parser);
+                    String element = parser.getName();
+                    if (element == null) {
+                        break;
+                    }
+                    if (element.equals("keyboard-layout")) {
+                        TypedArray a = resources.obtainAttributes(
+                                parser, com.android.internal.R.styleable.KeyboardLayout);
+                        try {
+                            String name = a.getString(
+                                    com.android.internal.R.styleable.KeyboardLayout_name);
+                            String label = a.getString(
+                                    com.android.internal.R.styleable.KeyboardLayout_label);
+                            int keyboardLayoutResId = a.getResourceId(
+                                    com.android.internal.R.styleable.KeyboardLayout_keyboardLayout,
+                                    0);
+                            if (name == null || label == null || keyboardLayoutResId == 0) {
+                                Log.w(TAG, "Missing required 'name', 'label' or 'keyboardLayout' "
+                                        + "attributes in keyboard layout "
+                                        + "resource from receiver "
+                                        + receiver.packageName + "/" + receiver.name);
+                            } else {
+                                String descriptor = KeyboardLayoutDescriptor.format(
+                                        receiver.packageName, receiver.name, name);
+                                if (keyboardName == null || name.equals(keyboardName)) {
+                                    visitor.visitKeyboardLayout(resources, descriptor,
+                                            label, collection, keyboardLayoutResId);
+                                }
+                            }
+                        } finally {
+                            a.recycle();
+                        }
+                    } else {
+                        Log.w(TAG, "Skipping unrecognized element '" + element
+                                + "' in keyboard layout resource from receiver "
+                                + receiver.packageName + "/" + receiver.name);
+                    }
+                }
+            } finally {
+                parser.close();
+            }
+        } catch (Exception ex) {
+            Log.w(TAG, "Could not parse keyboard layout resource from receiver "
+                    + receiver.packageName + "/" + receiver.name, ex);
+        }
+!!!8313484.java!!!	getCurrentKeyboardLayoutForInputDevice(in inputDeviceDescriptor : String) : String
+        if (inputDeviceDescriptor == null) {
+            throw new IllegalArgumentException("inputDeviceDescriptor must not be null");
+        }
+
+        synchronized (mDataStore) {
+            return mDataStore.getCurrentKeyboardLayout(inputDeviceDescriptor);
+        }
+!!!8313612.java!!!	setCurrentKeyboardLayoutForInputDevice(in inputDeviceDescriptor : String, in keyboardLayoutDescriptor : String) : void
+        if (!checkCallingPermission(android.Manifest.permission.SET_KEYBOARD_LAYOUT,
+                "setCurrentKeyboardLayoutForInputDevice()")) {
+            throw new SecurityException("Requires SET_KEYBOARD_LAYOUT permission");
+        }
+        if (inputDeviceDescriptor == null) {
+            throw new IllegalArgumentException("inputDeviceDescriptor must not be null");
+        }
+        if (keyboardLayoutDescriptor == null) {
+            throw new IllegalArgumentException("keyboardLayoutDescriptor must not be null");
+        }
+
+        synchronized (mDataStore) {
+            try {
+                if (mDataStore.setCurrentKeyboardLayout(
+                        inputDeviceDescriptor, keyboardLayoutDescriptor)) {
+                    mHandler.sendEmptyMessage(MSG_RELOAD_KEYBOARD_LAYOUTS);
+                }
+            } finally {
+                mDataStore.saveIfNeeded();
+            }
+        }
+!!!8313740.java!!!	getKeyboardLayoutsForInputDevice(in inputDeviceDescriptor : String) : String
+        if (inputDeviceDescriptor == null) {
+            throw new IllegalArgumentException("inputDeviceDescriptor must not be null");
+        }
+
+        synchronized (mDataStore) {
+            return mDataStore.getKeyboardLayouts(inputDeviceDescriptor);
+        }
+!!!8313868.java!!!	addKeyboardLayoutForInputDevice(in inputDeviceDescriptor : String, in keyboardLayoutDescriptor : String) : void
+        if (!checkCallingPermission(android.Manifest.permission.SET_KEYBOARD_LAYOUT,
+                "addKeyboardLayoutForInputDevice()")) {
+            throw new SecurityException("Requires SET_KEYBOARD_LAYOUT permission");
+        }
+        if (inputDeviceDescriptor == null) {
+            throw new IllegalArgumentException("inputDeviceDescriptor must not be null");
+        }
+        if (keyboardLayoutDescriptor == null) {
+            throw new IllegalArgumentException("keyboardLayoutDescriptor must not be null");
+        }
+
+        synchronized (mDataStore) {
+            try {
+                String oldLayout = mDataStore.getCurrentKeyboardLayout(inputDeviceDescriptor);
+                if (mDataStore.addKeyboardLayout(inputDeviceDescriptor, keyboardLayoutDescriptor)
+                        && !Objects.equal(oldLayout,
+                                mDataStore.getCurrentKeyboardLayout(inputDeviceDescriptor))) {
+                    mHandler.sendEmptyMessage(MSG_RELOAD_KEYBOARD_LAYOUTS);
+                }
+            } finally {
+                mDataStore.saveIfNeeded();
+            }
+        }
+!!!8313996.java!!!	removeKeyboardLayoutForInputDevice(in inputDeviceDescriptor : String, in keyboardLayoutDescriptor : String) : void
+        if (!checkCallingPermission(android.Manifest.permission.SET_KEYBOARD_LAYOUT,
+                "removeKeyboardLayoutForInputDevice()")) {
+            throw new SecurityException("Requires SET_KEYBOARD_LAYOUT permission");
+        }
+        if (inputDeviceDescriptor == null) {
+            throw new IllegalArgumentException("inputDeviceDescriptor must not be null");
+        }
+        if (keyboardLayoutDescriptor == null) {
+            throw new IllegalArgumentException("keyboardLayoutDescriptor must not be null");
+        }
+
+        synchronized (mDataStore) {
+            try {
+                String oldLayout = mDataStore.getCurrentKeyboardLayout(inputDeviceDescriptor);
+                if (mDataStore.removeKeyboardLayout(inputDeviceDescriptor,
+                        keyboardLayoutDescriptor)
+                        && !Objects.equal(oldLayout,
+                                mDataStore.getCurrentKeyboardLayout(inputDeviceDescriptor))) {
+                    mHandler.sendEmptyMessage(MSG_RELOAD_KEYBOARD_LAYOUTS);
+                }
+            } finally {
+                mDataStore.saveIfNeeded();
+            }
+        }
+!!!8314124.java!!!	switchKeyboardLayout(in deviceId : int, in direction : int) : void
+        mHandler.obtainMessage(MSG_SWITCH_KEYBOARD_LAYOUT, deviceId, direction).sendToTarget();
+!!!8314252.java!!!	handleSwitchKeyboardLayout(in deviceId : int, in direction : int) : void
+        final InputDevice device = getInputDevice(deviceId);
+        if (device != null) {
+            final String inputDeviceDescriptor = device.getDescriptor();
+            final boolean changed;
+            final String keyboardLayoutDescriptor;
+            synchronized (mDataStore) {
+                try {
+                    changed = mDataStore.switchKeyboardLayout(inputDeviceDescriptor, direction);
+                    keyboardLayoutDescriptor = mDataStore.getCurrentKeyboardLayout(
+                            inputDeviceDescriptor);
+                } finally {
+                    mDataStore.saveIfNeeded();
+                }
+            }
+
+            if (changed) {
+                if (mSwitchedKeyboardLayoutToast != null) {
+                    mSwitchedKeyboardLayoutToast.cancel();
+                    mSwitchedKeyboardLayoutToast = null;
+                }
+                if (keyboardLayoutDescriptor != null) {
+                    KeyboardLayout keyboardLayout = getKeyboardLayout(keyboardLayoutDescriptor);
+                    if (keyboardLayout != null) {
+                        mSwitchedKeyboardLayoutToast = Toast.makeText(
+                                mContext, keyboardLayout.getLabel(), Toast.LENGTH_SHORT);
+                        mSwitchedKeyboardLayoutToast.show();
+                    }
+                }
+
+                reloadKeyboardLayouts();
+            }
+        }
+!!!8314380.java!!!	setInputWindows(inout windowHandles : InputWindowHandle) : void
+        nativeSetInputWindows(mPtr, windowHandles);
+!!!8314508.java!!!	setFocusedApplication(inout application : InputApplicationHandle) : void
+        nativeSetFocusedApplication(mPtr, application);
+!!!8314636.java!!!	setInputDispatchMode(inout enabled : boolean, inout frozen : boolean) : void
+        nativeSetInputDispatchMode(mPtr, enabled, frozen);
+!!!8314764.java!!!	setSystemUiVisibility(in visibility : int) : void
+        nativeSetSystemUiVisibility(mPtr, visibility);
+!!!8314892.java!!!	transferTouchFocus(inout fromChannel : InputChannel, inout toChannel : InputChannel) : boolean
+        if (fromChannel == null) {
+            throw new IllegalArgumentException("fromChannel must not be null.");
+        }
+        if (toChannel == null) {
+            throw new IllegalArgumentException("toChannel must not be null.");
+        }
+        return nativeTransferTouchFocus(mPtr, fromChannel, toChannel);
+!!!8315020.java!!!	tryPointerSpeed(in speed : int) : void
+        if (!checkCallingPermission(android.Manifest.permission.SET_POINTER_SPEED,
+                "tryPointerSpeed()")) {
+            throw new SecurityException("Requires SET_POINTER_SPEED permission");
+        }
+
+        if (speed < InputManager.MIN_POINTER_SPEED || speed > InputManager.MAX_POINTER_SPEED) {
+            throw new IllegalArgumentException("speed out of range");
+        }
+
+        setPointerSpeedUnchecked(speed);
+!!!8315148.java!!!	updatePointerIcon(inout icon : PointerIcon) : void
+        if (icon != null) {
+            nativeUpdatePointerIcon(mPtr, icon);
+        }
+!!!8315276.java!!!	updatePointerSpeedFromSettings() : void
+        int speed = getPointerSpeedSetting();
+        setPointerSpeedUnchecked(speed);
+!!!8315404.java!!!	setPointerSpeedUnchecked(in speed : int) : void
+        speed = Math.min(Math.max(speed, InputManager.MIN_POINTER_SPEED),
+                InputManager.MAX_POINTER_SPEED);
+        nativeSetPointerSpeed(mPtr, speed);
+!!!8315532.java!!!	registerPointerSpeedSettingObserver() : void
+        mContext.getContentResolver().registerContentObserver(
+                Settings.System.getUriFor(Settings.System.POINTER_SPEED), true,
+                new ContentObserver(mHandler) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        updatePointerSpeedFromSettings();
+                    }
+                }, UserHandle.USER_ALL);
+!!!8315660.java!!!	getPointerSpeedSetting() : int
+        int speed = InputManager.DEFAULT_POINTER_SPEED;
+        try {
+            speed = Settings.System.getIntForUser(mContext.getContentResolver(),
+                    Settings.System.POINTER_SPEED, UserHandle.USER_CURRENT);
+        } catch (SettingNotFoundException snfe) {
+        }
+        return speed;
+!!!8315788.java!!!	updateShowTouchesFromSettings() : void
+        int setting = getShowTouchesSetting(0);
+        nativeSetShowTouches(mPtr, setting != 0);
+!!!8315916.java!!!	registerShowTouchesSettingObserver() : void
+        mContext.getContentResolver().registerContentObserver(
+                Settings.System.getUriFor(Settings.System.SHOW_TOUCHES), true,
+                new ContentObserver(mHandler) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        updateShowTouchesFromSettings();
+                    }
+                }, UserHandle.USER_ALL);
+!!!8316044.java!!!	getShowTouchesSetting(in defaultValue : int) : int
+        int result = defaultValue;
+        try {
+            result = Settings.System.getIntForUser(mContext.getContentResolver(),
+                    Settings.System.SHOW_TOUCHES, UserHandle.USER_CURRENT);
+        } catch (SettingNotFoundException snfe) {
+        }
+        return result;
+!!!8316172.java!!!	vibrate(in deviceId : int, inout pattern : long, in repeat : int, inout token : IBinder) : void
+        if (repeat >= pattern.length) {
+            throw new ArrayIndexOutOfBoundsException();
+        }
+
+        VibratorToken v;
+        synchronized (mVibratorLock) {
+            v = mVibratorTokens.get(token);
+            if (v == null) {
+                v = new VibratorToken(deviceId, token, mNextVibratorTokenValue++);
+                try {
+                    token.linkToDeath(v, 0);
+                } catch (RemoteException ex) {
+                    // give up
+                    throw new RuntimeException(ex);
+                }
+                mVibratorTokens.put(token, v);
+            }
+        }
+
+        synchronized (v) {
+            v.mVibrating = true;
+            nativeVibrate(mPtr, deviceId, pattern, repeat, v.mTokenValue);
+        }
+!!!8316300.java!!!	cancelVibrate(in deviceId : int, inout token : IBinder) : void
+        VibratorToken v;
+        synchronized (mVibratorLock) {
+            v = mVibratorTokens.get(token);
+            if (v == null || v.mDeviceId != deviceId) {
+                return; // nothing to cancel
+            }
+        }
+
+        cancelVibrateIfNeeded(v);
+!!!8316428.java!!!	onVibratorTokenDied(inout v : VibratorToken) : void
+        synchronized (mVibratorLock) {
+            mVibratorTokens.remove(v.mToken);
+        }
+
+        cancelVibrateIfNeeded(v);
+!!!8316556.java!!!	cancelVibrateIfNeeded(inout v : VibratorToken) : void
+        synchronized (v) {
+            if (v.mVibrating) {
+                nativeCancelVibrate(mPtr, v.mDeviceId, v.mTokenValue);
+                v.mVibrating = false;
+            }
+        }
+!!!8316684.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump InputManager from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        pw.println("INPUT MANAGER (dumpsys input)\n");
+        String dumpStr = nativeDump(mPtr);
+        if (dumpStr != null) {
+            pw.println(dumpStr);
+        }
+!!!8316812.java!!!	checkCallingPermission(in permission : String, in func : String) : boolean
+        // Quick check: if the calling permission is me, it's all okay.
+        if (Binder.getCallingPid() == Process.myPid()) {
+            return true;
+        }
+
+        if (mContext.checkCallingPermission(permission) == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        String msg = "Permission Denial: " + func + " from pid="
+                + Binder.getCallingPid()
+                + ", uid=" + Binder.getCallingUid()
+                + " requires " + permission;
+        Slog.w(TAG, msg);
+        return false;
+!!!8316940.java!!!	monitor() : void
+        synchronized (mInputFilterLock) { }
+        nativeMonitor(mPtr);
+!!!8317068.java!!!	notifyConfigurationChanged(in whenNanos : long) : void
+        mWindowManagerCallbacks.notifyConfigurationChanged();
+!!!8317196.java!!!	notifyInputDevicesChanged(inout inputDevices : InputDevice) : void
+        synchronized (mInputDevicesLock) {
+            if (!mInputDevicesChangedPending) {
+                mInputDevicesChangedPending = true;
+                mHandler.obtainMessage(MSG_DELIVER_INPUT_DEVICES_CHANGED,
+                        mInputDevices).sendToTarget();
+            }
+
+            mInputDevices = inputDevices;
+        }
+!!!8317324.java!!!	notifySwitch(in whenNanos : long, in switchValues : int, in switchMask : int) : void
+        if (DEBUG) {
+            Slog.d(TAG, "notifySwitch: values=" + Integer.toHexString(switchValues)
+                    + ", mask=" + Integer.toHexString(switchMask));
+        }
+
+        if ((switchMask & SW_LID_BIT) != 0) {
+            final boolean lidOpen = ((switchValues & SW_LID_BIT) == 0);
+            mWindowManagerCallbacks.notifyLidSwitchChanged(whenNanos, lidOpen);
+        }
+
+        if (mUseDevInputEventForAudioJack && (switchMask & SW_JACK_BITS) != 0) {
+            mWiredAccessoryCallbacks.notifyWiredAccessoryChanged(whenNanos, switchValues,
+                    switchMask);
+        }
+!!!8317452.java!!!	notifyInputChannelBroken(inout inputWindowHandle : InputWindowHandle) : void
+        mWindowManagerCallbacks.notifyInputChannelBroken(inputWindowHandle);
+!!!8317580.java!!!	notifyANR(inout inputApplicationHandle : InputApplicationHandle, inout inputWindowHandle : InputWindowHandle) : long
+        return mWindowManagerCallbacks.notifyANR(inputApplicationHandle, inputWindowHandle);
+!!!8317708.java!!!	filterInputEvent(inout event : InputEvent, in policyFlags : int) : boolean
+        synchronized (mInputFilterLock) {
+            if (mInputFilter != null) {
+                try {
+                    mInputFilter.filterInputEvent(event, policyFlags);
+                } catch (RemoteException e) {
+                    /* ignore */
+                }
+                return false;
+            }
+        }
+        event.recycle();
+        return true;
+!!!8317836.java!!!	interceptKeyBeforeQueueing(inout event : KeyEvent, in policyFlags : int, inout isScreenOn : boolean) : int
+        return mWindowManagerCallbacks.interceptKeyBeforeQueueing(
+                event, policyFlags, isScreenOn);
+!!!8317964.java!!!	interceptMotionBeforeQueueingWhenScreenOff(in policyFlags : int) : int
+        return mWindowManagerCallbacks.interceptMotionBeforeQueueingWhenScreenOff(policyFlags);
+!!!8318092.java!!!	interceptKeyBeforeDispatching(inout focus : InputWindowHandle, inout event : KeyEvent, in policyFlags : int) : long
+        return mWindowManagerCallbacks.interceptKeyBeforeDispatching(focus, event, policyFlags);
+!!!8318220.java!!!	dispatchUnhandledKey(inout focus : InputWindowHandle, inout event : KeyEvent, in policyFlags : int) : KeyEvent
+        return mWindowManagerCallbacks.dispatchUnhandledKey(focus, event, policyFlags);
+!!!8318348.java!!!	checkInjectEventsPermission(in injectorPid : int, in injectorUid : int) : boolean
+        return mContext.checkPermission(android.Manifest.permission.INJECT_EVENTS,
+                injectorPid, injectorUid) == PackageManager.PERMISSION_GRANTED;
+!!!8318476.java!!!	getVirtualKeyQuietTimeMillis() : int
+        return mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_virtualKeyQuietTimeMillis);
+!!!8318604.java!!!	getExcludedDeviceNames() : String
+        ArrayList<String> names = new ArrayList<String>();
+
+        // Read partner-provided list of excluded input devices
+        XmlPullParser parser = null;
+        // Environment.getRootDirectory() is a fancy way of saying ANDROID_ROOT or "/system".
+        File confFile = new File(Environment.getRootDirectory(), EXCLUDED_DEVICES_PATH);
+        FileReader confreader = null;
+        try {
+            confreader = new FileReader(confFile);
+            parser = Xml.newPullParser();
+            parser.setInput(confreader);
+            XmlUtils.beginDocument(parser, "devices");
+
+            while (true) {
+                XmlUtils.nextElement(parser);
+                if (!"device".equals(parser.getName())) {
+                    break;
+                }
+                String name = parser.getAttributeValue(null, "name");
+                if (name != null) {
+                    names.add(name);
+                }
+            }
+        } catch (FileNotFoundException e) {
+            // It's ok if the file does not exist.
+        } catch (Exception e) {
+            Slog.e(TAG, "Exception while parsing '" + confFile.getAbsolutePath() + "'", e);
+        } finally {
+            try { if (confreader != null) confreader.close(); } catch (IOException e) { }
+        }
+
+        return names.toArray(new String[names.size()]);
+!!!8318732.java!!!	getKeyRepeatTimeout() : int
+        return ViewConfiguration.getKeyRepeatTimeout();
+!!!8318860.java!!!	getKeyRepeatDelay() : int
+        return ViewConfiguration.getKeyRepeatDelay();
+!!!8318988.java!!!	getHoverTapTimeout() : int
+        return ViewConfiguration.getHoverTapTimeout();
+!!!8319116.java!!!	getHoverTapSlop() : int
+        return ViewConfiguration.getHoverTapSlop();
+!!!8319244.java!!!	getDoubleTapTimeout() : int
+        return ViewConfiguration.getDoubleTapTimeout();
+!!!8319372.java!!!	getLongPressTimeout() : int
+        return ViewConfiguration.getLongPressTimeout();
+!!!8319500.java!!!	getPointerLayer() : int
+        return mWindowManagerCallbacks.getPointerLayer();
+!!!8319628.java!!!	getPointerIcon() : PointerIcon
+        return PointerIcon.getDefaultIcon(mContext);
+!!!8319756.java!!!	getKeyboardLayoutOverlay(in inputDeviceDescriptor : String) : String
+        if (!mSystemReady) {
+            return null;
+        }
+
+        String keyboardLayoutDescriptor = getCurrentKeyboardLayoutForInputDevice(
+                inputDeviceDescriptor);
+        if (keyboardLayoutDescriptor == null) {
+            return null;
+        }
+
+        final String[] result = new String[2];
+        visitKeyboardLayout(keyboardLayoutDescriptor, new KeyboardLayoutVisitor() {
+            @Override
+            public void visitKeyboardLayout(Resources resources,
+                    String descriptor, String label, String collection, int keyboardLayoutResId) {
+                try {
+                    result[0] = descriptor;
+                    result[1] = Streams.readFully(new InputStreamReader(
+                            resources.openRawResource(keyboardLayoutResId)));
+                } catch (IOException ex) {
+                } catch (NotFoundException ex) {
+                }
+            }
+        });
+        if (result[0] == null) {
+            Log.w(TAG, "Could not get keyboard layout with descriptor '"
+                    + keyboardLayoutDescriptor + "'.");
+            return null;
+        }
+        return result;
+!!!8319884.java!!!	getDeviceAlias(in uniqueId : String) : String
+        if (BluetoothAdapter.checkBluetoothAddress(uniqueId)) {
+            // TODO(BT) mBluetoothService.getRemoteAlias(uniqueId)
+            return null;
+        }
+        return null;

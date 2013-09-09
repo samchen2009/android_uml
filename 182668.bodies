@@ -1,0 +1,490 @@
+class MPEG2TSWriter
+!!!391052.cpp!!!	MPEG2TSWriter(in fd : int)
+    init();
+!!!391180.cpp!!!	MPEG2TSWriter(in filename : char)
+    init();
+!!!391308.cpp!!!	MPEG2TSWriter(inout cookie : void, in write : ssize_t (*)(void *cookie, const void *data, size_t size))
+    init();
+!!!391436.cpp!!!	addSource(in source : sp<MediaSource>) : status_t
+    CHECK(!mStarted);
+
+    sp<MetaData> meta = source->getFormat();
+    const char *mime;
+    CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+    if (strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)
+            && strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
+        return ERROR_UNSUPPORTED;
+    }
+
+    sp<SourceInfo> info = new SourceInfo(source);
+
+    mSources.push(info);
+
+    return OK;
+!!!391564.cpp!!!	start(inout param : MetaData = NULL) : status_t
+    CHECK(!mStarted);
+
+    mStarted = true;
+    mNumSourcesDone = 0;
+    mNumTSPacketsWritten = 0;
+    mNumTSPacketsBeforeMeta = 0;
+
+    for (size_t i = 0; i < mSources.size(); ++i) {
+        sp<AMessage> notify =
+            new AMessage(kWhatSourceNotify, mReflector->id());
+
+        notify->setInt32("source-index", i);
+
+        mSources.editItemAt(i)->start(notify);
+    }
+
+    return OK;
+!!!391820.cpp!!!	pause() : status_t
+    CHECK(mStarted);
+
+    return OK;
+!!!391948.cpp!!!	reachedEOS() : bool
+    return !mStarted || (mNumSourcesDone == mSources.size() ? true : false);
+!!!392076.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    return OK;
+!!!392204.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatSourceNotify:
+        {
+            int32_t sourceIndex;
+            CHECK(msg->findInt32("source-index", &sourceIndex));
+
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            if (what == SourceInfo::kNotifyReachedEOS
+                    || what == SourceInfo::kNotifyStartFailed) {
+                sp<SourceInfo> source = mSources.editItemAt(sourceIndex);
+                source->setEOSReceived();
+
+                sp<ABuffer> buffer = source->lastAccessUnit();
+                source->setLastAccessUnit(NULL);
+
+                if (buffer != NULL) {
+                    writeTS();
+                    writeAccessUnit(sourceIndex, buffer);
+                }
+
+                ++mNumSourcesDone;
+            } else if (what == SourceInfo::kNotifyBuffer) {
+                sp<ABuffer> buffer;
+                CHECK(msg->findBuffer("buffer", &buffer));
+
+                int32_t oob;
+                if (msg->findInt32("oob", &oob) && oob) {
+                    // This is codec specific data delivered out of band.
+                    // It can be written out immediately.
+                    writeTS();
+                    writeAccessUnit(sourceIndex, buffer);
+                    break;
+                }
+
+                // We don't just write out data as we receive it from
+                // the various sources. That would essentially write them
+                // out in random order (as the thread scheduler determines
+                // how the messages are dispatched).
+                // Instead we gather an access unit for all tracks and
+                // write out the one with the smallest timestamp, then
+                // request more data for the written out track.
+                // Rinse, repeat.
+                // If we don't have data on any track we don't write
+                // anything just yet.
+
+                sp<SourceInfo> source = mSources.editItemAt(sourceIndex);
+
+                CHECK(source->lastAccessUnit() == NULL);
+                source->setLastAccessUnit(buffer);
+
+                ALOGV("lastAccessUnitTimeUs[%d] = %.2f secs",
+                     sourceIndex, source->lastAccessUnitTimeUs() / 1E6);
+
+                int64_t minTimeUs = -1;
+                size_t minIndex = 0;
+
+                for (size_t i = 0; i < mSources.size(); ++i) {
+                    const sp<SourceInfo> &source = mSources.editItemAt(i);
+
+                    if (source->eosReceived()) {
+                        continue;
+                    }
+
+                    int64_t timeUs = source->lastAccessUnitTimeUs();
+                    if (timeUs < 0) {
+                        minTimeUs = -1;
+                        break;
+                    } else if (minTimeUs < 0 || timeUs < minTimeUs) {
+                        minTimeUs = timeUs;
+                        minIndex = i;
+                    }
+                }
+
+                if (minTimeUs < 0) {
+                    ALOGV("not a all tracks have valid data.");
+                    break;
+                }
+
+                ALOGV("writing access unit at time %.2f secs (index %d)",
+                     minTimeUs / 1E6, minIndex);
+
+                source = mSources.editItemAt(minIndex);
+
+                buffer = source->lastAccessUnit();
+                source->setLastAccessUnit(NULL);
+
+                writeTS();
+                writeAccessUnit(minIndex, buffer);
+
+                source->readMore();
+            }
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!392332.cpp!!!	~MPEG2TSWriter()
+    if (mStarted) {
+        reset();
+    }
+
+    mLooper->unregisterHandler(mReflector->id());
+    mLooper->stop();
+
+    if (mFile != NULL) {
+        fclose(mFile);
+        mFile = NULL;
+    }
+!!!392460.cpp!!!	init() : void
+    CHECK(mFile != NULL || mWriteFunc != NULL);
+
+    initCrcTable();
+
+    mLooper = new ALooper;
+    mLooper->setName("MPEG2TSWriter");
+
+    mReflector = new AHandlerReflector<MPEG2TSWriter>(this);
+
+    mLooper->registerHandler(mReflector);
+    mLooper->start();
+!!!392588.cpp!!!	writeTS() : void
+    if (mNumTSPacketsWritten >= mNumTSPacketsBeforeMeta) {
+        writeProgramAssociationTable();
+        writeProgramMap();
+
+        mNumTSPacketsBeforeMeta = mNumTSPacketsWritten + 2500;
+    }
+!!!392716.cpp!!!	writeProgramAssociationTable() : void
+    // 0x47
+    // transport_error_indicator = b0
+    // payload_unit_start_indicator = b1
+    // transport_priority = b0
+    // PID = b0000000000000 (13 bits)
+    // transport_scrambling_control = b00
+    // adaptation_field_control = b01 (no adaptation field, payload only)
+    // continuity_counter = b????
+    // skip = 0x00
+    // --- payload follows
+    // table_id = 0x00
+    // section_syntax_indicator = b1
+    // must_be_zero = b0
+    // reserved = b11
+    // section_length = 0x00d
+    // transport_stream_id = 0x0000
+    // reserved = b11
+    // version_number = b00001
+    // current_next_indicator = b1
+    // section_number = 0x00
+    // last_section_number = 0x00
+    //   one program follows:
+    //   program_number = 0x0001
+    //   reserved = b111
+    //   program_map_PID = 0x01e0 (13 bits!)
+    // CRC = 0x????????
+
+    static const uint8_t kData[] = {
+        0x47,
+        0x40, 0x00, 0x10, 0x00,  // b0100 0000 0000 0000 0001 ???? 0000 0000
+        0x00, 0xb0, 0x0d, 0x00,  // b0000 0000 1011 0000 0000 1101 0000 0000
+        0x00, 0xc3, 0x00, 0x00,  // b0000 0000 1100 0011 0000 0000 0000 0000
+        0x00, 0x01, 0xe1, 0xe0,  // b0000 0000 0000 0001 1110 0001 1110 0000
+        0x00, 0x00, 0x00, 0x00   // b???? ???? ???? ???? ???? ???? ???? ????
+    };
+
+    sp<ABuffer> buffer = new ABuffer(188);
+    memset(buffer->data(), 0xff, buffer->size());
+    memcpy(buffer->data(), kData, sizeof(kData));
+
+    if (++mPATContinuityCounter == 16) {
+        mPATContinuityCounter = 0;
+    }
+    buffer->data()[3] |= mPATContinuityCounter;
+
+    uint32_t crc = htonl(crc32(&buffer->data()[5], 12));
+    memcpy(&buffer->data()[17], &crc, sizeof(crc));
+
+    CHECK_EQ(internalWrite(buffer->data(), buffer->size()), buffer->size());
+!!!392844.cpp!!!	writeProgramMap() : void
+    // 0x47
+    // transport_error_indicator = b0
+    // payload_unit_start_indicator = b1
+    // transport_priority = b0
+    // PID = b0 0001 1110 0000 (13 bits) [0x1e0]
+    // transport_scrambling_control = b00
+    // adaptation_field_control = b01 (no adaptation field, payload only)
+    // continuity_counter = b????
+    // skip = 0x00
+    // -- payload follows
+    // table_id = 0x02
+    // section_syntax_indicator = b1
+    // must_be_zero = b0
+    // reserved = b11
+    // section_length = 0x???
+    // program_number = 0x0001
+    // reserved = b11
+    // version_number = b00001
+    // current_next_indicator = b1
+    // section_number = 0x00
+    // last_section_number = 0x00
+    // reserved = b111
+    // PCR_PID = b? ???? ???? ???? (13 bits)
+    // reserved = b1111
+    // program_info_length = 0x000
+    //   one or more elementary stream descriptions follow:
+    //   stream_type = 0x??
+    //   reserved = b111
+    //   elementary_PID = b? ???? ???? ???? (13 bits)
+    //   reserved = b1111
+    //   ES_info_length = 0x000
+    // CRC = 0x????????
+
+    static const uint8_t kData[] = {
+        0x47,
+        0x41, 0xe0, 0x10, 0x00,  // b0100 0001 1110 0000 0001 ???? 0000 0000
+        0x02, 0xb0, 0x00, 0x00,  // b0000 0010 1011 ???? ???? ???? 0000 0000
+        0x01, 0xc3, 0x00, 0x00,  // b0000 0001 1100 0011 0000 0000 0000 0000
+        0xe0, 0x00, 0xf0, 0x00   // b111? ???? ???? ???? 1111 0000 0000 0000
+    };
+
+    sp<ABuffer> buffer = new ABuffer(188);
+    memset(buffer->data(), 0xff, buffer->size());
+    memcpy(buffer->data(), kData, sizeof(kData));
+
+    if (++mPMTContinuityCounter == 16) {
+        mPMTContinuityCounter = 0;
+    }
+    buffer->data()[3] |= mPMTContinuityCounter;
+
+    size_t section_length = 5 * mSources.size() + 4 + 9;
+    buffer->data()[6] |= section_length >> 8;
+    buffer->data()[7] = section_length & 0xff;
+
+    static const unsigned kPCR_PID = 0x1e1;
+    buffer->data()[13] |= (kPCR_PID >> 8) & 0x1f;
+    buffer->data()[14] = kPCR_PID & 0xff;
+
+    uint8_t *ptr = &buffer->data()[sizeof(kData)];
+    for (size_t i = 0; i < mSources.size(); ++i) {
+        *ptr++ = mSources.editItemAt(i)->streamType();
+
+        const unsigned ES_PID = 0x1e0 + i + 1;
+        *ptr++ = 0xe0 | (ES_PID >> 8);
+        *ptr++ = ES_PID & 0xff;
+        *ptr++ = 0xf0;
+        *ptr++ = 0x00;
+    }
+
+    uint32_t crc = htonl(crc32(&buffer->data()[5], 12+mSources.size()*5));
+    memcpy(&buffer->data()[17+mSources.size()*5], &crc, sizeof(crc));
+
+    CHECK_EQ(internalWrite(buffer->data(), buffer->size()), buffer->size());
+!!!392972.cpp!!!	writeAccessUnit(in sourceIndex : int32_t, in accessUnit : sp<ABuffer>) : void
+    // 0x47
+    // transport_error_indicator = b0
+    // payload_unit_start_indicator = b1
+    // transport_priority = b0
+    // PID = b0 0001 1110 ???? (13 bits) [0x1e0 + 1 + sourceIndex]
+    // transport_scrambling_control = b00
+    // adaptation_field_control = b??
+    // continuity_counter = b????
+    // -- payload follows
+    // packet_startcode_prefix = 0x000001
+    // stream_id = 0x?? (0xe0 for avc video, 0xc0 for aac audio)
+    // PES_packet_length = 0x????
+    // reserved = b10
+    // PES_scrambling_control = b00
+    // PES_priority = b0
+    // data_alignment_indicator = b1
+    // copyright = b0
+    // original_or_copy = b0
+    // PTS_DTS_flags = b10  (PTS only)
+    // ESCR_flag = b0
+    // ES_rate_flag = b0
+    // DSM_trick_mode_flag = b0
+    // additional_copy_info_flag = b0
+    // PES_CRC_flag = b0
+    // PES_extension_flag = b0
+    // PES_header_data_length = 0x05
+    // reserved = b0010 (PTS)
+    // PTS[32..30] = b???
+    // reserved = b1
+    // PTS[29..15] = b??? ???? ???? ???? (15 bits)
+    // reserved = b1
+    // PTS[14..0] = b??? ???? ???? ???? (15 bits)
+    // reserved = b1
+    // the first fragment of "buffer" follows
+
+    sp<ABuffer> buffer = new ABuffer(188);
+    memset(buffer->data(), 0xff, buffer->size());
+
+    const unsigned PID = 0x1e0 + sourceIndex + 1;
+
+    const unsigned continuity_counter =
+        mSources.editItemAt(sourceIndex)->incrementContinuityCounter();
+
+    // XXX if there are multiple streams of a kind (more than 1 audio or
+    // more than 1 video) they need distinct stream_ids.
+    const unsigned stream_id =
+        mSources.editItemAt(sourceIndex)->streamType() == 0x0f ? 0xc0 : 0xe0;
+
+    int64_t timeUs;
+    CHECK(accessUnit->meta()->findInt64("timeUs", &timeUs));
+
+    uint32_t PTS = (timeUs * 9ll) / 100ll;
+
+    size_t PES_packet_length = accessUnit->size() + 8;
+    bool padding = (accessUnit->size() < (188 - 18));
+
+    if (PES_packet_length >= 65536) {
+        // This really should only happen for video.
+        CHECK_EQ(stream_id, 0xe0u);
+
+        // It's valid to set this to 0 for video according to the specs.
+        PES_packet_length = 0;
+    }
+
+    uint8_t *ptr = buffer->data();
+    *ptr++ = 0x47;
+    *ptr++ = 0x40 | (PID >> 8);
+    *ptr++ = PID & 0xff;
+    *ptr++ = (padding ? 0x30 : 0x10) | continuity_counter;
+    if (padding) {
+        int paddingSize = 188 - accessUnit->size() - 18;
+        *ptr++ = paddingSize - 1;
+        if (paddingSize >= 2) {
+            *ptr++ = 0x00;
+            ptr += paddingSize - 2;
+        }
+    }
+    *ptr++ = 0x00;
+    *ptr++ = 0x00;
+    *ptr++ = 0x01;
+    *ptr++ = stream_id;
+    *ptr++ = PES_packet_length >> 8;
+    *ptr++ = PES_packet_length & 0xff;
+    *ptr++ = 0x84;
+    *ptr++ = 0x80;
+    *ptr++ = 0x05;
+    *ptr++ = 0x20 | (((PTS >> 30) & 7) << 1) | 1;
+    *ptr++ = (PTS >> 22) & 0xff;
+    *ptr++ = (((PTS >> 15) & 0x7f) << 1) | 1;
+    *ptr++ = (PTS >> 7) & 0xff;
+    *ptr++ = ((PTS & 0x7f) << 1) | 1;
+
+    size_t sizeLeft = buffer->data() + buffer->size() - ptr;
+    size_t copy = accessUnit->size();
+    if (copy > sizeLeft) {
+        copy = sizeLeft;
+    }
+
+    memcpy(ptr, accessUnit->data(), copy);
+
+    CHECK_EQ(internalWrite(buffer->data(), buffer->size()), buffer->size());
+
+    size_t offset = copy;
+    while (offset < accessUnit->size()) {
+        bool lastAccessUnit = ((accessUnit->size() - offset) < 184);
+        // for subsequent fragments of "buffer":
+        // 0x47
+        // transport_error_indicator = b0
+        // payload_unit_start_indicator = b0
+        // transport_priority = b0
+        // PID = b0 0001 1110 ???? (13 bits) [0x1e0 + 1 + sourceIndex]
+        // transport_scrambling_control = b00
+        // adaptation_field_control = b??
+        // continuity_counter = b????
+        // the fragment of "buffer" follows.
+
+        memset(buffer->data(), 0xff, buffer->size());
+
+        const unsigned continuity_counter =
+            mSources.editItemAt(sourceIndex)->incrementContinuityCounter();
+
+        ptr = buffer->data();
+        *ptr++ = 0x47;
+        *ptr++ = 0x00 | (PID >> 8);
+        *ptr++ = PID & 0xff;
+        *ptr++ = (lastAccessUnit ? 0x30 : 0x10) | continuity_counter;
+
+        if (lastAccessUnit) {
+            // Pad packet using an adaptation field
+            // Adaptation header all to 0 execpt size
+            uint8_t paddingSize = (uint8_t)184 - (accessUnit->size() - offset);
+            *ptr++ = paddingSize - 1;
+            if (paddingSize >= 2) {
+                *ptr++ = 0x00;
+                ptr += paddingSize - 2;
+            }
+        }
+
+        size_t sizeLeft = buffer->data() + buffer->size() - ptr;
+        size_t copy = accessUnit->size() - offset;
+        if (copy > sizeLeft) {
+            copy = sizeLeft;
+        }
+
+        memcpy(ptr, accessUnit->data() + offset, copy);
+        CHECK_EQ(internalWrite(buffer->data(), buffer->size()),
+                 buffer->size());
+
+        offset += copy;
+    }
+!!!393100.cpp!!!	initCrcTable() : void
+    uint32_t poly = 0x04C11DB7;
+
+    for (int i = 0; i < 256; i++) {
+        uint32_t crc = i << 24;
+        for (int j = 0; j < 8; j++) {
+            crc = (crc << 1) ^ ((crc & 0x80000000) ? (poly) : 0);
+        }
+        mCrcTable[i] = crc;
+    }
+!!!393228.cpp!!!	crc32(in p_start : uint8_t, in length : size_t) : uint32_t
+    uint32_t crc = 0xFFFFFFFF;
+    const uint8_t *p;
+
+    for (p = p_start; p < p_start + length; p++) {
+        crc = (crc << 8) ^ mCrcTable[((crc >> 24) ^ *p) & 0xFF];
+    }
+
+    return crc;
+!!!393356.cpp!!!	internalWrite(in data : void, in size : size_t) : ssize_t
+    if (mFile != NULL) {
+        return fwrite(data, 1, size, mFile);
+    }
+
+    return (*mWriteFunc)(mWriteCookie, data, size);
+!!!393484.cpp!!!	reset() : status_t
+    CHECK(mStarted);
+
+    for (size_t i = 0; i < mSources.size(); ++i) {
+        mSources.editItemAt(i)->stop();
+    }
+    mStarted = false;
+
+    return OK;

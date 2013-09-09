@@ -1,0 +1,475 @@
+class InputReader
+!!!1273612.cpp!!!	InputReader(in eventHub : sp<EventHubInterface>, in policy : sp<InputReaderPolicyInterface>, in listener : sp<InputListenerInterface>)
+    mQueuedListener = new QueuedInputListener(listener);
+
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        refreshConfigurationLocked(0);
+        updateGlobalMetaStateLocked();
+    } // release lock
+!!!1273740.cpp!!!	~InputReader()
+    for (size_t i = 0; i < mDevices.size(); i++) {
+        delete mDevices.valueAt(i);
+    }
+!!!1273868.cpp!!!	dump(inout dump : String8) : void
+    AutoMutex _l(mLock);
+
+    mEventHub->dump(dump);
+    dump.append("\n");
+
+    dump.append("Input Reader State:\n");
+
+    for (size_t i = 0; i < mDevices.size(); i++) {
+        mDevices.valueAt(i)->dump(dump);
+    }
+
+    dump.append(INDENT "Configuration:\n");
+    dump.append(INDENT2 "ExcludedDeviceNames: [");
+    for (size_t i = 0; i < mConfig.excludedDeviceNames.size(); i++) {
+        if (i != 0) {
+            dump.append(", ");
+        }
+        dump.append(mConfig.excludedDeviceNames.itemAt(i).string());
+    }
+    dump.append("]\n");
+    dump.appendFormat(INDENT2 "VirtualKeyQuietTime: %0.1fms\n",
+            mConfig.virtualKeyQuietTime * 0.000001f);
+
+    dump.appendFormat(INDENT2 "PointerVelocityControlParameters: "
+            "scale=%0.3f, lowThreshold=%0.3f, highThreshold=%0.3f, acceleration=%0.3f\n",
+            mConfig.pointerVelocityControlParameters.scale,
+            mConfig.pointerVelocityControlParameters.lowThreshold,
+            mConfig.pointerVelocityControlParameters.highThreshold,
+            mConfig.pointerVelocityControlParameters.acceleration);
+
+    dump.appendFormat(INDENT2 "WheelVelocityControlParameters: "
+            "scale=%0.3f, lowThreshold=%0.3f, highThreshold=%0.3f, acceleration=%0.3f\n",
+            mConfig.wheelVelocityControlParameters.scale,
+            mConfig.wheelVelocityControlParameters.lowThreshold,
+            mConfig.wheelVelocityControlParameters.highThreshold,
+            mConfig.wheelVelocityControlParameters.acceleration);
+
+    dump.appendFormat(INDENT2 "PointerGesture:\n");
+    dump.appendFormat(INDENT3 "Enabled: %s\n",
+            toString(mConfig.pointerGesturesEnabled));
+    dump.appendFormat(INDENT3 "QuietInterval: %0.1fms\n",
+            mConfig.pointerGestureQuietInterval * 0.000001f);
+    dump.appendFormat(INDENT3 "DragMinSwitchSpeed: %0.1fpx/s\n",
+            mConfig.pointerGestureDragMinSwitchSpeed);
+    dump.appendFormat(INDENT3 "TapInterval: %0.1fms\n",
+            mConfig.pointerGestureTapInterval * 0.000001f);
+    dump.appendFormat(INDENT3 "TapDragInterval: %0.1fms\n",
+            mConfig.pointerGestureTapDragInterval * 0.000001f);
+    dump.appendFormat(INDENT3 "TapSlop: %0.1fpx\n",
+            mConfig.pointerGestureTapSlop);
+    dump.appendFormat(INDENT3 "MultitouchSettleInterval: %0.1fms\n",
+            mConfig.pointerGestureMultitouchSettleInterval * 0.000001f);
+    dump.appendFormat(INDENT3 "MultitouchMinDistance: %0.1fpx\n",
+            mConfig.pointerGestureMultitouchMinDistance);
+    dump.appendFormat(INDENT3 "SwipeTransitionAngleCosine: %0.1f\n",
+            mConfig.pointerGestureSwipeTransitionAngleCosine);
+    dump.appendFormat(INDENT3 "SwipeMaxWidthRatio: %0.1f\n",
+            mConfig.pointerGestureSwipeMaxWidthRatio);
+    dump.appendFormat(INDENT3 "MovementSpeedRatio: %0.1f\n",
+            mConfig.pointerGestureMovementSpeedRatio);
+    dump.appendFormat(INDENT3 "ZoomSpeedRatio: %0.1f\n",
+            mConfig.pointerGestureZoomSpeedRatio);
+!!!1273996.cpp!!!	monitor() : void
+    // Acquire and release the lock to ensure that the reader has not deadlocked.
+    mLock.lock();
+    mEventHub->wake();
+    mReaderIsAliveCondition.wait(mLock);
+    mLock.unlock();
+
+    // Check the EventHub
+    mEventHub->monitor();
+!!!1274124.cpp!!!	loopOnce() : void
+    int32_t oldGeneration;
+    int32_t timeoutMillis;
+    bool inputDevicesChanged = false;
+    Vector<InputDeviceInfo> inputDevices;
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        oldGeneration = mGeneration;
+        timeoutMillis = -1;
+
+        uint32_t changes = mConfigurationChangesToRefresh;
+        if (changes) {
+            mConfigurationChangesToRefresh = 0;
+            timeoutMillis = 0;
+            refreshConfigurationLocked(changes);
+        } else if (mNextTimeout != LLONG_MAX) {
+            nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+            timeoutMillis = toMillisecondTimeoutDelay(now, mNextTimeout);
+        }
+    } // release lock
+
+    size_t count = mEventHub->getEvents(timeoutMillis, mEventBuffer, EVENT_BUFFER_SIZE);
+
+    { // acquire lock
+        AutoMutex _l(mLock);
+        mReaderIsAliveCondition.broadcast();
+
+        if (count) {
+            processEventsLocked(mEventBuffer, count);
+        }
+
+        if (mNextTimeout != LLONG_MAX) {
+            nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+            if (now >= mNextTimeout) {
+#if DEBUG_RAW_EVENTS
+                ALOGD("Timeout expired, latency=%0.3fms", (now - mNextTimeout) * 0.000001f);
+#endif
+                mNextTimeout = LLONG_MAX;
+                timeoutExpiredLocked(now);
+            }
+        }
+
+        if (oldGeneration != mGeneration) {
+            inputDevicesChanged = true;
+            getInputDevicesLocked(inputDevices);
+        }
+    } // release lock
+
+    // Send out a message that the describes the changed input devices.
+    if (inputDevicesChanged) {
+        mPolicy->notifyInputDevicesChanged(inputDevices);
+    }
+
+    // Flush queued events out to the listener.
+    // This must happen outside of the lock because the listener could potentially call
+    // back into the InputReader's methods, such as getScanCodeState, or become blocked
+    // on another thread similarly waiting to acquire the InputReader lock thereby
+    // resulting in a deadlock.  This situation is actually quite plausible because the
+    // listener is actually the input dispatcher, which calls into the window manager,
+    // which occasionally calls into the input reader.
+    mQueuedListener->flush();
+!!!1274252.cpp!!!	getInputDevices(inout outInputDevices : Vector<InputDeviceInfo>) : void
+    AutoMutex _l(mLock);
+    getInputDevicesLocked(outInputDevices);
+!!!1274380.cpp!!!	getScanCodeState(in deviceId : int32_t, in sourceMask : uint32_t, in scanCode : int32_t) : int32_t
+    AutoMutex _l(mLock);
+
+    return getStateLocked(deviceId, sourceMask, scanCode, &InputDevice::getScanCodeState);
+!!!1274508.cpp!!!	getKeyCodeState(in deviceId : int32_t, in sourceMask : uint32_t, in keyCode : int32_t) : int32_t
+    AutoMutex _l(mLock);
+
+    return getStateLocked(deviceId, sourceMask, keyCode, &InputDevice::getKeyCodeState);
+!!!1274636.cpp!!!	getSwitchState(in deviceId : int32_t, in sourceMask : uint32_t, in switchCode : int32_t) : int32_t
+    AutoMutex _l(mLock);
+
+    return getStateLocked(deviceId, sourceMask, switchCode, &InputDevice::getSwitchState);
+!!!1274764.cpp!!!	hasKeys(in deviceId : int32_t, in sourceMask : uint32_t, in numCodes : size_t, in keyCodes : int32_t, inout outFlags : uint8_t) : bool
+    AutoMutex _l(mLock);
+
+    memset(outFlags, 0, numCodes);
+    return markSupportedKeyCodesLocked(deviceId, sourceMask, numCodes, keyCodes, outFlags);
+!!!1274892.cpp!!!	requestRefreshConfiguration(in changes : uint32_t) : void
+    AutoMutex _l(mLock);
+
+    if (changes) {
+        bool needWake = !mConfigurationChangesToRefresh;
+        mConfigurationChangesToRefresh |= changes;
+
+        if (needWake) {
+            mEventHub->wake();
+        }
+    }
+!!!1275020.cpp!!!	vibrate(in deviceId : int32_t, in pattern : nsecs_t, in patternSize : size_t, in repeat : ssize_t, in token : int32_t) : void
+    AutoMutex _l(mLock);
+
+    ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+    if (deviceIndex >= 0) {
+        InputDevice* device = mDevices.valueAt(deviceIndex);
+        device->vibrate(pattern, patternSize, repeat, token);
+    }
+!!!1275148.cpp!!!	cancelVibrate(in deviceId : int32_t, in token : int32_t) : void
+    AutoMutex _l(mLock);
+
+    ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+    if (deviceIndex >= 0) {
+        InputDevice* device = mDevices.valueAt(deviceIndex);
+        device->cancelVibrate(token);
+    }
+!!!1275276.cpp!!!	createDeviceLocked(in deviceId : int32_t, in identifier : InputDeviceIdentifier, in classes : uint32_t) : InputDevice
+    InputDevice* device = new InputDevice(&mContext, deviceId, bumpGenerationLocked(),
+            identifier, classes);
+
+    // External devices.
+    if (classes & INPUT_DEVICE_CLASS_EXTERNAL) {
+        device->setExternal(true);
+    }
+
+    // Switch-like devices.
+    if (classes & INPUT_DEVICE_CLASS_SWITCH) {
+        device->addMapper(new SwitchInputMapper(device));
+    }
+
+    // Vibrator-like devices.
+    if (classes & INPUT_DEVICE_CLASS_VIBRATOR) {
+        device->addMapper(new VibratorInputMapper(device));
+    }
+
+    // Keyboard-like devices.
+    uint32_t keyboardSource = 0;
+    int32_t keyboardType = AINPUT_KEYBOARD_TYPE_NON_ALPHABETIC;
+    if (classes & INPUT_DEVICE_CLASS_KEYBOARD) {
+        keyboardSource |= AINPUT_SOURCE_KEYBOARD;
+    }
+    if (classes & INPUT_DEVICE_CLASS_ALPHAKEY) {
+        keyboardType = AINPUT_KEYBOARD_TYPE_ALPHABETIC;
+    }
+    if (classes & INPUT_DEVICE_CLASS_DPAD) {
+        keyboardSource |= AINPUT_SOURCE_DPAD;
+    }
+    if (classes & INPUT_DEVICE_CLASS_GAMEPAD) {
+        keyboardSource |= AINPUT_SOURCE_GAMEPAD;
+    }
+
+    if (keyboardSource != 0) {
+        device->addMapper(new KeyboardInputMapper(device, keyboardSource, keyboardType));
+    }
+
+    // Cursor-like devices.
+    if (classes & INPUT_DEVICE_CLASS_CURSOR) {
+        bool enableAbsCoordinate = !((classes & INPUT_DEVICE_CLASS_TOUCH)
+                                      || (classes & INPUT_DEVICE_CLASS_TOUCH_MT));
+        device->addMapper(new CursorInputMapper(device, enableAbsCoordinate));
+    }
+
+    // Touchscreens and touchpad devices.
+    if (classes & INPUT_DEVICE_CLASS_TOUCH_MT) {
+        device->addMapper(new MultiTouchInputMapper(device));
+    } else if (classes & INPUT_DEVICE_CLASS_TOUCH) {
+        device->addMapper(new SingleTouchInputMapper(device));
+    }
+
+    // Joystick-like devices.
+    if (classes & INPUT_DEVICE_CLASS_JOYSTICK) {
+        device->addMapper(new JoystickInputMapper(device));
+    }
+
+    return device;
+!!!1276812.cpp!!!	processEventsLocked(in rawEvents : RawEvent, in count : size_t) : void
+    for (const RawEvent* rawEvent = rawEvents; count;) {
+        int32_t type = rawEvent->type;
+        size_t batchSize = 1;
+        if (type < EventHubInterface::FIRST_SYNTHETIC_EVENT) {
+            int32_t deviceId = rawEvent->deviceId;
+            while (batchSize < count) {
+                if (rawEvent[batchSize].type >= EventHubInterface::FIRST_SYNTHETIC_EVENT
+                        || rawEvent[batchSize].deviceId != deviceId) {
+                    break;
+                }
+                batchSize += 1;
+            }
+#if DEBUG_RAW_EVENTS
+            ALOGD("BatchSize: %d Count: %d", batchSize, count);
+#endif
+            processEventsForDeviceLocked(deviceId, rawEvent, batchSize);
+        } else {
+            switch (rawEvent->type) {
+            case EventHubInterface::DEVICE_ADDED:
+                addDeviceLocked(rawEvent->when, rawEvent->deviceId);
+                break;
+            case EventHubInterface::DEVICE_REMOVED:
+                removeDeviceLocked(rawEvent->when, rawEvent->deviceId);
+                break;
+            case EventHubInterface::FINISHED_DEVICE_SCAN:
+                handleConfigurationChangedLocked(rawEvent->when);
+                break;
+            default:
+                ALOG_ASSERT(false); // can't happen
+                break;
+            }
+        }
+        count -= batchSize;
+        rawEvent += batchSize;
+    }
+!!!1276940.cpp!!!	addDeviceLocked(in when : nsecs_t, in deviceId : int32_t) : void
+    ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+    if (deviceIndex >= 0) {
+        ALOGW("Ignoring spurious device added event for deviceId %d.", deviceId);
+        return;
+    }
+
+    InputDeviceIdentifier identifier = mEventHub->getDeviceIdentifier(deviceId);
+    uint32_t classes = mEventHub->getDeviceClasses(deviceId);
+
+    InputDevice* device = createDeviceLocked(deviceId, identifier, classes);
+    device->configure(when, &mConfig, 0);
+    device->reset(when);
+
+    if (device->isIgnored()) {
+        ALOGI("Device added: id=%d, name='%s' (ignored non-input device)", deviceId,
+                identifier.name.string());
+    } else {
+        ALOGI("Device added: id=%d, name='%s', sources=0x%08x", deviceId,
+                identifier.name.string(), device->getSources());
+    }
+
+    mDevices.add(deviceId, device);
+    bumpGenerationLocked();
+!!!1277068.cpp!!!	removeDeviceLocked(in when : nsecs_t, in deviceId : int32_t) : void
+    InputDevice* device = NULL;
+    ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+    if (deviceIndex < 0) {
+        ALOGW("Ignoring spurious device removed event for deviceId %d.", deviceId);
+        return;
+    }
+
+    device = mDevices.valueAt(deviceIndex);
+    mDevices.removeItemsAt(deviceIndex, 1);
+    bumpGenerationLocked();
+
+    if (device->isIgnored()) {
+        ALOGI("Device removed: id=%d, name='%s' (ignored non-input device)",
+                device->getId(), device->getName().string());
+    } else {
+        ALOGI("Device removed: id=%d, name='%s', sources=0x%08x",
+                device->getId(), device->getName().string(), device->getSources());
+    }
+
+    device->reset(when);
+    delete device;
+!!!1277196.cpp!!!	processEventsForDeviceLocked(in deviceId : int32_t, in rawEvents : RawEvent, in count : size_t) : void
+    ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+    if (deviceIndex < 0) {
+        ALOGW("Discarding event for unknown deviceId %d.", deviceId);
+        return;
+    }
+
+    InputDevice* device = mDevices.valueAt(deviceIndex);
+    if (device->isIgnored()) {
+        //ALOGD("Discarding event for ignored deviceId %d.", deviceId);
+        return;
+    }
+
+    device->process(rawEvents, count);
+!!!1277324.cpp!!!	timeoutExpiredLocked(in when : nsecs_t) : void
+    for (size_t i = 0; i < mDevices.size(); i++) {
+        InputDevice* device = mDevices.valueAt(i);
+        if (!device->isIgnored()) {
+            device->timeoutExpired(when);
+        }
+    }
+!!!1277452.cpp!!!	handleConfigurationChangedLocked(in when : nsecs_t) : void
+    // Reset global meta state because it depends on the list of all configured devices.
+    updateGlobalMetaStateLocked();
+
+    // Enqueue configuration changed.
+    NotifyConfigurationChangedArgs args(when);
+    mQueuedListener->notifyConfigurationChanged(&args);
+!!!1277580.cpp!!!	updateGlobalMetaStateLocked() : void
+    mGlobalMetaState = 0;
+
+    for (size_t i = 0; i < mDevices.size(); i++) {
+        InputDevice* device = mDevices.valueAt(i);
+        mGlobalMetaState |= device->getMetaState();
+    }
+!!!1277708.cpp!!!	getGlobalMetaStateLocked() : int32_t
+    return mGlobalMetaState;
+!!!1277836.cpp!!!	fadePointerLocked() : void
+    for (size_t i = 0; i < mDevices.size(); i++) {
+        InputDevice* device = mDevices.valueAt(i);
+        device->fadePointer();
+    }
+!!!1277964.cpp!!!	bumpGenerationLocked() : int32_t
+    return ++mGeneration;
+!!!1278092.cpp!!!	getInputDevicesLocked(inout outInputDevices : Vector<InputDeviceInfo>) : void
+    outInputDevices.clear();
+
+    size_t numDevices = mDevices.size();
+    for (size_t i = 0; i < numDevices; i++) {
+        InputDevice* device = mDevices.valueAt(i);
+        if (!device->isIgnored()) {
+            outInputDevices.push();
+            device->getDeviceInfo(&outInputDevices.editTop());
+        }
+    }
+!!!1278220.cpp!!!	disableVirtualKeysUntilLocked(in time : nsecs_t) : void
+    mDisableVirtualKeysTimeout = time;
+!!!1278348.cpp!!!	shouldDropVirtualKeyLocked(in now : nsecs_t, inout device : InputDevice, in keyCode : int32_t, in scanCode : int32_t) : bool
+    if (now < mDisableVirtualKeysTimeout) {
+        ALOGI("Dropping virtual key from device %s because virtual keys are "
+                "temporarily disabled for the next %0.3fms.  keyCode=%d, scanCode=%d",
+                device->getName().string(),
+                (mDisableVirtualKeysTimeout - now) * 0.000001,
+                keyCode, scanCode);
+        return true;
+    } else {
+        return false;
+    }
+!!!1278476.cpp!!!	requestTimeoutAtTimeLocked(in when : nsecs_t) : void
+    if (when < mNextTimeout) {
+        mNextTimeout = when;
+        mEventHub->wake();
+    }
+!!!1278604.cpp!!!	refreshConfigurationLocked(in changes : uint32_t) : void
+    mPolicy->getReaderConfiguration(&mConfig);
+    mEventHub->setExcludedDevices(mConfig.excludedDeviceNames);
+
+    if (changes) {
+        ALOGI("Reconfiguring input devices.  changes=0x%08x", changes);
+        nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+
+        if (changes & InputReaderConfiguration::CHANGE_MUST_REOPEN) {
+            mEventHub->requestReopenDevices();
+        } else {
+            for (size_t i = 0; i < mDevices.size(); i++) {
+                InputDevice* device = mDevices.valueAt(i);
+                device->configure(now, &mConfig, changes);
+            }
+        }
+    }
+!!!1278732.cpp!!!	getStateLocked(in deviceId : int32_t, in sourceMask : uint32_t, in code : int32_t, in getStateFunc : GetStateFunc) : int32_t
+    int32_t result = AKEY_STATE_UNKNOWN;
+    if (deviceId >= 0) {
+        ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+        if (deviceIndex >= 0) {
+            InputDevice* device = mDevices.valueAt(deviceIndex);
+            if (! device->isIgnored() && sourcesMatchMask(device->getSources(), sourceMask)) {
+                result = (device->*getStateFunc)(sourceMask, code);
+            }
+        }
+    } else {
+        size_t numDevices = mDevices.size();
+        for (size_t i = 0; i < numDevices; i++) {
+            InputDevice* device = mDevices.valueAt(i);
+            if (! device->isIgnored() && sourcesMatchMask(device->getSources(), sourceMask)) {
+                // If any device reports AKEY_STATE_DOWN or AKEY_STATE_VIRTUAL, return that
+                // value.  Otherwise, return AKEY_STATE_UP as long as one device reports it.
+                int32_t currentResult = (device->*getStateFunc)(sourceMask, code);
+                if (currentResult >= AKEY_STATE_DOWN) {
+                    return currentResult;
+                } else if (currentResult == AKEY_STATE_UP) {
+                    result = currentResult;
+                }
+            }
+        }
+    }
+    return result;
+!!!1278860.cpp!!!	markSupportedKeyCodesLocked(in deviceId : int32_t, in sourceMask : uint32_t, in numCodes : size_t, in keyCodes : int32_t, inout outFlags : uint8_t) : bool
+    bool result = false;
+    if (deviceId >= 0) {
+        ssize_t deviceIndex = mDevices.indexOfKey(deviceId);
+        if (deviceIndex >= 0) {
+            InputDevice* device = mDevices.valueAt(deviceIndex);
+            if (! device->isIgnored() && sourcesMatchMask(device->getSources(), sourceMask)) {
+                result = device->markSupportedKeyCodes(sourceMask,
+                        numCodes, keyCodes, outFlags);
+            }
+        }
+    } else {
+        size_t numDevices = mDevices.size();
+        for (size_t i = 0; i < numDevices; i++) {
+            InputDevice* device = mDevices.valueAt(i);
+            if (! device->isIgnored() && sourcesMatchMask(device->getSources(), sourceMask)) {
+                result |= device->markSupportedKeyCodes(sourceMask,
+                        numCodes, keyCodes, outFlags);
+            }
+        }
+    }
+    return result;

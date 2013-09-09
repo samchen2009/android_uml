@@ -1,0 +1,317 @@
+class MonitorThread
+!!!9728268.java!!!	MonitorThread()
+            super("WifiMonitor");
+!!!9728396.java!!!	run() : void
+
+            if (connectToSupplicant()) {
+                // Send a message indicating that it is now possible to send commands
+                // to the supplicant
+                mStateMachine.sendMessage(SUP_CONNECTION_EVENT);
+            } else {
+                mStateMachine.sendMessage(SUP_DISCONNECTION_EVENT);
+                return;
+            }
+
+            //noinspection InfiniteLoopStatement
+            for (;;) {
+                String eventStr = mWifiNative.waitForEvent();
+
+                // Skip logging the common but mostly uninteresting scan-results event
+                if (false && eventStr.indexOf(SCAN_RESULTS_STR) == -1) {
+                    Log.d(TAG, "Event [" + eventStr + "]");
+                }
+                if (!eventStr.startsWith(EVENT_PREFIX_STR)) {
+                    if (eventStr.startsWith(WPA_EVENT_PREFIX_STR) &&
+                            0 < eventStr.indexOf(PASSWORD_MAY_BE_INCORRECT_STR)) {
+                        mStateMachine.sendMessage(AUTHENTICATION_FAILURE_EVENT);
+                    } else if (eventStr.startsWith(WPS_SUCCESS_STR)) {
+                        mStateMachine.sendMessage(WPS_SUCCESS_EVENT);
+                    } else if (eventStr.startsWith(WPS_FAIL_STR)) {
+                        handleWpsFailEvent(eventStr);
+                    } else if (eventStr.startsWith(WPS_OVERLAP_STR)) {
+                        mStateMachine.sendMessage(WPS_OVERLAP_EVENT);
+                    } else if (eventStr.startsWith(WPS_TIMEOUT_STR)) {
+                        mStateMachine.sendMessage(WPS_TIMEOUT_EVENT);
+                    } else if (eventStr.startsWith(P2P_EVENT_PREFIX_STR)) {
+                        handleP2pEvents(eventStr);
+                    } else if (eventStr.startsWith(HOST_AP_EVENT_PREFIX_STR)) {
+                        handleHostApEvents(eventStr);
+                    }
+                    continue;
+                }
+
+                String eventName = eventStr.substring(EVENT_PREFIX_LEN_STR);
+                int nameEnd = eventName.indexOf(' ');
+                if (nameEnd != -1)
+                    eventName = eventName.substring(0, nameEnd);
+                if (eventName.length() == 0) {
+                    if (false) Log.i(TAG, "Received wpa_supplicant event with empty event name");
+                    continue;
+                }
+                /*
+                 * Map event name into event enum
+                 */
+                int event;
+                if (eventName.equals(CONNECTED_STR))
+                    event = CONNECTED;
+                else if (eventName.equals(DISCONNECTED_STR))
+                    event = DISCONNECTED;
+                else if (eventName.equals(STATE_CHANGE_STR))
+                    event = STATE_CHANGE;
+                else if (eventName.equals(SCAN_RESULTS_STR))
+                    event = SCAN_RESULTS;
+                else if (eventName.equals(LINK_SPEED_STR))
+                    event = LINK_SPEED;
+                else if (eventName.equals(TERMINATING_STR))
+                    event = TERMINATING;
+                else if (eventName.equals(DRIVER_STATE_STR))
+                    event = DRIVER_STATE;
+                else if (eventName.equals(EAP_FAILURE_STR))
+                    event = EAP_FAILURE;
+                else
+                    event = UNKNOWN;
+
+                String eventData = eventStr;
+                if (event == DRIVER_STATE || event == LINK_SPEED)
+                    eventData = eventData.split(" ")[1];
+                else if (event == STATE_CHANGE || event == EAP_FAILURE) {
+                    int ind = eventStr.indexOf(" ");
+                    if (ind != -1) {
+                        eventData = eventStr.substring(ind + 1);
+                    }
+                } else {
+                    int ind = eventStr.indexOf(" - ");
+                    if (ind != -1) {
+                        eventData = eventStr.substring(ind + 3);
+                    }
+                }
+
+                if (event == STATE_CHANGE) {
+                    handleSupplicantStateChange(eventData);
+                } else if (event == DRIVER_STATE) {
+                    handleDriverEvent(eventData);
+                } else if (event == TERMINATING) {
+                    /**
+                     * Close the supplicant connection if we see
+                     * too many recv errors
+                     */
+                    if (eventData.startsWith(WPA_RECV_ERROR_STR)) {
+                        if (++mRecvErrors > MAX_RECV_ERRORS) {
+                            if (false) {
+                                Log.d(TAG, "too many recv errors, closing connection");
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // notify and exit
+                    mStateMachine.sendMessage(SUP_DISCONNECTION_EVENT);
+                    break;
+                } else if (event == EAP_FAILURE) {
+                    if (eventData.startsWith(EAP_AUTH_FAILURE_STR)) {
+                        mStateMachine.sendMessage(AUTHENTICATION_FAILURE_EVENT);
+                    }
+                } else {
+                    handleEvent(event, eventData);
+                }
+                mRecvErrors = 0;
+            }
+!!!9728524.java!!!	connectToSupplicant() : boolean
+            int connectTries = 0;
+
+            while (true) {
+                if (mWifiNative.connectToSupplicant()) {
+                    return true;
+                }
+                if (connectTries++ < 5) {
+                    nap(1);
+                } else {
+                    break;
+                }
+            }
+            return false;
+!!!9728652.java!!!	handleDriverEvent(in state : String) : void
+            if (state == null) {
+                return;
+            }
+            if (state.equals("HANGED")) {
+                mStateMachine.sendMessage(DRIVER_HUNG_EVENT);
+            }
+!!!9728780.java!!!	handleEvent(in event : int, in remainder : String) : void
+            switch (event) {
+                case DISCONNECTED:
+                    handleNetworkStateChange(NetworkInfo.DetailedState.DISCONNECTED, remainder);
+                    break;
+
+                case CONNECTED:
+                    handleNetworkStateChange(NetworkInfo.DetailedState.CONNECTED, remainder);
+                    break;
+
+                case SCAN_RESULTS:
+                    mStateMachine.sendMessage(SCAN_RESULTS_EVENT);
+                    break;
+
+                case UNKNOWN:
+                    break;
+            }
+!!!9728908.java!!!	handleWpsFailEvent(in dataString : String) : void
+            final Pattern p = Pattern.compile(WPS_FAIL_PATTERN);
+            Matcher match = p.matcher(dataString);
+            if (match.find()) {
+                String cfgErr = match.group(1);
+                String reason = match.group(2);
+
+                if (reason != null) {
+                    switch(Integer.parseInt(reason)) {
+                        case REASON_TKIP_ONLY_PROHIBITED:
+                            mStateMachine.sendMessage(mStateMachine.obtainMessage(WPS_FAIL_EVENT,
+                                    WifiManager.WPS_TKIP_ONLY_PROHIBITED, 0));
+                            return;
+                        case REASON_WEP_PROHIBITED:
+                            mStateMachine.sendMessage(mStateMachine.obtainMessage(WPS_FAIL_EVENT,
+                                    WifiManager.WPS_WEP_PROHIBITED, 0));
+                            return;
+                    }
+                }
+                if (cfgErr != null) {
+                    switch(Integer.parseInt(cfgErr)) {
+                        case CONFIG_AUTH_FAILURE:
+                            mStateMachine.sendMessage(mStateMachine.obtainMessage(WPS_FAIL_EVENT,
+                                    WifiManager.WPS_AUTH_FAILURE, 0));
+                            return;
+                        case CONFIG_MULTIPLE_PBC_DETECTED:
+                            mStateMachine.sendMessage(mStateMachine.obtainMessage(WPS_FAIL_EVENT,
+                                    WifiManager.WPS_OVERLAP_ERROR, 0));
+                            return;
+                    }
+                }
+            }
+            //For all other errors, return a generic internal error
+            mStateMachine.sendMessage(mStateMachine.obtainMessage(WPS_FAIL_EVENT,
+                    WifiManager.ERROR, 0));
+!!!9729036.java!!!	p2pError(in dataString : String) : P2pStatus
+            P2pStatus err = P2pStatus.UNKNOWN;
+            String[] tokens = dataString.split(" ");
+            if (tokens.length < 2) return err;
+            String[] nameValue = tokens[1].split("=");
+            if (nameValue.length != 2) return err;
+
+            /* Handle the special case of reason=FREQ+CONFLICT */
+            if (nameValue[1].equals("FREQ_CONFLICT")) {
+                return P2pStatus.NO_COMMON_CHANNEL;
+            }
+            try {
+                err = P2pStatus.valueOf(Integer.parseInt(nameValue[1]));
+            } catch (NumberFormatException e) {
+                e.printStackTrace();
+            }
+            return err;
+!!!9729164.java!!!	handleP2pEvents(in dataString : String) : void
+            if (dataString.startsWith(P2P_DEVICE_FOUND_STR)) {
+                mStateMachine.sendMessage(P2P_DEVICE_FOUND_EVENT, new WifiP2pDevice(dataString));
+            } else if (dataString.startsWith(P2P_DEVICE_LOST_STR)) {
+                mStateMachine.sendMessage(P2P_DEVICE_LOST_EVENT, new WifiP2pDevice(dataString));
+            } else if (dataString.startsWith(P2P_FIND_STOPPED_STR)) {
+                mStateMachine.sendMessage(P2P_FIND_STOPPED_EVENT);
+            } else if (dataString.startsWith(P2P_GO_NEG_REQUEST_STR)) {
+                mStateMachine.sendMessage(P2P_GO_NEGOTIATION_REQUEST_EVENT,
+                        new WifiP2pConfig(dataString));
+            } else if (dataString.startsWith(P2P_GO_NEG_SUCCESS_STR)) {
+                mStateMachine.sendMessage(P2P_GO_NEGOTIATION_SUCCESS_EVENT);
+            } else if (dataString.startsWith(P2P_GO_NEG_FAILURE_STR)) {
+                mStateMachine.sendMessage(P2P_GO_NEGOTIATION_FAILURE_EVENT, p2pError(dataString));
+            } else if (dataString.startsWith(P2P_GROUP_FORMATION_SUCCESS_STR)) {
+                mStateMachine.sendMessage(P2P_GROUP_FORMATION_SUCCESS_EVENT);
+            } else if (dataString.startsWith(P2P_GROUP_FORMATION_FAILURE_STR)) {
+                mStateMachine.sendMessage(P2P_GROUP_FORMATION_FAILURE_EVENT, p2pError(dataString));
+            } else if (dataString.startsWith(P2P_GROUP_STARTED_STR)) {
+                mStateMachine.sendMessage(P2P_GROUP_STARTED_EVENT, new WifiP2pGroup(dataString));
+            } else if (dataString.startsWith(P2P_GROUP_REMOVED_STR)) {
+                mStateMachine.sendMessage(P2P_GROUP_REMOVED_EVENT, new WifiP2pGroup(dataString));
+            } else if (dataString.startsWith(P2P_INVITATION_RECEIVED_STR)) {
+                mStateMachine.sendMessage(P2P_INVITATION_RECEIVED_EVENT,
+                        new WifiP2pGroup(dataString));
+            } else if (dataString.startsWith(P2P_INVITATION_RESULT_STR)) {
+                mStateMachine.sendMessage(P2P_INVITATION_RESULT_EVENT, p2pError(dataString));
+            } else if (dataString.startsWith(P2P_PROV_DISC_PBC_REQ_STR)) {
+                mStateMachine.sendMessage(P2P_PROV_DISC_PBC_REQ_EVENT,
+                        new WifiP2pProvDiscEvent(dataString));
+            } else if (dataString.startsWith(P2P_PROV_DISC_PBC_RSP_STR)) {
+                mStateMachine.sendMessage(P2P_PROV_DISC_PBC_RSP_EVENT,
+                        new WifiP2pProvDiscEvent(dataString));
+            } else if (dataString.startsWith(P2P_PROV_DISC_ENTER_PIN_STR)) {
+                mStateMachine.sendMessage(P2P_PROV_DISC_ENTER_PIN_EVENT,
+                        new WifiP2pProvDiscEvent(dataString));
+            } else if (dataString.startsWith(P2P_PROV_DISC_SHOW_PIN_STR)) {
+                mStateMachine.sendMessage(P2P_PROV_DISC_SHOW_PIN_EVENT,
+                        new WifiP2pProvDiscEvent(dataString));
+            } else if (dataString.startsWith(P2P_PROV_DISC_FAILURE_STR)) {
+                mStateMachine.sendMessage(P2P_PROV_DISC_FAILURE_EVENT);
+            } else if (dataString.startsWith(P2P_SERV_DISC_RESP_STR)) {
+                List<WifiP2pServiceResponse> list = WifiP2pServiceResponse.newInstance(dataString);
+                if (list != null) {
+                    mStateMachine.sendMessage(P2P_SERV_DISC_RESP_EVENT, list);
+                } else {
+                    Log.e(TAG, "Null service resp " + dataString);
+                }
+            }
+!!!9729292.java!!!	handleHostApEvents(in dataString : String) : void
+            String[] tokens = dataString.split(" ");
+            /* AP-STA-CONNECTED 42:fc:89:a8:96:09 p2p_dev_addr=02:90:4c:a0:92:54 */
+            if (tokens[0].equals(AP_STA_CONNECTED_STR)) {
+                mStateMachine.sendMessage(AP_STA_CONNECTED_EVENT, new WifiP2pDevice(dataString));
+            /* AP-STA-DISCONNECTED 42:fc:89:a8:96:09 p2p_dev_addr=02:90:4c:a0:92:54 */
+            } else if (tokens[0].equals(AP_STA_DISCONNECTED_STR)) {
+                mStateMachine.sendMessage(AP_STA_DISCONNECTED_EVENT, new WifiP2pDevice(dataString));
+            }
+!!!9729420.java!!!	handleSupplicantStateChange(in dataString : String) : void
+            WifiSsid wifiSsid = null;
+            int index = dataString.lastIndexOf("SSID=");
+            if (index != -1) {
+                wifiSsid = WifiSsid.createFromAsciiEncoded(
+                        dataString.substring(index + 5));
+            }
+            String[] dataTokens = dataString.split(" ");
+
+            String BSSID = null;
+            int networkId = -1;
+            int newState  = -1;
+            for (String token : dataTokens) {
+                String[] nameValue = token.split("=");
+                if (nameValue.length != 2) {
+                    continue;
+                }
+
+                if (nameValue[0].equals("BSSID")) {
+                    BSSID = nameValue[1];
+                    continue;
+                }
+
+                int value;
+                try {
+                    value = Integer.parseInt(nameValue[1]);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+
+                if (nameValue[0].equals("id")) {
+                    networkId = value;
+                } else if (nameValue[0].equals("state")) {
+                    newState = value;
+                }
+            }
+
+            if (newState == -1) return;
+
+            SupplicantState newSupplicantState = SupplicantState.INVALID;
+            for (SupplicantState state : SupplicantState.values()) {
+                if (state.ordinal() == newState) {
+                    newSupplicantState = state;
+                    break;
+                }
+            }
+            if (newSupplicantState == SupplicantState.INVALID) {
+                Log.w(TAG, "Invalid supplicant state: " + newState);
+            }
+            notifySupplicantStateChange(networkId, wifiSsid, BSSID, newSupplicantState);

@@ -1,0 +1,172 @@
+class TransferStack
+!!!1617691.java!!!	isFulfilling(in m : int) : boolean
+ return (m & FULFILLING) != 0;
+!!!1618459.java!!!	casHead(inout h : SNode, inout nh : SNode) : boolean
+            return h == head &&
+                UNSAFE.compareAndSwapObject(this, headOffset, h, nh);
+!!!1618587.java!!!	snode(inout s : SNode, inout e : Object, inout next : SNode, in mode : int) : SNode
+            if (s == null) s = new SNode(e);
+            s.mode = mode;
+            s.next = next;
+            return s;
+!!!1618715.java!!!	transfer(inout e : Object, inout timed : boolean, in nanos : long) : Object
+            /*
+             * Basic algorithm is to loop trying one of three actions:
+             *
+             * 1. If apparently empty or already containing nodes of same
+             *    mode, try to push node on stack and wait for a match,
+             *    returning it, or null if cancelled.
+             *
+             * 2. If apparently containing node of complementary mode,
+             *    try to push a fulfilling node on to stack, match
+             *    with corresponding waiting node, pop both from
+             *    stack, and return matched item. The matching or
+             *    unlinking might not actually be necessary because of
+             *    other threads performing action 3:
+             *
+             * 3. If top of stack already holds another fulfilling node,
+             *    help it out by doing its match and/or pop
+             *    operations, and then continue. The code for helping
+             *    is essentially the same as for fulfilling, except
+             *    that it doesn't return the item.
+             */
+
+            SNode s = null; // constructed/reused as needed
+            int mode = (e == null) ? REQUEST : DATA;
+
+            for (;;) {
+                SNode h = head;
+                if (h == null || h.mode == mode) {  // empty or same-mode
+                    if (timed && nanos <= 0) {      // can't wait
+                        if (h != null && h.isCancelled())
+                            casHead(h, h.next);     // pop cancelled node
+                        else
+                            return null;
+                    } else if (casHead(h, s = snode(s, e, h, mode))) {
+                        SNode m = awaitFulfill(s, timed, nanos);
+                        if (m == s) {               // wait was cancelled
+                            clean(s);
+                            return null;
+                        }
+                        if ((h = head) != null && h.next == s)
+                            casHead(h, s.next);     // help s's fulfiller
+                        return (mode == REQUEST) ? m.item : s.item;
+                    }
+                } else if (!isFulfilling(h.mode)) { // try to fulfill
+                    if (h.isCancelled())            // already cancelled
+                        casHead(h, h.next);         // pop and retry
+                    else if (casHead(h, s=snode(s, e, h, FULFILLING|mode))) {
+                        for (;;) { // loop until matched or waiters disappear
+                            SNode m = s.next;       // m is s's match
+                            if (m == null) {        // all waiters are gone
+                                casHead(s, null);   // pop fulfill node
+                                s = null;           // use new node next time
+                                break;              // restart main loop
+                            }
+                            SNode mn = m.next;
+                            if (m.tryMatch(s)) {
+                                casHead(s, mn);     // pop both s and m
+                                return (mode == REQUEST) ? m.item : s.item;
+                            } else                  // lost match
+                                s.casNext(m, mn);   // help unlink
+                        }
+                    }
+                } else {                            // help a fulfiller
+                    SNode m = h.next;               // m is h's match
+                    if (m == null)                  // waiter is gone
+                        casHead(h, null);           // pop fulfilling node
+                    else {
+                        SNode mn = m.next;
+                        if (m.tryMatch(h))          // help match
+                            casHead(h, mn);         // pop both h and m
+                        else                        // lost match
+                            h.casNext(m, mn);       // help unlink
+                    }
+                }
+            }
+!!!1618843.java!!!	awaitFulfill(inout s : SNode, inout timed : boolean, in nanos : long) : SNode
+            /*
+             * When a node/thread is about to block, it sets its waiter
+             * field and then rechecks state at least one more time
+             * before actually parking, thus covering race vs
+             * fulfiller noticing that waiter is non-null so should be
+             * woken.
+             *
+             * When invoked by nodes that appear at the point of call
+             * to be at the head of the stack, calls to park are
+             * preceded by spins to avoid blocking when producers and
+             * consumers are arriving very close in time.  This can
+             * happen enough to bother only on multiprocessors.
+             *
+             * The order of checks for returning out of main loop
+             * reflects fact that interrupts have precedence over
+             * normal returns, which have precedence over
+             * timeouts. (So, on timeout, one last check for match is
+             * done before giving up.) Except that calls from untimed
+             * SynchronousQueue.{poll/offer} don't check interrupts
+             * and don't wait at all, so are trapped in transfer
+             * method rather than calling awaitFulfill.
+             */
+            long lastTime = timed ? System.nanoTime() : 0;
+            Thread w = Thread.currentThread();
+            int spins = (shouldSpin(s) ?
+                         (timed ? maxTimedSpins : maxUntimedSpins) : 0);
+            for (;;) {
+                if (w.isInterrupted())
+                    s.tryCancel();
+                SNode m = s.match;
+                if (m != null)
+                    return m;
+                if (timed) {
+                    long now = System.nanoTime();
+                    nanos -= now - lastTime;
+                    lastTime = now;
+                    if (nanos <= 0) {
+                        s.tryCancel();
+                        continue;
+                    }
+                }
+                if (spins > 0)
+                    spins = shouldSpin(s) ? (spins-1) : 0;
+                else if (s.waiter == null)
+                    s.waiter = w; // establish waiter so can park next iter
+                else if (!timed)
+                    LockSupport.park(this);
+                else if (nanos > spinForTimeoutThreshold)
+                    LockSupport.parkNanos(this, nanos);
+            }
+!!!1618971.java!!!	shouldSpin(inout s : SNode) : boolean
+            SNode h = head;
+            return (h == s || h == null || isFulfilling(h.mode));
+!!!1619099.java!!!	clean(inout s : SNode) : void
+            s.item = null;   // forget item
+            s.waiter = null; // forget thread
+
+            /*
+             * At worst we may need to traverse entire stack to unlink
+             * s. If there are multiple concurrent calls to clean, we
+             * might not see s if another thread has already removed
+             * it. But we can stop when we see any node known to
+             * follow s. We use s.next unless it too is cancelled, in
+             * which case we try the node one past. We don't check any
+             * further because we don't want to doubly traverse just to
+             * find sentinel.
+             */
+
+            SNode past = s.next;
+            if (past != null && past.isCancelled())
+                past = past.next;
+
+            // Absorb cancelled nodes at head
+            SNode p;
+            while ((p = head) != null && p != past && p.isCancelled())
+                casHead(p, p.next);
+
+            // Unsplice embedded nodes
+            while (p != null && p != past) {
+                SNode n = p.next;
+                if (n != null && n.isCancelled())
+                    p.casNext(n, n.next);
+                else
+                    p = n;
+            }

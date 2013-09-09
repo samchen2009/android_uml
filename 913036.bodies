@@ -1,0 +1,156 @@
+class SynthesisPlaybackQueueItem
+!!!4163724.java!!!	SynthesisPlaybackQueueItem(in streamType : int, in sampleRate : int, in audioFormat : int, in channelCount : int, in volume : float, in pan : float, inout dispatcher : UtteranceProgressDispatcher, inout callerIdentity : Object, inout logger : EventLogger)
+        super(dispatcher, callerIdentity);
+
+        mUnconsumedBytes = 0;
+
+        mStopped = false;
+        mDone = false;
+        mIsError = false;
+
+        mAudioTrack = new BlockingAudioTrack(streamType, sampleRate, audioFormat,
+                channelCount, volume, pan);
+        mLogger = logger;
+!!!4163852.java!!!	run() : void
+        final UtteranceProgressDispatcher dispatcher = getDispatcher();
+        dispatcher.dispatchOnStart();
+
+
+        if (!mAudioTrack.init()) {
+            dispatcher.dispatchOnError();
+            return;
+        }
+
+        try {
+            byte[] buffer = null;
+
+            // take() will block until:
+            //
+            // (a) there is a buffer available to tread. In which case
+            // a non null value is returned.
+            // OR (b) stop() is called in which case it will return null.
+            // OR (c) done() is called in which case it will return null.
+            while ((buffer = take()) != null) {
+                mAudioTrack.write(buffer);
+                mLogger.onAudioDataWritten();
+            }
+
+        } catch (InterruptedException ie) {
+            if (DBG) Log.d(TAG, "Interrupted waiting for buffers, cleaning up.");
+        }
+
+        mAudioTrack.waitAndRelease();
+
+        if (mIsError) {
+            dispatcher.dispatchOnError();
+        } else {
+            dispatcher.dispatchOnDone();
+        }
+
+        mLogger.onWriteData();
+!!!4163980.java!!!	stop(inout isError : boolean) : void
+        try {
+            mListLock.lock();
+
+            // Update our internal state.
+            mStopped = true;
+            mIsError = isError;
+
+            // Wake up the audio playback thread if it was waiting on take().
+            // take() will return null since mStopped was true, and will then
+            // break out of the data write loop.
+            mReadReady.signal();
+
+            // Wake up the synthesis thread if it was waiting on put(). Its
+            // buffers will no longer be copied since mStopped is true. The
+            // PlaybackSynthesisCallback that this synthesis corresponds to
+            // would also have been stopped, and so all calls to
+            // Callback.onDataAvailable( ) will return errors too.
+            mNotFull.signal();
+        } finally {
+            mListLock.unlock();
+        }
+
+        // Stop the underlying audio track. This will stop sending
+        // data to the mixer and discard any pending buffers that the
+        // track holds.
+        mAudioTrack.stop();
+!!!4164108.java!!!	done() : void
+        try {
+            mListLock.lock();
+
+            // Update state.
+            mDone = true;
+
+            // Unblocks the audio playback thread if it was waiting on take()
+            // after having consumed all available buffers. It will then return
+            // null and leave the write loop.
+            mReadReady.signal();
+
+            // Just so that engines that try to queue buffers after
+            // calling done() don't block the synthesis thread forever. Ideally
+            // this should be called from the same thread as put() is, and hence
+            // this call should be pointless.
+            mNotFull.signal();
+        } finally {
+            mListLock.unlock();
+        }
+!!!4164236.java!!!	put(inout buffer : byte) : void
+        try {
+            mListLock.lock();
+            long unconsumedAudioMs = 0;
+
+            while ((unconsumedAudioMs = mAudioTrack.getAudioLengthMs(mUnconsumedBytes)) >
+                    MAX_UNCONSUMED_AUDIO_MS && !mStopped) {
+                mNotFull.await();
+            }
+
+            // Don't bother queueing the buffer if we've stopped. The playback thread
+            // would have woken up when stop() is called (if it was blocked) and will
+            // proceed to leave the write loop since take() will return null when
+            // stopped.
+            if (mStopped) {
+                return;
+            }
+
+            mDataBufferList.add(new ListEntry(buffer));
+            mUnconsumedBytes += buffer.length;
+            mReadReady.signal();
+        } finally {
+            mListLock.unlock();
+        }
+!!!4164364.java!!!	take() : byte
+        try {
+            mListLock.lock();
+
+            // Block if there are no available buffers, and stop() has not
+            // been called and done() has not been called.
+            while (mDataBufferList.size() == 0 && !mStopped && !mDone) {
+                mReadReady.await();
+            }
+
+            // If stopped, return null so that we can exit the playback loop
+            // as soon as possible.
+            if (mStopped) {
+                return null;
+            }
+
+            // Remove the first entry from the queue.
+            ListEntry entry = mDataBufferList.poll();
+
+            // This is the normal playback loop exit case, when done() was
+            // called. (mDone will be true at this point).
+            if (entry == null) {
+                return null;
+            }
+
+            mUnconsumedBytes -= entry.mBytes.length;
+            // Unblock the waiting writer. We use signal() and not signalAll()
+            // because there will only be one thread waiting on this (the
+            // Synthesis thread).
+            mNotFull.signal();
+
+            return entry.mBytes;
+        } finally {
+            mListLock.unlock();
+        }

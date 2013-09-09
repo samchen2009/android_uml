@@ -1,0 +1,111 @@
+class ACodec::UninitializedState
+!!!1848716.cpp!!!	stateEntered() : void
+    ALOGV("Now uninitialized");
+!!!1848844.cpp!!!	onSetup(in msg : sp<AMessage>) : void
+    if (onAllocateComponent(msg)
+            && mCodec->mLoadedState->onConfigureComponent(msg)) {
+        mCodec->mLoadedState->onStart();
+    }
+!!!1848972.cpp!!!	onAllocateComponent(in msg : sp<AMessage>) : bool
+    ALOGV("onAllocateComponent");
+
+    CHECK(mCodec->mNode == NULL);
+
+    OMXClient client;
+    CHECK_EQ(client.connect(), (status_t)OK);
+
+    sp<IOMX> omx = client.interface();
+
+    Vector<OMXCodec::CodecNameAndQuirks> matchingCodecs;
+
+    AString mime;
+
+    AString componentName;
+    uint32_t quirks = 0;
+    if (msg->findString("componentName", &componentName)) {
+        ssize_t index = matchingCodecs.add();
+        OMXCodec::CodecNameAndQuirks *entry = &matchingCodecs.editItemAt(index);
+        entry->mName = String8(componentName.c_str());
+
+        if (!OMXCodec::findCodecQuirks(
+                    componentName.c_str(), &entry->mQuirks)) {
+            entry->mQuirks = 0;
+        }
+    } else {
+        CHECK(msg->findString("mime", &mime));
+
+        int32_t encoder;
+        if (!msg->findInt32("encoder", &encoder)) {
+            encoder = false;
+        }
+
+        OMXCodec::findMatchingCodecs(
+                mime.c_str(),
+                encoder, // createEncoder
+                NULL,  // matchComponentName
+                0,     // flags
+                &matchingCodecs);
+    }
+
+    sp<CodecObserver> observer = new CodecObserver;
+    IOMX::node_id node = NULL;
+
+    for (size_t matchIndex = 0; matchIndex < matchingCodecs.size();
+            ++matchIndex) {
+        componentName = matchingCodecs.itemAt(matchIndex).mName.string();
+        quirks = matchingCodecs.itemAt(matchIndex).mQuirks;
+
+        pid_t tid = androidGetTid();
+        int prevPriority = androidGetThreadPriority(tid);
+        androidSetThreadPriority(tid, ANDROID_PRIORITY_FOREGROUND);
+        status_t err = omx->allocateNode(componentName.c_str(), observer, &node);
+        androidSetThreadPriority(tid, prevPriority);
+
+        if (err == OK) {
+            break;
+        }
+
+        node = NULL;
+    }
+
+    if (node == NULL) {
+        if (!mime.empty()) {
+            ALOGE("Unable to instantiate a decoder for type '%s'.",
+                 mime.c_str());
+        } else {
+            ALOGE("Unable to instantiate decoder '%s'.", componentName.c_str());
+        }
+
+        mCodec->signalError(OMX_ErrorComponentNotFound);
+        return false;
+    }
+
+    sp<AMessage> notify = new AMessage(kWhatOMXMessage, mCodec->id());
+    observer->setNotificationMessage(notify);
+
+    mCodec->mComponentName = componentName;
+    mCodec->mFlags = 0;
+
+    if (componentName.endsWith(".secure")) {
+        mCodec->mFlags |= kFlagIsSecure;
+    }
+
+    mCodec->mQuirks = quirks;
+    mCodec->mOMX = omx;
+    mCodec->mNode = node;
+
+    mCodec->mPortEOS[kPortIndexInput] =
+        mCodec->mPortEOS[kPortIndexOutput] = false;
+
+    mCodec->mInputEOSResult = OK;
+
+    {
+        sp<AMessage> notify = mCodec->mNotify->dup();
+        notify->setInt32("what", ACodec::kWhatComponentAllocated);
+        notify->setString("componentName", mCodec->mComponentName.c_str());
+        notify->post();
+    }
+
+    mCodec->changeState(mCodec->mLoadedState);
+
+    return true;

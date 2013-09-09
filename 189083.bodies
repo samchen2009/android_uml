@@ -1,0 +1,288 @@
+class SocketChannelImpl
+!!!774939.java!!!	SocketChannelImpl(inout selectorProvider : SelectorProvider)
+        this(selectorProvider, true);
+!!!775067.java!!!	SocketChannelImpl(inout selectorProvider : SelectorProvider, inout connect : boolean)
+        super(selectorProvider);
+        status = SOCKET_STATUS_UNCONNECTED;
+        fd = (connect ? IoBridge.socket(true) : new FileDescriptor());
+!!!775195.java!!!	SocketChannelImpl(inout selectorProvider : SelectorProvider, inout existingFd : FileDescriptor)
+        super(selectorProvider);
+        status = SOCKET_STATUS_CONNECTED;
+        fd = existingFd;
+!!!775323.java!!!	socket() : Socket
+        if (socket == null) {
+            try {
+                InetAddress addr = null;
+                int port = 0;
+                if (connectAddress != null) {
+                    addr = connectAddress.getAddress();
+                    port = connectAddress.getPort();
+                }
+                socket = new SocketAdapter(new PlainSocketImpl(fd, localPort, addr, port), this);
+            } catch (SocketException e) {
+                return null;
+            }
+        }
+        return socket;
+!!!775451.java!!!	isConnected() : boolean
+        return status == SOCKET_STATUS_CONNECTED;
+!!!775579.java!!!	setConnected() : void
+        status = SOCKET_STATUS_CONNECTED;
+!!!775707.java!!!	setBound(inout flag : boolean) : void
+        isBound = flag;
+!!!775835.java!!!	isConnectionPending() : boolean
+        return status == SOCKET_STATUS_PENDING;
+!!!775963.java!!!	connect(inout socketAddress : SocketAddress) : boolean
+        // status must be open and unconnected
+        checkUnconnected();
+
+        // check the address
+        InetSocketAddress inetSocketAddress = validateAddress(socketAddress);
+        InetAddress normalAddr = inetSocketAddress.getAddress();
+        int port = inetSocketAddress.getPort();
+
+        // When connecting, map ANY address to localhost
+        if (normalAddr.isAnyLocalAddress()) {
+            normalAddr = InetAddress.getLocalHost();
+        }
+
+        boolean finished = false;
+        try {
+            if (isBlocking()) {
+                begin();
+            }
+            finished = IoBridge.connect(fd, normalAddr, port);
+            isBound = finished;
+        } catch (IOException e) {
+            if (e instanceof ConnectException && !isBlocking()) {
+                status = SOCKET_STATUS_PENDING;
+            } else {
+                if (isOpen()) {
+                    close();
+                    finished = true;
+                }
+                throw e;
+            }
+        } finally {
+            if (isBlocking()) {
+                end(finished);
+            }
+        }
+
+        initLocalAddressAndPort();
+        connectAddress = inetSocketAddress;
+        if (socket != null) {
+            socket.socketImpl().initRemoteAddressAndPort(connectAddress.getAddress(),
+                    connectAddress.getPort());
+        }
+
+        synchronized (this) {
+            if (isBlocking()) {
+                status = (finished ? SOCKET_STATUS_CONNECTED : SOCKET_STATUS_UNCONNECTED);
+            } else {
+                status = SOCKET_STATUS_PENDING;
+            }
+        }
+        return finished;
+!!!776091.java!!!	initLocalAddressAndPort() : void
+        SocketAddress sa;
+        try {
+            sa = Libcore.os.getsockname(fd);
+        } catch (ErrnoException errnoException) {
+            throw new AssertionError(errnoException);
+        }
+        InetSocketAddress isa = (InetSocketAddress) sa;
+        localAddress = isa.getAddress();
+        localPort = isa.getPort();
+        if (socket != null) {
+            socket.socketImpl().initLocalPort(localPort);
+        }
+!!!776219.java!!!	finishConnect() : boolean
+        synchronized (this) {
+            if (!isOpen()) {
+                throw new ClosedChannelException();
+            }
+            if (status == SOCKET_STATUS_CONNECTED) {
+                return true;
+            }
+            if (status != SOCKET_STATUS_PENDING) {
+                throw new NoConnectionPendingException();
+            }
+        }
+
+        boolean finished = false;
+        try {
+            begin();
+            InetAddress inetAddress = connectAddress.getAddress();
+            int port = connectAddress.getPort();
+            finished = IoBridge.isConnected(fd, inetAddress, port, 0, 0); // Return immediately.
+            isBound = finished;
+        } catch (ConnectException e) {
+            if (isOpen()) {
+                close();
+                finished = true;
+            }
+            throw e;
+        } finally {
+            end(finished);
+        }
+
+        synchronized (this) {
+            status = (finished ? SOCKET_STATUS_CONNECTED : status);
+            isBound = finished;
+        }
+        return finished;
+!!!776347.java!!!	finishAccept() : void
+        initLocalAddressAndPort();
+!!!776475.java!!!	read(inout dst : ByteBuffer) : int
+        dst.checkWritable();
+        checkOpenConnected();
+        if (!dst.hasRemaining()) {
+            return 0;
+        }
+        return readImpl(dst);
+!!!776603.java!!!	read(inout targets : ByteBuffer, in offset : int, in length : int) : long
+        Arrays.checkOffsetAndCount(targets.length, offset, length);
+        checkOpenConnected();
+        int totalCount = FileChannelImpl.calculateTotalRemaining(targets, offset, length, true);
+        if (totalCount == 0) {
+            return 0;
+        }
+        byte[] readArray = new byte[totalCount];
+        ByteBuffer readBuffer = ByteBuffer.wrap(readArray);
+        int readCount;
+        // read data to readBuffer, and then transfer data from readBuffer to targets.
+        readCount = readImpl(readBuffer);
+        readBuffer.flip();
+        if (readCount > 0) {
+            int left = readCount;
+            int index = offset;
+            // transfer data from readArray to targets
+            while (left > 0) {
+                int putLength = Math.min(targets[index].remaining(), left);
+                targets[index].put(readArray, readCount - left, putLength);
+                index++;
+                left -= putLength;
+            }
+        }
+        return readCount;
+!!!776731.java!!!	readImpl(inout dst : ByteBuffer) : int
+        synchronized (readLock) {
+            int readCount = 0;
+            try {
+                if (isBlocking()) {
+                    begin();
+                }
+                readCount = IoBridge.recvfrom(true, fd, dst, 0, null, false);
+                if (readCount > 0) {
+                    dst.position(dst.position() + readCount);
+                }
+            } finally {
+                if (isBlocking()) {
+                    end(readCount > 0);
+                }
+            }
+            return readCount;
+        }
+!!!776859.java!!!	write(inout src : ByteBuffer) : int
+        if (src == null) {
+            throw new NullPointerException("src == null");
+        }
+        checkOpenConnected();
+        if (!src.hasRemaining()) {
+            return 0;
+        }
+        return writeImpl(src);
+!!!776987.java!!!	write(inout sources : ByteBuffer, in offset : int, in length : int) : long
+        Arrays.checkOffsetAndCount(sources.length, offset, length);
+        checkOpenConnected();
+        int count = FileChannelImpl.calculateTotalRemaining(sources, offset, length, false);
+        if (count == 0) {
+            return 0;
+        }
+        ByteBuffer writeBuf = ByteBuffer.allocate(count);
+        for (int val = offset; val < length + offset; val++) {
+            ByteBuffer source = sources[val];
+            int oldPosition = source.position();
+            writeBuf.put(source);
+            source.position(oldPosition);
+        }
+        writeBuf.flip();
+        int result = writeImpl(writeBuf);
+        int val = offset;
+        int written = result;
+        while (result > 0) {
+            ByteBuffer source = sources[val];
+            int gap = Math.min(result, source.remaining());
+            source.position(source.position() + gap);
+            val++;
+            result -= gap;
+        }
+        return written;
+!!!777115.java!!!	writeImpl(inout src : ByteBuffer) : int
+        synchronized (writeLock) {
+            if (!src.hasRemaining()) {
+                return 0;
+            }
+            int writeCount = 0;
+            try {
+                if (isBlocking()) {
+                    begin();
+                }
+                writeCount = IoBridge.sendto(fd, src, 0, null, 0);
+                if (writeCount > 0) {
+                    src.position(src.position() + writeCount);
+                }
+            } finally {
+                if (isBlocking()) {
+                    end(writeCount >= 0);
+                }
+            }
+            return writeCount;
+        }
+!!!777243.java!!!	checkOpenConnected() : void
+        if (!isOpen()) {
+            throw new ClosedChannelException();
+        }
+        if (!isConnected()) {
+            throw new NotYetConnectedException();
+        }
+!!!777371.java!!!	checkUnconnected() : void
+        if (!isOpen()) {
+            throw new ClosedChannelException();
+        }
+        if (status == SOCKET_STATUS_CONNECTED) {
+            throw new AlreadyConnectedException();
+        }
+        if (status == SOCKET_STATUS_PENDING) {
+            throw new ConnectionPendingException();
+        }
+!!!777499.java!!!	validateAddress(inout socketAddress : SocketAddress) : InetSocketAddress
+        if (socketAddress == null) {
+            throw new IllegalArgumentException("socketAddress == null");
+        }
+        if (!(socketAddress instanceof InetSocketAddress)) {
+            throw new UnsupportedAddressTypeException();
+        }
+        InetSocketAddress inetSocketAddress = (InetSocketAddress) socketAddress;
+        if (inetSocketAddress.isUnresolved()) {
+            throw new UnresolvedAddressException();
+        }
+        return inetSocketAddress;
+!!!777627.java!!!	getLocalAddress() : InetAddress
+        return isBound ? localAddress : Inet4Address.ANY;
+!!!777755.java!!!	implCloseSelectableChannel() : void
+        if (status != SOCKET_STATUS_CLOSED) {
+            status = SOCKET_STATUS_CLOSED;
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+            } else {
+                IoBridge.closeSocket(fd);
+            }
+        }
+!!!777883.java!!!	implConfigureBlocking(inout blocking : boolean) : void
+        synchronized (blockingLock()) {
+            IoUtils.setBlocking(fd, blocking);
+        }
+!!!778011.java!!!	getFD() : FileDescriptor
+        return fd;

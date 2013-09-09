@@ -1,0 +1,649 @@
+class EffectModule
+!!!842252.cpp!!!	EffectModule(inout thread : ThreadBase, in chain : wp<AudioFlinger::EffectChain>, inout desc : effect_descriptor_t, in id : int, in sessionId : int)
+    ALOGV("Constructor %p", this);
+    int lStatus;
+
+    // create effect engine from effect factory
+    mStatus = EffectCreate(&desc->uuid, sessionId, thread->id(), &mEffectInterface);
+
+    if (mStatus != NO_ERROR) {
+        return;
+    }
+    lStatus = init();
+    if (lStatus < 0) {
+        mStatus = lStatus;
+        goto Error;
+    }
+
+    ALOGV("Constructor success name %s, Interface %p", mDescriptor.name, mEffectInterface);
+    return;
+Error:
+    EffectRelease(mEffectInterface);
+    mEffectInterface = NULL;
+    ALOGV("Constructor Error %d", mStatus);
+!!!842380.cpp!!!	~EffectModule()
+    ALOGV("Destructor %p", this);
+    if (mEffectInterface != NULL) {
+        if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
+                (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) {
+            sp<ThreadBase> thread = mThread.promote();
+            if (thread != 0) {
+                audio_stream_t *stream = thread->stream();
+                if (stream != NULL) {
+                    stream->remove_audio_effect(stream, mEffectInterface);
+                }
+            }
+        }
+        // release effect engine
+        EffectRelease(mEffectInterface);
+    }
+!!!842636.cpp!!!	process() : void
+    Mutex::Autolock _l(mLock);
+
+    if (mState == DESTROYED || mEffectInterface == NULL ||
+            mConfig.inputCfg.buffer.raw == NULL ||
+            mConfig.outputCfg.buffer.raw == NULL) {
+        return;
+    }
+
+    if (isProcessEnabled()) {
+        // do 32 bit to 16 bit conversion for auxiliary effect input buffer
+        if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) {
+            ditherAndClamp(mConfig.inputCfg.buffer.s32,
+                                        mConfig.inputCfg.buffer.s32,
+                                        mConfig.inputCfg.buffer.frameCount/2);
+        }
+
+        // do the actual processing in the effect engine
+        int ret = (*mEffectInterface)->process(mEffectInterface,
+                                               &mConfig.inputCfg.buffer,
+                                               &mConfig.outputCfg.buffer);
+
+        // force transition to IDLE state when engine is ready
+        if (mState == STOPPED && ret == -ENODATA) {
+            mDisableWaitCnt = 1;
+        }
+
+        // clear auxiliary effect input buffer for next accumulation
+        if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) {
+            memset(mConfig.inputCfg.buffer.raw, 0,
+                   mConfig.inputCfg.buffer.frameCount*sizeof(int32_t));
+        }
+    } else if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_INSERT &&
+                mConfig.inputCfg.buffer.raw != mConfig.outputCfg.buffer.raw) {
+        // If an insert effect is idle and input buffer is different from output buffer,
+        // accumulate input onto output
+        sp<EffectChain> chain = mChain.promote();
+        if (chain != 0 && chain->activeTrackCnt() != 0) {
+            size_t frameCnt = mConfig.inputCfg.buffer.frameCount * 2;  //always stereo here
+            int16_t *in = mConfig.inputCfg.buffer.s16;
+            int16_t *out = mConfig.outputCfg.buffer.s16;
+            for (size_t i = 0; i < frameCnt; i++) {
+                out[i] = clamp16((int32_t)out[i] + (int32_t)in[i]);
+            }
+        }
+    }
+!!!842764.cpp!!!	updateState() : void
+    Mutex::Autolock _l(mLock);
+
+    switch (mState) {
+    case RESTART:
+        reset_l();
+        // FALL THROUGH
+
+    case STARTING:
+        // clear auxiliary effect input buffer for next accumulation
+        if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) {
+            memset(mConfig.inputCfg.buffer.raw,
+                   0,
+                   mConfig.inputCfg.buffer.frameCount*sizeof(int32_t));
+        }
+        start_l();
+        mState = ACTIVE;
+        break;
+    case STOPPING:
+        stop_l();
+        mDisableWaitCnt = mMaxDisableWaitCnt;
+        mState = STOPPED;
+        break;
+    case STOPPED:
+        // mDisableWaitCnt is forced to 1 by process() when the engine indicates the end of the
+        // turn off sequence.
+        if (--mDisableWaitCnt == 0) {
+            reset_l();
+            mState = IDLE;
+        }
+        break;
+    default: //IDLE , ACTIVE, DESTROYED
+        break;
+    }
+!!!842892.cpp!!!	command(in cmdCode : uint32_t, in cmdSize : uint32_t, inout pCmdData : void, inout replySize : uint32_t, inout pReplyData : void) : status_t
+    Mutex::Autolock _l(mLock);
+//    ALOGV("command(), cmdCode: %d, mEffectInterface: %p", cmdCode, mEffectInterface);
+
+    if (mState == DESTROYED || mEffectInterface == NULL) {
+        return NO_INIT;
+    }
+    status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                   cmdCode,
+                                                   cmdSize,
+                                                   pCmdData,
+                                                   replySize,
+                                                   pReplyData);
+    if (cmdCode != EFFECT_CMD_GET_PARAM && status == NO_ERROR) {
+        uint32_t size = (replySize == NULL) ? 0 : *replySize;
+        for (size_t i = 1; i < mHandles.size(); i++) {
+            EffectHandle *h = mHandles[i];
+            if (h != NULL && !h->destroyed_l()) {
+                h->commandExecuted(cmdCode, cmdSize, pCmdData, size, pReplyData);
+            }
+        }
+    }
+    return status;
+!!!843020.cpp!!!	reset_l() : void
+    if (mEffectInterface == NULL) {
+        return;
+    }
+    (*mEffectInterface)->command(mEffectInterface, EFFECT_CMD_RESET, 0, NULL, 0, NULL);
+!!!843148.cpp!!!	configure() : status_t
+    if (mEffectInterface == NULL) {
+        return NO_INIT;
+    }
+
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread == 0) {
+        return DEAD_OBJECT;
+    }
+
+    // TODO: handle configuration of effects replacing track process
+    audio_channel_mask_t channelMask = thread->channelMask();
+
+    if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) {
+        mConfig.inputCfg.channels = AUDIO_CHANNEL_OUT_MONO;
+    } else {
+        mConfig.inputCfg.channels = channelMask;
+    }
+    mConfig.outputCfg.channels = channelMask;
+    mConfig.inputCfg.format = AUDIO_FORMAT_PCM_16_BIT;
+    mConfig.outputCfg.format = AUDIO_FORMAT_PCM_16_BIT;
+    mConfig.inputCfg.samplingRate = thread->sampleRate();
+    mConfig.outputCfg.samplingRate = mConfig.inputCfg.samplingRate;
+    mConfig.inputCfg.bufferProvider.cookie = NULL;
+    mConfig.inputCfg.bufferProvider.getBuffer = NULL;
+    mConfig.inputCfg.bufferProvider.releaseBuffer = NULL;
+    mConfig.outputCfg.bufferProvider.cookie = NULL;
+    mConfig.outputCfg.bufferProvider.getBuffer = NULL;
+    mConfig.outputCfg.bufferProvider.releaseBuffer = NULL;
+    mConfig.inputCfg.accessMode = EFFECT_BUFFER_ACCESS_READ;
+    // Insert effect:
+    // - in session AUDIO_SESSION_OUTPUT_MIX or AUDIO_SESSION_OUTPUT_STAGE,
+    // always overwrites output buffer: input buffer == output buffer
+    // - in other sessions:
+    //      last effect in the chain accumulates in output buffer: input buffer != output buffer
+    //      other effect: overwrites output buffer: input buffer == output buffer
+    // Auxiliary effect:
+    //      accumulates in output buffer: input buffer != output buffer
+    // Therefore: accumulate <=> input buffer != output buffer
+    if (mConfig.inputCfg.buffer.raw != mConfig.outputCfg.buffer.raw) {
+        mConfig.outputCfg.accessMode = EFFECT_BUFFER_ACCESS_ACCUMULATE;
+    } else {
+        mConfig.outputCfg.accessMode = EFFECT_BUFFER_ACCESS_WRITE;
+    }
+    mConfig.inputCfg.mask = EFFECT_CONFIG_ALL;
+    mConfig.outputCfg.mask = EFFECT_CONFIG_ALL;
+    mConfig.inputCfg.buffer.frameCount = thread->frameCount();
+    mConfig.outputCfg.buffer.frameCount = mConfig.inputCfg.buffer.frameCount;
+
+    ALOGV("configure() %p thread %p buffer %p framecount %d",
+            this, thread.get(), mConfig.inputCfg.buffer.raw, mConfig.inputCfg.buffer.frameCount);
+
+    status_t cmdStatus;
+    uint32_t size = sizeof(int);
+    status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                   EFFECT_CMD_SET_CONFIG,
+                                                   sizeof(effect_config_t),
+                                                   &mConfig,
+                                                   &size,
+                                                   &cmdStatus);
+    if (status == 0) {
+        status = cmdStatus;
+    }
+
+    if (status == 0 &&
+            (memcmp(&mDescriptor.type, SL_IID_VISUALIZATION, sizeof(effect_uuid_t)) == 0)) {
+        uint32_t buf32[sizeof(effect_param_t) / sizeof(uint32_t) + 2];
+        effect_param_t *p = (effect_param_t *)buf32;
+
+        p->psize = sizeof(uint32_t);
+        p->vsize = sizeof(uint32_t);
+        size = sizeof(int);
+        *(int32_t *)p->data = VISUALIZER_PARAM_LATENCY;
+
+        uint32_t latency = 0;
+        PlaybackThread *pbt = thread->mAudioFlinger->checkPlaybackThread_l(thread->mId);
+        if (pbt != NULL) {
+            latency = pbt->latency_l();
+        }
+
+        *((int32_t *)p->data + 1)= latency;
+        (*mEffectInterface)->command(mEffectInterface,
+                                     EFFECT_CMD_SET_PARAM,
+                                     sizeof(effect_param_t) + 8,
+                                     &buf32,
+                                     &size,
+                                     &cmdStatus);
+    }
+
+    mMaxDisableWaitCnt = (MAX_DISABLE_TIME_MS * mConfig.outputCfg.samplingRate) /
+            (1000 * mConfig.outputCfg.buffer.frameCount);
+
+    return status;
+!!!843276.cpp!!!	init() : status_t
+    Mutex::Autolock _l(mLock);
+    if (mEffectInterface == NULL) {
+        return NO_INIT;
+    }
+    status_t cmdStatus;
+    uint32_t size = sizeof(status_t);
+    status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                   EFFECT_CMD_INIT,
+                                                   0,
+                                                   NULL,
+                                                   &size,
+                                                   &cmdStatus);
+    if (status == 0) {
+        status = cmdStatus;
+    }
+    return status;
+!!!843788.cpp!!!	setEnabled(in enabled : bool) : status_t
+    Mutex::Autolock _l(mLock);
+    return setEnabled_l(enabled);
+!!!843916.cpp!!!	setEnabled_l(in enabled : bool) : status_t
+
+    ALOGV("setEnabled %p enabled %d", this, enabled);
+
+    if (enabled != isEnabled()) {
+        status_t status = AudioSystem::setEffectEnabled(mId, enabled);
+        if (enabled && status != NO_ERROR) {
+            return status;
+        }
+
+        switch (mState) {
+        // going from disabled to enabled
+        case IDLE:
+            mState = STARTING;
+            break;
+        case STOPPED:
+            mState = RESTART;
+            break;
+        case STOPPING:
+            mState = ACTIVE;
+            break;
+
+        // going from enabled to disabled
+        case RESTART:
+            mState = STOPPED;
+            break;
+        case STARTING:
+            mState = IDLE;
+            break;
+        case ACTIVE:
+            mState = STOPPING;
+            break;
+        case DESTROYED:
+            return NO_ERROR; // simply ignore as we are being destroyed
+        }
+        for (size_t i = 1; i < mHandles.size(); i++) {
+            EffectHandle *h = mHandles[i];
+            if (h != NULL && !h->destroyed_l()) {
+                h->setEnabled(enabled);
+            }
+        }
+    }
+    return NO_ERROR;
+!!!844044.cpp!!!	isEnabled() : bool
+    switch (mState) {
+    case RESTART:
+    case STARTING:
+    case ACTIVE:
+        return true;
+    case IDLE:
+    case STOPPING:
+    case STOPPED:
+    case DESTROYED:
+    default:
+        return false;
+    }
+!!!844172.cpp!!!	isProcessEnabled() : bool
+    switch (mState) {
+    case RESTART:
+    case ACTIVE:
+    case STOPPING:
+    case STOPPED:
+        return true;
+    case IDLE:
+    case STARTING:
+    case DESTROYED:
+    default:
+        return false;
+    }
+!!!845196.cpp!!!	addHandle(inout handle : EffectHandle) : status_t
+    status_t status;
+
+    Mutex::Autolock _l(mLock);
+    int priority = handle->priority();
+    size_t size = mHandles.size();
+    EffectHandle *controlHandle = NULL;
+    size_t i;
+    for (i = 0; i < size; i++) {
+        EffectHandle *h = mHandles[i];
+        if (h == NULL || h->destroyed_l()) continue;
+        // first non destroyed handle is considered in control
+        if (controlHandle == NULL)
+            controlHandle = h;
+        if (h->priority() <= priority) break;
+    }
+    // if inserted in first place, move effect control from previous owner to this handle
+    if (i == 0) {
+        bool enabled = false;
+        if (controlHandle != NULL) {
+            enabled = controlHandle->enabled();
+            controlHandle->setControl(false/*hasControl*/, true /*signal*/, enabled /*enabled*/);
+        }
+        handle->setControl(true /*hasControl*/, false /*signal*/, enabled /*enabled*/);
+        status = NO_ERROR;
+    } else {
+        status = ALREADY_EXISTS;
+    }
+    ALOGV("addHandle() %p added handle %p in position %d", this, handle, i);
+    mHandles.insertAt(handle, i);
+    return status;
+!!!845324.cpp!!!	disconnect(inout handle : EffectHandle, in unpinIfLast : bool) : size_t
+    ALOGV("disconnect() %p handle %p", this, handle);
+    // keep a strong reference on this EffectModule to avoid calling the
+    // destructor before we exit
+    sp<EffectModule> keep(this);
+    {
+        sp<ThreadBase> thread = mThread.promote();
+        if (thread != 0) {
+            thread->disconnectEffect(keep, handle, unpinIfLast);
+        }
+    }
+    return mHandles.size();
+!!!845452.cpp!!!	removeHandle(inout handle : EffectHandle) : size_t
+    Mutex::Autolock _l(mLock);
+    size_t size = mHandles.size();
+    size_t i;
+    for (i = 0; i < size; i++) {
+        if (mHandles[i] == handle) break;
+    }
+    if (i == size) {
+        return size;
+    }
+    ALOGV("removeHandle() %p removed handle %p in position %d", this, handle, i);
+
+    mHandles.removeAt(i);
+    // if removed from first place, move effect control from this handle to next in line
+    if (i == 0) {
+        EffectHandle *h = controlHandle_l();
+        if (h != NULL) {
+            h->setControl(true /*hasControl*/, true /*signal*/ , handle->enabled() /*enabled*/);
+        }
+    }
+
+    // Prevent calls to process() and other functions on effect interface from now on.
+    // The effect engine will be released by the destructor when the last strong reference on
+    // this object is released which can happen after next process is called.
+    if (mHandles.size() == 0 && !mPinned) {
+        mState = DESTROYED;
+    }
+
+    return mHandles.size();
+!!!845836.cpp!!!	setDevice(in device : audio_devices_t) : status_t
+    if (device == AUDIO_DEVICE_NONE) {
+        return NO_ERROR;
+    }
+
+    Mutex::Autolock _l(mLock);
+    status_t status = NO_ERROR;
+    if (device && (mDescriptor.flags & EFFECT_FLAG_DEVICE_MASK) == EFFECT_FLAG_DEVICE_IND) {
+        status_t cmdStatus;
+        uint32_t size = sizeof(status_t);
+        uint32_t cmd = audio_is_output_devices(device) ? EFFECT_CMD_SET_DEVICE :
+                            EFFECT_CMD_SET_INPUT_DEVICE;
+        status = (*mEffectInterface)->command(mEffectInterface,
+                                              cmd,
+                                              sizeof(uint32_t),
+                                              &device,
+                                              &size,
+                                              &cmdStatus);
+    }
+    return status;
+!!!845964.cpp!!!	setVolume(inout left : uint32_t, inout right : uint32_t, in controller : bool) : status_t
+    Mutex::Autolock _l(mLock);
+    status_t status = NO_ERROR;
+
+    // Send volume indication if EFFECT_FLAG_VOLUME_IND is set and read back altered volume
+    // if controller flag is set (Note that controller == TRUE => EFFECT_FLAG_VOLUME_CTRL set)
+    if (isProcessEnabled() &&
+            ((mDescriptor.flags & EFFECT_FLAG_VOLUME_MASK) == EFFECT_FLAG_VOLUME_CTRL ||
+            (mDescriptor.flags & EFFECT_FLAG_VOLUME_MASK) == EFFECT_FLAG_VOLUME_IND)) {
+        status_t cmdStatus;
+        uint32_t volume[2];
+        uint32_t *pVolume = NULL;
+        uint32_t size = sizeof(volume);
+        volume[0] = *left;
+        volume[1] = *right;
+        if (controller) {
+            pVolume = volume;
+        }
+        status = (*mEffectInterface)->command(mEffectInterface,
+                                              EFFECT_CMD_SET_VOLUME,
+                                              size,
+                                              volume,
+                                              &size,
+                                              pVolume);
+        if (controller && status == NO_ERROR && size == sizeof(volume)) {
+            *left = volume[0];
+            *right = volume[1];
+        }
+    }
+    return status;
+!!!846092.cpp!!!	setMode(in mode : audio_mode_t) : status_t
+    Mutex::Autolock _l(mLock);
+    status_t status = NO_ERROR;
+    if ((mDescriptor.flags & EFFECT_FLAG_AUDIO_MODE_MASK) == EFFECT_FLAG_AUDIO_MODE_IND) {
+        status_t cmdStatus;
+        uint32_t size = sizeof(status_t);
+        status = (*mEffectInterface)->command(mEffectInterface,
+                                              EFFECT_CMD_SET_AUDIO_MODE,
+                                              sizeof(audio_mode_t),
+                                              &mode,
+                                              &size,
+                                              &cmdStatus);
+        if (status == NO_ERROR) {
+            status = cmdStatus;
+        }
+    }
+    return status;
+!!!846220.cpp!!!	setAudioSource(in source : audio_source_t) : status_t
+    Mutex::Autolock _l(mLock);
+    status_t status = NO_ERROR;
+    if ((mDescriptor.flags & EFFECT_FLAG_AUDIO_SOURCE_MASK) == EFFECT_FLAG_AUDIO_SOURCE_IND) {
+        uint32_t size = 0;
+        status = (*mEffectInterface)->command(mEffectInterface,
+                                              EFFECT_CMD_SET_AUDIO_SOURCE,
+                                              sizeof(audio_source_t),
+                                              &source,
+                                              &size,
+                                              NULL);
+    }
+    return status;
+!!!846348.cpp!!!	start() : status_t
+    Mutex::Autolock _l(mLock);
+    return start_l();
+!!!846476.cpp!!!	stop() : status_t
+    Mutex::Autolock _l(mLock);
+    return stop_l();
+!!!846604.cpp!!!	setSuspended(in suspended : bool) : void
+    Mutex::Autolock _l(mLock);
+    mSuspended = suspended;
+!!!846732.cpp!!!	suspended() : bool
+    Mutex::Autolock _l(mLock);
+    return mSuspended;
+!!!846860.cpp!!!	controlHandle_l() : EffectHandle
+    // the first valid handle in the list has control over the module
+    for (size_t i = 0; i < mHandles.size(); i++) {
+        EffectHandle *h = mHandles[i];
+        if (h != NULL && !h->destroyed_l()) {
+            return h;
+        }
+    }
+
+    return NULL;
+!!!847244.cpp!!!	purgeHandles() : bool
+    bool enabled = false;
+    Mutex::Autolock _l(mLock);
+    for (size_t i = 0; i < mHandles.size(); i++) {
+        EffectHandle *handle = mHandles[i];
+        if (handle != NULL && !handle->destroyed_l()) {
+            handle->effect().clear();
+            if (handle->hasControl()) {
+                enabled = handle->enabled();
+            }
+        }
+    }
+    return enabled;
+!!!847628.cpp!!!	dump(in fd : int, in args : Vector<String16>) : void
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    snprintf(buffer, SIZE, "\tEffect ID %d:\n", mId);
+    result.append(buffer);
+
+    bool locked = tryLock(mLock);
+    // failed to lock - AudioFlinger is probably deadlocked
+    if (!locked) {
+        result.append("\t\tCould not lock Fx mutex:\n");
+    }
+
+    result.append("\t\tSession Status State Engine:\n");
+    snprintf(buffer, SIZE, "\t\t%05d   %03d    %03d   0x%08x\n",
+            mSessionId, mStatus, mState, (uint32_t)mEffectInterface);
+    result.append(buffer);
+
+    result.append("\t\tDescriptor:\n");
+    snprintf(buffer, SIZE, "\t\t- UUID: %08X-%04X-%04X-%04X-%02X%02X%02X%02X%02X%02X\n",
+            mDescriptor.uuid.timeLow, mDescriptor.uuid.timeMid, mDescriptor.uuid.timeHiAndVersion,
+            mDescriptor.uuid.clockSeq, mDescriptor.uuid.node[0], mDescriptor.uuid.node[1],mDescriptor.uuid.node[2],
+            mDescriptor.uuid.node[3],mDescriptor.uuid.node[4],mDescriptor.uuid.node[5]);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "\t\t- TYPE: %08X-%04X-%04X-%04X-%02X%02X%02X%02X%02X%02X\n",
+                mDescriptor.type.timeLow, mDescriptor.type.timeMid, mDescriptor.type.timeHiAndVersion,
+                mDescriptor.type.clockSeq, mDescriptor.type.node[0], mDescriptor.type.node[1],mDescriptor.type.node[2],
+                mDescriptor.type.node[3],mDescriptor.type.node[4],mDescriptor.type.node[5]);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "\t\t- apiVersion: %08X\n\t\t- flags: %08X\n",
+            mDescriptor.apiVersion,
+            mDescriptor.flags);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "\t\t- name: %s\n",
+            mDescriptor.name);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "\t\t- implementor: %s\n",
+            mDescriptor.implementor);
+    result.append(buffer);
+
+    result.append("\t\t- Input configuration:\n");
+    result.append("\t\t\tBuffer     Frames  Smp rate Channels Format\n");
+    snprintf(buffer, SIZE, "\t\t\t0x%08x %05d   %05d    %08x %d\n",
+            (uint32_t)mConfig.inputCfg.buffer.raw,
+            mConfig.inputCfg.buffer.frameCount,
+            mConfig.inputCfg.samplingRate,
+            mConfig.inputCfg.channels,
+            mConfig.inputCfg.format);
+    result.append(buffer);
+
+    result.append("\t\t- Output configuration:\n");
+    result.append("\t\t\tBuffer     Frames  Smp rate Channels Format\n");
+    snprintf(buffer, SIZE, "\t\t\t0x%08x %05d   %05d    %08x %d\n",
+            (uint32_t)mConfig.outputCfg.buffer.raw,
+            mConfig.outputCfg.buffer.frameCount,
+            mConfig.outputCfg.samplingRate,
+            mConfig.outputCfg.channels,
+            mConfig.outputCfg.format);
+    result.append(buffer);
+
+    snprintf(buffer, SIZE, "\t\t%d Clients:\n", mHandles.size());
+    result.append(buffer);
+    result.append("\t\t\tPid   Priority Ctrl Locked client server\n");
+    for (size_t i = 0; i < mHandles.size(); ++i) {
+        EffectHandle *handle = mHandles[i];
+        if (handle != NULL && !handle->destroyed_l()) {
+            handle->dump(buffer, SIZE);
+            result.append(buffer);
+        }
+    }
+
+    result.append("\n");
+
+    write(fd, result.string(), result.length());
+
+    if (locked) {
+        mLock.unlock();
+    }
+!!!848012.cpp!!!	start_l() : status_t
+    if (mEffectInterface == NULL) {
+        return NO_INIT;
+    }
+    status_t cmdStatus;
+    uint32_t size = sizeof(status_t);
+    status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                   EFFECT_CMD_ENABLE,
+                                                   0,
+                                                   NULL,
+                                                   &size,
+                                                   &cmdStatus);
+    if (status == 0) {
+        status = cmdStatus;
+    }
+    if (status == 0 &&
+            ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
+             (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC)) {
+        sp<ThreadBase> thread = mThread.promote();
+        if (thread != 0) {
+            audio_stream_t *stream = thread->stream();
+            if (stream != NULL) {
+                stream->add_audio_effect(stream, mEffectInterface);
+            }
+        }
+    }
+    return status;
+!!!848140.cpp!!!	stop_l() : status_t
+    if (mEffectInterface == NULL) {
+        return NO_INIT;
+    }
+    status_t cmdStatus;
+    uint32_t size = sizeof(status_t);
+    status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                   EFFECT_CMD_DISABLE,
+                                                   0,
+                                                   NULL,
+                                                   &size,
+                                                   &cmdStatus);
+    if (status == 0) {
+        status = cmdStatus;
+    }
+    if (status == 0 &&
+            ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
+             (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC)) {
+        sp<ThreadBase> thread = mThread.promote();
+        if (thread != 0) {
+            audio_stream_t *stream = thread->stream();
+            if (stream != NULL) {
+                stream->remove_audio_effect(stream, mEffectInterface);
+            }
+        }
+    }
+    return status;

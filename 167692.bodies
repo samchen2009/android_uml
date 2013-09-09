@@ -1,0 +1,152 @@
+class MediaScannerClient
+!!!311436.cpp!!!	~MediaScannerClient()
+    delete mNames;
+    delete mValues;
+!!!311564.cpp!!!	setLocale(in locale : char) : void
+    if (!locale) return;
+
+    if (!strncmp(locale, "ja", 2))
+        mLocaleEncoding = kEncodingShiftJIS;
+    else if (!strncmp(locale, "ko", 2))
+        mLocaleEncoding = kEncodingEUCKR;
+    else if (!strncmp(locale, "zh", 2)) {
+        if (!strcmp(locale, "zh_CN")) {
+            // simplified chinese for mainland China
+            mLocaleEncoding = kEncodingGBK;
+        } else {
+            // assume traditional for non-mainland Chinese locales (Taiwan, Hong Kong, Singapore)
+            mLocaleEncoding = kEncodingBig5;
+        }
+    }
+!!!311692.cpp!!!	beginFile() : void
+    mNames = new StringArray;
+    mValues = new StringArray;
+!!!311820.cpp!!!	addStringTag(in name : char, in value : char) : status_t
+    if (mLocaleEncoding != kEncodingNone) {
+        // don't bother caching strings that are all ASCII.
+        // call handleStringTag directly instead.
+        // check to see if value (which should be utf8) has any non-ASCII characters
+        bool nonAscii = false;
+        const char* chp = value;
+        char ch;
+        while ((ch = *chp++)) {
+            if (ch & 0x80) {
+                nonAscii = true;
+                break;
+            }
+        }
+
+        if (nonAscii) {
+            // save the strings for later so they can be used for native encoding detection
+            mNames->push_back(name);
+            mValues->push_back(value);
+            return OK;
+        }
+        // else fall through
+    }
+
+    // autodetection is not necessary, so no need to cache the values
+    // pass directly to the client instead
+    return handleStringTag(name, value);
+!!!311948.cpp!!!	endFile() : void
+    if (mLocaleEncoding != kEncodingNone) {
+        int size = mNames->size();
+        uint32_t encoding = kEncodingAll;
+
+        // compute a bit mask containing all possible encodings
+        for (int i = 0; i < mNames->size(); i++)
+            encoding &= possibleEncodings(mValues->getEntry(i));
+
+        // if the locale encoding matches, then assume we have a native encoding.
+        if (encoding & mLocaleEncoding)
+            convertValues(mLocaleEncoding);
+
+        // finally, push all name/value pairs to the client
+        for (int i = 0; i < mNames->size(); i++) {
+            status_t status = handleStringTag(mNames->getEntry(i), mValues->getEntry(i));
+            if (status) {
+                break;
+            }
+        }
+    }
+    // else addStringTag() has done all the work so we have nothing to do
+
+    delete mNames;
+    delete mValues;
+    mNames = NULL;
+    mValues = NULL;
+!!!312460.cpp!!!	convertValues(in encoding : uint32_t) : void
+    const char* enc = NULL;
+    switch (encoding) {
+        case kEncodingShiftJIS:
+            enc = "shift-jis";
+            break;
+        case kEncodingGBK:
+            enc = "gbk";
+            break;
+        case kEncodingBig5:
+            enc = "Big5";
+            break;
+        case kEncodingEUCKR:
+            enc = "EUC-KR";
+            break;
+    }
+
+    if (enc) {
+        UErrorCode status = U_ZERO_ERROR;
+
+        UConverter *conv = ucnv_open(enc, &status);
+        if (U_FAILURE(status)) {
+            ALOGE("could not create UConverter for %s", enc);
+            return;
+        }
+        UConverter *utf8Conv = ucnv_open("UTF-8", &status);
+        if (U_FAILURE(status)) {
+            ALOGE("could not create UConverter for UTF-8");
+            ucnv_close(conv);
+            return;
+        }
+
+        // for each value string, convert from native encoding to UTF-8
+        for (int i = 0; i < mNames->size(); i++) {
+            // first we need to untangle the utf8 and convert it back to the original bytes
+            // since we are reducing the length of the string, we can do this in place
+            uint8_t* src = (uint8_t *)mValues->getEntry(i);
+            int len = strlen((char *)src);
+            uint8_t* dest = src;
+
+            uint8_t uch;
+            while ((uch = *src++)) {
+                if (uch & 0x80)
+                    *dest++ = ((uch << 6) & 0xC0) | (*src++ & 0x3F);
+                else
+                    *dest++ = uch;
+            }
+            *dest = 0;
+
+            // now convert from native encoding to UTF-8
+            const char* source = mValues->getEntry(i);
+            int targetLength = len * 3 + 1;
+            char* buffer = new char[targetLength];
+            // don't normally check for NULL, but in this case targetLength may be large
+            if (!buffer)
+                break;
+            char* target = buffer;
+
+            ucnv_convertEx(utf8Conv, conv, &target, target + targetLength,
+                    &source, (const char *)dest, NULL, NULL, NULL, NULL, TRUE, TRUE, &status);
+            if (U_FAILURE(status)) {
+                ALOGE("ucnv_convertEx failed: %d", status);
+                mValues->setEntry(i, "???");
+            } else {
+                // zero terminate
+                *target = 0;
+                mValues->setEntry(i, buffer);
+            }
+
+            delete[] buffer;
+        }
+
+        ucnv_close(conv);
+        ucnv_close(utf8Conv);
+    }

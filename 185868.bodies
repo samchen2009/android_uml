@@ -1,0 +1,895 @@
+class BufferQueue
+!!!1486988.cpp!!!	BufferQueue(in allowSynchronousMode : bool = true, in allocator : sp<IGraphicBufferAlloc> = NULL)
+    // Choose a name using the PID and a process-unique ID.
+    mConsumerName = String8::format("unnamed-%d-%d", getpid(), createProcessUniqueId());
+
+    ST_LOGV("BufferQueue");
+    if (allocator == NULL) {
+        sp<ISurfaceComposer> composer(ComposerService::getComposerService());
+        mGraphicBufferAlloc = composer->createGraphicBufferAlloc();
+        if (mGraphicBufferAlloc == 0) {
+            ST_LOGE("createGraphicBufferAlloc() failed in BufferQueue()");
+        }
+    } else {
+        mGraphicBufferAlloc = allocator;
+    }
+!!!1487116.cpp!!!	~BufferQueue()
+    ST_LOGV("~BufferQueue");
+!!!1487244.cpp!!!	query(in what : int, inout outValue : int) : int
+    ATRACE_CALL();
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ST_LOGE("query: SurfaceTexture has been abandoned!");
+        return NO_INIT;
+    }
+
+    int value;
+    switch (what) {
+    case NATIVE_WINDOW_WIDTH:
+        value = mDefaultWidth;
+        break;
+    case NATIVE_WINDOW_HEIGHT:
+        value = mDefaultHeight;
+        break;
+    case NATIVE_WINDOW_FORMAT:
+        value = mDefaultBufferFormat;
+        break;
+    case NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS:
+        value = getMinUndequeuedBufferCountLocked();
+        break;
+    case NATIVE_WINDOW_CONSUMER_RUNNING_BEHIND:
+        value = (mQueue.size() >= 2);
+        break;
+    default:
+        return BAD_VALUE;
+    }
+    outValue[0] = value;
+    return NO_ERROR;
+!!!1487372.cpp!!!	setBufferCount(in bufferCount : int) : status_t
+    ST_LOGV("setBufferCount: count=%d", bufferCount);
+
+    sp<ConsumerListener> listener;
+    {
+        Mutex::Autolock lock(mMutex);
+
+        if (mAbandoned) {
+            ST_LOGE("setBufferCount: SurfaceTexture has been abandoned!");
+            return NO_INIT;
+        }
+        if (bufferCount > NUM_BUFFER_SLOTS) {
+            ST_LOGE("setBufferCount: bufferCount larger than slots available");
+            return BAD_VALUE;
+        }
+
+        // Error out if the user has dequeued buffers
+        int maxBufferCount = getMaxBufferCountLocked();
+        for (int i=0 ; i<maxBufferCount; i++) {
+            if (mSlots[i].mBufferState == BufferSlot::DEQUEUED) {
+                ST_LOGE("setBufferCount: client owns some buffers");
+                return -EINVAL;
+            }
+        }
+
+        const int minBufferSlots = getMinMaxBufferCountLocked();
+        if (bufferCount == 0) {
+            mOverrideMaxBufferCount = 0;
+            mDequeueCondition.broadcast();
+            return OK;
+        }
+
+        if (bufferCount < minBufferSlots) {
+            ST_LOGE("setBufferCount: requested buffer count (%d) is less than "
+                    "minimum (%d)", bufferCount, minBufferSlots);
+            return BAD_VALUE;
+        }
+
+        // here we're guaranteed that the client doesn't have dequeued buffers
+        // and will release all of its buffer references.
+        //
+        // XXX: Should this use drainQueueAndFreeBuffersLocked instead?
+        freeAllBuffersLocked();
+        mOverrideMaxBufferCount = bufferCount;
+        mBufferHasBeenQueued = false;
+        mDequeueCondition.broadcast();
+        listener = mConsumerListener;
+    } // scope for lock
+
+    if (listener != NULL) {
+        listener->onBuffersReleased();
+    }
+
+    return OK;
+!!!1487500.cpp!!!	requestBuffer(in slot : int, inout buf : sp<GraphicBuffer>) : status_t
+    ATRACE_CALL();
+    ST_LOGV("requestBuffer: slot=%d", slot);
+    Mutex::Autolock lock(mMutex);
+    if (mAbandoned) {
+        ST_LOGE("requestBuffer: SurfaceTexture has been abandoned!");
+        return NO_INIT;
+    }
+    int maxBufferCount = getMaxBufferCountLocked();
+    if (slot < 0 || maxBufferCount <= slot) {
+        ST_LOGE("requestBuffer: slot index out of range [0, %d]: %d",
+                maxBufferCount, slot);
+        return BAD_VALUE;
+    } else if (mSlots[slot].mBufferState != BufferSlot::DEQUEUED) {
+        // XXX: I vaguely recall there was some reason this can be valid, but
+        // for the life of me I can't recall under what circumstances that's
+        // the case.
+        ST_LOGE("requestBuffer: slot %d is not owned by the client (state=%d)",
+                slot, mSlots[slot].mBufferState);
+        return BAD_VALUE;
+    }
+    mSlots[slot].mRequestBufferCalled = true;
+    *buf = mSlots[slot].mGraphicBuffer;
+    return NO_ERROR;
+!!!1487628.cpp!!!	dequeueBuffer(inout outBuf : int, inout outFence : sp<Fence>, in w : uint32_t, in h : uint32_t, in format : uint32_t, in usage : uint32_t) : status_t
+    ATRACE_CALL();
+    ST_LOGV("dequeueBuffer: w=%d h=%d fmt=%#x usage=%#x", w, h, format, usage);
+
+    if ((w && !h) || (!w && h)) {
+        ST_LOGE("dequeueBuffer: invalid size: w=%u, h=%u", w, h);
+        return BAD_VALUE;
+    }
+
+    status_t returnFlags(OK);
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    EGLSyncKHR eglFence = EGL_NO_SYNC_KHR;
+
+    { // Scope for the lock
+        Mutex::Autolock lock(mMutex);
+
+        if (format == 0) {
+            format = mDefaultBufferFormat;
+        }
+        // turn on usage bits the consumer requested
+        usage |= mConsumerUsageBits;
+
+        int found = -1;
+        int dequeuedCount = 0;
+        bool tryAgain = true;
+        while (tryAgain) {
+            if (mAbandoned) {
+                ST_LOGE("dequeueBuffer: SurfaceTexture has been abandoned!");
+                return NO_INIT;
+            }
+
+            const int maxBufferCount = getMaxBufferCountLocked();
+
+            // Free up any buffers that are in slots beyond the max buffer
+            // count.
+            for (int i = maxBufferCount; i < NUM_BUFFER_SLOTS; i++) {
+                assert(mSlots[i].mBufferState == BufferSlot::FREE);
+                if (mSlots[i].mGraphicBuffer != NULL) {
+                    freeBufferLocked(i);
+                    returnFlags |= ISurfaceTexture::RELEASE_ALL_BUFFERS;
+                }
+            }
+
+            // look for a free buffer to give to the client
+            found = INVALID_BUFFER_SLOT;
+            dequeuedCount = 0;
+            for (int i = 0; i < maxBufferCount; i++) {
+                const int state = mSlots[i].mBufferState;
+                if (state == BufferSlot::DEQUEUED) {
+                    dequeuedCount++;
+                }
+
+                if (state == BufferSlot::FREE) {
+                    /* We return the oldest of the free buffers to avoid
+                     * stalling the producer if possible.  This is because
+                     * the consumer may still have pending reads of the
+                     * buffers in flight.
+                     */
+                    if ((found < 0) ||
+                            mSlots[i].mFrameNumber < mSlots[found].mFrameNumber) {
+                        found = i;
+                    }
+                }
+            }
+
+            // clients are not allowed to dequeue more than one buffer
+            // if they didn't set a buffer count.
+            if (!mOverrideMaxBufferCount && dequeuedCount) {
+                ST_LOGE("dequeueBuffer: can't dequeue multiple buffers without "
+                        "setting the buffer count");
+                return -EINVAL;
+            }
+
+            // See whether a buffer has been queued since the last
+            // setBufferCount so we know whether to perform the min undequeued
+            // buffers check below.
+            if (mBufferHasBeenQueued) {
+                // make sure the client is not trying to dequeue more buffers
+                // than allowed.
+                const int newUndequeuedCount = maxBufferCount - (dequeuedCount+1);
+                const int minUndequeuedCount = getMinUndequeuedBufferCountLocked();
+                if (newUndequeuedCount < minUndequeuedCount) {
+                    ST_LOGE("dequeueBuffer: min undequeued buffer count (%d) "
+                            "exceeded (dequeued=%d undequeudCount=%d)",
+                            minUndequeuedCount, dequeuedCount,
+                            newUndequeuedCount);
+                    return -EBUSY;
+                }
+            }
+
+            // If no buffer is found, wait for a buffer to be released or for
+            // the max buffer count to change.
+            tryAgain = found == INVALID_BUFFER_SLOT;
+            if (tryAgain) {
+                mDequeueCondition.wait(mMutex);
+            }
+        }
+
+
+        if (found == INVALID_BUFFER_SLOT) {
+            // This should not happen.
+            ST_LOGE("dequeueBuffer: no available buffer slots");
+            return -EBUSY;
+        }
+
+        const int buf = found;
+        *outBuf = found;
+
+        ATRACE_BUFFER_INDEX(buf);
+
+        const bool useDefaultSize = !w && !h;
+        if (useDefaultSize) {
+            // use the default size
+            w = mDefaultWidth;
+            h = mDefaultHeight;
+        }
+
+        // buffer is now in DEQUEUED (but can also be current at the same time,
+        // if we're in synchronous mode)
+        mSlots[buf].mBufferState = BufferSlot::DEQUEUED;
+
+        const sp<GraphicBuffer>& buffer(mSlots[buf].mGraphicBuffer);
+        if ((buffer == NULL) ||
+            (uint32_t(buffer->width)  != w) ||
+            (uint32_t(buffer->height) != h) ||
+            (uint32_t(buffer->format) != format) ||
+            ((uint32_t(buffer->usage) & usage) != usage))
+        {
+            mSlots[buf].mAcquireCalled = false;
+            mSlots[buf].mGraphicBuffer = NULL;
+            mSlots[buf].mRequestBufferCalled = false;
+            mSlots[buf].mEglFence = EGL_NO_SYNC_KHR;
+            mSlots[buf].mFence.clear();
+            mSlots[buf].mEglDisplay = EGL_NO_DISPLAY;
+
+            returnFlags |= ISurfaceTexture::BUFFER_NEEDS_REALLOCATION;
+        }
+
+        dpy = mSlots[buf].mEglDisplay;
+        eglFence = mSlots[buf].mEglFence;
+        outFence = mSlots[buf].mFence;
+        mSlots[buf].mEglFence = EGL_NO_SYNC_KHR;
+        mSlots[buf].mFence.clear();
+    }  // end lock scope
+
+    if (returnFlags & ISurfaceTexture::BUFFER_NEEDS_REALLOCATION) {
+        status_t error;
+        sp<GraphicBuffer> graphicBuffer(
+                mGraphicBufferAlloc->createGraphicBuffer(
+                        w, h, format, usage, &error));
+        if (graphicBuffer == 0) {
+            ST_LOGE("dequeueBuffer: SurfaceComposer::createGraphicBuffer "
+                    "failed");
+            return error;
+        }
+
+        { // Scope for the lock
+            Mutex::Autolock lock(mMutex);
+
+            if (mAbandoned) {
+                ST_LOGE("dequeueBuffer: SurfaceTexture has been abandoned!");
+                return NO_INIT;
+            }
+
+            mSlots[*outBuf].mGraphicBuffer = graphicBuffer;
+        }
+    }
+
+
+    if (eglFence != EGL_NO_SYNC_KHR) {
+        EGLint result = eglClientWaitSyncKHR(dpy, eglFence, 0, 1000000000);
+        // If something goes wrong, log the error, but return the buffer without
+        // synchronizing access to it.  It's too late at this point to abort the
+        // dequeue operation.
+        if (result == EGL_FALSE) {
+            ST_LOGE("dequeueBuffer: error waiting for fence: %#x", eglGetError());
+        } else if (result == EGL_TIMEOUT_EXPIRED_KHR) {
+            ST_LOGE("dequeueBuffer: timeout waiting for fence");
+        }
+        eglDestroySyncKHR(dpy, eglFence);
+    }
+
+    ST_LOGV("dequeueBuffer: returning slot=%d buf=%p flags=%#x", *outBuf,
+            mSlots[*outBuf].mGraphicBuffer->handle, returnFlags);
+
+    return returnFlags;
+!!!1487756.cpp!!!	queueBuffer(in buf : int, in input : QueueBufferInput, inout output : QueueBufferOutput) : status_t
+    ATRACE_CALL();
+    ATRACE_BUFFER_INDEX(buf);
+
+    Rect crop;
+    uint32_t transform;
+    int scalingMode;
+    int64_t timestamp;
+    sp<Fence> fence;
+
+    input.deflate(&timestamp, &crop, &scalingMode, &transform, &fence);
+
+    ST_LOGV("queueBuffer: slot=%d time=%#llx crop=[%d,%d,%d,%d] tr=%#x "
+            "scale=%s",
+            buf, timestamp, crop.left, crop.top, crop.right, crop.bottom,
+            transform, scalingModeName(scalingMode));
+
+    sp<ConsumerListener> listener;
+
+    { // scope for the lock
+        Mutex::Autolock lock(mMutex);
+        if (mAbandoned) {
+            ST_LOGE("queueBuffer: SurfaceTexture has been abandoned!");
+            return NO_INIT;
+        }
+        int maxBufferCount = getMaxBufferCountLocked();
+        if (buf < 0 || buf >= maxBufferCount) {
+            ST_LOGE("queueBuffer: slot index out of range [0, %d]: %d",
+                    maxBufferCount, buf);
+            return -EINVAL;
+        } else if (mSlots[buf].mBufferState != BufferSlot::DEQUEUED) {
+            ST_LOGE("queueBuffer: slot %d is not owned by the client "
+                    "(state=%d)", buf, mSlots[buf].mBufferState);
+            return -EINVAL;
+        } else if (!mSlots[buf].mRequestBufferCalled) {
+            ST_LOGE("queueBuffer: slot %d was enqueued without requesting a "
+                    "buffer", buf);
+            return -EINVAL;
+        }
+
+        const sp<GraphicBuffer>& graphicBuffer(mSlots[buf].mGraphicBuffer);
+        Rect bufferRect(graphicBuffer->getWidth(), graphicBuffer->getHeight());
+        Rect croppedCrop;
+        crop.intersect(bufferRect, &croppedCrop);
+        if (croppedCrop != crop) {
+            ST_LOGE("queueBuffer: crop rect is not contained within the "
+                    "buffer in slot %d", buf);
+            return -EINVAL;
+        }
+
+        if (mSynchronousMode) {
+            // In synchronous mode we queue all buffers in a FIFO.
+            mQueue.push_back(buf);
+
+            // Synchronous mode always signals that an additional frame should
+            // be consumed.
+            listener = mConsumerListener;
+        } else {
+            // In asynchronous mode we only keep the most recent buffer.
+            if (mQueue.empty()) {
+                mQueue.push_back(buf);
+
+                // Asynchronous mode only signals that a frame should be
+                // consumed if no previous frame was pending. If a frame were
+                // pending then the consumer would have already been notified.
+                listener = mConsumerListener;
+            } else {
+                Fifo::iterator front(mQueue.begin());
+                // buffer currently queued is freed
+                mSlots[*front].mBufferState = BufferSlot::FREE;
+                // and we record the new buffer index in the queued list
+                *front = buf;
+            }
+        }
+
+        mSlots[buf].mTimestamp = timestamp;
+        mSlots[buf].mCrop = crop;
+        mSlots[buf].mTransform = transform;
+        mSlots[buf].mFence = fence;
+
+        switch (scalingMode) {
+            case NATIVE_WINDOW_SCALING_MODE_FREEZE:
+            case NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW:
+            case NATIVE_WINDOW_SCALING_MODE_SCALE_CROP:
+                break;
+            default:
+                ST_LOGE("unknown scaling mode: %d (ignoring)", scalingMode);
+                scalingMode = mSlots[buf].mScalingMode;
+                break;
+        }
+
+        mSlots[buf].mBufferState = BufferSlot::QUEUED;
+        mSlots[buf].mScalingMode = scalingMode;
+        mFrameCounter++;
+        mSlots[buf].mFrameNumber = mFrameCounter;
+
+        mBufferHasBeenQueued = true;
+        mDequeueCondition.broadcast();
+
+        output->inflate(mDefaultWidth, mDefaultHeight, mTransformHint,
+                mQueue.size());
+
+        ATRACE_INT(mConsumerName.string(), mQueue.size());
+    } // scope for the lock
+
+    // call back without lock held
+    if (listener != 0) {
+        listener->onFrameAvailable();
+    }
+    return OK;
+!!!1487884.cpp!!!	cancelBuffer(in buf : int, in fence : sp<Fence>) : void
+    ATRACE_CALL();
+    ST_LOGV("cancelBuffer: slot=%d", buf);
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ST_LOGW("cancelBuffer: BufferQueue has been abandoned!");
+        return;
+    }
+
+    int maxBufferCount = getMaxBufferCountLocked();
+    if (buf < 0 || buf >= maxBufferCount) {
+        ST_LOGE("cancelBuffer: slot index out of range [0, %d]: %d",
+                maxBufferCount, buf);
+        return;
+    } else if (mSlots[buf].mBufferState != BufferSlot::DEQUEUED) {
+        ST_LOGE("cancelBuffer: slot %d is not owned by the client (state=%d)",
+                buf, mSlots[buf].mBufferState);
+        return;
+    }
+    mSlots[buf].mBufferState = BufferSlot::FREE;
+    mSlots[buf].mFrameNumber = 0;
+    mSlots[buf].mFence = fence;
+    mDequeueCondition.broadcast();
+!!!1488012.cpp!!!	setSynchronousMode(in enabled : bool) : status_t
+    ATRACE_CALL();
+    ST_LOGV("setSynchronousMode: enabled=%d", enabled);
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ST_LOGE("setSynchronousMode: SurfaceTexture has been abandoned!");
+        return NO_INIT;
+    }
+
+    status_t err = OK;
+    if (!mAllowSynchronousMode && enabled)
+        return err;
+
+    if (!enabled) {
+        // going to asynchronous mode, drain the queue
+        err = drainQueueLocked();
+        if (err != NO_ERROR)
+            return err;
+    }
+
+    if (mSynchronousMode != enabled) {
+        // - if we're going to asynchronous mode, the queue is guaranteed to be
+        // empty here
+        // - if the client set the number of buffers, we're guaranteed that
+        // we have at least 3 (because we don't allow less)
+        mSynchronousMode = enabled;
+        mDequeueCondition.broadcast();
+    }
+    return err;
+!!!1488140.cpp!!!	connect(in api : int, inout output : QueueBufferOutput) : status_t
+    ATRACE_CALL();
+    ST_LOGV("connect: api=%d", api);
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ST_LOGE("connect: BufferQueue has been abandoned!");
+        return NO_INIT;
+    }
+
+    if (mConsumerListener == NULL) {
+        ST_LOGE("connect: BufferQueue has no consumer!");
+        return NO_INIT;
+    }
+
+    int err = NO_ERROR;
+    switch (api) {
+        case NATIVE_WINDOW_API_EGL:
+        case NATIVE_WINDOW_API_CPU:
+        case NATIVE_WINDOW_API_MEDIA:
+        case NATIVE_WINDOW_API_CAMERA:
+            if (mConnectedApi != NO_CONNECTED_API) {
+                ST_LOGE("connect: already connected (cur=%d, req=%d)",
+                        mConnectedApi, api);
+                err = -EINVAL;
+            } else {
+                mConnectedApi = api;
+                output->inflate(mDefaultWidth, mDefaultHeight, mTransformHint,
+                        mQueue.size());
+            }
+            break;
+        default:
+            err = -EINVAL;
+            break;
+    }
+
+    mBufferHasBeenQueued = false;
+
+    return err;
+!!!1488268.cpp!!!	disconnect(in api : int) : status_t
+    ATRACE_CALL();
+    ST_LOGV("disconnect: api=%d", api);
+
+    int err = NO_ERROR;
+    sp<ConsumerListener> listener;
+
+    { // Scope for the lock
+        Mutex::Autolock lock(mMutex);
+
+        if (mAbandoned) {
+            // it is not really an error to disconnect after the surface
+            // has been abandoned, it should just be a no-op.
+            return NO_ERROR;
+        }
+
+        switch (api) {
+            case NATIVE_WINDOW_API_EGL:
+            case NATIVE_WINDOW_API_CPU:
+            case NATIVE_WINDOW_API_MEDIA:
+            case NATIVE_WINDOW_API_CAMERA:
+                if (mConnectedApi == api) {
+                    drainQueueAndFreeBuffersLocked();
+                    mConnectedApi = NO_CONNECTED_API;
+                    mDequeueCondition.broadcast();
+                    listener = mConsumerListener;
+                } else {
+                    ST_LOGE("disconnect: connected to another api (cur=%d, req=%d)",
+                            mConnectedApi, api);
+                    err = -EINVAL;
+                }
+                break;
+            default:
+                ST_LOGE("disconnect: unknown API %d", api);
+                err = -EINVAL;
+                break;
+        }
+    }
+
+    if (listener != NULL) {
+        listener->onBuffersReleased();
+    }
+
+    return err;
+!!!1488396.cpp!!!	dump(inout result : String8) : void
+    char buffer[1024];
+    BufferQueue::dump(result, "", buffer, 1024);
+!!!1488524.cpp!!!	dump(inout result : String8, in prefix : char, inout buffer : char, in SIZE : size_t) : void
+    Mutex::Autolock _l(mMutex);
+
+    String8 fifo;
+    int fifoSize = 0;
+    Fifo::const_iterator i(mQueue.begin());
+    while (i != mQueue.end()) {
+       snprintf(buffer, SIZE, "%02d ", *i++);
+       fifoSize++;
+       fifo.append(buffer);
+    }
+
+    int maxBufferCount = getMaxBufferCountLocked();
+
+    snprintf(buffer, SIZE,
+            "%s-BufferQueue maxBufferCount=%d, mSynchronousMode=%d, default-size=[%dx%d], "
+            "default-format=%d, transform-hint=%02x, FIFO(%d)={%s}\n",
+            prefix, maxBufferCount, mSynchronousMode, mDefaultWidth,
+            mDefaultHeight, mDefaultBufferFormat, mTransformHint,
+            fifoSize, fifo.string());
+    result.append(buffer);
+
+
+    struct {
+        const char * operator()(int state) const {
+            switch (state) {
+                case BufferSlot::DEQUEUED: return "DEQUEUED";
+                case BufferSlot::QUEUED: return "QUEUED";
+                case BufferSlot::FREE: return "FREE";
+                case BufferSlot::ACQUIRED: return "ACQUIRED";
+                default: return "Unknown";
+            }
+        }
+    } stateName;
+
+    for (int i=0 ; i<maxBufferCount ; i++) {
+        const BufferSlot& slot(mSlots[i]);
+        snprintf(buffer, SIZE,
+                "%s%s[%02d] "
+                "state=%-8s, crop=[%d,%d,%d,%d], "
+                "xform=0x%02x, time=%#llx, scale=%s",
+                prefix, (slot.mBufferState == BufferSlot::ACQUIRED)?">":" ", i,
+                stateName(slot.mBufferState),
+                slot.mCrop.left, slot.mCrop.top, slot.mCrop.right,
+                slot.mCrop.bottom, slot.mTransform, slot.mTimestamp,
+                scalingModeName(slot.mScalingMode)
+        );
+        result.append(buffer);
+
+        const sp<GraphicBuffer>& buf(slot.mGraphicBuffer);
+        if (buf != NULL) {
+            snprintf(buffer, SIZE,
+                    ", %p [%4ux%4u:%4u,%3X]",
+                    buf->handle, buf->width, buf->height, buf->stride,
+                    buf->format);
+            result.append(buffer);
+        }
+        result.append("\n");
+    }
+!!!1488780.cpp!!!	acquireBuffer(inout buffer : BufferItem) : status_t
+    ATRACE_CALL();
+    Mutex::Autolock _l(mMutex);
+
+    // Check that the consumer doesn't currently have the maximum number of
+    // buffers acquired.  We allow the max buffer count to be exceeded by one
+    // buffer, so that the consumer can successfully set up the newly acquired
+    // buffer before releasing the old one.
+    int numAcquiredBuffers = 0;
+    for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
+        if (mSlots[i].mBufferState == BufferSlot::ACQUIRED) {
+            numAcquiredBuffers++;
+        }
+    }
+    if (numAcquiredBuffers >= mMaxAcquiredBufferCount+1) {
+        ST_LOGE("acquireBuffer: max acquired buffer count reached: %d (max=%d)",
+                numAcquiredBuffers, mMaxAcquiredBufferCount);
+        return INVALID_OPERATION;
+    }
+
+    // check if queue is empty
+    // In asynchronous mode the list is guaranteed to be one buffer
+    // deep, while in synchronous mode we use the oldest buffer.
+    if (!mQueue.empty()) {
+        Fifo::iterator front(mQueue.begin());
+        int buf = *front;
+
+        ATRACE_BUFFER_INDEX(buf);
+
+        if (mSlots[buf].mAcquireCalled) {
+            buffer->mGraphicBuffer = NULL;
+        } else {
+            buffer->mGraphicBuffer = mSlots[buf].mGraphicBuffer;
+        }
+        buffer->mCrop = mSlots[buf].mCrop;
+        buffer->mTransform = mSlots[buf].mTransform;
+        buffer->mScalingMode = mSlots[buf].mScalingMode;
+        buffer->mFrameNumber = mSlots[buf].mFrameNumber;
+        buffer->mTimestamp = mSlots[buf].mTimestamp;
+        buffer->mBuf = buf;
+        buffer->mFence = mSlots[buf].mFence;
+
+        mSlots[buf].mAcquireCalled = true;
+        mSlots[buf].mNeedsCleanupOnRelease = false;
+        mSlots[buf].mBufferState = BufferSlot::ACQUIRED;
+        mSlots[buf].mFence.clear();
+
+        mQueue.erase(front);
+        mDequeueCondition.broadcast();
+
+        ATRACE_INT(mConsumerName.string(), mQueue.size());
+    } else {
+        return NO_BUFFER_AVAILABLE;
+    }
+
+    return OK;
+!!!1488908.cpp!!!	releaseBuffer(in buf : int, in display : EGLDisplay, in eglFence : EGLSyncKHR, in fence : sp<Fence>) : status_t
+    ATRACE_CALL();
+    ATRACE_BUFFER_INDEX(buf);
+
+    Mutex::Autolock _l(mMutex);
+
+    if (buf == INVALID_BUFFER_SLOT) {
+        return -EINVAL;
+    }
+
+    mSlots[buf].mEglDisplay = display;
+    mSlots[buf].mEglFence = eglFence;
+    mSlots[buf].mFence = fence;
+
+    // The buffer can now only be released if its in the acquired state
+    if (mSlots[buf].mBufferState == BufferSlot::ACQUIRED) {
+        mSlots[buf].mBufferState = BufferSlot::FREE;
+    } else if (mSlots[buf].mNeedsCleanupOnRelease) {
+        ST_LOGV("releasing a stale buf %d its state was %d", buf, mSlots[buf].mBufferState);
+        mSlots[buf].mNeedsCleanupOnRelease = false;
+        return STALE_BUFFER_SLOT;
+    } else {
+        ST_LOGE("attempted to release buf %d but its state was %d", buf, mSlots[buf].mBufferState);
+        return -EINVAL;
+    }
+
+    mDequeueCondition.broadcast();
+    return OK;
+!!!1489036.cpp!!!	consumerConnect(in consumerListener : sp<ConsumerListener>) : status_t
+    ST_LOGV("consumerConnect");
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ST_LOGE("consumerConnect: BufferQueue has been abandoned!");
+        return NO_INIT;
+    }
+
+    mConsumerListener = consumerListener;
+
+    return OK;
+!!!1489164.cpp!!!	consumerDisconnect() : status_t
+    ST_LOGV("consumerDisconnect");
+    Mutex::Autolock lock(mMutex);
+
+    if (mConsumerListener == NULL) {
+        ST_LOGE("consumerDisconnect: No consumer is connected!");
+        return -EINVAL;
+    }
+
+    mAbandoned = true;
+    mConsumerListener = NULL;
+    mQueue.clear();
+    freeAllBuffersLocked();
+    mDequeueCondition.broadcast();
+    return OK;
+!!!1489292.cpp!!!	getReleasedBuffers(inout slotMask : uint32_t) : status_t
+    ST_LOGV("getReleasedBuffers");
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ST_LOGE("getReleasedBuffers: BufferQueue has been abandoned!");
+        return NO_INIT;
+    }
+
+    uint32_t mask = 0;
+    for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
+        if (!mSlots[i].mAcquireCalled) {
+            mask |= 1 << i;
+        }
+    }
+    *slotMask = mask;
+
+    ST_LOGV("getReleasedBuffers: returning mask %#x", mask);
+    return NO_ERROR;
+!!!1489420.cpp!!!	setDefaultBufferSize(in w : uint32_t, in h : uint32_t) : status_t
+    ST_LOGV("setDefaultBufferSize: w=%d, h=%d", w, h);
+    if (!w || !h) {
+        ST_LOGE("setDefaultBufferSize: dimensions cannot be 0 (w=%d, h=%d)",
+                w, h);
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock lock(mMutex);
+    mDefaultWidth = w;
+    mDefaultHeight = h;
+    return OK;
+!!!1489548.cpp!!!	setDefaultMaxBufferCount(in bufferCount : int) : status_t
+    ATRACE_CALL();
+    Mutex::Autolock lock(mMutex);
+    return setDefaultMaxBufferCountLocked(bufferCount);
+!!!1489676.cpp!!!	setMaxAcquiredBufferCount(in maxAcquiredBuffers : int) : status_t
+    ATRACE_CALL();
+    Mutex::Autolock lock(mMutex);
+    if (maxAcquiredBuffers < 1 || maxAcquiredBuffers > MAX_MAX_ACQUIRED_BUFFERS) {
+        ST_LOGE("setMaxAcquiredBufferCount: invalid count specified: %d",
+                maxAcquiredBuffers);
+        return BAD_VALUE;
+    }
+    if (mConnectedApi != NO_CONNECTED_API) {
+        return INVALID_OPERATION;
+    }
+    mMaxAcquiredBufferCount = maxAcquiredBuffers;
+    return OK;
+!!!1489804.cpp!!!	isSynchronousMode() : bool
+    Mutex::Autolock lock(mMutex);
+    return mSynchronousMode;
+!!!1489932.cpp!!!	setConsumerName(in name : String8) : void
+    Mutex::Autolock lock(mMutex);
+    mConsumerName = name;
+!!!1490060.cpp!!!	setDefaultBufferFormat(in defaultFormat : uint32_t) : status_t
+    Mutex::Autolock lock(mMutex);
+    mDefaultBufferFormat = defaultFormat;
+    return OK;
+!!!1490188.cpp!!!	setConsumerUsageBits(in usage : uint32_t) : status_t
+    Mutex::Autolock lock(mMutex);
+    mConsumerUsageBits = usage;
+    return OK;
+!!!1490316.cpp!!!	setTransformHint(in hint : uint32_t) : status_t
+    ST_LOGV("setTransformHint: %02x", hint);
+    Mutex::Autolock lock(mMutex);
+    mTransformHint = hint;
+    return OK;
+!!!1490444.cpp!!!	freeBufferLocked(in slot : int) : void
+    ST_LOGV("freeBufferLocked: slot=%d", slot);
+    mSlots[slot].mGraphicBuffer = 0;
+    if (mSlots[slot].mBufferState == BufferSlot::ACQUIRED) {
+        mSlots[slot].mNeedsCleanupOnRelease = true;
+    }
+    mSlots[slot].mBufferState = BufferSlot::FREE;
+    mSlots[slot].mFrameNumber = 0;
+    mSlots[slot].mAcquireCalled = false;
+
+    // destroy fence as BufferQueue now takes ownership
+    if (mSlots[slot].mEglFence != EGL_NO_SYNC_KHR) {
+        eglDestroySyncKHR(mSlots[slot].mEglDisplay, mSlots[slot].mEglFence);
+        mSlots[slot].mEglFence = EGL_NO_SYNC_KHR;
+    }
+    mSlots[slot].mFence.clear();
+!!!1490572.cpp!!!	freeAllBuffersLocked() : void
+    ALOGW_IF(!mQueue.isEmpty(),
+            "freeAllBuffersLocked called but mQueue is not empty");
+    mQueue.clear();
+    mBufferHasBeenQueued = false;
+    for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
+        freeBufferLocked(i);
+    }
+!!!1490700.cpp!!!	freeAllBuffersExceptHeadLocked() : void
+    int head = -1;
+    if (!mQueue.empty()) {
+        Fifo::iterator front(mQueue.begin());
+        head = *front;
+    }
+    mBufferHasBeenQueued = false;
+    for (int i = 0; i < NUM_BUFFER_SLOTS; i++) {
+        if (i != head) {
+            freeBufferLocked(i);
+        }
+    }
+!!!1490828.cpp!!!	drainQueueLocked() : status_t
+    while (mSynchronousMode && !mQueue.isEmpty()) {
+        mDequeueCondition.wait(mMutex);
+        if (mAbandoned) {
+            ST_LOGE("drainQueueLocked: BufferQueue has been abandoned!");
+            return NO_INIT;
+        }
+        if (mConnectedApi == NO_CONNECTED_API) {
+            ST_LOGE("drainQueueLocked: BufferQueue is not connected!");
+            return NO_INIT;
+        }
+    }
+    return NO_ERROR;
+!!!1490956.cpp!!!	drainQueueAndFreeBuffersLocked() : status_t
+    status_t err = drainQueueLocked();
+    if (err == NO_ERROR) {
+        if (mSynchronousMode) {
+            freeAllBuffersLocked();
+        } else {
+            freeAllBuffersExceptHeadLocked();
+        }
+    }
+    return err;
+!!!1491084.cpp!!!	setDefaultMaxBufferCountLocked(in count : int) : status_t
+    if (count < 2 || count > NUM_BUFFER_SLOTS)
+        return BAD_VALUE;
+
+    mDefaultMaxBufferCount = count;
+    mDequeueCondition.broadcast();
+
+    return OK;
+!!!1491212.cpp!!!	getMinMaxBufferCountLocked() : int
+    return getMinUndequeuedBufferCountLocked() + 1;
+!!!1491340.cpp!!!	getMinUndequeuedBufferCountLocked() : int
+    return mSynchronousMode ? mMaxAcquiredBufferCount :
+            mMaxAcquiredBufferCount + 1;
+!!!1491468.cpp!!!	getMaxBufferCountLocked() : int
+    int minMaxBufferCount = getMinMaxBufferCountLocked();
+
+    int maxBufferCount = mDefaultMaxBufferCount;
+    if (maxBufferCount < minMaxBufferCount) {
+        maxBufferCount = minMaxBufferCount;
+    }
+    if (mOverrideMaxBufferCount != 0) {
+        assert(mOverrideMaxBufferCount >= minMaxBufferCount);
+        maxBufferCount = mOverrideMaxBufferCount;
+    }
+
+    // Any buffers that are dequeued by the producer or sitting in the queue
+    // waiting to be consumed need to have their slots preserved.  Such
+    // buffers will temporarily keep the max buffer count up until the slots
+    // no longer need to be preserved.
+    for (int i = maxBufferCount; i < NUM_BUFFER_SLOTS; i++) {
+        BufferSlot::BufferState state = mSlots[i].mBufferState;
+        if (state == BufferSlot::QUEUED || state == BufferSlot::DEQUEUED) {
+            maxBufferCount = i + 1;
+        }
+    }
+
+    return maxBufferCount;

@@ -1,0 +1,161 @@
+class WiredAccessoryManager
+!!!8322828.java!!!	WiredAccessoryManager(inout context : Context, inout inputManager : InputManagerService)
+        PowerManager pm = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WiredAccessoryManager");
+        mWakeLock.setReferenceCounted(false);
+        mAudioManager = (AudioManager)context.getSystemService(Context.AUDIO_SERVICE);
+        mInputManager = inputManager;
+
+        mUseDevInputEventForAudioJack =
+                context.getResources().getBoolean(R.bool.config_useDevInputEventForAudioJack);
+
+        mObserver = new WiredAccessoryObserver();
+
+        context.registerReceiver(new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context ctx, Intent intent) {
+                        bootCompleted();
+                    }
+                },
+                new IntentFilter(Intent.ACTION_BOOT_COMPLETED), null, null);
+!!!8322956.java!!!	bootCompleted() : void
+        if (mUseDevInputEventForAudioJack) {
+            int switchValues = 0;
+            if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_HEADPHONE_INSERT) == 1) {
+                switchValues |= SW_HEADPHONE_INSERT_BIT;
+            }
+            if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_MICROPHONE_INSERT) == 1) {
+                switchValues |= SW_MICROPHONE_INSERT_BIT;
+            }
+            notifyWiredAccessoryChanged(0, switchValues,
+                    SW_HEADPHONE_INSERT_BIT | SW_MICROPHONE_INSERT_BIT);
+        }
+
+        mObserver.init();
+!!!8323084.java!!!	notifyWiredAccessoryChanged(in whenNanos : long, in switchValues : int, in switchMask : int) : void
+        if (LOG) Slog.v(TAG, "notifyWiredAccessoryChanged: when=" + whenNanos
+                + " bits=" + switchCodeToString(switchValues, switchMask)
+                + " mask=" + Integer.toHexString(switchMask));
+
+        synchronized (mLock) {
+            int headset;
+            mSwitchValues = (mSwitchValues & ~switchMask) | switchValues;
+            switch (mSwitchValues & (SW_HEADPHONE_INSERT_BIT | SW_MICROPHONE_INSERT_BIT)) {
+                case 0:
+                    headset = 0;
+                    break;
+
+                case SW_HEADPHONE_INSERT_BIT:
+                    headset = BIT_HEADSET_NO_MIC;
+                    break;
+
+                case SW_HEADPHONE_INSERT_BIT | SW_MICROPHONE_INSERT_BIT:
+                    headset = BIT_HEADSET;
+                    break;
+
+                case SW_MICROPHONE_INSERT_BIT:
+                    headset = BIT_HEADSET;
+                    break;
+
+                default:
+                    headset = 0;
+                    break;
+            }
+
+            updateLocked(NAME_H2W, (mHeadsetState & ~(BIT_HEADSET | BIT_HEADSET_NO_MIC)) | headset);
+        }
+!!!8323212.java!!!	updateLocked(in newName : String, in newState : int) : void
+        // Retain only relevant bits
+        int headsetState = newState & SUPPORTED_HEADSETS;
+        int usb_headset_anlg = headsetState & BIT_USB_HEADSET_ANLG;
+        int usb_headset_dgtl = headsetState & BIT_USB_HEADSET_DGTL;
+        int h2w_headset = headsetState & (BIT_HEADSET | BIT_HEADSET_NO_MIC);
+        boolean h2wStateChange = true;
+        boolean usbStateChange = true;
+        if (LOG) Slog.v(TAG, "newName=" + newName
+                + " newState=" + newState
+                + " headsetState=" + headsetState
+                + " prev headsetState=" + mHeadsetState);
+
+        if (mHeadsetState == headsetState) {
+            Log.e(TAG, "No state change.");
+            return;
+        }
+
+        // reject all suspect transitions: only accept state changes from:
+        // - a: 0 headset to 1 headset
+        // - b: 1 headset to 0 headset
+        if (h2w_headset == (BIT_HEADSET | BIT_HEADSET_NO_MIC)) {
+            Log.e(TAG, "Invalid combination, unsetting h2w flag");
+            h2wStateChange = false;
+        }
+        // - c: 0 usb headset to 1 usb headset
+        // - d: 1 usb headset to 0 usb headset
+        if (usb_headset_anlg == BIT_USB_HEADSET_ANLG && usb_headset_dgtl == BIT_USB_HEADSET_DGTL) {
+            Log.e(TAG, "Invalid combination, unsetting usb flag");
+            usbStateChange = false;
+        }
+        if (!h2wStateChange && !usbStateChange) {
+            Log.e(TAG, "invalid transition, returning ...");
+            return;
+        }
+
+        mWakeLock.acquire();
+
+        Message msg = mHandler.obtainMessage(MSG_NEW_DEVICE_STATE, headsetState,
+                mHeadsetState, newName);
+        mHandler.sendMessage(msg);
+
+        mHeadsetState = headsetState;
+!!!8323340.java!!!	setDevicesState(in headsetState : int, in prevHeadsetState : int, in headsetName : String) : void
+        synchronized (mLock) {
+            int allHeadsets = SUPPORTED_HEADSETS;
+            for (int curHeadset = 1; allHeadsets != 0; curHeadset <<= 1) {
+                if ((curHeadset & allHeadsets) != 0) {
+                    setDeviceStateLocked(curHeadset, headsetState, prevHeadsetState, headsetName);
+                    allHeadsets &= ~curHeadset;
+                }
+            }
+        }
+!!!8323468.java!!!	setDeviceStateLocked(in headset : int, in headsetState : int, in prevHeadsetState : int, in headsetName : String) : void
+        if ((headsetState & headset) != (prevHeadsetState & headset)) {
+            int device;
+            int state;
+
+            if ((headsetState & headset) != 0) {
+                state = 1;
+            } else {
+                state = 0;
+            }
+
+            if (headset == BIT_HEADSET) {
+                device = AudioManager.DEVICE_OUT_WIRED_HEADSET;
+            } else if (headset == BIT_HEADSET_NO_MIC){
+                device = AudioManager.DEVICE_OUT_WIRED_HEADPHONE;
+            } else if (headset == BIT_USB_HEADSET_ANLG) {
+                device = AudioManager.DEVICE_OUT_ANLG_DOCK_HEADSET;
+            } else if (headset == BIT_USB_HEADSET_DGTL) {
+                device = AudioManager.DEVICE_OUT_DGTL_DOCK_HEADSET;
+            } else if (headset == BIT_HDMI_AUDIO) {
+                device = AudioManager.DEVICE_OUT_AUX_DIGITAL;
+            } else {
+                Slog.e(TAG, "setDeviceState() invalid headset type: "+headset);
+                return;
+            }
+
+            if (LOG)
+                Slog.v(TAG, "device "+headsetName+((state == 1) ? " connected" : " disconnected"));
+
+            mAudioManager.setWiredDeviceConnectionState(device, state, headsetName);
+        }
+!!!8323596.java!!!	switchCodeToString(in switchValues : int, in switchMask : int) : String
+        StringBuffer sb = new StringBuffer();
+        if ((switchMask & SW_HEADPHONE_INSERT_BIT) != 0 &&
+                (switchValues & SW_HEADPHONE_INSERT_BIT) != 0) {
+            sb.append("SW_HEADPHONE_INSERT ");
+        }
+        if ((switchMask & SW_MICROPHONE_INSERT_BIT) != 0 &&
+                (switchValues & SW_MICROPHONE_INSERT_BIT) != 0) {
+            sb.append("SW_MICROPHONE_INSERT");
+        }
+        return sb.toString();

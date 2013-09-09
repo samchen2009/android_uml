@@ -1,0 +1,124 @@
+class BufferedTextOutput
+!!!1573132.cpp!!!	BufferedTextOutput(in flags : uint32_t = 0)
+    mGlobalState = new BufferState(mSeq);
+    if (mGlobalState) mGlobalState->incStrong(this);
+!!!1573260.cpp!!!	~BufferedTextOutput()
+    if (mGlobalState) mGlobalState->decStrong(this);
+    freeBufferIndex(mIndex);
+!!!1573388.cpp!!!	print(in txt : char, in len : size_t) : status_t
+    //printf("BufferedTextOutput: printing %d\n", len);
+    
+    AutoMutex _l(mLock);
+    BufferState* b = getBuffer();
+    
+    const char* const end = txt+len;
+    
+    status_t err;
+
+    while (txt < end) {
+        // Find the next line.
+        const char* first = txt;
+        while (txt < end && *txt != '\n') txt++;
+        
+        // Include this and all following empty lines.
+        while (txt < end && *txt == '\n') txt++;
+        
+        // Special cases for first data on a line.
+        if (b->atFront) {
+            if (b->indent > 0) {
+                // If this is the start of a line, add the indent.
+                const char* prefix = stringForIndent(b->indent);
+                err = b->append(prefix, strlen(prefix));
+                if (err != NO_ERROR) return err;
+                
+            } else if (*(txt-1) == '\n' && !b->bundle) {
+                // Fast path: if we are not indenting or bundling, and
+                // have been given one or more complete lines, just write
+                // them out without going through the buffer.
+                
+                // Slurp up all of the lines.
+                const char* lastLine = txt+1;
+                while (txt < end) {
+                    if (*txt++ == '\n') lastLine = txt;
+                }
+                struct iovec vec;
+                vec.iov_base = (void*)first;
+                vec.iov_len = lastLine-first;
+                //printf("Writing %d bytes of data!\n", vec.iov_len);
+                writeLines(vec, 1);
+                txt = lastLine;
+                continue;
+            }
+        }
+        
+        // Append the new text to the buffer.
+        err = b->append(first, txt-first);
+        if (err != NO_ERROR) return err;
+        b->atFront = *(txt-1) == '\n';
+        
+        // If we have finished a line and are not bundling, write
+        // it out.
+        //printf("Buffer is now %d bytes\n", b->bufferPos);
+        if (b->atFront && !b->bundle) {
+            struct iovec vec;
+            vec.iov_base = b->buffer;
+            vec.iov_len = b->bufferPos;
+            //printf("Writing %d bytes of data!\n", vec.iov_len);
+            writeLines(vec, 1);
+            b->restart();
+        }
+    }
+    
+    return NO_ERROR;
+!!!1573516.cpp!!!	moveIndent(in delta : int) : void
+    AutoMutex _l(mLock);
+    BufferState* b = getBuffer();
+    b->indent += delta;
+    if (b->indent < 0) b->indent = 0;
+!!!1573644.cpp!!!	pushBundle() : void
+    AutoMutex _l(mLock);
+    BufferState* b = getBuffer();
+    b->bundle++;
+!!!1573772.cpp!!!	popBundle() : void
+    AutoMutex _l(mLock);
+    BufferState* b = getBuffer();
+    b->bundle--;
+    LOG_FATAL_IF(b->bundle < 0,
+        "TextOutput::popBundle() called more times than pushBundle()");
+    if (b->bundle < 0) b->bundle = 0;
+    
+    if (b->bundle == 0) {
+        // Last bundle, write out data if it is complete.  If it is not
+        // complete, don't write until the last line is done... this may
+        // or may not be the write thing to do, but it's the easiest.
+        if (b->bufferPos > 0 && b->atFront) {
+            struct iovec vec;
+            vec.iov_base = b->buffer;
+            vec.iov_len = b->bufferPos;
+            writeLines(vec, 1);
+            b->restart();
+        }
+    }
+!!!1574028.cpp!!!	getThreadState() : ThreadState
+    ThreadState*  ts = (ThreadState*) thread_store_get( &tls );
+    if (ts) return ts;
+    ts = new ThreadState;
+    thread_store_set( &tls, ts, threadDestructor );
+    return ts;
+!!!1574156.cpp!!!	threadDestructor(inout st : void) : void
+    delete ((ThreadState*)st);
+!!!1574284.cpp!!!	getBuffer() : BufferState
+    if ((mFlags&MULTITHREADED) != 0) {
+        ThreadState* ts = getThreadState();
+        if (ts) {
+            while (ts->states.size() <= (size_t)mIndex) ts->states.add(NULL);
+            BufferState* bs = ts->states[mIndex].get();
+            if (bs != NULL && bs->seq == mSeq) return bs;
+            
+            ts->states.editItemAt(mIndex) = new BufferState(mIndex);
+            bs = ts->states[mIndex].get();
+            if (bs != NULL) return bs;
+        }
+    }
+    
+    return mGlobalState;

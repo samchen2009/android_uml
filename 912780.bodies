@@ -1,0 +1,167 @@
+class FileSynthesisCallback
+!!!4160652.java!!!	FileSynthesisCallback(inout fileName : File)
+        mFileName = fileName;
+!!!4160780.java!!!	stop() : void
+        synchronized (mStateLock) {
+            mStopped = true;
+            cleanUp();
+        }
+!!!4160908.java!!!	cleanUp() : void
+        closeFileAndWidenPermissions();
+        if (mFile != null) {
+            mFileName.delete();
+        }
+!!!4161036.java!!!	closeFileAndWidenPermissions() : void
+        try {
+            if (mFile != null) {
+                mFile.close();
+                mFile = null;
+            }
+        } catch (IOException ex) {
+            Log.e(TAG, "Failed to close " + mFileName + ": " + ex);
+        }
+
+        try {
+            // Make the written file readable and writeable by everyone.
+            // This allows the app that requested synthesis to read the file.
+            //
+            // Note that the directory this file was written must have already
+            // been world writeable in order it to have been
+            // written to in the first place.
+            FileUtils.setPermissions(mFileName.getAbsolutePath(), 0666, -1, -1); //-rw-rw-rw
+        } catch (SecurityException se) {
+            Log.e(TAG, "Security exception setting rw permissions on : " + mFileName);
+        }
+!!!4161164.java!!!	maybeCleanupExistingFile(inout file : File) : boolean
+        if (file.exists()) {
+            Log.v(TAG, "File " + file + " exists, deleting.");
+            if (!file.delete()) {
+                Log.e(TAG, "Failed to delete " + file);
+                return false;
+            }
+        }
+
+        return true;
+!!!4161292.java!!!	getMaxBufferSize() : int
+        return MAX_AUDIO_BUFFER_SIZE;
+!!!4161420.java!!!	isDone() : boolean
+        return mDone;
+!!!4161548.java!!!	start(in sampleRateInHz : int, in audioFormat : int, in channelCount : int) : int
+        if (DBG) {
+            Log.d(TAG, "FileSynthesisRequest.start(" + sampleRateInHz + "," + audioFormat
+                    + "," + channelCount + ")");
+        }
+        synchronized (mStateLock) {
+            if (mStopped) {
+                if (DBG) Log.d(TAG, "Request has been aborted.");
+                return TextToSpeech.ERROR;
+            }
+            if (mFile != null) {
+                cleanUp();
+                throw new IllegalArgumentException("FileSynthesisRequest.start() called twice");
+            }
+
+            if (!maybeCleanupExistingFile(mFileName)) {
+                return TextToSpeech.ERROR;
+            }
+
+            mSampleRateInHz = sampleRateInHz;
+            mAudioFormat = audioFormat;
+            mChannelCount = channelCount;
+            try {
+                mFile = new RandomAccessFile(mFileName, "rw");
+                // Reserve space for WAV header
+                mFile.write(new byte[WAV_HEADER_LENGTH]);
+                return TextToSpeech.SUCCESS;
+            } catch (IOException ex) {
+                Log.e(TAG, "Failed to open " + mFileName + ": " + ex);
+                cleanUp();
+                return TextToSpeech.ERROR;
+            }
+        }
+!!!4161676.java!!!	audioAvailable(inout buffer : byte, in offset : int, in length : int) : int
+        if (DBG) {
+            Log.d(TAG, "FileSynthesisRequest.audioAvailable(" + buffer + "," + offset
+                    + "," + length + ")");
+        }
+        synchronized (mStateLock) {
+            if (mStopped) {
+                if (DBG) Log.d(TAG, "Request has been aborted.");
+                return TextToSpeech.ERROR;
+            }
+            if (mFile == null) {
+                Log.e(TAG, "File not open");
+                return TextToSpeech.ERROR;
+            }
+            try {
+                mFile.write(buffer, offset, length);
+                return TextToSpeech.SUCCESS;
+            } catch (IOException ex) {
+                Log.e(TAG, "Failed to write to " + mFileName + ": " + ex);
+                cleanUp();
+                return TextToSpeech.ERROR;
+            }
+        }
+!!!4161804.java!!!	done() : int
+        if (DBG) Log.d(TAG, "FileSynthesisRequest.done()");
+        synchronized (mStateLock) {
+            if (mDone) {
+                if (DBG) Log.d(TAG, "Duplicate call to done()");
+                // This preserves existing behaviour. Earlier, if done was called twice
+                // we'd return ERROR because mFile == null and we'd add to logspam.
+                return TextToSpeech.ERROR;
+            }
+            if (mStopped) {
+                if (DBG) Log.d(TAG, "Request has been aborted.");
+                return TextToSpeech.ERROR;
+            }
+            if (mFile == null) {
+                Log.e(TAG, "File not open");
+                return TextToSpeech.ERROR;
+            }
+            try {
+                // Write WAV header at start of file
+                mFile.seek(0);
+                int dataLength = (int) (mFile.length() - WAV_HEADER_LENGTH);
+                mFile.write(
+                        makeWavHeader(mSampleRateInHz, mAudioFormat, mChannelCount, dataLength));
+                closeFileAndWidenPermissions();
+                mDone = true;
+                return TextToSpeech.SUCCESS;
+            } catch (IOException ex) {
+                Log.e(TAG, "Failed to write to " + mFileName + ": " + ex);
+                cleanUp();
+                return TextToSpeech.ERROR;
+            }
+        }
+!!!4161932.java!!!	error() : void
+        if (DBG) Log.d(TAG, "FileSynthesisRequest.error()");
+        synchronized (mStateLock) {
+            cleanUp();
+        }
+!!!4162060.java!!!	makeWavHeader(in sampleRateInHz : int, in audioFormat : int, in channelCount : int, in dataLength : int) : byte
+        // TODO: is AudioFormat.ENCODING_DEFAULT always the same as ENCODING_PCM_16BIT?
+        int sampleSizeInBytes = (audioFormat == AudioFormat.ENCODING_PCM_8BIT ? 1 : 2);
+        int byteRate = sampleRateInHz * sampleSizeInBytes * channelCount;
+        short blockAlign = (short) (sampleSizeInBytes * channelCount);
+        short bitsPerSample = (short) (sampleSizeInBytes * 8);
+
+        byte[] headerBuf = new byte[WAV_HEADER_LENGTH];
+        ByteBuffer header = ByteBuffer.wrap(headerBuf);
+        header.order(ByteOrder.LITTLE_ENDIAN);
+
+        header.put(new byte[]{ 'R', 'I', 'F', 'F' });
+        header.putInt(dataLength + WAV_HEADER_LENGTH - 8);  // RIFF chunk size
+        header.put(new byte[]{ 'W', 'A', 'V', 'E' });
+        header.put(new byte[]{ 'f', 'm', 't', ' ' });
+        header.putInt(16);  // size of fmt chunk
+        header.putShort(WAV_FORMAT_PCM);
+        header.putShort((short) channelCount);
+        header.putInt(sampleRateInHz);
+        header.putInt(byteRate);
+        header.putShort(blockAlign);
+        header.putShort(bitsPerSample);
+        header.put(new byte[]{ 'd', 'a', 't', 'a' });
+        header.putInt(dataLength);
+
+        return headerBuf;

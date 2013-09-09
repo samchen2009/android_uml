@@ -1,0 +1,486 @@
+class MrvlTvPlayer
+!!!11085452.cpp!!!	MrvlTvPlayer()
+    TRACE();
+!!!11085580.cpp!!!	~MrvlTvPlayer()
+    TRACE();
+    output_control_ = NULL;
+!!!11085708.cpp!!!	createPlayer(in url : char, in listener : sp<MrvlTvPlayerListener>) : status_t
+    TRACE("createPlayer url = %s", url);
+
+    player_state_ = PLAYER_STATE_IDLE;
+    fe_player_ = NULL;
+#ifdef MV_TUNER_DTV_STACK_ATSC
+    usdtv_service_ = NULL;
+#endif
+
+    tv_player_listener_ = listener;
+
+    String8 uri = String8(url);
+    status_t ret = source_control_->getSourceByUri(uri, &video_source_id_);
+    if (OK != ret) {
+        ALOGE("getSourceByUri() through source control failed!");
+        return ret;
+    }
+    TRACE("video_source_id_: %d", video_source_id_);
+
+    if (isValidSource(video_source_id_)) {
+        SourceAttr source_attr;
+        source_control_->getSourceAttr(video_source_id_, &source_attr);
+        ret = createPlayerInternal(source_attr.type, source_attr.hw_id);
+    } else {
+        ret = android::UNKNOWN_ERROR;
+    }
+    return ret;
+!!!11085836.cpp!!!	setResources(in vpp_id : int32_t, in app_id : int32_t, in adec_id : int32_t) : void
+    TRACE();
+    android::AutoMutex state_lock(state_lock_);
+
+    vpp_id_ = vpp_id;
+    app_id_ = app_id;
+    adec_id_ = adec_id;
+!!!11085964.cpp!!!	updateResources() : void
+    TRACE();
+    android::AutoMutex state_lock(state_lock_);
+
+    status_t ret = source_control_->setSource(video_source_id_, vpp_id_);
+    if (OK != ret) {
+        ALOGE("setSource() through source control failed!");
+        video_source_id_ = kInvalidSourceID;
+    }
+
+    ALOGI("requested an vpp_id_:%d", vpp_id_);
+    char audio_url[64];
+    memset(audio_url, 0, sizeof(audio_url));
+    snprintf(audio_url,
+             sizeof(audio_url), "%s%d",
+             marvell::kAudioRenderSourcePrefix ,
+             app_id_);
+    ALOGI("audio render source url:%s", audio_url);
+    String8 uri = String8(audio_url);
+    ret = source_control_->getSourceByUri(uri, &audio_render_source_id_);
+    ALOGD("audio_render_source_id_:%d,ret %d, ret == OK %s",
+          audio_render_source_id_,
+          ret,
+          ret == OK ? "OK" : "failed");
+    if (OK != ret || !isValidSource(audio_render_source_id_)) {
+        ALOGE("AUDIO RENDER CASE getSourceByUri() failed!");
+    }
+
+    ALOGI("adec_id_:%d", adec_id_);
+    memset(audio_url, 0, sizeof(audio_url));
+    snprintf(audio_url,
+             sizeof(audio_url), "%s%d",
+             marvell::kAudioDecoderSourcePrefix ,
+             adec_id_);
+    ALOGI("audio decoder source url:%s", audio_url);
+    uri = String8(audio_url);
+    ret = source_control_->getSourceByUri(uri, &audio_decoder_source_id_);
+    ALOGD("audio_decoder_source_id_:%d,ret %d, ret == OK %s",
+          audio_decoder_source_id_,
+          ret,
+          ret == OK ? "OK" : "failed");
+    if (OK != ret || !isValidSource(audio_decoder_source_id_)) {
+        ALOGE("AUDIO DECODER CASE getSourceByUri() failed!");
+    }
+    if (source_control_ != NULL) {
+        source_control_->bindVideoSource(audio_decoder_source_id_,
+                                         video_source_id_);
+    }
+
+    if (NULL != fe_player_) {
+        bool ret = FEParamUtil::setVideoPlane(fe_player_, vpp_id_);
+        if (!ret) {
+            ALOGE("setVideoPlane(%d) error!", vpp_id_);
+        }
+#ifdef MV_TUNER_DTV_STACK_ATSC
+    } else if (usdtv_service_ != NULL) {
+        // TODO: Set Video Channel
+        usdtv_service_->usdtvSetVideoPlane(vpp_id_);
+        usdtv_service_->usdtvSetAudioChannel(app_id_);
+#endif
+    }
+!!!11086092.cpp!!!	startMonitoring() : void
+    TRACE("player state %d", player_state_);
+
+    android::AutoMutex state_lock(state_lock_);
+    if (NULL != fe_player_) {
+        fe_player_->startMonitor();
+    }
+    player_state_ = PLAYER_STATE_PREPARED;
+!!!11086220.cpp!!!	startPlayback() : status_t
+    TRACE("player state %d", player_state_);
+
+    android::AutoMutex state_lock(state_lock_);
+    if (player_state_ == PLAYER_STATE_PREPARED) {
+        if (NULL != fe_player_) {
+            fe_player_->start();
+#ifdef MV_TUNER_DTV_STACK_ATSC
+        } else if (usdtv_service_ != NULL) {
+            usdtv_service_->usdtvSetPlatformSource(ATSC_INPUT,
+                                                   vpp_id_,
+                                                   app_id_,
+                                                   false);
+            usdtv_service_->usdtvStartCurrentSource(ATSC_INPUT);
+#endif
+        }
+        player_state_ = PLAYER_STATE_STARTED;
+    } else if (player_state_ != PLAYER_STATE_STARTED) {
+        ALOGE("player state is wrong: %d", player_state_);
+        return android::UNKNOWN_ERROR;
+    }
+
+    return android::OK;
+!!!11086348.cpp!!!	stopPlayback() : status_t
+    TRACE("player state %d", player_state_);
+
+    android::AutoMutex state_lock(state_lock_);
+    if (player_state_ == PLAYER_STATE_STARTED) {
+        if (NULL != fe_player_) {
+            fe_player_->stop();
+#ifdef MV_TUNER_DTV_STACK_ATSC
+        } else if (usdtv_service_ != NULL) {
+            usdtv_service_->usdtvStopCurrentSource();
+#endif
+        }
+    }
+    player_state_ = PLAYER_STATE_PREPARED;
+
+    if (isValidSource(video_source_id_) && source_control_ != NULL) {
+        source_control_->bindVideoSource(audio_decoder_source_id_,
+                                         kInvalidSourceID);
+        source_control_->exitSource(video_source_id_);
+        video_source_id_ = kInvalidSourceID;
+        source_control_ = NULL;
+    }
+
+    return android::OK;
+!!!11086476.cpp!!!	stopMonitoring() : void
+    TRACE("player state %d", player_state_);
+
+    android::AutoMutex state_lock(state_lock_);
+    if (NULL != fe_player_) {
+        fe_player_->stopMonitor();
+    }
+    player_state_ = PLAYER_STATE_IDLE;
+!!!11086604.cpp!!!	setVolumeLocked(in leftVolume : float, in rightVolume : float) : status_t
+    ENTER();
+    TRACE("leftVolume=%.2f rightVolume=%.2f", leftVolume, rightVolume);
+    status_t ret = android::NO_INIT;
+
+    if (NULL != fe_player_) {
+        IFEPlayer::CmdContext context;
+        context.param1.iParam = 100 * leftVolume;
+        context.param2.iParam = 100 * rightVolume;
+        bool cmdRet = fe_player_->command(IFEPlayer::kSetVolume, context);
+        ret = (cmdRet ? android::OK : android::NO_INIT);
+#ifdef MV_TUNER_DTV_STACK_ATSC
+    } else if (usdtv_service_ != NULL) {
+        // TODO: set volume
+        usdtv_service_->usdtvSetVolume(0,(uint32_t)100 * leftVolume,
+                                      (uint32_t)100 * rightVolume,
+                                      (uint32_t)((leftVolume+rightVolume) * 50));
+        ret = android::OK;
+#endif
+    }
+    LEAVE();
+    return ret;
+!!!11086732.cpp!!!	isPlaying() : bool
+    TRACE();
+
+    android::AutoMutex state_lock(state_lock_);
+    if (NULL != fe_player_) {
+        return port_enabled_;
+    }
+    return (player_state_ == PLAYER_STATE_STARTED);
+!!!11086860.cpp!!!	setVolume(in leftVolume : float, in rightVolume : float) : status_t
+    ENTER();
+    android::AutoMutex state_lock(state_lock_);
+    LEAVE();
+    return setVolumeLocked(leftVolume, rightVolume);
+!!!11086988.cpp!!!	releasePlayer() : void
+    TRACE();
+
+    android::AutoMutex state_lock(state_lock_);
+    if (output_control_ != NULL) {
+        output_control_->removeObserver(avs_observer_);
+    }
+    if (NULL != fe_player_) {
+        fe_player_->unregisterListener(this);
+        delete fe_player_;
+        fe_player_ = NULL;
+#ifdef MV_TUNER_DTV_STACK_ATSC
+    } else if (usdtv_service_ != NULL) {
+        String16 client_name(USDTV_LISTENER_CLIENT_NAME);
+        usdtv_service_->usdtvUnRegisterAppListener(client_name);
+        usdtv_service_->asBinder()->unlinkToDeath(this);
+        usdtv_service_ = NULL;
+#endif
+    }
+!!!11087116.cpp!!!	notify(in event : FEPlayerEvent, inout user_data : void) : bool
+    TRACE();
+
+    switch (event) {
+        case FEPlayerEvent_PortEnabled:
+            ALOGI("notify case FEPlayerEvent_PortEnabled");
+            #if 0
+            // pseudo code for input lock support
+            if (source_control != NULL) {
+                lock_sts_ = source_control->getLockSts(current_source_id);
+                if (lock_sts_) {
+                    notifyInputLock(lock_sts_);
+                }
+            }
+            #endif
+            port_enabled_ = true;
+            break;
+
+        case FEPlayerEvent_PortDisabled:
+            ALOGI("notify case FEPlayerEvent_PortDisabled");
+            port_enabled_ = false;
+            break;
+
+        case FEPlayerEvent_ConfigOutput:
+        ALOGI("notify case FEPlayerEvent_ConfigOutput user_data:%p", user_data);
+            {
+                android::AutoMutex state_lock(state_lock_);
+                AVMetaInfo *metaInfo = NULL;
+                int resolution = 0, video_mode = 0;
+                if ((NULL != user_data)
+                    && (kInvalidSourceID != video_source_id_)) {
+                    metaInfo = reinterpret_cast<AVMetaInfo *>(user_data);
+                if (kStreamVideo == metaInfo->type
+                        && isValidSource(video_source_id_)) {
+                        char const* stereoDispModeStr = metaInfo->data.v.stereo_mode.strMode;
+                        ALOGD("VideoMetaData:");
+                        ALOGD("width:%d", metaInfo->data.v.width);
+                        ALOGD("height:%d", metaInfo->data.v.height);
+                        ALOGD("stereo_mode:%s", stereoDispModeStr);
+                        ALOGD("is_interlaced:%d", metaInfo->data.v.is_interlaced);
+                        ALOGD("frame_rate:%d", metaInfo->data.v.frame_rate);
+                        ALOGD("aspect_width:%d", metaInfo->data.v.aspect_width);
+                        ALOGD("aspect_height:%d", metaInfo->data.v.aspect_height);
+                        int stereoDispMode = StereoModeFromString(stereoDispModeStr);
+                        ALOGD("after convert stereoDispMode: %d", stereoDispMode);
+
+                        source_control_->notifySourceVideoInfo(video_source_id_,
+                                                               metaInfo->data.v.width,
+                                                               metaInfo->data.v.height,
+                                                               stereoDispMode,
+                                                               metaInfo->data.v.is_interlaced,
+                                                               metaInfo->data.v.frame_rate,
+                                                               metaInfo->data.v.aspect_width,
+                                                               metaInfo->data.v.aspect_height);
+                        source_control_->applyPQ(video_source_id_);
+                    } else if (kStreamAudio == metaInfo->type) {
+                        ALOGD("AudioMetaData:");
+                        ALOGD("audio_format:%d", metaInfo->data.a.audio_format);
+                        ALOGD("sample_rate:%d", metaInfo->data.a.sample_rate);
+                        ALOGD("channels:%d", metaInfo->data.a.channels);
+                        ALOGD("lfe_channels:%d", metaInfo->data.a.lfe_channels);
+                        ALOGD("dual_mono:%d", metaInfo->data.a.dual_mono);
+
+                        source_control_->notifySourceAudioInfo(video_source_id_,
+                                                               metaInfo->data.a.audio_format,
+                                                               metaInfo->data.a.sample_rate,
+                                                               metaInfo->data.a.channels,
+                                                               metaInfo->data.a.lfe_channels,
+                                                               metaInfo->data.a.dual_mono);
+                        source_control_->applyAQ(video_source_id_);
+
+                        // config amp pipeline with following parameters as much as possible
+                        int32_t drc_mode = kInvalidAQParam;
+                        int32_t source_gain = kInvalidAQParam;
+                        int32_t chan_map = kInvalidAQParam;
+
+                        // retrieve DRC mode from source control & config it to AMP pipeline
+                        status_t ret = source_control_->getDRCMode(audio_decoder_source_id_,
+                            &drc_mode);
+                        if (OK != ret || drc_mode == kInvalidAQParam) {
+                            ALOGE("getDRCMode() through source control failed, "
+                                "ret:%s drc_mode:%d!", ret == OK ? "Success" : "failed", drc_mode);
+                        } else {
+                            ALOGD("got DRC mode(%d) from source control success", drc_mode);
+                            setDRCMode(drc_mode);
+                        }
+
+                        // retrieve channel map from source control & config it to AMP pipeline
+                        ret = source_control_->getChannelMap(audio_decoder_source_id_, &chan_map);
+                        if (OK != ret || chan_map == kInvalidAQParam) {
+                            ALOGE("getChannelMap() through source control failed, "
+                                "ret:%s chan_map:%d!", ret == OK ? "Success" : "failed", chan_map);
+                        } else {
+                            ALOGD("got channel map (%d) from source control success", chan_map);
+                            setChanMap(chan_map);
+                        }
+
+                        // retrieve source gain from source control & config it to AMP pipeline
+                        ret = source_control_->getSourceGain(audio_decoder_source_id_,
+                                                             &source_gain);
+                        if (OK != ret || source_gain == kInvalidAQParam) {
+                            ALOGE("getSourceGain() through source control failed, "
+                                "ret:%s source_gain:%d!", ret == OK ? "Success" : "failed",
+                                source_gain);
+                        } else {
+                            ALOGD("got souce gain(%d) from source control success", source_gain);
+                            setSourceGain(source_gain);
+                        }
+                    } else {
+                        ALOGE("Error! unsupported stream type %d!", metaInfo->type);
+                        return false;
+                    }
+                }
+            }
+            break;
+
+        case FEPlayerEvent_PipelineBroken:
+            ALOGI("Case FEPlayerEvent_PipelineBroken");
+            if (tv_player_listener_ != NULL) {
+                tv_player_listener_->notify((int32_t)MEDIA_ERROR,
+                    (int32_t)FEPlayerEvent_PipelineBroken);
+            }
+            break;
+
+        case FEPlayerEvent_RequestAVMute:
+        case FEPlayerEvent_RequestAVUnMute:
+            // TODO: actually handle these arbitration requests when adding rating support
+            {
+                int targetStream = reinterpret_cast<int>(user_data);
+                ALOGD("request to %s stream %d",
+                    event == FEPlayerEvent_RequestAVMute ? "Mute" : "UnMute",
+                    targetStream);
+                return true;
+            }
+
+        default:
+            ALOGE("unhandled FEPlayer event(%d)", event);
+            break;
+    }
+
+    return true;
+!!!11087244.cpp!!!	binderDied(in who : android::wp<android::IBinder>) : void
+    TRACE("MrvlTvPlayer - binderDied()");
+
+#ifdef MV_TUNER_DTV_STACK_ATSC
+    status_t ret = android::OK;
+
+    // Reconnect USDTVService.
+    ret = connectUSDTVService();
+    if (ret != android::OK) {
+        ALOGE("Failed to connect USDTVService");
+    }
+    if (NULL != fe_player_) {
+        // Restart for Rating.
+    } else {
+        // Restart for playback.
+        updateResources();
+        int32_t old_player_state = player_state_;
+        if (old_player_state == PLAYER_STATE_PREPARED ||
+            old_player_state == PLAYER_STATE_STARTED) {
+            player_state_ = PLAYER_STATE_IDLE;
+            startMonitoring();
+        }
+        if (old_player_state == PLAYER_STATE_STARTED) {
+            player_state_ = PLAYER_STATE_PREPARED;
+            startPlayback();
+        }
+    }
+#endif
+!!!11087372.cpp!!!	createPlayerInternal(inout source_type : String8, in source_id : int32_t) : status_t
+    TRACE("source_type: %s, source_id: %d", source_type.string(), source_id);
+
+    status_t ret = android::OK;
+#ifdef MV_TUNER_DTV_STACK_ATSC
+    // Create USDTV anyway since we need it for Rating
+    ret = connectUSDTVService();
+    if (ret != android::OK) {
+        ALOGE("fail to connect USDTVService");
+        return ret;
+    }
+#endif
+
+    android::AutoMutex state_lock(state_lock_);
+    if (source_type == "tv") {
+        ALOGD("This is TV source, do nothing");
+    } else {
+#ifdef MV_TUNER_DTV_STACK_ATSC
+        if ((source_type == "cvbs") && (usdtv_service_ != NULL)) {
+            usdtv_listener_ = new USDTVListener(*this);
+            String16 client_name(USDTV_LISTENER_CLIENT_NAME);
+            usdtv_service_->usdtvRegisterAppListener(client_name, usdtv_listener_);
+        }
+#endif
+        ALOGI("start to create fe_player_(exact CtPlayer)! feplayer %p", fe_player_);
+        fe_player_ = FEFactory::Instance()->createFEPlayer();
+        if (NULL == fe_player_) {
+            ALOGE("Failed to create fe_player_(exact CtPlayer)!");
+            return UNKNOWN_ERROR;
+        }
+
+        // once FEPlayer created, register observer to avsetting
+        if (output_control_ != NULL) {
+            output_control_->registerObserver(MRVL_AVSETTINGS_OUTPUT_PREFIX,
+                avs_observer_);
+        }
+
+        fe_player_->init();
+        ALOGI("start to register self to feplayer %p", fe_player_);
+        fe_player_->registerListener(this);
+        if (fe_player_->setInputSource(source_id)) {
+            ret = android::OK;
+        } else {
+            ret = android::UNKNOWN_ERROR;
+        }
+    }
+    return ret;
+!!!11087500.cpp!!!	connectUSDTVService() : status_t
+    ALOGD("MrvlTvPlayer - connect to USDTVService()");
+
+    android::AutoMutex state_lock(state_lock_);
+    int count = 0;
+    sp<android::IServiceManager> sm = android::defaultServiceManager();
+    sp<android::IBinder> binder;
+    do {
+        binder = sm->getService(android::String16(SERVICE_CLASS));
+        if (binder != 0) {
+            break;
+        }
+        usleep(WAIT_TIME);
+    } while (count++ < WAIT_COUNT);
+
+    usdtv_service_ = android::interface_cast<android::IUSDTVService>(binder);
+    if (binder != NULL) {
+        ALOGD("MrvlTvPlayer - registering linkToDeath()");
+        usdtv_service_->asBinder()->linkToDeath(this);
+        return android::OK;
+    }
+    return android::UNKNOWN_ERROR;
+!!!11088524.cpp!!!	setChanMap(in chan_map : int) : void
+    IFEPlayer::CmdContext context;
+    memset(&context, 0, sizeof(context));
+    context.param1.iParam = chan_map;
+    invoke(IFEPlayer::kSetChanMap, context);
+!!!11088652.cpp!!!	setSourceGain(in src_gain : int) : void
+    ENTER();
+    IFEPlayer::CmdContext context;
+    memset(&context, 0, sizeof(context));
+    context.param1.iParam = src_gain;
+    context.param2.iParam = src_gain;
+    invoke(IFEPlayer::kSetSourceGain, context);
+!!!11088780.cpp!!!	setDRCMode(in drc_mode : int) : void
+    ENTER();
+    IFEPlayer::CmdContext context;
+    memset(&context, 0, sizeof(context));
+    context.param1.iParam = drc_mode;
+    invoke(IFEPlayer::kSetDRCMode, context);
+!!!11088908.cpp!!!	invoke(in cmd : IFEPlayer::CmdID, in context : IFEPlayer::CmdContext) : bool
+    ENTER();
+    if (NULL == fe_player_) {
+        LEAVE();
+        return false;
+    }
+    bool cmdRet = fe_player_->command(cmd, context);
+    if (!cmdRet) {
+        ALOGE("command FEPlayer to %s failed!", FEPlayerCMDString(cmd));
+    }
+    LEAVE();
+    return cmdRet;

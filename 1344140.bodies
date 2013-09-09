@@ -1,0 +1,105 @@
+class BootReceiver
+!!!8066956.java!!!	onReceive(in context : Context, inout intent : Intent) : void
+        // Log boot events in the background to avoid blocking the main thread with I/O
+        new Thread() {
+            @Override
+            public void run() {
+                try {
+                    logBootEvents(context);
+                } catch (Exception e) {
+                    Slog.e(TAG, "Can't log boot events", e);
+                }
+                try {
+                    boolean onlyCore = false;
+                    try {
+                        onlyCore = IPackageManager.Stub.asInterface(ServiceManager.getService(
+                                "package")).isOnlyCoreApps();
+                    } catch (RemoteException e) {
+                    }
+                    if (!onlyCore) {
+                        removeOldUpdatePackages(context);
+                    }
+                } catch (Exception e) {
+                    Slog.e(TAG, "Can't remove old update packages", e);
+                }
+
+            }
+        }.start();
+!!!8067084.java!!!	removeOldUpdatePackages(inout context : Context) : void
+        Downloads.removeAllDownloadsByPackage(context, OLD_UPDATER_PACKAGE, OLD_UPDATER_CLASS);
+!!!8067212.java!!!	logBootEvents(inout ctx : Context) : void
+        final DropBoxManager db = (DropBoxManager) ctx.getSystemService(Context.DROPBOX_SERVICE);
+        final SharedPreferences prefs = ctx.getSharedPreferences("log_files", Context.MODE_PRIVATE);
+        final String headers = new StringBuilder(512)
+            .append("Build: ").append(Build.FINGERPRINT).append("\n")
+            .append("Hardware: ").append(Build.BOARD).append("\n")
+            .append("Revision: ")
+            .append(SystemProperties.get("ro.revision", "")).append("\n")
+            .append("Bootloader: ").append(Build.BOOTLOADER).append("\n")
+            .append("Radio: ").append(Build.RADIO).append("\n")
+            .append("Kernel: ")
+            .append(FileUtils.readTextFile(new File("/proc/version"), 1024, "...\n"))
+            .append("\n").toString();
+
+        String recovery = RecoverySystem.handleAftermath();
+        if (recovery != null && db != null) {
+            db.addText("SYSTEM_RECOVERY_LOG", headers + recovery);
+        }
+
+        if (SystemProperties.getLong("ro.runtime.firstboot", 0) == 0) {
+            String now = Long.toString(System.currentTimeMillis());
+            SystemProperties.set("ro.runtime.firstboot", now);
+            if (db != null) db.addText("SYSTEM_BOOT", headers);
+
+            // Negative sizes mean to take the *tail* of the file (see FileUtils.readTextFile())
+            addFileToDropBox(db, prefs, headers, "/proc/last_kmsg",
+                    -LOG_SIZE, "SYSTEM_LAST_KMSG");
+            addFileToDropBox(db, prefs, headers, "/cache/recovery/log",
+                    -LOG_SIZE, "SYSTEM_RECOVERY_LOG");
+            addFileToDropBox(db, prefs, headers, "/data/dontpanic/apanic_console",
+                    -LOG_SIZE, "APANIC_CONSOLE");
+            addFileToDropBox(db, prefs, headers, "/data/dontpanic/apanic_threads",
+                    -LOG_SIZE, "APANIC_THREADS");
+        } else {
+            if (db != null) db.addText("SYSTEM_RESTART", headers);
+        }
+
+        // Scan existing tombstones (in case any new ones appeared)
+        File[] tombstoneFiles = TOMBSTONE_DIR.listFiles();
+        for (int i = 0; tombstoneFiles != null && i < tombstoneFiles.length; i++) {
+            addFileToDropBox(db, prefs, headers, tombstoneFiles[i].getPath(),
+                    LOG_SIZE, "SYSTEM_TOMBSTONE");
+        }
+
+        // Start watching for new tombstone files; will record them as they occur.
+        // This gets registered with the singleton file observer thread.
+        sTombstoneObserver = new FileObserver(TOMBSTONE_DIR.getPath(), FileObserver.CLOSE_WRITE) {
+            @Override
+            public void onEvent(int event, String path) {
+                try {
+                    String filename = new File(TOMBSTONE_DIR, path).getPath();
+                    addFileToDropBox(db, prefs, headers, filename, LOG_SIZE, "SYSTEM_TOMBSTONE");
+                } catch (IOException e) {
+                    Slog.e(TAG, "Can't log tombstone", e);
+                }
+            }
+        };
+
+        sTombstoneObserver.startWatching();
+!!!8067340.java!!!	addFileToDropBox(inout db : DropBoxManager, inout prefs : SharedPreferences, in headers : String, in filename : String, in maxSize : int, in tag : String) : void
+        if (db == null || !db.isTagEnabled(tag)) return;  // Logging disabled
+
+        File file = new File(filename);
+        long fileTime = file.lastModified();
+        if (fileTime <= 0) return;  // File does not exist
+
+        if (prefs != null) {
+            long lastTime = prefs.getLong(filename, 0);
+            if (lastTime == fileTime) return;  // Already logged this particular file
+            // TODO: move all these SharedPreferences Editor commits
+            // outside this function to the end of logBootEvents
+            prefs.edit().putLong(filename, fileTime).apply();
+        }
+
+        Slog.i(TAG, "Copying " + filename + " to DropBox (" + tag + ")");
+        db.addText(tag, headers + FileUtils.readTextFile(file, maxSize, "[[TRUNCATED]]\n"));

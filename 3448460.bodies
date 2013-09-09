@@ -1,0 +1,556 @@
+class Main
+!!!14884364.java!!!	Main()
+        // This space intentionally left blank.
+!!!14884492.java!!!	main(inout argArray : String) : void
+        Arguments arguments = new Arguments();
+        arguments.parse(argArray);
+
+        int result = run(arguments);
+        if (result != 0) {
+            System.exit(result);
+        }
+!!!14884620.java!!!	run(inout arguments : Arguments) : int
+        // Reset the error/warning count to start fresh.
+        warnings = 0;
+        errors = 0;
+        // empty the list, so that  tools that load dx and keep it around
+        // for multiple runs don't reuse older buffers.
+        libraryDexBuffers.clear();
+
+        args = arguments;
+        args.makeOptionsObjects();
+
+        File incrementalOutFile = null;
+        if (args.incremental) {
+            if (args.outName == null) {
+                System.err.println(
+                        "error: no incremental output name specified");
+                return -1;
+            }
+            incrementalOutFile = new File(args.outName);
+            if (incrementalOutFile.exists()) {
+                minimumFileAge = incrementalOutFile.lastModified();
+            }
+        }
+
+        if (!processAllFiles()) {
+            return 1;
+        }
+
+        if (args.incremental && !anyFilesProcessed) {
+            return 0; // this was a no-op incremental build
+        }
+
+        // this array is null if no classes were defined
+        byte[] outArray = null;
+
+        if (!outputDex.isEmpty()) {
+            outArray = writeDex();
+
+            if (outArray == null) {
+                return 2;
+            }
+        }
+
+        if (args.incremental) {
+            outArray = mergeIncremental(outArray, incrementalOutFile);
+        }
+
+        outArray = mergeLibraryDexBuffers(outArray);
+
+        if (args.jarOutput) {
+            // Effectively free up the (often massive) DexFile memory.
+            outputDex = null;
+
+            if (!createJar(args.outName, outArray)) {
+                return 3;
+            }
+        } else if (outArray != null && args.outName != null) {
+            OutputStream out = openOutput(args.outName);
+            out.write(outArray);
+            closeOutput(out);
+        }
+
+        return 0;
+!!!14884748.java!!!	mergeIncremental(inout update : byte, inout base : File) : byte
+        DexBuffer dexA = null;
+        DexBuffer dexB = null;
+
+        if (update != null) {
+            dexA = new DexBuffer(update);
+        }
+
+        if (base.exists()) {
+            dexB = new DexBuffer(base);
+        }
+
+        DexBuffer result;
+        if (dexA == null && dexB == null) {
+            return null;
+        } else if (dexA == null) {
+            result = dexB;
+        } else if (dexB == null) {
+            result = dexA;
+        } else {
+            result = new DexMerger(dexA, dexB, CollisionPolicy.KEEP_FIRST).merge();
+        }
+
+        ByteArrayOutputStream bytesOut = new ByteArrayOutputStream();
+        result.writeTo(bytesOut);
+        return bytesOut.toByteArray();
+!!!14884876.java!!!	mergeLibraryDexBuffers(inout outArray : byte) : byte
+        for (byte[] libraryDexBuffer : libraryDexBuffers) {
+            if (outArray == null) {
+                outArray = libraryDexBuffer;
+                continue;
+            }
+
+            DexBuffer a = new DexBuffer(outArray);
+            DexBuffer b = new DexBuffer(libraryDexBuffer);
+            DexBuffer ab = new DexMerger(a, b, CollisionPolicy.FAIL).merge();
+            outArray = ab.getBytes();
+        }
+
+        return outArray;
+!!!14885004.java!!!	processAllFiles() : boolean
+        outputDex = new DexFile(args.dexOptions);
+
+        if (args.jarOutput) {
+            outputResources = new TreeMap<String, byte[]>();
+        }
+
+        if (args.dumpWidth != 0) {
+            outputDex.setDumpWidth(args.dumpWidth);
+        }
+
+        anyFilesProcessed = false;
+        String[] fileNames = args.fileNames;
+
+        if (args.numThreads > 1) {
+            threadPool = Executors.newFixedThreadPool(args.numThreads);
+        }
+
+        try {
+            for (int i = 0; i < fileNames.length; i++) {
+                if (processOne(fileNames[i])) {
+                    anyFilesProcessed = true;
+                }
+            }
+        } catch (StopProcessing ex) {
+            /*
+             * Ignore it and just let the warning/error reporting do
+             * their things.
+             */
+        }
+
+        if (args.numThreads > 1) {
+            try {
+                threadPool.shutdown();
+                threadPool.awaitTermination(600L, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+                throw new RuntimeException("Timed out waiting for threads.");
+            }
+        }
+
+        if (warnings != 0) {
+            DxConsole.err.println(warnings + " warning" +
+                               ((warnings == 1) ? "" : "s"));
+        }
+
+        if (errors != 0) {
+            DxConsole.err.println(errors + " error" +
+                    ((errors == 1) ? "" : "s") + "; aborting");
+            return false;
+        }
+
+        if (args.incremental && !anyFilesProcessed) {
+            return true;
+        }
+
+        if (!(anyFilesProcessed || args.emptyOk)) {
+            DxConsole.err.println("no classfiles specified");
+            return false;
+        }
+
+        if (args.optimize && args.statistics) {
+            CodeStatistics.dumpStatistics(DxConsole.out);
+        }
+
+        return true;
+!!!14885132.java!!!	processOne(inout pathname : String) : boolean
+        ClassPathOpener opener;
+
+        opener = new ClassPathOpener(pathname, false,
+                new ClassPathOpener.Consumer() {
+            public boolean processFileBytes(String name, long lastModified, byte[] bytes) {
+                if (args.numThreads > 1) {
+                    threadPool.execute(new ParallelProcessor(name, lastModified, bytes));
+                    return false;
+                } else {
+                    return Main.processFileBytes(name, lastModified, bytes);
+                }
+            }
+            public void onException(Exception ex) {
+                if (ex instanceof StopProcessing) {
+                    throw (StopProcessing) ex;
+                } else if (ex instanceof SimException) {
+                    DxConsole.err.println("\nEXCEPTION FROM SIMULATION:");
+                    DxConsole.err.println(ex.getMessage() + "\n");
+                    DxConsole.err.println(((SimException) ex).getContext());
+                } else {
+                    DxConsole.err.println("\nUNEXPECTED TOP-LEVEL EXCEPTION:");
+                    ex.printStackTrace(DxConsole.err);
+                }
+                errors++;
+            }
+            public void onProcessArchiveStart(File file) {
+                if (args.verbose) {
+                    DxConsole.out.println("processing archive " + file +
+                            "...");
+                }
+            }
+        });
+
+        return opener.process();
+!!!14885260.java!!!	processFileBytes(inout name : String, in lastModified : long, inout bytes : byte) : boolean
+        boolean isClass = name.endsWith(".class");
+        boolean isClassesDex = name.equals(DexFormat.DEX_IN_JAR_NAME);
+        boolean keepResources = (outputResources != null);
+
+        if (!isClass && !isClassesDex && !keepResources) {
+            if (args.verbose) {
+                DxConsole.out.println("ignored resource " + name);
+            }
+            return false;
+        }
+
+        if (args.verbose) {
+            DxConsole.out.println("processing " + name + "...");
+        }
+
+        String fixedName = fixPath(name);
+
+        if (isClass) {
+            if (keepResources && args.keepClassesInJar) {
+                synchronized (outputResources) {
+                    outputResources.put(fixedName, bytes);
+                }
+            }
+            if (lastModified < minimumFileAge) {
+                return true;
+            }
+            return processClass(fixedName, bytes);
+        } else if (isClassesDex) {
+            synchronized (libraryDexBuffers) {
+                libraryDexBuffers.add(bytes);
+            }
+            return true;
+        } else {
+            synchronized (outputResources) {
+                outputResources.put(fixedName, bytes);
+            }
+            return true;
+        }
+!!!14885388.java!!!	processClass(inout name : String, inout bytes : byte) : boolean
+        if (! args.coreLibrary) {
+            checkClassName(name);
+        }
+
+        try {
+            ClassDefItem clazz =
+                CfTranslator.translate(name, bytes, args.cfOptions, args.dexOptions);
+            synchronized (outputDex) {
+                outputDex.add(clazz);
+            }
+            return true;
+        } catch (ParseException ex) {
+            DxConsole.err.println("\ntrouble processing:");
+            if (args.debug) {
+                ex.printStackTrace(DxConsole.err);
+            } else {
+                ex.printContext(DxConsole.err);
+            }
+        }
+
+        warnings++;
+        return false;
+!!!14885516.java!!!	checkClassName(inout name : String) : void
+        boolean bogus = false;
+
+        if (name.startsWith("java/")) {
+            bogus = true;
+        } else if (name.startsWith("javax/")) {
+            int slashAt = name.indexOf('/', 6);
+            if (slashAt == -1) {
+                // Top-level javax classes are verboten.
+                bogus = true;
+            } else {
+                String pkg = name.substring(6, slashAt);
+                bogus = (Arrays.binarySearch(JAVAX_CORE, pkg) >= 0);
+            }
+        }
+
+        if (! bogus) {
+            return;
+        }
+
+        /*
+         * The user is probably trying to include an entire desktop
+         * core library in a misguided attempt to get their application
+         * working. Try to help them understand what's happening.
+         */
+
+        DxConsole.err.println("\ntrouble processing \"" + name + "\":\n\n" +
+                IN_RE_CORE_CLASSES);
+        errors++;
+        throw new StopProcessing();
+!!!14885644.java!!!	writeDex() : byte
+        byte[] outArray = null;
+
+        try {
+            OutputStream humanOutRaw = null;
+            OutputStreamWriter humanOut = null;
+            try {
+                if (args.humanOutName != null) {
+                    humanOutRaw = openOutput(args.humanOutName);
+                    humanOut = new OutputStreamWriter(humanOutRaw);
+                }
+
+                if (args.methodToDump != null) {
+                    /*
+                     * Simply dump the requested method. Note: The call
+                     * to toDex() is required just to get the underlying
+                     * structures ready.
+                     */
+                    outputDex.toDex(null, false);
+                    dumpMethod(outputDex, args.methodToDump, humanOut);
+                } else {
+                    /*
+                     * This is the usual case: Create an output .dex file,
+                     * and write it, dump it, etc.
+                     */
+                    outArray = outputDex.toDex(humanOut, args.verboseDump);
+                }
+
+                if (args.statistics) {
+                    DxConsole.out.println(outputDex.getStatistics().toHuman());
+                }
+            } finally {
+                if (humanOut != null) {
+                    humanOut.flush();
+                }
+                closeOutput(humanOutRaw);
+            }
+        } catch (Exception ex) {
+            if (args.debug) {
+                DxConsole.err.println("\ntrouble writing output:");
+                ex.printStackTrace(DxConsole.err);
+            } else {
+                DxConsole.err.println("\ntrouble writing output: " +
+                                   ex.getMessage());
+            }
+            return null;
+        }
+
+        return outArray;
+!!!14885772.java!!!	createJar(inout fileName : String, inout dexArray : byte) : boolean
+        /*
+         * Make or modify the manifest (as appropriate), put the dex
+         * array into the resources map, and then process the entire
+         * resources map in a uniform manner.
+         */
+
+        try {
+            Manifest manifest = makeManifest();
+            OutputStream out = openOutput(fileName);
+            JarOutputStream jarOut = new JarOutputStream(out, manifest);
+
+            if (dexArray != null) {
+                outputResources.put(DexFormat.DEX_IN_JAR_NAME, dexArray);
+            }
+
+            try {
+                for (Map.Entry<String, byte[]> e :
+                         outputResources.entrySet()) {
+                    String name = e.getKey();
+                    byte[] contents = e.getValue();
+                    JarEntry entry = new JarEntry(name);
+
+                    if (args.verbose) {
+                        DxConsole.out.println("writing " + name + "; size " +
+                                           contents.length + "...");
+                    }
+
+                    entry.setSize(contents.length);
+                    jarOut.putNextEntry(entry);
+                    jarOut.write(contents);
+                    jarOut.closeEntry();
+                }
+            } finally {
+                jarOut.finish();
+                jarOut.flush();
+                closeOutput(out);
+            }
+        } catch (Exception ex) {
+            if (args.debug) {
+                DxConsole.err.println("\ntrouble writing output:");
+                ex.printStackTrace(DxConsole.err);
+            } else {
+                DxConsole.err.println("\ntrouble writing output: " +
+                                   ex.getMessage());
+            }
+            return false;
+        }
+
+        return true;
+!!!14885900.java!!!	makeManifest() : Manifest
+        byte[] manifestBytes = outputResources.get(MANIFEST_NAME);
+        Manifest manifest;
+        Attributes attribs;
+
+        if (manifestBytes == null) {
+            // We need to construct an entirely new manifest.
+            manifest = new Manifest();
+            attribs = manifest.getMainAttributes();
+            attribs.put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        } else {
+            manifest = new Manifest(new ByteArrayInputStream(manifestBytes));
+            attribs = manifest.getMainAttributes();
+            outputResources.remove(MANIFEST_NAME);
+        }
+
+        String createdBy = attribs.getValue(CREATED_BY);
+        if (createdBy == null) {
+            createdBy = "";
+        } else {
+            createdBy += " + ";
+        }
+        createdBy += "dx " + Version.VERSION;
+
+        attribs.put(CREATED_BY, createdBy);
+        attribs.putValue("Dex-Location", DexFormat.DEX_IN_JAR_NAME);
+
+        return manifest;
+!!!14886028.java!!!	openOutput(inout name : String) : OutputStream
+        if (name.equals("-") ||
+                name.startsWith("-.")) {
+            return System.out;
+        }
+
+        return new FileOutputStream(name);
+!!!14886156.java!!!	closeOutput(inout stream : OutputStream) : void
+        if (stream == null) {
+            return;
+        }
+
+        stream.flush();
+
+        if (stream != System.out) {
+            stream.close();
+        }
+!!!14886284.java!!!	fixPath(inout path : String) : String
+        /*
+         * If the path separator is \ (like on windows), we convert the
+         * path to a standard '/' separated path.
+         */
+        if (File.separatorChar == '\\') {
+            path = path.replace('\\', '/');
+        }
+
+        int index = path.lastIndexOf("/./");
+
+        if (index != -1) {
+            return path.substring(index + 3);
+        }
+
+        if (path.startsWith("./")) {
+            return path.substring(2);
+        }
+
+        return path;
+!!!14886412.java!!!	dumpMethod(inout dex : DexFile, inout fqName : String, inout out : OutputStreamWriter) : void
+        boolean wildcard = fqName.endsWith("*");
+        int lastDot = fqName.lastIndexOf('.');
+
+        if ((lastDot <= 0) || (lastDot == (fqName.length() - 1))) {
+            DxConsole.err.println("bogus fully-qualified method name: " +
+                               fqName);
+            return;
+        }
+
+        String className = fqName.substring(0, lastDot).replace('.', '/');
+        String methodName = fqName.substring(lastDot + 1);
+        ClassDefItem clazz = dex.getClassOrNull(className);
+
+        if (clazz == null) {
+            DxConsole.err.println("no such class: " + className);
+            return;
+        }
+
+        if (wildcard) {
+            methodName = methodName.substring(0, methodName.length() - 1);
+        }
+
+        ArrayList<EncodedMethod> allMeths = clazz.getMethods();
+        TreeMap<CstNat, EncodedMethod> meths =
+            new TreeMap<CstNat, EncodedMethod>();
+
+        /*
+         * Figure out which methods to include in the output, and get them
+         * all sorted, so that the printout code is robust with respect to
+         * changes in the underlying order.
+         */
+        for (EncodedMethod meth : allMeths) {
+            String methName = meth.getName().getString();
+            if ((wildcard && methName.startsWith(methodName)) ||
+                (!wildcard && methName.equals(methodName))) {
+                meths.put(meth.getRef().getNat(), meth);
+            }
+        }
+
+        if (meths.size() == 0) {
+            DxConsole.err.println("no such method: " + fqName);
+            return;
+        }
+
+        PrintWriter pw = new PrintWriter(out);
+
+        for (EncodedMethod meth : meths.values()) {
+            // TODO: Better stuff goes here, perhaps.
+            meth.debugPrint(pw, args.verboseDump);
+
+            /*
+             * The (default) source file is an attribute of the class, but
+             * it's useful to see it in method dumps.
+             */
+            CstString sourceFile = clazz.getSourceFile();
+            if (sourceFile != null) {
+                pw.println("  source file: " + sourceFile.toQuoted());
+            }
+
+            Annotations methodAnnotations =
+                clazz.getMethodAnnotations(meth.getRef());
+            AnnotationsList parameterAnnotations =
+                clazz.getParameterAnnotations(meth.getRef());
+
+            if (methodAnnotations != null) {
+                pw.println("  method annotations:");
+                for (Annotation a : methodAnnotations.getAnnotations()) {
+                    pw.println("    " + a);
+                }
+            }
+
+            if (parameterAnnotations != null) {
+                pw.println("  parameter annotations:");
+                int sz = parameterAnnotations.size();
+                for (int i = 0; i < sz; i++) {
+                    pw.println("    parameter " + i);
+                    Annotations annotations = parameterAnnotations.get(i);
+                    for (Annotation a : annotations.getAnnotations()) {
+                        pw.println("      " + a);
+                    }
+                }
+            }
+        }
+
+        pw.flush();

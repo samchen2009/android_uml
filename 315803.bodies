@@ -1,0 +1,340 @@
+class DiskLruCache
+!!!2025755.java!!!	DiskLruCache(inout directory : File, in appVersion : int, in valueCount : int, in maxSize : long)
+        this.directory = directory;
+        this.appVersion = appVersion;
+        this.journalFile = new File(directory, JOURNAL_FILE);
+        this.journalFileTmp = new File(directory, JOURNAL_FILE_TMP);
+        this.valueCount = valueCount;
+        this.maxSize = maxSize;
+!!!2025883.java!!!	open(inout directory : File, in appVersion : int, in valueCount : int, in maxSize : long) : DiskLruCache
+        if (maxSize <= 0) {
+            throw new IllegalArgumentException("maxSize <= 0");
+        }
+        if (valueCount <= 0) {
+            throw new IllegalArgumentException("valueCount <= 0");
+        }
+
+        // prefer to pick up where we left off
+        DiskLruCache cache = new DiskLruCache(directory, appVersion, valueCount, maxSize);
+        if (cache.journalFile.exists()) {
+            try {
+                cache.readJournal();
+                cache.processJournal();
+                cache.journalWriter = new BufferedWriter(new FileWriter(cache.journalFile, true));
+                return cache;
+            } catch (IOException journalIsCorrupt) {
+                System.logW("DiskLruCache " + directory + " is corrupt: "
+                        + journalIsCorrupt.getMessage() + ", removing");
+                cache.delete();
+            }
+        }
+
+        // create a new empty cache
+        directory.mkdirs();
+        cache = new DiskLruCache(directory, appVersion, valueCount, maxSize);
+        cache.rebuildJournal();
+        return cache;
+!!!2026011.java!!!	readJournal() : void
+        StrictLineReader reader = new StrictLineReader(new FileInputStream(journalFile),
+                Charsets.US_ASCII);
+        try {
+            String magic = reader.readLine();
+            String version = reader.readLine();
+            String appVersionString = reader.readLine();
+            String valueCountString = reader.readLine();
+            String blank = reader.readLine();
+            if (!MAGIC.equals(magic)
+                    || !VERSION_1.equals(version)
+                    || !Integer.toString(appVersion).equals(appVersionString)
+                    || !Integer.toString(valueCount).equals(valueCountString)
+                    || !"".equals(blank)) {
+                throw new IOException("unexpected journal header: ["
+                        + magic + ", " + version + ", " + valueCountString + ", " + blank + "]");
+            }
+
+            int lineCount = 0;
+            while (true) {
+                try {
+                    readJournalLine(reader.readLine());
+                    lineCount++;
+                } catch (EOFException endOfJournal) {
+                    break;
+                }
+            }
+            redundantOpCount = lineCount - lruEntries.size();
+        } finally {
+            IoUtils.closeQuietly(reader);
+        }
+!!!2026139.java!!!	readJournalLine(inout line : String) : void
+        int firstSpace = line.indexOf(' ');
+        if (firstSpace == -1) {
+            throw new IOException("unexpected journal line: " + line);
+        }
+
+        int keyBegin = firstSpace + 1;
+        int secondSpace = line.indexOf(' ', keyBegin);
+        final String key;
+        if (secondSpace == -1) {
+            key = line.substring(keyBegin);
+            if (firstSpace == REMOVE.length() && line.startsWith(REMOVE)) {
+                lruEntries.remove(key);
+                return;
+            }
+        } else {
+            key = line.substring(keyBegin, secondSpace);
+        }
+
+        Entry entry = lruEntries.get(key);
+        if (entry == null) {
+            entry = new Entry(key);
+            lruEntries.put(key, entry);
+        }
+
+        if (secondSpace != -1 && firstSpace == CLEAN.length() && line.startsWith(CLEAN)) {
+            String[] parts = line.substring(secondSpace + 1).split(" ");
+            entry.readable = true;
+            entry.currentEditor = null;
+            entry.setLengths(parts);
+        } else if (secondSpace == -1 && firstSpace == DIRTY.length() && line.startsWith(DIRTY)) {
+            entry.currentEditor = new Editor(entry);
+        } else if (secondSpace == -1 && firstSpace == READ.length() && line.startsWith(READ)) {
+            // this work was already done by calling lruEntries.get()
+        } else {
+            throw new IOException("unexpected journal line: " + line);
+        }
+!!!2026267.java!!!	processJournal() : void
+        deleteIfExists(journalFileTmp);
+        for (Iterator<Entry> i = lruEntries.values().iterator(); i.hasNext(); ) {
+            Entry entry = i.next();
+            if (entry.currentEditor == null) {
+                for (int t = 0; t < valueCount; t++) {
+                    size += entry.lengths[t];
+                }
+            } else {
+                entry.currentEditor = null;
+                for (int t = 0; t < valueCount; t++) {
+                    deleteIfExists(entry.getCleanFile(t));
+                    deleteIfExists(entry.getDirtyFile(t));
+                }
+                i.remove();
+            }
+        }
+!!!2026395.java!!!	rebuildJournal() : void
+        if (journalWriter != null) {
+            journalWriter.close();
+        }
+
+        Writer writer = new BufferedWriter(new FileWriter(journalFileTmp));
+        writer.write(MAGIC);
+        writer.write("\n");
+        writer.write(VERSION_1);
+        writer.write("\n");
+        writer.write(Integer.toString(appVersion));
+        writer.write("\n");
+        writer.write(Integer.toString(valueCount));
+        writer.write("\n");
+        writer.write("\n");
+
+        for (Entry entry : lruEntries.values()) {
+            if (entry.currentEditor != null) {
+                writer.write(DIRTY + ' ' + entry.key + '\n');
+            } else {
+                writer.write(CLEAN + ' ' + entry.key + entry.getLengths() + '\n');
+            }
+        }
+
+        writer.close();
+        journalFileTmp.renameTo(journalFile);
+        journalWriter = new BufferedWriter(new FileWriter(journalFile, true));
+!!!2026523.java!!!	deleteIfExists(inout file : File) : void
+        try {
+            Libcore.os.remove(file.getPath());
+        } catch (ErrnoException errnoException) {
+            if (errnoException.errno != OsConstants.ENOENT) {
+                throw errnoException.rethrowAsIOException();
+            }
+        }
+!!!2026651.java!!!	get(inout key : String) : Snapshot
+        checkNotClosed();
+        validateKey(key);
+        Entry entry = lruEntries.get(key);
+        if (entry == null) {
+            return null;
+        }
+
+        if (!entry.readable) {
+            return null;
+        }
+
+        /*
+         * Open all streams eagerly to guarantee that we see a single published
+         * snapshot. If we opened streams lazily then the streams could come
+         * from different edits.
+         */
+        InputStream[] ins = new InputStream[valueCount];
+        try {
+            for (int i = 0; i < valueCount; i++) {
+                ins[i] = new FileInputStream(entry.getCleanFile(i));
+            }
+        } catch (FileNotFoundException e) {
+            // a file must have been deleted manually!
+            return null;
+        }
+
+        redundantOpCount++;
+        journalWriter.append(READ + ' ' + key + '\n');
+        if (journalRebuildRequired()) {
+            executorService.submit(cleanupCallable);
+        }
+
+        return new Snapshot(key, entry.sequenceNumber, ins);
+!!!2026779.java!!!	edit(inout key : String) : Editor
+        return edit(key, ANY_SEQUENCE_NUMBER);
+!!!2026907.java!!!	edit(inout key : String, in expectedSequenceNumber : long) : Editor
+        checkNotClosed();
+        validateKey(key);
+        Entry entry = lruEntries.get(key);
+        if (expectedSequenceNumber != ANY_SEQUENCE_NUMBER
+                && (entry == null || entry.sequenceNumber != expectedSequenceNumber)) {
+            return null; // snapshot is stale
+        }
+        if (entry == null) {
+            entry = new Entry(key);
+            lruEntries.put(key, entry);
+        } else if (entry.currentEditor != null) {
+            return null; // another edit is in progress
+        }
+
+        Editor editor = new Editor(entry);
+        entry.currentEditor = editor;
+
+        // flush the journal before creating files to prevent file leaks
+        journalWriter.write(DIRTY + ' ' + key + '\n');
+        journalWriter.flush();
+        return editor;
+!!!2027035.java!!!	getDirectory() : File
+        return directory;
+!!!2027163.java!!!	maxSize() : long
+        return maxSize;
+!!!2027291.java!!!	size() : long
+        return size;
+!!!2027419.java!!!	completeEdit(inout editor : Editor, inout success : boolean) : void
+        Entry entry = editor.entry;
+        if (entry.currentEditor != editor) {
+            throw new IllegalStateException();
+        }
+
+        // if this edit is creating the entry for the first time, every index must have a value
+        if (success && !entry.readable) {
+            for (int i = 0; i < valueCount; i++) {
+                if (!editor.written[i]) {
+                    editor.abort();
+                    throw new IllegalStateException("Newly created entry didn't create value for index " + i);
+                }
+                if (!entry.getDirtyFile(i).exists()) {
+                    editor.abort();
+                    System.logW("DiskLruCache: Newly created entry doesn't have file for index " + i);
+                    return;
+                }
+            }
+        }
+
+        for (int i = 0; i < valueCount; i++) {
+            File dirty = entry.getDirtyFile(i);
+            if (success) {
+                if (dirty.exists()) {
+                    File clean = entry.getCleanFile(i);
+                    dirty.renameTo(clean);
+                    long oldLength = entry.lengths[i];
+                    long newLength = clean.length();
+                    entry.lengths[i] = newLength;
+                    size = size - oldLength + newLength;
+                }
+            } else {
+                deleteIfExists(dirty);
+            }
+        }
+
+        redundantOpCount++;
+        entry.currentEditor = null;
+        if (entry.readable | success) {
+            entry.readable = true;
+            journalWriter.write(CLEAN + ' ' + entry.key + entry.getLengths() + '\n');
+            if (success) {
+                entry.sequenceNumber = nextSequenceNumber++;
+            }
+        } else {
+            lruEntries.remove(entry.key);
+            journalWriter.write(REMOVE + ' ' + entry.key + '\n');
+        }
+
+        if (size > maxSize || journalRebuildRequired()) {
+            executorService.submit(cleanupCallable);
+        }
+!!!2027547.java!!!	journalRebuildRequired() : boolean
+        final int REDUNDANT_OP_COMPACT_THRESHOLD = 2000;
+        return redundantOpCount >= REDUNDANT_OP_COMPACT_THRESHOLD
+                && redundantOpCount >= lruEntries.size();
+!!!2027675.java!!!	remove(inout key : String) : boolean
+        checkNotClosed();
+        validateKey(key);
+        Entry entry = lruEntries.get(key);
+        if (entry == null || entry.currentEditor != null) {
+            return false;
+        }
+
+        for (int i = 0; i < valueCount; i++) {
+            File file = entry.getCleanFile(i);
+            if (!file.delete()) {
+                throw new IOException("failed to delete " + file);
+            }
+            size -= entry.lengths[i];
+            entry.lengths[i] = 0;
+        }
+
+        redundantOpCount++;
+        journalWriter.append(REMOVE + ' ' + key + '\n');
+        lruEntries.remove(key);
+
+        if (journalRebuildRequired()) {
+            executorService.submit(cleanupCallable);
+        }
+
+        return true;
+!!!2027803.java!!!	isClosed() : boolean
+        return journalWriter == null;
+!!!2027931.java!!!	checkNotClosed() : void
+        if (journalWriter == null) {
+            throw new IllegalStateException("cache is closed");
+        }
+!!!2028059.java!!!	flush() : void
+        checkNotClosed();
+        trimToSize();
+        journalWriter.flush();
+!!!2028187.java!!!	close() : void
+        if (journalWriter == null) {
+            return; // already closed
+        }
+        for (Entry entry : new ArrayList<Entry>(lruEntries.values())) {
+            if (entry.currentEditor != null) {
+                entry.currentEditor.abort();
+            }
+        }
+        trimToSize();
+        journalWriter.close();
+        journalWriter = null;
+!!!2028315.java!!!	trimToSize() : void
+        while (size > maxSize) {
+            Map.Entry<String, Entry> toEvict = lruEntries.eldest();
+            remove(toEvict.getKey());
+        }
+!!!2028443.java!!!	delete() : void
+        close();
+        IoUtils.deleteContents(directory);
+!!!2028571.java!!!	validateKey(inout key : String) : void
+        if (key.contains(" ") || key.contains("\n") || key.contains("\r")) {
+            throw new IllegalArgumentException(
+                    "keys must not contain spaces or newlines: \"" + key + "\"");
+        }
+!!!2028699.java!!!	inputStreamToString(inout in : InputStream) : String
+        return Streams.readFully(new InputStreamReader(in, Charsets.UTF_8));

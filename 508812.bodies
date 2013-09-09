@@ -1,0 +1,143 @@
+class ConsumerBase
+!!!1491852.cpp!!!	~ConsumerBase()
+	CB_LOGV("~ConsumerBase");
+    abandon();
+!!!1491980.cpp!!!	abandon() : void
+    CB_LOGV("abandon");
+    Mutex::Autolock lock(mMutex);
+
+    if (!mAbandoned) {
+        abandonLocked();
+        mAbandoned = true;
+    }
+!!!1492236.cpp!!!	getBufferQueue() : sp<BufferQueue>
+    Mutex::Autolock lock(mMutex);
+    return mBufferQueue;
+!!!1492364.cpp!!!	dump(inout result : String8) : void
+    char buffer[1024];
+    dump(result, "", buffer, 1024);
+!!!1492492.cpp!!!	dump(inout result : String8, in prefix : char, inout buffer : char, in size : size_t) : void
+    Mutex::Autolock _l(mMutex);
+    dumpLocked(result, prefix, buffer, size);
+!!!1492620.cpp!!!	setFrameAvailableListener(in listener : sp<FrameAvailableListener>) : void
+    CB_LOGV("setFrameAvailableListener");
+    Mutex::Autolock lock(mMutex);
+    mFrameAvailableListener = listener;
+!!!1493004.cpp!!!	ConsumerBase(in bufferQueue : sp<BufferQueue>)
+    // Choose a name using the PID and a process-unique ID.
+    mName = String8::format("unnamed-%d-%d", getpid(), createProcessUniqueId());
+
+    // Note that we can't create an sp<...>(this) in a ctor that will not keep a
+    // reference once the ctor ends, as that would cause the refcount of 'this'
+    // dropping to 0 at the end of the ctor.  Since all we need is a wp<...>
+    // that's what we create.
+    wp<BufferQueue::ConsumerListener> listener;
+    sp<BufferQueue::ConsumerListener> proxy;
+    listener = static_cast<BufferQueue::ConsumerListener*>(this);
+    proxy = new BufferQueue::ProxyConsumerListener(listener);
+
+    status_t err = mBufferQueue->consumerConnect(proxy);
+    if (err != NO_ERROR) {
+        CB_LOGE("SurfaceTexture: error connecting to BufferQueue: %s (%d)",
+                strerror(-err), err);
+    } else {
+        mBufferQueue->setConsumerName(mName);
+    }
+!!!1493132.cpp!!!	onFrameAvailable() : void
+    CB_LOGV("onFrameAvailable");
+
+    sp<FrameAvailableListener> listener;
+    { // scope for the lock
+        Mutex::Autolock lock(mMutex);
+        listener = mFrameAvailableListener;
+    }
+
+    if (listener != NULL) {
+        CB_LOGV("actually calling onFrameAvailable");
+        listener->onFrameAvailable();
+    }
+!!!1493260.cpp!!!	onBuffersReleased() : void
+    Mutex::Autolock lock(mMutex);
+
+    CB_LOGV("onBuffersReleased");
+
+    if (mAbandoned) {
+        // Nothing to do if we're already abandoned.
+        return;
+    }
+
+    uint32_t mask = 0;
+    mBufferQueue->getReleasedBuffers(&mask);
+    for (int i = 0; i < BufferQueue::NUM_BUFFER_SLOTS; i++) {
+        if (mask & (1 << i)) {
+            freeBufferLocked(i);
+        }
+    }
+!!!1493388.cpp!!!	freeBufferLocked(in slotIndex : int) : void
+    CB_LOGV("freeBufferLocked: slotIndex=%d", slotIndex);
+    mSlots[slotIndex].mGraphicBuffer = 0;
+    mSlots[slotIndex].mFence = 0;
+!!!1493516.cpp!!!	abandonLocked() : void
+	CB_LOGV("abandonLocked");
+    for (int i =0; i < BufferQueue::NUM_BUFFER_SLOTS; i++) {
+        freeBufferLocked(i);
+    }
+    // disconnect from the BufferQueue
+    mBufferQueue->consumerDisconnect();
+    mBufferQueue.clear();
+!!!1493644.cpp!!!	dumpLocked(inout result : String8, in prefix : char, inout buffer : char, in SIZE : size_t) : void
+    snprintf(buffer, SIZE, "%smAbandoned=%d\n", prefix, int(mAbandoned));
+    result.append(buffer);
+
+    if (!mAbandoned) {
+        mBufferQueue->dump(result, prefix, buffer, SIZE);
+    }
+!!!1493772.cpp!!!	acquireBufferLocked(inout item : BufferItem) : status_t
+    status_t err = mBufferQueue->acquireBuffer(item);
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    if (item->mGraphicBuffer != NULL) {
+        mSlots[item->mBuf].mGraphicBuffer = item->mGraphicBuffer;
+    }
+
+    mSlots[item->mBuf].mFence = item->mFence;
+
+    CB_LOGV("acquireBufferLocked: -> slot=%d", item->mBuf);
+
+    return OK;
+!!!1493900.cpp!!!	releaseBufferLocked(in slot : int, in display : EGLDisplay, in eglFence : EGLSyncKHR) : status_t
+    CB_LOGV("releaseBufferLocked: slot=%d", slot);
+    status_t err = mBufferQueue->releaseBuffer(slot, display, eglFence,
+            mSlots[slot].mFence);
+    if (err == BufferQueue::STALE_BUFFER_SLOT) {
+        freeBufferLocked(slot);
+    }
+
+    mSlots[slot].mFence.clear();
+
+    return err;
+!!!1494028.cpp!!!	addReleaseFence(in slot : int, in fence : sp<Fence>) : status_t
+    Mutex::Autolock lock(mMutex);
+    return addReleaseFenceLocked(slot, fence);
+!!!1494156.cpp!!!	addReleaseFenceLocked(in slot : int, in fence : sp<Fence>) : status_t
+    CB_LOGV("addReleaseFenceLocked: slot=%d", slot);
+
+    if (!mSlots[slot].mFence.get()) {
+        mSlots[slot].mFence = fence;
+    } else {
+        sp<Fence> mergedFence = Fence::merge(
+                String8::format("%.28s:%d", mName.string(), slot),
+                mSlots[slot].mFence, fence);
+        if (!mergedFence.get()) {
+            CB_LOGE("failed to merge release fences");
+            // synchronization is broken, the best we can do is hope fences
+            // signal in order so the new fence will act like a union
+            mSlots[slot].mFence = fence;
+            return BAD_VALUE;
+        }
+        mSlots[slot].mFence = mergedFence;
+    }
+
+    return OK;

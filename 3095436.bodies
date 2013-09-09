@@ -1,0 +1,273 @@
+class AndroidSpellCheckerSession
+!!!12889612.java!!!	AndroidSpellCheckerSession(in service : AndroidSpellCheckerService)
+            mService = service;
+            final ContentResolver cres = service.getContentResolver();
+
+            mObserver = new ContentObserver(null) {
+                @Override
+                public void onChange(boolean self) {
+                    mSuggestionsCache.clearCache();
+                }
+            };
+            cres.registerContentObserver(Words.CONTENT_URI, true, mObserver);
+!!!12889740.java!!!	onCreate() : void
+            final String localeString = getLocale();
+            mDictionaryPool = mService.getDictionaryPool(localeString);
+            mLocale = LocaleUtils.constructLocaleFromString(localeString);
+            mScript = getScriptFromLocale(mLocale);
+!!!12889868.java!!!	onClose() : void
+            final ContentResolver cres = mService.getContentResolver();
+            cres.unregisterContentObserver(mObserver);
+!!!12889996.java!!!	isLetterCheckableByLanguage(in codePoint : int, in script : int) : boolean
+            switch (script) {
+            case SCRIPT_LATIN:
+                // Our supported latin script dictionaries (EFIGS) at the moment only include
+                // characters in the C0, C1, Latin Extended A and B, IPA extensions unicode
+                // blocks. As it happens, those are back-to-back in the code range 0x40 to 0x2AF,
+                // so the below is a very efficient way to test for it. As for the 0-0x3F, it's
+                // excluded from isLetter anyway.
+                return codePoint <= 0x2AF && Character.isLetter(codePoint);
+            case SCRIPT_CYRILLIC:
+                // All Cyrillic characters are in the 400~52F block. There are some in the upper
+                // Unicode range, but they are archaic characters that are not used in modern
+                // russian and are not used by our dictionary.
+                return codePoint >= 0x400 && codePoint <= 0x52F && Character.isLetter(codePoint);
+            default:
+                // Should never come here
+                throw new RuntimeException("Impossible value of script: " + script);
+            }
+!!!12890124.java!!!	shouldFilterOut(in text : String, in script : int) : boolean
+            if (TextUtils.isEmpty(text) || text.length() <= 1) return true;
+
+            // TODO: check if an equivalent processing can't be done more quickly with a
+            // compiled regexp.
+            // Filter by first letter
+            final int firstCodePoint = text.codePointAt(0);
+            // Filter out words that don't start with a letter or an apostrophe
+            if (!isLetterCheckableByLanguage(firstCodePoint, script)
+                    && '\'' != firstCodePoint) return true;
+
+            // Filter contents
+            final int length = text.length();
+            int letterCount = 0;
+            for (int i = 0; i < length; i = text.offsetByCodePoints(i, 1)) {
+                final int codePoint = text.codePointAt(i);
+                // Any word containing a '@' is probably an e-mail address
+                // Any word containing a '/' is probably either an ad-hoc combination of two
+                // words or a URI - in either case we don't want to spell check that
+                if ('@' == codePoint || '/' == codePoint) return true;
+                if (isLetterCheckableByLanguage(codePoint, script)) ++letterCount;
+            }
+            // Guestimate heuristic: perform spell checking if at least 3/4 of the characters
+            // in this word are letters
+            return (letterCount * 4 < length * 3);
+!!!12890252.java!!!	fixWronglyInvalidatedWordWithSingleQuote(inout ti : TextInfo, inout ssi : SentenceSuggestionsInfo) : SentenceSuggestionsInfo
+            final String typedText = ti.getText();
+            if (!typedText.contains(SINGLE_QUOTE)) {
+                return null;
+            }
+            final int N = ssi.getSuggestionsCount();
+            final ArrayList<Integer> additionalOffsets = new ArrayList<Integer>();
+            final ArrayList<Integer> additionalLengths = new ArrayList<Integer>();
+            final ArrayList<SuggestionsInfo> additionalSuggestionsInfos =
+                    new ArrayList<SuggestionsInfo>();
+            for (int i = 0; i < N; ++i) {
+                final SuggestionsInfo si = ssi.getSuggestionsInfoAt(i);
+                final int flags = si.getSuggestionsAttributes();
+                if ((flags & SuggestionsInfo.RESULT_ATTR_IN_THE_DICTIONARY) == 0) {
+                    continue;
+                }
+                final int offset = ssi.getOffsetAt(i);
+                final int length = ssi.getLengthAt(i);
+                final String subText = typedText.substring(offset, offset + length);
+                if (!subText.contains(SINGLE_QUOTE)) {
+                    continue;
+                }
+                final String[] splitTexts = subText.split(SINGLE_QUOTE, -1);
+                if (splitTexts == null || splitTexts.length <= 1) {
+                    continue;
+                }
+                final int splitNum = splitTexts.length;
+                for (int j = 0; j < splitNum; ++j) {
+                    final String splitText = splitTexts[j];
+                    if (TextUtils.isEmpty(splitText)) {
+                        continue;
+                    }
+                    if (mSuggestionsCache.getSuggestionsFromCache(splitText) == null) {
+                        continue;
+                    }
+                    final int newLength = splitText.length();
+                    // Neither RESULT_ATTR_IN_THE_DICTIONARY nor RESULT_ATTR_LOOKS_LIKE_TYPO
+                    final int newFlags = 0;
+                    final SuggestionsInfo newSi = new SuggestionsInfo(newFlags, EMPTY_STRING_ARRAY);
+                    newSi.setCookieAndSequence(si.getCookie(), si.getSequence());
+                    if (DBG) {
+                        Log.d(TAG, "Override and remove old span over: "
+                                + splitText + ", " + offset + "," + newLength);
+                    }
+                    additionalOffsets.add(offset);
+                    additionalLengths.add(newLength);
+                    additionalSuggestionsInfos.add(newSi);
+                }
+            }
+            final int additionalSize = additionalOffsets.size();
+            if (additionalSize <= 0) {
+                return null;
+            }
+            final int suggestionsSize = N + additionalSize;
+            final int[] newOffsets = new int[suggestionsSize];
+            final int[] newLengths = new int[suggestionsSize];
+            final SuggestionsInfo[] newSuggestionsInfos = new SuggestionsInfo[suggestionsSize];
+            int i;
+            for (i = 0; i < N; ++i) {
+                newOffsets[i] = ssi.getOffsetAt(i);
+                newLengths[i] = ssi.getLengthAt(i);
+                newSuggestionsInfos[i] = ssi.getSuggestionsInfoAt(i);
+            }
+            for (; i < suggestionsSize; ++i) {
+                newOffsets[i] = additionalOffsets.get(i - N);
+                newLengths[i] = additionalLengths.get(i - N);
+                newSuggestionsInfos[i] = additionalSuggestionsInfos.get(i - N);
+            }
+            return new SentenceSuggestionsInfo(newSuggestionsInfos, newOffsets, newLengths);
+!!!12890380.java!!!	onGetSentenceSuggestionsMultiple(inout textInfos : TextInfo, in suggestionsLimit : int) : SentenceSuggestionsInfo
+            final SentenceSuggestionsInfo[] retval = super.onGetSentenceSuggestionsMultiple(
+                    textInfos, suggestionsLimit);
+            if (retval == null || retval.length != textInfos.length) {
+                return retval;
+            }
+            for (int i = 0; i < retval.length; ++i) {
+                final SentenceSuggestionsInfo tempSsi =
+                        fixWronglyInvalidatedWordWithSingleQuote(textInfos[i], retval[i]);
+                if (tempSsi != null) {
+                    retval[i] = tempSsi;
+                }
+            }
+            return retval;
+!!!12890508.java!!!	onGetSuggestionsMultiple(inout textInfos : TextInfo, in suggestionsLimit : int, inout sequentialWords : boolean) : SuggestionsInfo
+            final int length = textInfos.length;
+            final SuggestionsInfo[] retval = new SuggestionsInfo[length];
+            for (int i = 0; i < length; ++i) {
+                final String prevWord;
+                if (sequentialWords && i > 0) {
+                    final String prevWordCandidate = textInfos[i - 1].getText();
+                    // Note that an empty string would be used to indicate the initial word
+                    // in the future.
+                    prevWord = TextUtils.isEmpty(prevWordCandidate) ? null : prevWordCandidate;
+                } else {
+                    prevWord = null;
+                }
+                retval[i] = onGetSuggestions(textInfos[i], prevWord, suggestionsLimit);
+                retval[i].setCookieAndSequence(
+                        textInfos[i].getCookie(), textInfos[i].getSequence());
+            }
+            return retval;
+!!!12890636.java!!!	onGetSuggestions(in textInfo : TextInfo, in suggestionsLimit : int) : SuggestionsInfo
+            return onGetSuggestions(textInfo, null, suggestionsLimit);
+!!!12890764.java!!!	onGetSuggestions(in textInfo : TextInfo, in prevWord : String, in suggestionsLimit : int) : SuggestionsInfo
+            try {
+                final String inText = textInfo.getText();
+                final SuggestionsParams cachedSuggestionsParams =
+                        mSuggestionsCache.getSuggestionsFromCache(inText);
+                if (cachedSuggestionsParams != null) {
+                    if (DBG) {
+                        Log.d(TAG, "Cache hit: " + inText + ", " + cachedSuggestionsParams.mFlags);
+                    }
+                    return new SuggestionsInfo(
+                            cachedSuggestionsParams.mFlags, cachedSuggestionsParams.mSuggestions);
+                }
+
+                if (shouldFilterOut(inText, mScript)) {
+                    DictAndProximity dictInfo = null;
+                    try {
+                        dictInfo = mDictionaryPool.takeOrGetNull();
+                        if (null == dictInfo) return getNotInDictEmptySuggestions();
+                        return dictInfo.mDictionary.isValidWord(inText) ?
+                                getInDictEmptySuggestions() : getNotInDictEmptySuggestions();
+                    } finally {
+                        if (null != dictInfo) {
+                            if (!mDictionaryPool.offer(dictInfo)) {
+                                Log.e(TAG, "Can't re-insert a dictionary into its pool");
+                            }
+                        }
+                    }
+                }
+                final String text = inText.replaceAll(APOSTROPHE, SINGLE_QUOTE);
+
+                // TODO: Don't gather suggestions if the limit is <= 0 unless necessary
+                final SuggestionsGatherer suggestionsGatherer = new SuggestionsGatherer(text,
+                        mService.mSuggestionThreshold, mService.mRecommendedThreshold,
+                        suggestionsLimit);
+                final WordComposer composer = new WordComposer();
+                final int length = text.length();
+                for (int i = 0; i < length; i = text.offsetByCodePoints(i, 1)) {
+                    final int codePoint = text.codePointAt(i);
+                    // The getXYForCodePointAndScript method returns (Y << 16) + X
+                    final int xy = SpellCheckerProximityInfo.getXYForCodePointAndScript(
+                            codePoint, mScript);
+                    if (SpellCheckerProximityInfo.NOT_A_COORDINATE_PAIR == xy) {
+                        composer.add(codePoint, WordComposer.NOT_A_COORDINATE,
+                                WordComposer.NOT_A_COORDINATE, null);
+                    } else {
+                        composer.add(codePoint, xy & 0xFFFF, xy >> 16, null);
+                    }
+                }
+
+                final int capitalizeType = getCapitalizationType(text);
+                boolean isInDict = true;
+                DictAndProximity dictInfo = null;
+                try {
+                    dictInfo = mDictionaryPool.takeOrGetNull();
+                    if (null == dictInfo) return getNotInDictEmptySuggestions();
+                    dictInfo.mDictionary.getWords(composer, prevWord, suggestionsGatherer,
+                            dictInfo.mProximityInfo);
+                    isInDict = dictInfo.mDictionary.isValidWord(text);
+                    if (!isInDict && CAPITALIZE_NONE != capitalizeType) {
+                        // We want to test the word again if it's all caps or first caps only.
+                        // If it's fully down, we already tested it, if it's mixed case, we don't
+                        // want to test a lowercase version of it.
+                        isInDict = dictInfo.mDictionary.isValidWord(text.toLowerCase(mLocale));
+                    }
+                } finally {
+                    if (null != dictInfo) {
+                        if (!mDictionaryPool.offer(dictInfo)) {
+                            Log.e(TAG, "Can't re-insert a dictionary into its pool");
+                        }
+                    }
+                }
+
+                final SuggestionsGatherer.Result result = suggestionsGatherer.getResults(
+                        capitalizeType, mLocale);
+
+                if (DBG) {
+                    Log.i(TAG, "Spell checking results for " + text + " with suggestion limit "
+                            + suggestionsLimit);
+                    Log.i(TAG, "IsInDict = " + isInDict);
+                    Log.i(TAG, "LooksLikeTypo = " + (!isInDict));
+                    Log.i(TAG, "HasRecommendedSuggestions = " + result.mHasRecommendedSuggestions);
+                    if (null != result.mSuggestions) {
+                        for (String suggestion : result.mSuggestions) {
+                            Log.i(TAG, suggestion);
+                        }
+                    }
+                }
+
+                final int flags =
+                        (isInDict ? SuggestionsInfo.RESULT_ATTR_IN_THE_DICTIONARY
+                                : SuggestionsInfo.RESULT_ATTR_LOOKS_LIKE_TYPO)
+                        | (result.mHasRecommendedSuggestions
+                                ? SuggestionsInfoCompatUtils
+                                        .getValueOf_RESULT_ATTR_HAS_RECOMMENDED_SUGGESTIONS()
+                                : 0);
+                final SuggestionsInfo retval = new SuggestionsInfo(flags, result.mSuggestions);
+                mSuggestionsCache.putSuggestionsToCache(text, result.mSuggestions, flags);
+                return retval;
+            } catch (RuntimeException e) {
+                // Don't kill the keyboard if there is a bug in the spell checker
+                if (DBG) {
+                    throw e;
+                } else {
+                    Log.e(TAG, "Exception while spellcheking: " + e);
+                    return getNotInDictEmptySuggestions();
+                }
+            }

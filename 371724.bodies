@@ -1,0 +1,518 @@
+class TSPacketizer
+!!!745868.cpp!!!	TSPacketizer()
+    initCrcTable();
+!!!745996.cpp!!!	addTrack(in format : sp<AMessage>) : ssize_t
+    AString mime;
+    CHECK(format->findString("mime", &mime));
+
+    unsigned PIDStart;
+    bool isVideo = !strncasecmp("video/", mime.c_str(), 6);
+    bool isAudio = !strncasecmp("audio/", mime.c_str(), 6);
+
+    if (isVideo) {
+        PIDStart = 0x1011;
+    } else if (isAudio) {
+        PIDStart = 0x1100;
+    } else {
+        return ERROR_UNSUPPORTED;
+    }
+
+    unsigned streamType;
+    unsigned streamIDStart;
+    unsigned streamIDStop;
+
+    if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_VIDEO_AVC)) {
+        streamType = 0x1b;
+        streamIDStart = 0xe0;
+        streamIDStop = 0xef;
+    } else if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_AUDIO_AAC)) {
+        streamType = 0x0f;
+        streamIDStart = 0xc0;
+        streamIDStop = 0xdf;
+    } else if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_AUDIO_RAW)) {
+        streamType = 0x83;
+        streamIDStart = 0xbd;
+        streamIDStop = 0xbd;
+    } else {
+        return ERROR_UNSUPPORTED;
+    }
+
+    size_t numTracksOfThisType = 0;
+    unsigned PID = PIDStart;
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        const sp<Track> &track = mTracks.itemAt(i);
+
+        if (track->streamType() == streamType) {
+            ++numTracksOfThisType;
+        }
+
+        if ((isAudio && track->isAudio()) || (isVideo && track->isVideo())) {
+            ++PID;
+        }
+    }
+
+    unsigned streamID = streamIDStart + numTracksOfThisType;
+    if (streamID > streamIDStop) {
+        return -ERANGE;
+    }
+
+    sp<Track> track = new Track(format, PID, streamType, streamID);
+    return mTracks.add(track);
+!!!746124.cpp!!!	packetize(in trackIndex : size_t, in _accessUnit : sp<ABuffer>, inout packets : sp<ABuffer>, in flags : uint32_t, in PES_private_data : uint8_t, in PES_private_data_len : size_t, in numStuffingBytes : size_t = 0) : status_t
+    sp<ABuffer> accessUnit = _accessUnit;
+
+    int64_t timeUs;
+    CHECK(accessUnit->meta()->findInt64("timeUs", &timeUs));
+
+    packets->clear();
+
+    if (trackIndex >= mTracks.size()) {
+        return -ERANGE;
+    }
+
+    const sp<Track> &track = mTracks.itemAt(trackIndex);
+
+    if (track->isH264() && (flags & PREPEND_SPS_PPS_TO_IDR_FRAMES)
+            && IsIDR(accessUnit)) {
+        // prepend codec specific data, i.e. SPS and PPS.
+        accessUnit = track->prependCSD(accessUnit);
+    } else if (track->isAAC() && track->lacksADTSHeader()) {
+        CHECK(!(flags & IS_ENCRYPTED));
+        accessUnit = track->prependADTSHeader(accessUnit);
+    }
+
+    // 0x47
+    // transport_error_indicator = b0
+    // payload_unit_start_indicator = b1
+    // transport_priority = b0
+    // PID
+    // transport_scrambling_control = b00
+    // adaptation_field_control = b??
+    // continuity_counter = b????
+    // -- payload follows
+    // packet_startcode_prefix = 0x000001
+    // stream_id
+    // PES_packet_length = 0x????
+    // reserved = b10
+    // PES_scrambling_control = b00
+    // PES_priority = b0
+    // data_alignment_indicator = b1
+    // copyright = b0
+    // original_or_copy = b0
+    // PTS_DTS_flags = b10  (PTS only)
+    // ESCR_flag = b0
+    // ES_rate_flag = b0
+    // DSM_trick_mode_flag = b0
+    // additional_copy_info_flag = b0
+    // PES_CRC_flag = b0
+    // PES_extension_flag = b0
+    // PES_header_data_length = 0x05
+    // reserved = b0010 (PTS)
+    // PTS[32..30] = b???
+    // reserved = b1
+    // PTS[29..15] = b??? ???? ???? ???? (15 bits)
+    // reserved = b1
+    // PTS[14..0] = b??? ???? ???? ???? (15 bits)
+    // reserved = b1
+    // the first fragment of "buffer" follows
+
+    size_t PES_packet_length = accessUnit->size() + 8 + numStuffingBytes;
+    if (PES_private_data_len > 0) {
+        PES_packet_length += PES_private_data_len + 1;
+    }
+
+    size_t numTSPackets;
+    if (PES_packet_length <= 178) {
+        numTSPackets = 1;
+    } else {
+        numTSPackets = 1 + ((PES_packet_length - 178) + 183) / 184;
+    }
+
+    if (flags & EMIT_PAT_AND_PMT) {
+        numTSPackets += 2;
+    }
+
+    if (flags & EMIT_PCR) {
+        ++numTSPackets;
+    }
+
+    sp<ABuffer> buffer = new ABuffer(numTSPackets * 188);
+    uint8_t *packetDataStart = buffer->data();
+
+    if (flags & EMIT_PAT_AND_PMT) {
+        // Program Association Table (PAT):
+        // 0x47
+        // transport_error_indicator = b0
+        // payload_unit_start_indicator = b1
+        // transport_priority = b0
+        // PID = b0000000000000 (13 bits)
+        // transport_scrambling_control = b00
+        // adaptation_field_control = b01 (no adaptation field, payload only)
+        // continuity_counter = b????
+        // skip = 0x00
+        // --- payload follows
+        // table_id = 0x00
+        // section_syntax_indicator = b1
+        // must_be_zero = b0
+        // reserved = b11
+        // section_length = 0x00d
+        // transport_stream_id = 0x0000
+        // reserved = b11
+        // version_number = b00001
+        // current_next_indicator = b1
+        // section_number = 0x00
+        // last_section_number = 0x00
+        //   one program follows:
+        //   program_number = 0x0001
+        //   reserved = b111
+        //   program_map_PID = kPID_PMT (13 bits!)
+        // CRC = 0x????????
+
+        if (++mPATContinuityCounter == 16) {
+            mPATContinuityCounter = 0;
+        }
+
+        uint8_t *ptr = packetDataStart;
+        *ptr++ = 0x47;
+        *ptr++ = 0x40;
+        *ptr++ = 0x00;
+        *ptr++ = 0x10 | mPATContinuityCounter;
+        *ptr++ = 0x00;
+
+        uint8_t *crcDataStart = ptr;
+        *ptr++ = 0x00;
+        *ptr++ = 0xb0;
+        *ptr++ = 0x0d;
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        *ptr++ = 0xc3;
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        *ptr++ = 0x01;
+        *ptr++ = 0xe0 | (kPID_PMT >> 8);
+        *ptr++ = kPID_PMT & 0xff;
+
+        CHECK_EQ(ptr - crcDataStart, 12);
+        uint32_t crc = htonl(crc32(crcDataStart, ptr - crcDataStart));
+        memcpy(ptr, &crc, 4);
+        ptr += 4;
+
+        size_t sizeLeft = packetDataStart + 188 - ptr;
+        memset(ptr, 0xff, sizeLeft);
+
+        packetDataStart += 188;
+
+        // Program Map (PMT):
+        // 0x47
+        // transport_error_indicator = b0
+        // payload_unit_start_indicator = b1
+        // transport_priority = b0
+        // PID = kPID_PMT (13 bits)
+        // transport_scrambling_control = b00
+        // adaptation_field_control = b01 (no adaptation field, payload only)
+        // continuity_counter = b????
+        // skip = 0x00
+        // -- payload follows
+        // table_id = 0x02
+        // section_syntax_indicator = b1
+        // must_be_zero = b0
+        // reserved = b11
+        // section_length = 0x???
+        // program_number = 0x0001
+        // reserved = b11
+        // version_number = b00001
+        // current_next_indicator = b1
+        // section_number = 0x00
+        // last_section_number = 0x00
+        // reserved = b111
+        // PCR_PID = kPCR_PID (13 bits)
+        // reserved = b1111
+        // program_info_length = 0x000
+        //   one or more elementary stream descriptions follow:
+        //   stream_type = 0x??
+        //   reserved = b111
+        //   elementary_PID = b? ???? ???? ???? (13 bits)
+        //   reserved = b1111
+        //   ES_info_length = 0x000
+        // CRC = 0x????????
+
+        if (++mPMTContinuityCounter == 16) {
+            mPMTContinuityCounter = 0;
+        }
+
+        ptr = packetDataStart;
+        *ptr++ = 0x47;
+        *ptr++ = 0x40 | (kPID_PMT >> 8);
+        *ptr++ = kPID_PMT & 0xff;
+        *ptr++ = 0x10 | mPMTContinuityCounter;
+        *ptr++ = 0x00;
+
+        crcDataStart = ptr;
+        *ptr++ = 0x02;
+
+        *ptr++ = 0x00;  // section_length to be filled in below.
+        *ptr++ = 0x00;
+
+        *ptr++ = 0x00;
+        *ptr++ = 0x01;
+        *ptr++ = 0xc3;
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        *ptr++ = 0xe0 | (kPID_PCR >> 8);
+        *ptr++ = kPID_PCR & 0xff;
+        *ptr++ = 0xf0;
+        *ptr++ = 0x00;
+
+        for (size_t i = 0; i < mTracks.size(); ++i) {
+            const sp<Track> &track = mTracks.itemAt(i);
+
+            // Make sure all the decriptors have been added.
+            track->finalize();
+
+            *ptr++ = track->streamType();
+            *ptr++ = 0xe0 | (track->PID() >> 8);
+            *ptr++ = track->PID() & 0xff;
+
+            size_t ES_info_length = 0;
+            for (size_t i = 0; i < track->countDescriptors(); ++i) {
+                ES_info_length += track->descriptorAt(i)->size();
+            }
+            CHECK_LE(ES_info_length, 0xfff);
+
+            *ptr++ = 0xf0 | (ES_info_length >> 8);
+            *ptr++ = (ES_info_length & 0xff);
+
+            for (size_t i = 0; i < track->countDescriptors(); ++i) {
+                const sp<ABuffer> &descriptor = track->descriptorAt(i);
+                memcpy(ptr, descriptor->data(), descriptor->size());
+                ptr += descriptor->size();
+            }
+        }
+
+        size_t section_length = ptr - (crcDataStart + 3) + 4 /* CRC */;
+
+        crcDataStart[1] = 0xb0 | (section_length >> 8);
+        crcDataStart[2] = section_length & 0xff;
+
+        crc = htonl(crc32(crcDataStart, ptr - crcDataStart));
+        memcpy(ptr, &crc, 4);
+        ptr += 4;
+
+        sizeLeft = packetDataStart + 188 - ptr;
+        memset(ptr, 0xff, sizeLeft);
+
+        packetDataStart += 188;
+    }
+
+    if (flags & EMIT_PCR) {
+        // PCR stream
+        // 0x47
+        // transport_error_indicator = b0
+        // payload_unit_start_indicator = b1
+        // transport_priority = b0
+        // PID = kPCR_PID (13 bits)
+        // transport_scrambling_control = b00
+        // adaptation_field_control = b10 (adaptation field only, no payload)
+        // continuity_counter = b0000 (does not increment)
+        // adaptation_field_length = 183
+        // discontinuity_indicator = b0
+        // random_access_indicator = b0
+        // elementary_stream_priority_indicator = b0
+        // PCR_flag = b1
+        // OPCR_flag = b0
+        // splicing_point_flag = b0
+        // transport_private_data_flag = b0
+        // adaptation_field_extension_flag = b0
+        // program_clock_reference_base = b?????????????????????????????????
+        // reserved = b111111
+        // program_clock_reference_extension = b?????????
+
+        int64_t nowUs = ALooper::GetNowUs();
+
+        uint64_t PCR = nowUs * 27;  // PCR based on a 27MHz clock
+        uint64_t PCR_base = PCR / 300;
+        uint32_t PCR_ext = PCR % 300;
+
+        uint8_t *ptr = packetDataStart;
+        *ptr++ = 0x47;
+        *ptr++ = 0x40 | (kPID_PCR >> 8);
+        *ptr++ = kPID_PCR & 0xff;
+        *ptr++ = 0x20;
+        *ptr++ = 0xb7;  // adaptation_field_length
+        *ptr++ = 0x10;
+        *ptr++ = (PCR_base >> 25) & 0xff;
+        *ptr++ = (PCR_base >> 17) & 0xff;
+        *ptr++ = (PCR_base >> 9) & 0xff;
+        *ptr++ = ((PCR_base & 1) << 7) | 0x7e | ((PCR_ext >> 8) & 1);
+        *ptr++ = (PCR_ext & 0xff);
+
+        size_t sizeLeft = packetDataStart + 188 - ptr;
+        memset(ptr, 0xff, sizeLeft);
+
+        packetDataStart += 188;
+    }
+
+    uint64_t PTS = (timeUs * 9ll) / 100ll;
+
+    bool padding = (PES_packet_length < (188 - 10));
+
+    if (PES_packet_length >= 65536) {
+        // This really should only happen for video.
+        CHECK(track->isVideo());
+
+        // It's valid to set this to 0 for video according to the specs.
+        PES_packet_length = 0;
+    }
+
+    uint8_t *ptr = packetDataStart;
+    *ptr++ = 0x47;
+    *ptr++ = 0x40 | (track->PID() >> 8);
+    *ptr++ = track->PID() & 0xff;
+    *ptr++ = (padding ? 0x30 : 0x10) | track->incrementContinuityCounter();
+
+    if (padding) {
+        size_t paddingSize = 188 - 10 - PES_packet_length;
+        *ptr++ = paddingSize - 1;
+        if (paddingSize >= 2) {
+            *ptr++ = 0x00;
+            memset(ptr, 0xff, paddingSize - 2);
+            ptr += paddingSize - 2;
+        }
+    }
+
+    *ptr++ = 0x00;
+    *ptr++ = 0x00;
+    *ptr++ = 0x01;
+    *ptr++ = track->streamID();
+    *ptr++ = PES_packet_length >> 8;
+    *ptr++ = PES_packet_length & 0xff;
+    *ptr++ = 0x84;
+    *ptr++ = (PES_private_data_len > 0) ? 0x81 : 0x80;
+
+    size_t headerLength = 0x05 + numStuffingBytes;
+    if (PES_private_data_len > 0) {
+        headerLength += 1 + PES_private_data_len;
+    }
+
+    *ptr++ = headerLength;
+
+    *ptr++ = 0x20 | (((PTS >> 30) & 7) << 1) | 1;
+    *ptr++ = (PTS >> 22) & 0xff;
+    *ptr++ = (((PTS >> 15) & 0x7f) << 1) | 1;
+    *ptr++ = (PTS >> 7) & 0xff;
+    *ptr++ = ((PTS & 0x7f) << 1) | 1;
+
+    if (PES_private_data_len > 0) {
+        *ptr++ = 0x8e;  // PES_private_data_flag, reserved.
+        memcpy(ptr, PES_private_data, PES_private_data_len);
+        ptr += PES_private_data_len;
+    }
+
+    for (size_t i = 0; i < numStuffingBytes; ++i) {
+        *ptr++ = 0xff;
+    }
+
+    // 18 bytes of TS/PES header leave 188 - 18 = 170 bytes for the payload
+
+    size_t sizeLeft = packetDataStart + 188 - ptr;
+    size_t copy = accessUnit->size();
+    if (copy > sizeLeft) {
+        copy = sizeLeft;
+    }
+
+    memcpy(ptr, accessUnit->data(), copy);
+    ptr += copy;
+    CHECK_EQ(sizeLeft, copy);
+    memset(ptr, 0xff, sizeLeft - copy);
+
+    packetDataStart += 188;
+
+    size_t offset = copy;
+    while (offset < accessUnit->size()) {
+        bool padding = (accessUnit->size() - offset) < (188 - 4);
+
+        // for subsequent fragments of "buffer":
+        // 0x47
+        // transport_error_indicator = b0
+        // payload_unit_start_indicator = b0
+        // transport_priority = b0
+        // PID = b0 0001 1110 ???? (13 bits) [0x1e0 + 1 + sourceIndex]
+        // transport_scrambling_control = b00
+        // adaptation_field_control = b??
+        // continuity_counter = b????
+        // the fragment of "buffer" follows.
+
+        uint8_t *ptr = packetDataStart;
+        *ptr++ = 0x47;
+        *ptr++ = 0x00 | (track->PID() >> 8);
+        *ptr++ = track->PID() & 0xff;
+
+        *ptr++ = (padding ? 0x30 : 0x10) | track->incrementContinuityCounter();
+
+        if (padding) {
+            size_t paddingSize = 188 - 4 - (accessUnit->size() - offset);
+            *ptr++ = paddingSize - 1;
+            if (paddingSize >= 2) {
+                *ptr++ = 0x00;
+                memset(ptr, 0xff, paddingSize - 2);
+                ptr += paddingSize - 2;
+            }
+        }
+
+        // 4 bytes of TS header leave 188 - 4 = 184 bytes for the payload
+
+        size_t sizeLeft = packetDataStart + 188 - ptr;
+        size_t copy = accessUnit->size() - offset;
+        if (copy > sizeLeft) {
+            copy = sizeLeft;
+        }
+
+        memcpy(ptr, accessUnit->data() + offset, copy);
+        ptr += copy;
+        CHECK_EQ(sizeLeft, copy);
+        memset(ptr, 0xff, sizeLeft - copy);
+
+        offset += copy;
+        packetDataStart += 188;
+    }
+
+    CHECK(packetDataStart == buffer->data() + buffer->capacity());
+
+    *packets = buffer;
+
+    return OK;
+!!!746252.cpp!!!	prependCSD(in trackIndex : size_t, in accessUnit : sp<ABuffer>) : sp<ABuffer>
+    CHECK_LT(trackIndex, mTracks.size());
+
+    const sp<Track> &track = mTracks.itemAt(trackIndex);
+    CHECK(track->isH264() && IsIDR(accessUnit));
+
+    int64_t timeUs;
+    CHECK(accessUnit->meta()->findInt64("timeUs", &timeUs));
+
+    sp<ABuffer> accessUnit2 = track->prependCSD(accessUnit);
+
+    accessUnit2->meta()->setInt64("timeUs", timeUs);
+
+    return accessUnit2;
+!!!746508.cpp!!!	initCrcTable() : void
+    uint32_t poly = 0x04C11DB7;
+
+    for (int i = 0; i < 256; i++) {
+        uint32_t crc = i << 24;
+        for (int j = 0; j < 8; j++) {
+            crc = (crc << 1) ^ ((crc & 0x80000000) ? (poly) : 0);
+        }
+        mCrcTable[i] = crc;
+    }
+!!!746636.cpp!!!	crc32(in start : uint8_t, in size : size_t) : uint32_t
+    uint32_t crc = 0xFFFFFFFF;
+    const uint8_t *p;
+
+    for (p = start; p < start + size; ++p) {
+        crc = (crc << 8) ^ mCrcTable[((crc >> 24) ^ *p) & 0xFF];
+    }
+
+    return crc;

@@ -1,0 +1,362 @@
+class MPEG4Source
+!!!1868300.cpp!!!	MPEG4Source(in format : sp<MetaData>, in dataSource : sp<DataSource>, in timeScale : int32_t, in sampleTable : sp<SampleTable>)
+    const char *mime;
+    bool success = mFormat->findCString(kKeyMIMEType, &mime);
+    CHECK(success);
+
+    mIsAVC = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC);
+
+    if (mIsAVC) {
+        uint32_t type;
+        const void *data;
+        size_t size;
+        CHECK(format->findData(kKeyAVCC, &type, &data, &size));
+
+        const uint8_t *ptr = (const uint8_t *)data;
+
+        CHECK(size >= 7);
+        CHECK_EQ((unsigned)ptr[0], 1u);  // configurationVersion == 1
+
+        // The number of bytes used to encode the length of a NAL unit.
+        mNALLengthSize = 1 + (ptr[4] & 3);
+    }
+!!!1868428.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK(!mStarted);
+
+    int32_t val;
+    if (params && params->findInt32(kKeyWantsNALFragments, &val)
+        && val != 0) {
+        mWantsNALFragments = true;
+    } else {
+        mWantsNALFragments = false;
+    }
+
+    mGroup = new MediaBufferGroup;
+
+    int32_t max_size;
+    CHECK(mFormat->findInt32(kKeyMaxInputSize, &max_size));
+
+    mGroup->add_buffer(new MediaBuffer(max_size));
+
+    mSrcBuffer = new uint8_t[max_size];
+
+    mStarted = true;
+
+    return OK;
+!!!1868556.cpp!!!	stop() : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK(mStarted);
+
+    if (mBuffer != NULL) {
+        mBuffer->release();
+        mBuffer = NULL;
+    }
+
+    delete[] mSrcBuffer;
+    mSrcBuffer = NULL;
+
+    delete mGroup;
+    mGroup = NULL;
+
+    mStarted = false;
+    mCurrentSampleIndex = 0;
+
+    return OK;
+!!!1868684.cpp!!!	getFormat() : sp<MetaData>
+    Mutex::Autolock autoLock(mLock);
+
+    return mFormat;
+!!!1868812.cpp!!!	read(inout out : MediaBuffer, in options : ReadOptions = NULL) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK(mStarted);
+
+    *out = NULL;
+
+    int64_t targetSampleTimeUs = -1;
+
+    int64_t seekTimeUs;
+    ReadOptions::SeekMode mode;
+    if (options && options->getSeekTo(&seekTimeUs, &mode)) {
+        uint32_t findFlags = 0;
+        switch (mode) {
+            case ReadOptions::SEEK_PREVIOUS_SYNC:
+                findFlags = SampleTable::kFlagBefore;
+                break;
+            case ReadOptions::SEEK_NEXT_SYNC:
+                findFlags = SampleTable::kFlagAfter;
+                break;
+            case ReadOptions::SEEK_CLOSEST_SYNC:
+            case ReadOptions::SEEK_CLOSEST:
+                findFlags = SampleTable::kFlagClosest;
+                break;
+            default:
+                CHECK(!"Should not be here.");
+                break;
+        }
+
+        uint32_t sampleIndex;
+        status_t err = mSampleTable->findSampleAtTime(
+                seekTimeUs * mTimescale / 1000000,
+                &sampleIndex, findFlags);
+
+        if (mode == ReadOptions::SEEK_CLOSEST) {
+            // We found the closest sample already, now we want the sync
+            // sample preceding it (or the sample itself of course), even
+            // if the subsequent sync sample is closer.
+            findFlags = SampleTable::kFlagBefore;
+        }
+
+        uint32_t syncSampleIndex;
+        if (err == OK) {
+            err = mSampleTable->findSyncSampleNear(
+                    sampleIndex, &syncSampleIndex, findFlags);
+        }
+
+        uint32_t sampleTime;
+        if (err == OK) {
+            err = mSampleTable->getMetaDataForSample(
+                    sampleIndex, NULL, NULL, &sampleTime);
+        }
+
+        if (err != OK) {
+            if (err == ERROR_OUT_OF_RANGE) {
+                // An attempt to seek past the end of the stream would
+                // normally cause this ERROR_OUT_OF_RANGE error. Propagating
+                // this all the way to the MediaPlayer would cause abnormal
+                // termination. Legacy behaviour appears to be to behave as if
+                // we had seeked to the end of stream, ending normally.
+                err = ERROR_END_OF_STREAM;
+            }
+            return err;
+        }
+
+        if (mode == ReadOptions::SEEK_CLOSEST) {
+            targetSampleTimeUs = (sampleTime * 1000000ll) / mTimescale;
+        }
+
+#if 0
+        uint32_t syncSampleTime;
+        CHECK_EQ(OK, mSampleTable->getMetaDataForSample(
+                    syncSampleIndex, NULL, NULL, &syncSampleTime));
+
+        ALOGI("seek to time %lld us => sample at time %lld us, "
+             "sync sample at time %lld us",
+             seekTimeUs,
+             sampleTime * 1000000ll / mTimescale,
+             syncSampleTime * 1000000ll / mTimescale);
+#endif
+
+        mCurrentSampleIndex = syncSampleIndex;
+        if (mBuffer != NULL) {
+            mBuffer->release();
+            mBuffer = NULL;
+        }
+
+        // fall through
+    }
+
+    off64_t offset;
+    size_t size;
+    uint32_t cts;
+    bool isSyncSample;
+    bool newBuffer = false;
+    if (mBuffer == NULL) {
+        newBuffer = true;
+
+        status_t err =
+            mSampleTable->getMetaDataForSample(
+                    mCurrentSampleIndex, &offset, &size, &cts, &isSyncSample);
+
+        if (err != OK) {
+            return err;
+        }
+
+        err = mGroup->acquire_buffer(&mBuffer);
+
+        if (err != OK) {
+            CHECK(mBuffer == NULL);
+            return err;
+        }
+    }
+
+    if (!mIsAVC || mWantsNALFragments) {
+        if (newBuffer) {
+            ssize_t num_bytes_read =
+                mDataSource->readAt(offset, (uint8_t *)mBuffer->data(), size);
+
+            if (num_bytes_read < (ssize_t)size) {
+                mBuffer->release();
+                mBuffer = NULL;
+
+                return ERROR_IO;
+            }
+
+            CHECK(mBuffer != NULL);
+            mBuffer->set_range(0, size);
+            mBuffer->meta_data()->clear();
+            mBuffer->meta_data()->setInt64(
+                    kKeyTime, ((int64_t)cts * 1000000) / mTimescale);
+
+            if (targetSampleTimeUs >= 0) {
+                mBuffer->meta_data()->setInt64(
+                        kKeyTargetTime, targetSampleTimeUs);
+            }
+
+            if (isSyncSample) {
+                mBuffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+            }
+
+            ++mCurrentSampleIndex;
+        }
+
+        if (!mIsAVC) {
+            *out = mBuffer;
+            mBuffer = NULL;
+
+            return OK;
+        }
+
+        // Each NAL unit is split up into its constituent fragments and
+        // each one of them returned in its own buffer.
+
+        CHECK(mBuffer->range_length() >= mNALLengthSize);
+
+        const uint8_t *src =
+            (const uint8_t *)mBuffer->data() + mBuffer->range_offset();
+
+        size_t nal_size = parseNALSize(src);
+        if (mBuffer->range_length() < mNALLengthSize + nal_size) {
+            ALOGE("incomplete NAL unit.");
+
+            mBuffer->release();
+            mBuffer = NULL;
+
+            return ERROR_MALFORMED;
+        }
+
+        MediaBuffer *clone = mBuffer->clone();
+        CHECK(clone != NULL);
+        clone->set_range(mBuffer->range_offset() + mNALLengthSize, nal_size);
+
+        CHECK(mBuffer != NULL);
+        mBuffer->set_range(
+                mBuffer->range_offset() + mNALLengthSize + nal_size,
+                mBuffer->range_length() - mNALLengthSize - nal_size);
+
+        if (mBuffer->range_length() == 0) {
+            mBuffer->release();
+            mBuffer = NULL;
+        }
+
+        *out = clone;
+
+        return OK;
+    } else {
+        // Whole NAL units are returned but each fragment is prefixed by
+        // the start code (0x00 00 00 01).
+        ssize_t num_bytes_read = 0;
+        int32_t drm = 0;
+        bool usesDRM = (mFormat->findInt32(kKeyIsDRM, &drm) && drm != 0);
+        if (usesDRM) {
+            num_bytes_read =
+                mDataSource->readAt(offset, (uint8_t*)mBuffer->data(), size);
+        } else {
+            num_bytes_read = mDataSource->readAt(offset, mSrcBuffer, size);
+        }
+
+        if (num_bytes_read < (ssize_t)size) {
+            mBuffer->release();
+            mBuffer = NULL;
+
+            return ERROR_IO;
+        }
+
+        if (usesDRM) {
+            CHECK(mBuffer != NULL);
+            mBuffer->set_range(0, size);
+
+        } else {
+            uint8_t *dstData = (uint8_t *)mBuffer->data();
+            size_t srcOffset = 0;
+            size_t dstOffset = 0;
+
+            while (srcOffset < size) {
+                bool isMalFormed = (srcOffset + mNALLengthSize > size);
+                size_t nalLength = 0;
+                if (!isMalFormed) {
+                    nalLength = parseNALSize(&mSrcBuffer[srcOffset]);
+                    srcOffset += mNALLengthSize;
+                    isMalFormed = srcOffset + nalLength > size;
+                }
+
+                if (isMalFormed) {
+                    ALOGE("Video is malformed");
+                    mBuffer->release();
+                    mBuffer = NULL;
+                    return ERROR_MALFORMED;
+                }
+
+                if (nalLength == 0) {
+                    continue;
+                }
+
+                CHECK(dstOffset + 4 <= mBuffer->size());
+
+                dstData[dstOffset++] = 0;
+                dstData[dstOffset++] = 0;
+                dstData[dstOffset++] = 0;
+                dstData[dstOffset++] = 1;
+                memcpy(&dstData[dstOffset], &mSrcBuffer[srcOffset], nalLength);
+                srcOffset += nalLength;
+                dstOffset += nalLength;
+            }
+            CHECK_EQ(srcOffset, size);
+            CHECK(mBuffer != NULL);
+            mBuffer->set_range(0, dstOffset);
+        }
+
+        mBuffer->meta_data()->clear();
+        mBuffer->meta_data()->setInt64(
+                kKeyTime, ((int64_t)cts * 1000000) / mTimescale);
+
+        if (targetSampleTimeUs >= 0) {
+            mBuffer->meta_data()->setInt64(
+                    kKeyTargetTime, targetSampleTimeUs);
+        }
+
+        if (isSyncSample) {
+            mBuffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+        }
+
+        ++mCurrentSampleIndex;
+
+        *out = mBuffer;
+        mBuffer = NULL;
+
+        return OK;
+    }
+!!!1868940.cpp!!!	~MPEG4Source()
+    if (mStarted) {
+        stop();
+    }
+!!!1869068.cpp!!!	parseNALSize(in data : uint8_t) : size_t
+    switch (mNALLengthSize) {
+        case 1:
+            return *data;
+        case 2:
+            return U16_AT(data);
+        case 3:
+            return ((size_t)data[0] << 16) | U16_AT(&data[1]);
+        case 4:
+            return U32_AT(data);
+    }
+
+    // This cannot happen, mNALLengthSize springs to life by adding 1 to
+    // a 2-bit integer.
+    CHECK(!"Should not be here.");
+
+    return 0;

@@ -1,0 +1,113 @@
+class NetworkTimeUpdateService
+!!!8231564.java!!!	NetworkTimeUpdateService(inout context : Context)
+        mContext = context;
+        mTime = NtpTrustedTime.getInstance(context);
+        mAlarmManager = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
+        Intent pollIntent = new Intent(ACTION_POLL, null);
+        mPendingPollIntent = PendingIntent.getBroadcast(mContext, POLL_REQUEST, pollIntent, 0);
+
+        mPollingIntervalMs = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_ntpPollingInterval);
+        mPollingIntervalShorterMs = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_ntpPollingIntervalShorter);
+        mTryAgainTimesMax = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_ntpRetry);
+        mTimeErrorThresholdMs = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_ntpThreshold);
+!!!8231692.java!!!	systemReady() : void
+        registerForTelephonyIntents();
+        registerForAlarms();
+        registerForConnectivityIntents();
+
+        mThread = new HandlerThread(TAG);
+        mThread.start();
+        mHandler = new MyHandler(mThread.getLooper());
+        // Check the network time on the new thread
+        mHandler.obtainMessage(EVENT_POLL_NETWORK_TIME).sendToTarget();
+
+        mSettingsObserver = new SettingsObserver(mHandler, EVENT_AUTO_TIME_CHANGED);
+        mSettingsObserver.observe(mContext);
+!!!8231820.java!!!	registerForTelephonyIntents() : void
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(TelephonyIntents.ACTION_NETWORK_SET_TIME);
+        intentFilter.addAction(TelephonyIntents.ACTION_NETWORK_SET_TIMEZONE);
+        mContext.registerReceiver(mNitzReceiver, intentFilter);
+!!!8231948.java!!!	registerForAlarms() : void
+        mContext.registerReceiver(
+            new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    mHandler.obtainMessage(EVENT_POLL_NETWORK_TIME).sendToTarget();
+                }
+            }, new IntentFilter(ACTION_POLL));
+!!!8232076.java!!!	registerForConnectivityIntents() : void
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
+        mContext.registerReceiver(mConnectivityReceiver, intentFilter);
+!!!8232204.java!!!	onPollNetworkTime(in event : int) : void
+        // If Automatic time is not set, don't bother.
+        if (!isAutomaticTimeRequested()) return;
+
+        final long refTime = SystemClock.elapsedRealtime();
+        // If NITZ time was received less than mPollingIntervalMs time ago,
+        // no need to sync to NTP.
+        if (mNitzTimeSetTime != NOT_SET && refTime - mNitzTimeSetTime < mPollingIntervalMs) {
+            resetAlarm(mPollingIntervalMs);
+            return;
+        }
+        final long currentTime = System.currentTimeMillis();
+        if (DBG) Log.d(TAG, "System time = " + currentTime);
+        // Get the NTP time
+        if (mLastNtpFetchTime == NOT_SET || refTime >= mLastNtpFetchTime + mPollingIntervalMs
+                || event == EVENT_AUTO_TIME_CHANGED) {
+            if (DBG) Log.d(TAG, "Before Ntp fetch");
+
+            // force refresh NTP cache when outdated
+            if (mTime.getCacheAge() >= mPollingIntervalMs) {
+                mTime.forceRefresh();
+            }
+
+            // only update when NTP time is fresh
+            if (mTime.getCacheAge() < mPollingIntervalMs) {
+                final long ntp = mTime.currentTimeMillis();
+                mTryAgainCounter = 0;
+                // If the clock is more than N seconds off or this is the first time it's been
+                // fetched since boot, set the current time.
+                if (Math.abs(ntp - currentTime) > mTimeErrorThresholdMs
+                        || mLastNtpFetchTime == NOT_SET) {
+                    // Set the system time
+                    if (DBG && mLastNtpFetchTime == NOT_SET
+                            && Math.abs(ntp - currentTime) <= mTimeErrorThresholdMs) {
+                        Log.d(TAG, "For initial setup, rtc = " + currentTime);
+                    }
+                    if (DBG) Log.d(TAG, "Ntp time to be set = " + ntp);
+                    // Make sure we don't overflow, since it's going to be converted to an int
+                    if (ntp / 1000 < Integer.MAX_VALUE) {
+                        SystemClock.setCurrentTimeMillis(ntp);
+                    }
+                } else {
+                    if (DBG) Log.d(TAG, "Ntp time is close enough = " + ntp);
+                }
+                mLastNtpFetchTime = SystemClock.elapsedRealtime();
+            } else {
+                // Try again shortly
+                mTryAgainCounter++;
+                if (mTryAgainTimesMax < 0 || mTryAgainCounter <= mTryAgainTimesMax) {
+                    resetAlarm(mPollingIntervalShorterMs);
+                } else {
+                    // Try much later
+                    mTryAgainCounter = 0;
+                    resetAlarm(mPollingIntervalMs);
+                }
+                return;
+            }
+        }
+        resetAlarm(mPollingIntervalMs);
+!!!8232332.java!!!	resetAlarm(in interval : long) : void
+        mAlarmManager.cancel(mPendingPollIntent);
+        long now = SystemClock.elapsedRealtime();
+        long next = now + interval;
+        mAlarmManager.set(AlarmManager.ELAPSED_REALTIME, next, mPendingPollIntent);
+!!!8232460.java!!!	isAutomaticTimeRequested() : boolean
+        return Settings.Global.getInt(
+                mContext.getContentResolver(), Settings.Global.AUTO_TIME, 0) != 0;

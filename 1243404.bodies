@@ -1,0 +1,124 @@
+class AutoFixFilter
+!!!7075596.java!!!	AutoFixFilter(in name : String)
+        super(name);
+!!!7075724.java!!!	setupPorts() : void
+        addMaskedInputPort("image", ImageFormat.create(ImageFormat.COLORSPACE_RGBA));
+        addOutputBasedOnInput("image", "image");
+!!!7075852.java!!!	getOutputFormat(in portName : String, inout inputFormat : FrameFormat) : FrameFormat
+        return inputFormat;
+!!!7075980.java!!!	initProgram(inout context : FilterContext, in target : int) : void
+        switch (target) {
+            case FrameFormat.TARGET_GPU:
+                ShaderProgram shaderProgram = new ShaderProgram(context, mAutoFixShader);
+                shaderProgram.setMaximumTileSize(mTileSize);
+                mShaderProgram = shaderProgram;
+                break;
+
+            default:
+                throw new RuntimeException("Filter Sharpen does not support frames of " +
+                    "target " + target + "!");
+        }
+        mTarget = target;
+!!!7076108.java!!!	initParameters() : void
+        mShaderProgram.setHostValue("shift_scale", 1.0f / 256f);
+        mShaderProgram.setHostValue("hist_offset", 0.5f / 766f);
+        mShaderProgram.setHostValue("hist_scale", 765f / 766f);
+        mShaderProgram.setHostValue("density_offset", 0.5f / 1024f);
+        mShaderProgram.setHostValue("density_scale", 1023f / 1024f);
+        mShaderProgram.setHostValue("scale", mScale);
+!!!7076236.java!!!	prepare(inout context : FilterContext) : void
+        int densityDim = 1024;
+        int histDim = 255 * 3 + 1;
+        long precision = (256l * 256l - 1l);
+
+        int[] densityTable = new int[densityDim];
+        for (int i = 0; i < densityDim; ++i) {
+            long temp = normal_cdf[i] * precision / histDim;
+            densityTable[i] = (int) temp;
+        }
+
+        FrameFormat densityFormat = ImageFormat.create(densityDim, 1,
+                                                       ImageFormat.COLORSPACE_RGBA,
+                                                       FrameFormat.TARGET_GPU);
+        mDensityFrame = context.getFrameManager().newFrame(densityFormat);
+        mDensityFrame.setInts(densityTable);
+!!!7076364.java!!!	tearDown(inout context : FilterContext) : void
+        if (mDensityFrame != null) {
+            mDensityFrame.release();
+            mDensityFrame = null;
+        }
+
+        if (mHistFrame != null) {
+            mHistFrame.release();
+            mHistFrame = null;
+        }
+!!!7076492.java!!!	fieldPortValueUpdated(in name : String, inout context : FilterContext) : void
+        if (mShaderProgram != null) {
+            mShaderProgram.setHostValue("scale", mScale);
+        }
+!!!7076620.java!!!	process(inout context : FilterContext) : void
+        // Get input frame
+        Frame input = pullInput("image");
+        FrameFormat inputFormat = input.getFormat();
+
+        // Create program if not created already
+        if (mShaderProgram == null || inputFormat.getTarget() != mTarget) {
+            initProgram(context, inputFormat.getTarget());
+            initParameters();
+        }
+
+        // Check if the frame size has changed
+        if (inputFormat.getWidth() != mWidth || inputFormat.getHeight() != mHeight) {
+            mWidth = inputFormat.getWidth();
+            mHeight = inputFormat.getHeight();
+            createHistogramFrame(context, mWidth, mHeight, input.getInts());
+        }
+
+        // Create output frame
+        Frame output = context.getFrameManager().newFrame(inputFormat);
+
+        // Process
+        Frame[] inputs = {input, mHistFrame, mDensityFrame};
+        mShaderProgram.process(inputs, output);
+
+        // Push output
+        pushOutput("image", output);
+
+        // Release pushed frame
+        output.release();
+!!!7076748.java!!!	createHistogramFrame(inout context : FilterContext, in width : int, in height : int, inout data : int) : void
+        int histDims = 255 * 3 + 1;
+        int[] histArray = new int[histDims];
+
+        float border_thickness_ratio = 0.05f;
+        int y_border_thickness = (int) (height * border_thickness_ratio);
+        int x_border_thickness = (int) (width * border_thickness_ratio);
+        int pixels = (width - 2 * x_border_thickness) * (height - 2 * y_border_thickness);
+
+        float count = 0f;
+        for (int y = y_border_thickness; y < height - y_border_thickness; ++y) {
+            for (int x = x_border_thickness; x < width - x_border_thickness; ++x) {
+                int index = y * width + x;
+                int energy = (data[index] & 0xFF) + ((data[index] >> 8) & 0xFF) +
+                    ((data[index] >> 16) & 0xFF);
+                histArray[energy] ++;
+            }
+        }
+
+        for (int i = 1; i < histDims; i++) {
+            histArray[i] += histArray[i-1];
+        }
+
+        for (int i = 0; i < histDims; i++) {
+            long temp = (256 * 256 - 1l) * histArray[i] / pixels;
+            histArray[i] =  (int) temp;
+        }
+
+        FrameFormat shaderHistFormat = ImageFormat.create(histDims, 1,
+                                                          ImageFormat.COLORSPACE_RGBA,
+                                                          FrameFormat.TARGET_GPU);
+        if (mHistFrame != null)
+            mHistFrame.release();
+
+        mHistFrame = context.getFrameManager().newFrame(shaderHistFormat);
+        mHistFrame.setInts(histArray);

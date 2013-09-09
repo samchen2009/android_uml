@@ -1,0 +1,197 @@
+class RequestQueue
+!!!3751052.java!!!	RequestQueue(inout context : Context)
+        this(context, CONNECTION_COUNT);
+!!!3751180.java!!!	RequestQueue(inout context : Context, in connectionCount : int)
+        mContext = context;
+
+        mPending = new LinkedHashMap<HttpHost, LinkedList<Request>>(32);
+
+        mActivePool = new ActivePool(connectionCount);
+        mActivePool.startup();
+
+        mConnectivityManager = (ConnectivityManager)
+                context.getSystemService(Context.CONNECTIVITY_SERVICE);
+!!!3751308.java!!!	enablePlatformNotifications() : void
+        if (HttpLog.LOGV) HttpLog.v("RequestQueue.enablePlatformNotifications() network");
+
+        if (mProxyChangeReceiver == null) {
+            mProxyChangeReceiver =
+                    new BroadcastReceiver() {
+                        @Override
+                        public void onReceive(Context ctx, Intent intent) {
+                            setProxyConfig();
+                        }
+                    };
+            mContext.registerReceiver(mProxyChangeReceiver,
+                                      new IntentFilter(Proxy.PROXY_CHANGE_ACTION));
+        }
+        // we need to resample the current proxy setup
+        setProxyConfig();
+!!!3751436.java!!!	disablePlatformNotifications() : void
+        if (HttpLog.LOGV) HttpLog.v("RequestQueue.disablePlatformNotifications() network");
+
+        if (mProxyChangeReceiver != null) {
+            mContext.unregisterReceiver(mProxyChangeReceiver);
+            mProxyChangeReceiver = null;
+        }
+!!!3751564.java!!!	setProxyConfig() : void
+        NetworkInfo info = mConnectivityManager.getActiveNetworkInfo();
+        if (info != null && info.getType() == ConnectivityManager.TYPE_WIFI) {
+            mProxyHost = null;
+        } else {
+            String host = Proxy.getHost(mContext);
+            if (HttpLog.LOGV) HttpLog.v("RequestQueue.setProxyConfig " + host);
+            if (host == null) {
+                mProxyHost = null;
+            } else {
+                mActivePool.disablePersistence();
+                mProxyHost = new HttpHost(host, Proxy.getPort(mContext), "http");
+            }
+        }
+!!!3751692.java!!!	getProxyHost() : HttpHost
+        return mProxyHost;
+!!!3751820.java!!!	queueRequest(in url : String, in method : String, inout headers : Map<String, String>, inout eventHandler : EventHandler, inout bodyProvider : InputStream, in bodyLength : int) : RequestHandle
+        WebAddress uri = new WebAddress(url);
+        return queueRequest(url, uri, method, headers, eventHandler,
+                            bodyProvider, bodyLength);
+!!!3751948.java!!!	queueRequest(in url : String, inout uri : WebAddress, in method : String, inout headers : Map<String, String>, inout eventHandler : EventHandler, inout bodyProvider : InputStream, in bodyLength : int) : RequestHandle
+
+        if (HttpLog.LOGV) HttpLog.v("RequestQueue.queueRequest " + uri);
+
+        // Ensure there is an eventHandler set
+        if (eventHandler == null) {
+            eventHandler = new LoggingEventHandler();
+        }
+
+        /* Create and queue request */
+        Request req;
+        HttpHost httpHost = new HttpHost(uri.getHost(), uri.getPort(), uri.getScheme());
+
+        // set up request
+        req = new Request(method, httpHost, mProxyHost, uri.getPath(), bodyProvider,
+                          bodyLength, eventHandler, headers);
+
+        queueRequest(req, false);
+
+        mActivePool.mTotalRequest++;
+
+        // dump();
+        mActivePool.startConnectionThread();
+
+        return new RequestHandle(
+                this, url, uri, method, headers, bodyProvider, bodyLength,
+                req);
+!!!3752716.java!!!	queueSynchronousRequest(in url : String, inout uri : WebAddress, in method : String, inout headers : Map<String, String>, inout eventHandler : EventHandler, inout bodyProvider : InputStream, in bodyLength : int) : RequestHandle
+        if (HttpLog.LOGV) {
+            HttpLog.v("RequestQueue.dispatchSynchronousRequest " + uri);
+        }
+
+        HttpHost host = new HttpHost(uri.getHost(), uri.getPort(), uri.getScheme());
+
+        Request req = new Request(method, host, mProxyHost, uri.getPath(),
+                bodyProvider, bodyLength, eventHandler, headers);
+
+        // Open a new connection that uses our special RequestFeeder
+        // implementation.
+        host = determineHost(host);
+        Connection conn = Connection.getConnection(mContext, host, mProxyHost,
+                new SyncFeeder());
+
+        // TODO: I would like to process the request here but LoadListener
+        // needs a RequestHandle to process some messages.
+        return new RequestHandle(this, url, uri, method, headers, bodyProvider,
+                bodyLength, req, conn);
+
+!!!3752844.java!!!	determineHost(inout host : HttpHost) : HttpHost
+        // There used to be a comment in ConnectionThread about t-mob's proxy
+        // being really bad about https. But, HttpsConnection actually looks
+        // for a proxy and connects through it anyway. I think that this check
+        // is still valid because if a site is https, we will use
+        // HttpsConnection rather than HttpConnection if the proxy address is
+        // not secure.
+        return (mProxyHost == null || "https".equals(host.getSchemeName()))
+                ? host : mProxyHost;
+!!!3752972.java!!!	requestsPending() : boolean
+        return !mPending.isEmpty();
+!!!3753100.java!!!	dump() : void
+        HttpLog.v("dump()");
+        StringBuilder dump = new StringBuilder();
+        int count = 0;
+        Iterator<Map.Entry<HttpHost, LinkedList<Request>>> iter;
+
+        // mActivePool.log(dump);
+
+        if (!mPending.isEmpty()) {
+            iter = mPending.entrySet().iterator();
+            while (iter.hasNext()) {
+                Map.Entry<HttpHost, LinkedList<Request>> entry = iter.next();
+                String hostName = entry.getKey().getHostName();
+                StringBuilder line = new StringBuilder("p" + count++ + " " + hostName + " ");
+
+                LinkedList<Request> reqList = entry.getValue();
+                ListIterator reqIter = reqList.listIterator(0);
+                while (iter.hasNext()) {
+                    Request request = (Request)iter.next();
+                    line.append(request + " ");
+                }
+                dump.append(line);
+                dump.append("\n");
+            }
+        }
+        HttpLog.v(dump.toString());
+!!!3753228.java!!!	getRequest() : Request
+        Request ret = null;
+
+        if (!mPending.isEmpty()) {
+            ret = removeFirst(mPending);
+        }
+        if (HttpLog.LOGV) HttpLog.v("RequestQueue.getRequest() => " + ret);
+        return ret;
+!!!3753356.java!!!	getRequest(inout host : HttpHost) : Request
+        Request ret = null;
+
+        if (mPending.containsKey(host)) {
+            LinkedList<Request> reqList = mPending.get(host);
+            ret = reqList.removeFirst();
+            if (reqList.isEmpty()) {
+                mPending.remove(host);
+            }
+        }
+        if (HttpLog.LOGV) HttpLog.v("RequestQueue.getRequest(" + host + ") => " + ret);
+        return ret;
+!!!3753484.java!!!	haveRequest(inout host : HttpHost) : boolean
+        return mPending.containsKey(host);
+!!!3753612.java!!!	requeueRequest(inout request : Request) : void
+        queueRequest(request, true);
+!!!3753740.java!!!	shutdown() : void
+        mActivePool.shutdown();
+!!!3753868.java!!!	queueRequest(inout request : Request, inout head : boolean) : void
+        HttpHost host = request.mProxyHost == null ? request.mHost : request.mProxyHost;
+        LinkedList<Request> reqList;
+        if (mPending.containsKey(host)) {
+            reqList = mPending.get(host);
+        } else {
+            reqList = new LinkedList<Request>();
+            mPending.put(host, reqList);
+        }
+        if (head) {
+            reqList.addFirst(request);
+        } else {
+            reqList.add(request);
+        }
+!!!3753996.java!!!	startTiming() : void
+        mActivePool.startTiming();
+!!!3754124.java!!!	stopTiming() : void
+        mActivePool.stopTiming();
+!!!3754252.java!!!	removeFirst(inout requestQueue : LinkedHashMap<HttpHost, LinkedList<Request>>) : Request
+        Request ret = null;
+        Iterator<Map.Entry<HttpHost, LinkedList<Request>>> iter = requestQueue.entrySet().iterator();
+        if (iter.hasNext()) {
+            Map.Entry<HttpHost, LinkedList<Request>> entry = iter.next();
+            LinkedList<Request> reqList = entry.getValue();
+            ret = reqList.removeFirst();
+            if (reqList.isEmpty()) {
+                requestQueue.remove(entry.getKey());
+            }
+        }
+        return ret;

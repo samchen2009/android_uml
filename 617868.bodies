@@ -1,0 +1,538 @@
+class ACodec::BaseState
+!!!1847436.cpp!!!	getPortMode(in portIndex : OMX_U32) : PortMode
+    return KEEP_BUFFERS;
+!!!1847564.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : bool
+    switch (msg->what()) {
+        case kWhatInputBufferFilled:
+        {
+            onInputBufferFilled(msg);
+            break;
+        }
+
+        case kWhatOutputBufferDrained:
+        {
+            onOutputBufferDrained(msg);
+            break;
+        }
+
+        case ACodec::kWhatOMXMessage:
+        {
+            return onOMXMessage(msg);
+        }
+
+        default:
+            return false;
+    }
+
+    return true;
+!!!1847692.cpp!!!	onOMXEvent(in event : OMX_EVENTTYPE, in data1 : OMX_U32, in data2 : OMX_U32) : bool
+    if (event != OMX_EventError) {
+        ALOGV("[%s] EVENT(%d, 0x%08lx, 0x%08lx)",
+             mCodec->mComponentName.c_str(), event, data1, data2);
+
+        return false;
+    }
+
+    ALOGE("[%s] ERROR(0x%08lx)", mCodec->mComponentName.c_str(), data1);
+
+    mCodec->signalError((OMX_ERRORTYPE)data1);
+
+    return true;
+!!!1847820.cpp!!!	onOutputBufferDrained(in msg : sp<AMessage>) : void
+    IOMX::buffer_id bufferID;
+    CHECK(msg->findPointer("buffer-id", &bufferID));
+
+    ssize_t index;
+    BufferInfo *info =
+        mCodec->findBufferByID(kPortIndexOutput, bufferID, &index);
+    CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_DOWNSTREAM);
+
+    int32_t render;
+    if (mCodec->mNativeWindow != NULL
+            && msg->findInt32("render", &render) && render != 0) {
+        // The client wants this buffer to be rendered.
+
+        status_t err;
+        if ((err = mCodec->mNativeWindow->queueBuffer(
+                    mCodec->mNativeWindow.get(),
+                    info->mGraphicBuffer.get(), -1)) == OK) {
+            info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
+        } else {
+            mCodec->signalError(OMX_ErrorUndefined, err);
+            info->mStatus = BufferInfo::OWNED_BY_US;
+        }
+    } else {
+        info->mStatus = BufferInfo::OWNED_BY_US;
+    }
+
+    PortMode mode = getPortMode(kPortIndexOutput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+        {
+            // XXX fishy, revisit!!! What about the FREE_BUFFERS case below?
+
+            if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
+                // We cannot resubmit the buffer we just rendered, dequeue
+                // the spare instead.
+
+                info = mCodec->dequeueBufferFromNativeWindow();
+            }
+            break;
+        }
+
+        case RESUBMIT_BUFFERS:
+        {
+            if (!mCodec->mPortEOS[kPortIndexOutput]) {
+                if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
+                    // We cannot resubmit the buffer we just rendered, dequeue
+                    // the spare instead.
+
+                    info = mCodec->dequeueBufferFromNativeWindow();
+                }
+
+                if (info != NULL) {
+                    ALOGV("[%s] calling fillBuffer %p",
+                         mCodec->mComponentName.c_str(), info->mBufferID);
+
+                    CHECK_EQ(mCodec->mOMX->fillBuffer(mCodec->mNode, info->mBufferID),
+                             (status_t)OK);
+
+                    info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+                }
+            }
+            break;
+        }
+
+        default:
+        {
+            CHECK_EQ((int)mode, (int)FREE_BUFFERS);
+
+            CHECK_EQ((status_t)OK,
+                     mCodec->freeBuffer(kPortIndexOutput, index));
+            break;
+        }
+    }
+!!!1847948.cpp!!!	onInputBufferFilled(in msg : sp<AMessage>) : void
+    IOMX::buffer_id bufferID;
+    CHECK(msg->findPointer("buffer-id", &bufferID));
+
+    sp<ABuffer> buffer;
+    int32_t err = OK;
+    bool eos = false;
+
+    if (!msg->findBuffer("buffer", &buffer)) {
+        CHECK(msg->findInt32("err", &err));
+
+        ALOGV("[%s] saw error %d instead of an input buffer",
+             mCodec->mComponentName.c_str(), err);
+
+        buffer.clear();
+
+        eos = true;
+    }
+
+    int32_t tmp;
+    if (buffer != NULL && buffer->meta()->findInt32("eos", &tmp) && tmp) {
+        eos = true;
+        err = ERROR_END_OF_STREAM;
+    }
+
+    BufferInfo *info = mCodec->findBufferByID(kPortIndexInput, bufferID);
+    CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_UPSTREAM);
+
+    info->mStatus = BufferInfo::OWNED_BY_US;
+
+    PortMode mode = getPortMode(kPortIndexInput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+        {
+            if (eos) {
+                if (!mCodec->mPortEOS[kPortIndexInput]) {
+                    mCodec->mPortEOS[kPortIndexInput] = true;
+                    mCodec->mInputEOSResult = err;
+                }
+            }
+            break;
+        }
+
+        case RESUBMIT_BUFFERS:
+        {
+            if (buffer != NULL && !mCodec->mPortEOS[kPortIndexInput]) {
+                int64_t timeUs;
+                CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
+
+                OMX_U32 flags = OMX_BUFFERFLAG_ENDOFFRAME;
+
+                int32_t isCSD;
+                if (buffer->meta()->findInt32("csd", &isCSD) && isCSD != 0) {
+                    flags |= OMX_BUFFERFLAG_CODECCONFIG;
+                }
+
+                if (eos) {
+                    flags |= OMX_BUFFERFLAG_EOS;
+                }
+
+                if (buffer != info->mData) {
+                    ALOGV("[%s] Needs to copy input data for buffer %p. (%p != %p)",
+                         mCodec->mComponentName.c_str(),
+                         bufferID,
+                         buffer.get(), info->mData.get());
+
+                    CHECK_LE(buffer->size(), info->mData->capacity());
+                    memcpy(info->mData->data(), buffer->data(), buffer->size());
+                }
+
+                if (flags & OMX_BUFFERFLAG_CODECCONFIG) {
+                    ALOGV("[%s] calling emptyBuffer %p w/ codec specific data",
+                         mCodec->mComponentName.c_str(), bufferID);
+                } else if (flags & OMX_BUFFERFLAG_EOS) {
+                    ALOGV("[%s] calling emptyBuffer %p w/ EOS",
+                         mCodec->mComponentName.c_str(), bufferID);
+                } else {
+#if TRACK_BUFFER_TIMING
+                    ALOGI("[%s] calling emptyBuffer %p w/ time %lld us",
+                         mCodec->mComponentName.c_str(), bufferID, timeUs);
+#else
+                    ALOGV("[%s] calling emptyBuffer %p w/ time %lld us",
+                         mCodec->mComponentName.c_str(), bufferID, timeUs);
+#endif
+                }
+
+#if TRACK_BUFFER_TIMING
+                ACodec::BufferStats stats;
+                stats.mEmptyBufferTimeUs = ALooper::GetNowUs();
+                stats.mFillBufferDoneTimeUs = -1ll;
+                mCodec->mBufferStats.add(timeUs, stats);
+#endif
+
+                CHECK_EQ(mCodec->mOMX->emptyBuffer(
+                            mCodec->mNode,
+                            bufferID,
+                            0,
+                            buffer->size(),
+                            flags,
+                            timeUs),
+                         (status_t)OK);
+
+                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+
+                if (!eos) {
+                    getMoreInputDataIfPossible();
+                } else {
+                    ALOGV("[%s] Signalled EOS on the input port",
+                         mCodec->mComponentName.c_str());
+
+                    mCodec->mPortEOS[kPortIndexInput] = true;
+                    mCodec->mInputEOSResult = err;
+                }
+            } else if (!mCodec->mPortEOS[kPortIndexInput]) {
+                if (err != ERROR_END_OF_STREAM) {
+                    ALOGV("[%s] Signalling EOS on the input port "
+                         "due to error %d",
+                         mCodec->mComponentName.c_str(), err);
+                } else {
+                    ALOGV("[%s] Signalling EOS on the input port",
+                         mCodec->mComponentName.c_str());
+                }
+
+                ALOGV("[%s] calling emptyBuffer %p signalling EOS",
+                     mCodec->mComponentName.c_str(), bufferID);
+
+                CHECK_EQ(mCodec->mOMX->emptyBuffer(
+                            mCodec->mNode,
+                            bufferID,
+                            0,
+                            0,
+                            OMX_BUFFERFLAG_EOS,
+                            0),
+                         (status_t)OK);
+
+                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+
+                mCodec->mPortEOS[kPortIndexInput] = true;
+                mCodec->mInputEOSResult = err;
+            }
+            break;
+
+            default:
+                CHECK_EQ((int)mode, (int)FREE_BUFFERS);
+                break;
+        }
+    }
+!!!1848076.cpp!!!	postFillThisBuffer(inout info : BufferInfo) : void
+    if (mCodec->mPortEOS[kPortIndexInput]) {
+        return;
+    }
+
+    CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_US);
+
+    sp<AMessage> notify = mCodec->mNotify->dup();
+    notify->setInt32("what", ACodec::kWhatFillThisBuffer);
+    notify->setPointer("buffer-id", info->mBufferID);
+
+    info->mData->meta()->clear();
+    notify->setBuffer("buffer", info->mData);
+
+    sp<AMessage> reply = new AMessage(kWhatInputBufferFilled, mCodec->id());
+    reply->setPointer("buffer-id", info->mBufferID);
+
+    notify->setMessage("reply", reply);
+
+    notify->post();
+
+    info->mStatus = BufferInfo::OWNED_BY_UPSTREAM;
+!!!1848204.cpp!!!	onOMXMessage(in msg : sp<AMessage>) : bool
+    int32_t type;
+    CHECK(msg->findInt32("type", &type));
+
+    IOMX::node_id nodeID;
+    CHECK(msg->findPointer("node", &nodeID));
+    CHECK_EQ(nodeID, mCodec->mNode);
+
+    switch (type) {
+        case omx_message::EVENT:
+        {
+            int32_t event, data1, data2;
+            CHECK(msg->findInt32("event", &event));
+            CHECK(msg->findInt32("data1", &data1));
+            CHECK(msg->findInt32("data2", &data2));
+
+            if (event == OMX_EventCmdComplete
+                    && data1 == OMX_CommandFlush
+                    && data2 == (int32_t)OMX_ALL) {
+                // Use of this notification is not consistent across
+                // implementations. We'll drop this notification and rely
+                // on flush-complete notifications on the individual port
+                // indices instead.
+
+                return true;
+            }
+
+            return onOMXEvent(
+                    static_cast<OMX_EVENTTYPE>(event),
+                    static_cast<OMX_U32>(data1),
+                    static_cast<OMX_U32>(data2));
+        }
+
+        case omx_message::EMPTY_BUFFER_DONE:
+        {
+            IOMX::buffer_id bufferID;
+            CHECK(msg->findPointer("buffer", &bufferID));
+
+            return onOMXEmptyBufferDone(bufferID);
+        }
+
+        case omx_message::FILL_BUFFER_DONE:
+        {
+            IOMX::buffer_id bufferID;
+            CHECK(msg->findPointer("buffer", &bufferID));
+
+            int32_t rangeOffset, rangeLength, flags;
+            int64_t timeUs;
+            void *platformPrivate;
+            void *dataPtr;
+
+            CHECK(msg->findInt32("range_offset", &rangeOffset));
+            CHECK(msg->findInt32("range_length", &rangeLength));
+            CHECK(msg->findInt32("flags", &flags));
+            CHECK(msg->findInt64("timestamp", &timeUs));
+            CHECK(msg->findPointer("platform_private", &platformPrivate));
+            CHECK(msg->findPointer("data_ptr", &dataPtr));
+
+            return onOMXFillBufferDone(
+                    bufferID,
+                    (size_t)rangeOffset, (size_t)rangeLength,
+                    (OMX_U32)flags,
+                    timeUs,
+                    platformPrivate,
+                    dataPtr);
+        }
+
+        default:
+            TRESPASS();
+            break;
+    }
+!!!1848332.cpp!!!	onOMXEmptyBufferDone(in bufferID : buffer_id) : bool
+    ALOGV("[%s] onOMXEmptyBufferDone %p",
+         mCodec->mComponentName.c_str(), bufferID);
+
+    BufferInfo *info =
+        mCodec->findBufferByID(kPortIndexInput, bufferID);
+
+    CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_COMPONENT);
+    info->mStatus = BufferInfo::OWNED_BY_US;
+
+    const sp<AMessage> &bufferMeta = info->mData->meta();
+    void *mediaBuffer;
+    if (bufferMeta->findPointer("mediaBuffer", &mediaBuffer)
+            && mediaBuffer != NULL) {
+        // We're in "store-metadata-in-buffers" mode, the underlying
+        // OMX component had access to data that's implicitly refcounted
+        // by this "mediaBuffer" object. Now that the OMX component has
+        // told us that it's done with the input buffer, we can decrement
+        // the mediaBuffer's reference count.
+
+        ALOGV("releasing mbuf %p", mediaBuffer);
+
+        ((MediaBuffer *)mediaBuffer)->release();
+        mediaBuffer = NULL;
+
+        bufferMeta->setPointer("mediaBuffer", NULL);
+    }
+
+    PortMode mode = getPortMode(kPortIndexInput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+            break;
+
+        case RESUBMIT_BUFFERS:
+            postFillThisBuffer(info);
+            break;
+
+        default:
+        {
+            CHECK_EQ((int)mode, (int)FREE_BUFFERS);
+            TRESPASS();  // Not currently used
+            break;
+        }
+    }
+
+    return true;
+!!!1848460.cpp!!!	onOMXFillBufferDone(in bufferID : buffer_id, in rangeOffset : size_t, in rangeLength : size_t, in flags : OMX_U32, in timeUs : int64_t, inout platformPrivate : void, inout dataPtr : void) : bool
+    ALOGV("[%s] onOMXFillBufferDone %p time %lld us, flags = 0x%08lx",
+         mCodec->mComponentName.c_str(), bufferID, timeUs, flags);
+
+    ssize_t index;
+
+#if TRACK_BUFFER_TIMING
+    index = mCodec->mBufferStats.indexOfKey(timeUs);
+    if (index >= 0) {
+        ACodec::BufferStats *stats = &mCodec->mBufferStats.editValueAt(index);
+        stats->mFillBufferDoneTimeUs = ALooper::GetNowUs();
+
+        ALOGI("frame PTS %lld: %lld",
+                timeUs,
+                stats->mFillBufferDoneTimeUs - stats->mEmptyBufferTimeUs);
+
+        mCodec->mBufferStats.removeItemsAt(index);
+        stats = NULL;
+    }
+#endif
+
+    BufferInfo *info =
+        mCodec->findBufferByID(kPortIndexOutput, bufferID, &index);
+
+    CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_COMPONENT);
+
+    info->mStatus = BufferInfo::OWNED_BY_US;
+
+    PortMode mode = getPortMode(kPortIndexOutput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+            break;
+
+        case RESUBMIT_BUFFERS:
+        {
+            if (rangeLength == 0 && !(flags & OMX_BUFFERFLAG_EOS)) {
+                ALOGV("[%s] calling fillBuffer %p",
+                     mCodec->mComponentName.c_str(), info->mBufferID);
+
+                CHECK_EQ(mCodec->mOMX->fillBuffer(
+                            mCodec->mNode, info->mBufferID),
+                         (status_t)OK);
+
+                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+                break;
+            }
+
+            if (!mCodec->mIsEncoder && !mCodec->mSentFormat) {
+                mCodec->sendFormatChange();
+            }
+
+            if (mCodec->mNativeWindow == NULL) {
+                info->mData->setRange(rangeOffset, rangeLength);
+
+#if 0
+                if (IsIDR(info->mData)) {
+                    ALOGI("IDR frame");
+                }
+#endif
+            }
+
+            if (mCodec->mSkipCutBuffer != NULL) {
+                mCodec->mSkipCutBuffer->submit(info->mData);
+            }
+            info->mData->meta()->setInt64("timeUs", timeUs);
+
+            sp<AMessage> notify = mCodec->mNotify->dup();
+            notify->setInt32("what", ACodec::kWhatDrainThisBuffer);
+            notify->setPointer("buffer-id", info->mBufferID);
+            notify->setBuffer("buffer", info->mData);
+            notify->setInt32("flags", flags);
+
+            sp<AMessage> reply =
+                new AMessage(kWhatOutputBufferDrained, mCodec->id());
+
+            reply->setPointer("buffer-id", info->mBufferID);
+
+            notify->setMessage("reply", reply);
+
+            notify->post();
+
+            info->mStatus = BufferInfo::OWNED_BY_DOWNSTREAM;
+
+            if (flags & OMX_BUFFERFLAG_EOS) {
+                ALOGV("[%s] saw output EOS", mCodec->mComponentName.c_str());
+
+                sp<AMessage> notify = mCodec->mNotify->dup();
+                notify->setInt32("what", ACodec::kWhatEOS);
+                notify->setInt32("err", mCodec->mInputEOSResult);
+                notify->post();
+
+                mCodec->mPortEOS[kPortIndexOutput] = true;
+            }
+            break;
+        }
+
+        default:
+        {
+            CHECK_EQ((int)mode, (int)FREE_BUFFERS);
+
+            CHECK_EQ((status_t)OK,
+                     mCodec->freeBuffer(kPortIndexOutput, index));
+            break;
+        }
+    }
+
+    return true;
+!!!1848588.cpp!!!	getMoreInputDataIfPossible() : void
+    if (mCodec->mPortEOS[kPortIndexInput]) {
+        return;
+    }
+
+    BufferInfo *eligible = NULL;
+
+    for (size_t i = 0; i < mCodec->mBuffers[kPortIndexInput].size(); ++i) {
+        BufferInfo *info = &mCodec->mBuffers[kPortIndexInput].editItemAt(i);
+
+#if 0
+        if (info->mStatus == BufferInfo::OWNED_BY_UPSTREAM) {
+            // There's already a "read" pending.
+            return;
+        }
+#endif
+
+        if (info->mStatus == BufferInfo::OWNED_BY_US) {
+            eligible = info;
+        }
+    }
+
+    if (eligible == NULL) {
+        return;
+    }
+
+    postFillThisBuffer(eligible);

@@ -1,0 +1,469 @@
+class StrictMode
+!!!3928716.java!!!	setThreadPolicy(in policy : ThreadPolicy) : void
+        setThreadPolicyMask(policy.mask);
+!!!3928844.java!!!	setThreadPolicyMask(in policyMask : int) : void
+        // In addition to the Java-level thread-local in Dalvik's
+        // BlockGuard, we also need to keep a native thread-local in
+        // Binder in order to propagate the value across Binder calls,
+        // even across native-only processes.  The two are kept in
+        // sync via the callback to onStrictModePolicyChange, below.
+        setBlockGuardPolicy(policyMask);
+
+        // And set the Android native version...
+        Binder.setThreadStrictModePolicy(policyMask);
+!!!3928972.java!!!	setBlockGuardPolicy(in policyMask : int) : void
+        if (policyMask == 0) {
+            BlockGuard.setThreadPolicy(BlockGuard.LAX_POLICY);
+            return;
+        }
+        BlockGuard.Policy policy = BlockGuard.getThreadPolicy();
+        if (!(policy instanceof AndroidBlockGuardPolicy)) {
+            BlockGuard.setThreadPolicy(new AndroidBlockGuardPolicy(policyMask));
+        } else {
+            AndroidBlockGuardPolicy androidPolicy = (AndroidBlockGuardPolicy) policy;
+            androidPolicy.setPolicyMask(policyMask);
+        }
+!!!3929100.java!!!	setCloseGuardEnabled(inout enabled : boolean) : void
+        if (!(CloseGuard.getReporter() instanceof AndroidCloseGuardReporter)) {
+            CloseGuard.setReporter(new AndroidCloseGuardReporter());
+        }
+        CloseGuard.setEnabled(enabled);
+!!!3929868.java!!!	getThreadPolicyMask() : int
+        return BlockGuard.getThreadPolicy().getPolicyMask();
+!!!3929996.java!!!	getThreadPolicy() : ThreadPolicy
+        // TODO: this was a last minute Gingerbread API change (to
+        // introduce VmPolicy cleanly) but this isn't particularly
+        // optimal for users who might call this method often.  This
+        // should be in a thread-local and not allocate on each call.
+        return new ThreadPolicy(getThreadPolicyMask());
+!!!3930124.java!!!	allowThreadDiskWrites() : ThreadPolicy
+        int oldPolicyMask = getThreadPolicyMask();
+        int newPolicyMask = oldPolicyMask & ~(DETECT_DISK_WRITE | DETECT_DISK_READ);
+        if (newPolicyMask != oldPolicyMask) {
+            setThreadPolicyMask(newPolicyMask);
+        }
+        return new ThreadPolicy(oldPolicyMask);
+!!!3930252.java!!!	allowThreadDiskReads() : ThreadPolicy
+        int oldPolicyMask = getThreadPolicyMask();
+        int newPolicyMask = oldPolicyMask & ~(DETECT_DISK_READ);
+        if (newPolicyMask != oldPolicyMask) {
+            setThreadPolicyMask(newPolicyMask);
+        }
+        return new ThreadPolicy(oldPolicyMask);
+!!!3930380.java!!!	amTheSystemServerProcess() : boolean
+        // Fast path.  Most apps don't have the system server's UID.
+        if (Process.myUid() != Process.SYSTEM_UID) {
+            return false;
+        }
+
+        // The settings app, though, has the system server's UID so
+        // look up our stack to see if we came from the system server.
+        Throwable stack = new Throwable();
+        stack.fillInStackTrace();
+        for (StackTraceElement ste : stack.getStackTrace()) {
+            String clsName = ste.getClassName();
+            if (clsName != null && clsName.startsWith("com.android.server.")) {
+                return true;
+            }
+        }
+        return false;
+!!!3930508.java!!!	conditionallyEnableDebugLogging() : boolean
+        boolean doFlashes = SystemProperties.getBoolean(VISUAL_PROPERTY, false)
+                && !amTheSystemServerProcess();
+        final boolean suppress = SystemProperties.getBoolean(DISABLE_PROPERTY, false);
+
+        // For debug builds, log event loop stalls to dropbox for analysis.
+        // Similar logic also appears in ActivityThread.java for system apps.
+        if (!doFlashes && (IS_USER_BUILD || suppress)) {
+            setCloseGuardEnabled(false);
+            return false;
+        }
+
+        // Eng builds have flashes on all the time.  The suppression property
+        // overrides this, so we force the behavior only after the short-circuit
+        // check above.
+        if (IS_ENG_BUILD) {
+            doFlashes = true;
+        }
+
+        // Thread policy controls BlockGuard.
+        int threadPolicyMask = StrictMode.DETECT_DISK_WRITE |
+                StrictMode.DETECT_DISK_READ |
+                StrictMode.DETECT_NETWORK;
+
+        if (!IS_USER_BUILD) {
+            threadPolicyMask |= StrictMode.PENALTY_DROPBOX;
+        }
+        if (doFlashes) {
+            threadPolicyMask |= StrictMode.PENALTY_FLASH;
+        }
+
+        StrictMode.setThreadPolicyMask(threadPolicyMask);
+
+        // VM Policy controls CloseGuard, detection of Activity leaks,
+        // and instance counting.
+        if (IS_USER_BUILD) {
+            setCloseGuardEnabled(false);
+        } else {
+            VmPolicy.Builder policyBuilder = new VmPolicy.Builder().detectAll().penaltyDropBox();
+            if (IS_ENG_BUILD) {
+                policyBuilder.penaltyLog();
+            }
+            setVmPolicy(policyBuilder.build());
+            setCloseGuardEnabled(vmClosableObjectLeaksEnabled());
+        }
+        return true;
+!!!3930636.java!!!	enableDeathOnNetwork() : void
+        int oldPolicy = getThreadPolicyMask();
+        int newPolicy = oldPolicy | DETECT_NETWORK | PENALTY_DEATH_ON_NETWORK;
+        setThreadPolicyMask(newPolicy);
+!!!3930764.java!!!	parsePolicyFromMessage(in message : String) : int
+        if (message == null || !message.startsWith("policy=")) {
+            return 0;
+        }
+        int spaceIndex = message.indexOf(' ');
+        if (spaceIndex == -1) {
+            return 0;
+        }
+        String policyString = message.substring(7, spaceIndex);
+        try {
+            return Integer.valueOf(policyString).intValue();
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+!!!3930892.java!!!	parseViolationFromMessage(in message : String) : int
+        if (message == null) {
+            return 0;
+        }
+        int violationIndex = message.indexOf("violation=");
+        if (violationIndex == -1) {
+            return 0;
+        }
+        int numberStartIndex = violationIndex + "violation=".length();
+        int numberEndIndex = message.indexOf(' ', numberStartIndex);
+        if (numberEndIndex == -1) {
+            numberEndIndex = message.length();
+        }
+        String violationString = message.substring(numberStartIndex, numberEndIndex);
+        try {
+            return Integer.valueOf(violationString).intValue();
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+!!!3931020.java!!!	tooManyViolationsThisLoop() : boolean
+        return violationsBeingTimed.get().size() >= MAX_OFFENSES_PER_LOOP;
+!!!3932556.java!!!	executeDeathPenalty(inout info : ViolationInfo) : void
+        int violationBit = parseViolationFromMessage(info.crashInfo.exceptionMessage);
+        throw new StrictModeViolation(info.policy, violationBit, null);
+!!!3932684.java!!!	dropboxViolationAsync(in violationMaskSubset : int, in info : ViolationInfo) : void
+        int outstanding = sDropboxCallsInFlight.incrementAndGet();
+        if (outstanding > 20) {
+            // What's going on?  Let's not make make the situation
+            // worse and just not log.
+            sDropboxCallsInFlight.decrementAndGet();
+            return;
+        }
+
+        if (LOG_V) Log.d(TAG, "Dropboxing async; in-flight=" + outstanding);
+
+        new Thread("callActivityManagerForStrictModeDropbox") {
+            public void run() {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                try {
+                    IActivityManager am = ActivityManagerNative.getDefault();
+                    if (am == null) {
+                        Log.d(TAG, "No activity manager; failed to Dropbox violation.");
+                    } else {
+                        am.handleApplicationStrictModeViolation(
+                            RuntimeInit.getApplicationObject(),
+                            violationMaskSubset,
+                            info);
+                    }
+                } catch (RemoteException e) {
+                    Log.e(TAG, "RemoteException handling StrictMode violation", e);
+                }
+                int outstanding = sDropboxCallsInFlight.decrementAndGet();
+                if (LOG_V) Log.d(TAG, "Dropbox complete; in-flight=" + outstanding);
+            }
+        }.start();
+!!!3932940.java!!!	hasGatheredViolations() : boolean
+        return gatheredViolations.get() != null;
+!!!3933068.java!!!	clearGatheredViolations() : void
+        gatheredViolations.set(null);
+!!!3933196.java!!!	conditionallyCheckInstanceCounts() : void
+        VmPolicy policy = getVmPolicy();
+        if (policy.classInstanceLimit.size() == 0) {
+            return;
+        }
+        Runtime.getRuntime().gc();
+        // Note: classInstanceLimit is immutable, so this is lock-free
+        for (Map.Entry<Class, Integer> entry : policy.classInstanceLimit.entrySet()) {
+            Class klass = entry.getKey();
+            int limit = entry.getValue();
+            long instances = VMDebug.countInstancesOfClass(klass, false);
+            if (instances <= limit) {
+                continue;
+            }
+            Throwable tr = new InstanceCountViolation(klass, instances, limit);
+            onVmPolicyViolation(tr.getMessage(), tr);
+        }
+!!!3933324.java!!!	setVmPolicy(in policy : VmPolicy) : void
+        synchronized (StrictMode.class) {
+            sVmPolicy = policy;
+            sVmPolicyMask = policy.mask;
+            setCloseGuardEnabled(vmClosableObjectLeaksEnabled());
+
+            Looper looper = Looper.getMainLooper();
+            if (looper != null) {
+                MessageQueue mq = looper.mQueue;
+                if (policy.classInstanceLimit.size() == 0 ||
+                    (sVmPolicyMask & VM_PENALTY_MASK) == 0) {
+                    mq.removeIdleHandler(sProcessIdleHandler);
+                    sIsIdlerRegistered = false;
+                } else if (!sIsIdlerRegistered) {
+                    mq.addIdleHandler(sProcessIdleHandler);
+                    sIsIdlerRegistered = true;
+                }
+            }
+        }
+!!!3933452.java!!!	getVmPolicy() : VmPolicy
+        synchronized (StrictMode.class) {
+            return sVmPolicy;
+        }
+!!!3933580.java!!!	enableDefaults() : void
+        StrictMode.setThreadPolicy(new StrictMode.ThreadPolicy.Builder()
+                                   .detectAll()
+                                   .penaltyLog()
+                                   .build());
+        StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder()
+                               .detectAll()
+                               .penaltyLog()
+                               .build());
+!!!3933708.java!!!	vmSqliteObjectLeaksEnabled() : boolean
+        return (sVmPolicyMask & DETECT_VM_CURSOR_LEAKS) != 0;
+!!!3933836.java!!!	vmClosableObjectLeaksEnabled() : boolean
+        return (sVmPolicyMask & DETECT_VM_CLOSABLE_LEAKS) != 0;
+!!!3933964.java!!!	vmRegistrationLeaksEnabled() : boolean
+        return (sVmPolicyMask & DETECT_VM_REGISTRATION_LEAKS) != 0;
+!!!3934092.java!!!	onSqliteObjectLeaked(in message : String, inout originStack : Throwable) : void
+        onVmPolicyViolation(message, originStack);
+!!!3934220.java!!!	onWebViewMethodCalledOnWrongThread(inout originStack : Throwable) : void
+        onVmPolicyViolation(null, originStack);
+!!!3934348.java!!!	onIntentReceiverLeaked(inout originStack : Throwable) : void
+        onVmPolicyViolation(null, originStack);
+!!!3934476.java!!!	onServiceConnectionLeaked(inout originStack : Throwable) : void
+        onVmPolicyViolation(null, originStack);
+!!!3934604.java!!!	onVmPolicyViolation(in message : String, inout originStack : Throwable) : void
+        final boolean penaltyDropbox = (sVmPolicyMask & PENALTY_DROPBOX) != 0;
+        final boolean penaltyDeath = (sVmPolicyMask & PENALTY_DEATH) != 0;
+        final boolean penaltyLog = (sVmPolicyMask & PENALTY_LOG) != 0;
+        final ViolationInfo info = new ViolationInfo(originStack, sVmPolicyMask);
+
+        // Erase stuff not relevant for process-wide violations
+        info.numAnimationsRunning = 0;
+        info.tags = null;
+        info.broadcastIntentAction = null;
+
+        final Integer fingerprint = info.hashCode();
+        final long now = SystemClock.uptimeMillis();
+        long lastViolationTime = 0;
+        long timeSinceLastViolationMillis = Long.MAX_VALUE;
+        synchronized (sLastVmViolationTime) {
+            if (sLastVmViolationTime.containsKey(fingerprint)) {
+                lastViolationTime = sLastVmViolationTime.get(fingerprint);
+                timeSinceLastViolationMillis = now - lastViolationTime;
+            }
+            if (timeSinceLastViolationMillis > MIN_LOG_INTERVAL_MS) {
+                sLastVmViolationTime.put(fingerprint, now);
+            }
+        }
+
+        if (penaltyLog && timeSinceLastViolationMillis > MIN_LOG_INTERVAL_MS) {
+            Log.e(TAG, message, originStack);
+        }
+
+        int violationMaskSubset = PENALTY_DROPBOX | (ALL_VM_DETECT_BITS & sVmPolicyMask);
+
+        if (penaltyDropbox && !penaltyDeath) {
+            // Common case for userdebug/eng builds.  If no death and
+            // just dropboxing, we can do the ActivityManager call
+            // asynchronously.
+            dropboxViolationAsync(violationMaskSubset, info);
+            return;
+        }
+
+        if (penaltyDropbox && lastViolationTime == 0) {
+            // The violationMask, passed to ActivityManager, is a
+            // subset of the original StrictMode policy bitmask, with
+            // only the bit violated and penalty bits to be executed
+            // by the ActivityManagerService remaining set.
+            final int savedPolicyMask = getThreadPolicyMask();
+            try {
+                // First, remove any policy before we call into the Activity Manager,
+                // otherwise we'll infinite recurse as we try to log policy violations
+                // to disk, thus violating policy, thus requiring logging, etc...
+                // We restore the current policy below, in the finally block.
+                setThreadPolicyMask(0);
+
+                ActivityManagerNative.getDefault().handleApplicationStrictModeViolation(
+                    RuntimeInit.getApplicationObject(),
+                    violationMaskSubset,
+                    info);
+            } catch (RemoteException e) {
+                Log.e(TAG, "RemoteException trying to handle StrictMode violation", e);
+            } finally {
+                // Restore the policy.
+                setThreadPolicyMask(savedPolicyMask);
+            }
+        }
+
+        if (penaltyDeath) {
+            System.err.println("StrictMode VmPolicy violation with POLICY_DEATH; shutting down.");
+            Process.killProcess(Process.myPid());
+            System.exit(10);
+        }
+!!!3934732.java!!!	writeGatheredViolationsToParcel(inout p : Parcel) : void
+        ArrayList<ViolationInfo> violations = gatheredViolations.get();
+        if (violations == null) {
+            p.writeInt(0);
+        } else {
+            p.writeInt(violations.size());
+            for (int i = 0; i < violations.size(); ++i) {
+                violations.get(i).writeToParcel(p, 0 /* unused flags? */);
+            }
+            if (LOG_V) Log.d(TAG, "wrote violations to response parcel; num=" + violations.size());
+            violations.clear(); // somewhat redundant, as we're about to null the threadlocal
+        }
+        gatheredViolations.set(null);
+!!!3934860.java!!!	readAndHandleBinderCallViolations(inout p : Parcel) : void
+        // Our own stack trace to append
+        StringWriter sw = new StringWriter();
+        new LogStackTrace().printStackTrace(new PrintWriter(sw));
+        String ourStack = sw.toString();
+
+        int policyMask = getThreadPolicyMask();
+        boolean currentlyGathering = (policyMask & PENALTY_GATHER) != 0;
+
+        int numViolations = p.readInt();
+        for (int i = 0; i < numViolations; ++i) {
+            if (LOG_V) Log.d(TAG, "strict mode violation stacks read from binder call.  i=" + i);
+            ViolationInfo info = new ViolationInfo(p, !currentlyGathering);
+            info.crashInfo.stackTrace += "# via Binder call with stack:\n" + ourStack;
+            BlockGuard.Policy policy = BlockGuard.getThreadPolicy();
+            if (policy instanceof AndroidBlockGuardPolicy) {
+                ((AndroidBlockGuardPolicy) policy).handleViolationWithTimingAttempt(info);
+            }
+        }
+!!!3934988.java!!!	onBinderStrictModePolicyChange(in newPolicy : int) : void
+        setBlockGuardPolicy(newPolicy);
+!!!3935500.java!!!	enterCriticalSpan(in name : String) : Span
+        if (IS_USER_BUILD) {
+            return NO_OP_SPAN;
+        }
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("name must be non-null and non-empty");
+        }
+        ThreadSpanState state = sThisThreadSpanState.get();
+        Span span = null;
+        synchronized (state) {
+            if (state.mFreeListHead != null) {
+                span = state.mFreeListHead;
+                state.mFreeListHead = span.mNext;
+                state.mFreeListSize--;
+            } else {
+                // Shouldn't have to do this often.
+                span = new Span(state);
+            }
+            span.mName = name;
+            span.mCreateMillis = SystemClock.uptimeMillis();
+            span.mNext = state.mActiveHead;
+            span.mPrev = null;
+            state.mActiveHead = span;
+            state.mActiveSize++;
+            if (span.mNext != null) {
+                span.mNext.mPrev = span;
+            }
+            if (LOG_V) Log.d(TAG, "Span enter=" + name + "; size=" + state.mActiveSize);
+        }
+        return span;
+!!!3935628.java!!!	noteSlowCall(in name : String) : void
+        BlockGuard.Policy policy = BlockGuard.getThreadPolicy();
+        if (!(policy instanceof AndroidBlockGuardPolicy)) {
+            // StrictMode not enabled.
+            return;
+        }
+        ((AndroidBlockGuardPolicy) policy).onCustomSlowCall(name);
+!!!3935756.java!!!	noteDiskRead() : void
+        BlockGuard.Policy policy = BlockGuard.getThreadPolicy();
+        if (!(policy instanceof AndroidBlockGuardPolicy)) {
+            // StrictMode not enabled.
+            return;
+        }
+        ((AndroidBlockGuardPolicy) policy).onReadFromDisk();
+!!!3935884.java!!!	noteDiskWrite() : void
+        BlockGuard.Policy policy = BlockGuard.getThreadPolicy();
+        if (!(policy instanceof AndroidBlockGuardPolicy)) {
+            // StrictMode not enabled.
+            return;
+        }
+        ((AndroidBlockGuardPolicy) policy).onWriteToDisk();
+!!!3936012.java!!!	trackActivity(inout instance : Object) : Object
+        return new InstanceTracker(instance);
+!!!3936140.java!!!	incrementExpectedActivityCount(inout klass : Class) : void
+        if (klass == null) {
+            return;
+        }
+
+        synchronized (StrictMode.class) {
+            if ((sVmPolicy.mask & DETECT_VM_ACTIVITY_LEAKS) == 0) {
+                return;
+            }
+
+            Integer expected = sExpectedActivityInstanceCount.get(klass);
+            Integer newExpected = expected == null ? 1 : expected + 1;
+            sExpectedActivityInstanceCount.put(klass, newExpected);
+        }
+!!!3936268.java!!!	decrementExpectedActivityCount(inout klass : Class) : void
+        if (klass == null) {
+            return;
+        }
+
+        final int limit;
+        synchronized (StrictMode.class) {
+            if ((sVmPolicy.mask & DETECT_VM_ACTIVITY_LEAKS) == 0) {
+                return;
+            }
+
+            Integer expected = sExpectedActivityInstanceCount.get(klass);
+            int newExpected = (expected == null || expected == 0) ? 0 : expected - 1;
+            if (newExpected == 0) {
+                sExpectedActivityInstanceCount.remove(klass);
+            } else {
+                sExpectedActivityInstanceCount.put(klass, newExpected);
+            }
+
+            // Note: adding 1 here to give some breathing room during
+            // orientation changes.  (shouldn't be necessary, though?)
+            limit = newExpected + 1;
+        }
+
+        // Quick check.
+        int actual = InstanceTracker.getInstanceCount(klass);
+        if (actual <= limit) {
+            return;
+        }
+
+        // Do a GC and explicit count to double-check.
+        // This is the work that we are trying to avoid by tracking the object instances
+        // explicity.  Running an explicit GC can be expensive (80ms) and so can walking
+        // the heap to count instance (30ms).  This extra work can make the system feel
+        // noticeably less responsive during orientation changes when activities are
+        // being restarted.  Granted, it is only a problem when StrictMode is enabled
+        // but it is annoying.
+        Runtime.getRuntime().gc();
+
+        long instances = VMDebug.countInstancesOfClass(klass, false);
+        if (instances > limit) {
+            Throwable tr = new InstanceCountViolation(klass, instances, limit);
+            onVmPolicyViolation(tr.getMessage(), tr);
+        }

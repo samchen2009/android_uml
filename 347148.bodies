@@ -1,0 +1,120 @@
+class LiveDataSource
+!!!591628.cpp!!!	LiveDataSource()
+#if SAVE_BACKUP
+    mBackupFile = fopen("/data/misc/backup.ts", "wb");
+    CHECK(mBackupFile != NULL);
+#endif
+!!!591756.cpp!!!	initCheck() : status_t
+    return OK;
+!!!591884.cpp!!!	readAt(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    Mutex::Autolock autoLock(mLock);
+    return readAt_l(offset, data, size);
+!!!592012.cpp!!!	readAtNonBlocking(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    Mutex::Autolock autoLock(mLock);
+
+    if (offset != mOffset) {
+        ALOGE("Attempt at reading non-sequentially from LiveDataSource.");
+        return -EPIPE;
+    }
+
+    size_t totalAvailable = 0;
+    for (List<sp<ABuffer> >::iterator it = mBufferQueue.begin();
+         it != mBufferQueue.end(); ++it) {
+        sp<ABuffer> buffer = *it;
+
+        totalAvailable += buffer->size();
+
+        if (totalAvailable >= size) {
+            break;
+        }
+    }
+
+    if (totalAvailable < size) {
+        return mFinalResult == OK ? -EWOULDBLOCK : mFinalResult;
+    }
+
+    return readAt_l(offset, data, size);
+!!!592140.cpp!!!	queueBuffer(in buffer : sp<ABuffer>) : void
+    Mutex::Autolock autoLock(mLock);
+
+    if (mFinalResult != OK) {
+        return;
+    }
+
+#if SAVE_BACKUP
+    if (mBackupFile != NULL) {
+        CHECK_EQ(fwrite(buffer->data(), 1, buffer->size(), mBackupFile),
+                 buffer->size());
+    }
+#endif
+
+    mBufferQueue.push_back(buffer);
+    mCondition.broadcast();
+!!!592268.cpp!!!	queueEOS(in finalResult : status_t) : void
+    CHECK_NE(finalResult, (status_t)OK);
+
+    Mutex::Autolock autoLock(mLock);
+
+    mFinalResult = finalResult;
+    mCondition.broadcast();
+!!!592396.cpp!!!	reset() : void
+    Mutex::Autolock autoLock(mLock);
+
+    // XXX FIXME: If we've done a partial read and waiting for more buffers,
+    // we'll mix old and new data...
+
+    mFinalResult = OK;
+    mBufferQueue.clear();
+!!!592524.cpp!!!	countQueuedBuffers() : size_t
+    Mutex::Autolock autoLock(mLock);
+
+    return mBufferQueue.size();
+!!!592652.cpp!!!	~LiveDataSource()
+    if (mBackupFile != NULL) {
+        fclose(mBackupFile);
+        mBackupFile = NULL;
+    }
+!!!592780.cpp!!!	readAt_l(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    if (offset != mOffset) {
+        ALOGE("Attempt at reading non-sequentially from LiveDataSource.");
+        return -EPIPE;
+    }
+
+    size_t sizeDone = 0;
+
+    while (sizeDone < size) {
+        while (mBufferQueue.empty() && mFinalResult == OK) {
+            mCondition.wait(mLock);
+        }
+
+        if (mBufferQueue.empty()) {
+            if (sizeDone > 0) {
+                mOffset += sizeDone;
+                return sizeDone;
+            }
+
+            return mFinalResult;
+        }
+
+        sp<ABuffer> buffer = *mBufferQueue.begin();
+
+        size_t copy = size - sizeDone;
+
+        if (copy > buffer->size()) {
+            copy = buffer->size();
+        }
+
+        memcpy((uint8_t *)data + sizeDone, buffer->data(), copy);
+
+        sizeDone += copy;
+
+        buffer->setRange(buffer->offset() + copy, buffer->size() - copy);
+
+        if (buffer->size() == 0) {
+            mBufferQueue.erase(mBufferQueue.begin());
+        }
+    }
+
+    mOffset += sizeDone;
+
+    return sizeDone;

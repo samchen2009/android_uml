@@ -1,0 +1,437 @@
+class ThreadBase
+!!!796300.cpp!!!	~ThreadBase()
+    mParamCond.broadcast();
+    // do not lock the mutex in destructor
+    releaseWakeLock_l();
+    if (mPowerManager != 0) {
+        sp<IBinder> binder = mPowerManager->asBinder();
+        binder->unlinkToDeath(mDeathRecipient);
+    }
+!!!796428.cpp!!!	dumpBase(in fd : int, in args : Vector<String16>) : void
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    bool locked = tryLock(mLock);
+    if (!locked) {
+        snprintf(buffer, SIZE, "thread %p maybe dead locked\n", this);
+        write(fd, buffer, strlen(buffer));
+    }
+
+    snprintf(buffer, SIZE, "io handle: %d\n", mId);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "TID: %d\n", getTid());
+    result.append(buffer);
+    snprintf(buffer, SIZE, "standby: %d\n", mStandby);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "Sample rate: %d\n", mSampleRate);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "HAL frame count: %d\n", mFrameCount);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "Normal frame count: %d\n", mNormalFrameCount);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "Channel Count: %d\n", mChannelCount);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "Channel Mask: 0x%08x\n", mChannelMask);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "Format: %d\n", mFormat);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "Frame size: %u\n", mFrameSize);
+    result.append(buffer);
+
+    snprintf(buffer, SIZE, "\nPending setParameters commands: \n");
+    result.append(buffer);
+    result.append(" Index Command");
+    for (size_t i = 0; i < mNewParameters.size(); ++i) {
+        snprintf(buffer, SIZE, "\n %02d    ", i);
+        result.append(buffer);
+        result.append(mNewParameters[i]);
+    }
+
+    snprintf(buffer, SIZE, "\n\nPending config events: \n");
+    result.append(buffer);
+    for (size_t i = 0; i < mConfigEvents.size(); i++) {
+        mConfigEvents[i]->dump(buffer, SIZE);
+        result.append(buffer);
+    }
+    result.append("\n");
+
+    write(fd, result.string(), result.size());
+
+    if (locked) {
+        mLock.unlock();
+    }
+!!!796556.cpp!!!	dumpEffectChains(in fd : int, in args : Vector<String16>) : void
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    snprintf(buffer, SIZE, "\n- %d Effect Chains:\n", mEffectChains.size());
+    write(fd, buffer, strlen(buffer));
+
+    for (size_t i = 0; i < mEffectChains.size(); ++i) {
+        sp<EffectChain> chain = mEffectChains[i];
+        if (chain != 0) {
+            chain->dump(fd, args);
+        }
+    }
+!!!796684.cpp!!!	clearPowerManager() : void
+    Mutex::Autolock _l(mLock);
+    releaseWakeLock_l();
+    mPowerManager.clear();
+!!!803724.cpp!!!	exit() : void
+    ALOGV("ThreadBase::exit");
+    // do any cleanup required for exit to succeed
+    preExit();
+    {
+        // This lock prevents the following race in thread (uniprocessor for illustration):
+        //  if (!exitPending()) {
+        //      // context switch from here to exit()
+        //      // exit() calls requestExit(), what exitPending() observes
+        //      // exit() calls signal(), which is dropped since no waiters
+        //      // context switch back from exit() to here
+        //      mWaitWorkCV.wait(...);
+        //      // now thread is hung
+        //  }
+        AutoMutex lock(mLock);
+        requestExit();
+        mWaitWorkCV.broadcast();
+    }
+    // When Thread::requestExitAndWait is made virtual and this method is renamed to
+    // "virtual status_t requestExitAndWait()", replace by "return Thread::requestExitAndWait();"
+    requestExitAndWait();
+!!!803980.cpp!!!	setParameters(in keyValuePairs : String8) : status_t
+    status_t status;
+
+    ALOGV("ThreadBase::setParameters() %s", keyValuePairs.string());
+    Mutex::Autolock _l(mLock);
+
+    mNewParameters.add(keyValuePairs);
+    mWaitWorkCV.signal();
+    // wait condition with timeout in case the thread loop has exited
+    // before the request could be processed
+    if (mParamCond.waitRelative(mLock, kSetParametersTimeoutNs) == NO_ERROR) {
+        status = mParamStatus;
+        mWaitWorkCV.signal();
+    } else {
+        status = TIMED_OUT;
+    }
+    return status;
+!!!804364.cpp!!!	sendIoConfigEvent(in event : int, in param : int = 0) : void
+    Mutex::Autolock _l(mLock);
+    sendIoConfigEvent_l(event, param);
+!!!804492.cpp!!!	sendIoConfigEvent_l(in event : int, in param : int = 0) : void
+    IoConfigEvent *ioEvent = new IoConfigEvent(event, param);
+    mConfigEvents.add(static_cast<ConfigEvent *>(ioEvent));
+    ALOGV("sendIoConfigEvent() num events %d event %d, param %d", mConfigEvents.size(), event, param);
+    mWaitWorkCV.signal();
+!!!804620.cpp!!!	sendPrioConfigEvent_l(in pid : pid_t, in tid : pid_t, in prio : int32_t) : void
+    PrioConfigEvent *prioEvent = new PrioConfigEvent(pid, tid, prio);
+    mConfigEvents.add(static_cast<ConfigEvent *>(prioEvent));
+    ALOGV("sendPrioConfigEvent_l() num events %d pid %d, tid %d prio %d",
+          mConfigEvents.size(), pid, tid, prio);
+    mWaitWorkCV.signal();
+!!!804748.cpp!!!	processConfigEvents() : void
+    mLock.lock();
+    while (!mConfigEvents.isEmpty()) {
+        ALOGV("processConfigEvents() remaining events %d", mConfigEvents.size());
+        ConfigEvent *event = mConfigEvents[0];
+        mConfigEvents.removeAt(0);
+        // release mLock before locking AudioFlinger mLock: lock order is always
+        // AudioFlinger then ThreadBase to avoid cross deadlock
+        mLock.unlock();
+        switch(event->type()) {
+            case CFG_EVENT_PRIO: {
+                PrioConfigEvent *prioEvent = static_cast<PrioConfigEvent *>(event);
+                int err = requestPriority(prioEvent->pid(), prioEvent->tid(), prioEvent->prio());
+                if (err != 0) {
+                    ALOGW("Policy SCHED_FIFO priority %d is unavailable for pid %d tid %d; error %d",
+                          prioEvent->prio(), prioEvent->pid(), prioEvent->tid(), err);
+                }
+            } break;
+            case CFG_EVENT_IO: {
+                IoConfigEvent *ioEvent = static_cast<IoConfigEvent *>(event);
+                mAudioFlinger->mLock.lock();
+                audioConfigChanged_l(ioEvent->event(), ioEvent->param());
+                mAudioFlinger->mLock.unlock();
+            } break;
+            default:
+                ALOGE("processConfigEvents() unknown event type %d", event->type());
+                break;
+        }
+        delete event;
+        mLock.lock();
+    }
+    mLock.unlock();
+!!!805388.cpp!!!	createEffect_l(in client : sp<AudioFlinger::Client>, in effectClient : sp<IEffectClient>, in priority : int32_t, in sessionId : int, inout desc : effect_descriptor_t, inout enabled : int, inout status : status_t) : sp<EffectHandle>
+    sp<EffectModule> effect;
+    sp<EffectHandle> handle;
+    status_t lStatus;
+    sp<EffectChain> chain;
+    bool chainCreated = false;
+    bool effectCreated = false;
+    bool effectRegistered = false;
+
+    lStatus = initCheck();
+    if (lStatus != NO_ERROR) {
+        ALOGW("createEffect_l() Audio driver not initialized.");
+        goto Exit;
+    }
+
+    // Do not allow effects with session ID 0 on direct output or duplicating threads
+    // TODO: add rule for hw accelerated effects on direct outputs with non PCM format
+    if (sessionId == AUDIO_SESSION_OUTPUT_MIX && mType != MIXER) {
+        ALOGW("createEffect_l() Cannot add auxiliary effect %s to session %d",
+                desc->name, sessionId);
+        lStatus = BAD_VALUE;
+        goto Exit;
+    }
+    // Only Pre processor effects are allowed on input threads and only on input threads
+    if ((mType == RECORD) != ((desc->flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC)) {
+        ALOGW("createEffect_l() effect %s (flags %08x) created on wrong thread type %d",
+                desc->name, desc->flags, mType);
+        lStatus = BAD_VALUE;
+        goto Exit;
+    }
+
+    ALOGV("createEffect_l() thread %p effect %s on session %d", this, desc->name, sessionId);
+
+    { // scope for mLock
+        Mutex::Autolock _l(mLock);
+
+        // check for existing effect chain with the requested audio session
+        chain = getEffectChain_l(sessionId);
+        if (chain == 0) {
+            // create a new chain for this session
+            ALOGV("createEffect_l() new effect chain for session %d", sessionId);
+            chain = new EffectChain(this, sessionId);
+            addEffectChain_l(chain);
+            chain->setStrategy(getStrategyForSession_l(sessionId));
+            chainCreated = true;
+        } else {
+            effect = chain->getEffectFromDesc_l(desc);
+        }
+
+        ALOGV("createEffect_l() got effect %p on chain %p", effect.get(), chain.get());
+
+        if (effect == 0) {
+            int id = mAudioFlinger->nextUniqueId();
+            // Check CPU and memory usage
+            lStatus = AudioSystem::registerEffect(desc, mId, chain->strategy(), sessionId, id);
+            if (lStatus != NO_ERROR) {
+                goto Exit;
+            }
+            effectRegistered = true;
+            // create a new effect module if none present in the chain
+            effect = new EffectModule(this, chain, desc, id, sessionId);
+            lStatus = effect->status();
+            if (lStatus != NO_ERROR) {
+                goto Exit;
+            }
+            lStatus = chain->addEffect_l(effect);
+            if (lStatus != NO_ERROR) {
+                goto Exit;
+            }
+            effectCreated = true;
+
+            effect->setDevice(mOutDevice);
+            effect->setDevice(mInDevice);
+            effect->setMode(mAudioFlinger->getMode());
+            effect->setAudioSource(mAudioSource);
+        }
+        // create effect handle and connect it to effect module
+        handle = new EffectHandle(effect, client, effectClient, priority);
+        lStatus = effect->addHandle(handle.get());
+        if (enabled != NULL) {
+            *enabled = (int)effect->isEnabled();
+        }
+    }
+
+Exit:
+    if (lStatus != NO_ERROR && lStatus != ALREADY_EXISTS) {
+        Mutex::Autolock _l(mLock);
+        if (effectCreated) {
+            chain->removeEffect_l(effect);
+        }
+        if (effectRegistered) {
+            AudioSystem::unregisterEffect(effect->id());
+        }
+        if (chainCreated) {
+            removeEffectChain_l(chain);
+        }
+        handle.clear();
+    }
+
+    if (status != NULL) {
+        *status = lStatus;
+    }
+    return handle;
+!!!805644.cpp!!!	getEffectChain(in sessionId : int) : sp<EffectChain>
+    Mutex::Autolock _l(mLock);
+    return getEffectChain_l(sessionId);
+!!!805772.cpp!!!	getEffectChain_l(in sessionId : int) : sp<EffectChain>
+    size_t size = mEffectChains.size();
+    for (size_t i = 0; i < size; i++) {
+        if (mEffectChains[i]->sessionId() == sessionId) {
+            return mEffectChains[i];
+        }
+    }
+    return 0;
+!!!806412.cpp!!!	setMode(in mode : audio_mode_t) : void
+    Mutex::Autolock _l(mLock);
+    size_t size = mEffectChains.size();
+    for (size_t i = 0; i < size; i++) {
+        mEffectChains[i]->setMode_l(mode);
+    }
+!!!806540.cpp!!!	getEffect(in sessionId : int, in effectId : int) : sp<AudioFlinger::EffectModule>
+    Mutex::Autolock _l(mLock);
+    return getEffect_l(sessionId, effectId);
+!!!806668.cpp!!!	getEffect_l(in sessionId : int, in effectId : int) : sp<AudioFlinger::EffectModule>
+    sp<EffectChain> chain = getEffectChain_l(sessionId);
+    return chain != 0 ? chain->getEffectFromId_l(effectId) : 0;
+!!!807436.cpp!!!	setEffectSuspended(in type : effect_uuid_t, in suspend : bool, in sessionId : int = AUDIO_SESSION_OUTPUT_MIX) : void
+    Mutex::Autolock _l(mLock);
+    setEffectSuspended_l(type, suspend, sessionId);
+!!!807564.cpp!!!	checkSuspendOnEffectEnabled(in effect : sp<EffectModule>, in enabled : bool, in sessionId : int = AUDIO_SESSION_OUTPUT_MIX) : void
+    Mutex::Autolock _l(mLock);
+    checkSuspendOnEffectEnabled_l(effect, enabled, sessionId);
+!!!807692.cpp!!!	checkSuspendOnEffectEnabled_l(in effect : sp<EffectModule>, in enabled : bool, in sessionId : int = AUDIO_SESSION_OUTPUT_MIX) : void
+    if (mType != RECORD) {
+        // suspend all effects in AUDIO_SESSION_OUTPUT_MIX when enabling any effect on
+        // another session. This gives the priority to well behaved effect control panels
+        // and applications not using global effects.
+        // Enabling post processing in AUDIO_SESSION_OUTPUT_STAGE session does not affect
+        // global effects
+        if ((sessionId != AUDIO_SESSION_OUTPUT_MIX) && (sessionId != AUDIO_SESSION_OUTPUT_STAGE)) {
+            setEffectSuspended_l(NULL, enabled, AUDIO_SESSION_OUTPUT_MIX);
+        }
+    }
+
+    sp<EffectChain> chain = getEffectChain_l(sessionId);
+    if (chain != 0) {
+        chain->checkSuspendOnEffectEnabled(effect, enabled);
+    }
+!!!808204.cpp!!!	acquireWakeLock() : void
+    Mutex::Autolock _l(mLock);
+    acquireWakeLock_l();
+!!!808332.cpp!!!	acquireWakeLock_l() : void
+    if (mPowerManager == 0) {
+        // use checkService() to avoid blocking if power service is not up yet
+        sp<IBinder> binder =
+            defaultServiceManager()->checkService(String16("power"));
+        if (binder == 0) {
+            ALOGW("Thread %s cannot connect to the power manager service", mName);
+        } else {
+            mPowerManager = interface_cast<IPowerManager>(binder);
+            binder->linkToDeath(mDeathRecipient);
+        }
+    }
+    if (mPowerManager != 0) {
+        sp<IBinder> binder = new BBinder();
+        status_t status = mPowerManager->acquireWakeLock(POWERMANAGER_PARTIAL_WAKE_LOCK,
+                                                         binder,
+                                                         String16(mName));
+        if (status == NO_ERROR) {
+            mWakeLockToken = binder;
+        }
+        ALOGV("acquireWakeLock_l() %s status %d", mName, status);
+    }
+!!!808460.cpp!!!	releaseWakeLock() : void
+    Mutex::Autolock _l(mLock);
+    releaseWakeLock_l();
+!!!808588.cpp!!!	releaseWakeLock_l() : void
+    if (mWakeLockToken != 0) {
+        ALOGV("releaseWakeLock_l() %s", mName);
+        if (mPowerManager != 0) {
+            mPowerManager->releaseWakeLock(mWakeLockToken, 0);
+        }
+        mWakeLockToken.clear();
+    }
+!!!808716.cpp!!!	setEffectSuspended_l(in type : effect_uuid_t, in suspend : bool, in sessionId : int) : void
+    sp<EffectChain> chain = getEffectChain_l(sessionId);
+    if (chain != 0) {
+        if (type != NULL) {
+            chain->setEffectSuspended_l(type, suspend);
+        } else {
+            chain->setEffectSuspendedAll_l(suspend);
+        }
+    }
+
+    updateSuspendedSessions_l(type, suspend, sessionId);
+!!!808844.cpp!!!	updateSuspendedSessions_l(in type : effect_uuid_t, in suspend : bool, in sessionId : int) : void
+    ssize_t index = mSuspendedSessions.indexOfKey(sessionId);
+
+    KeyedVector <int, sp<SuspendedSessionDesc> > sessionEffects;
+
+    if (suspend) {
+        if (index >= 0) {
+            sessionEffects = mSuspendedSessions.valueAt(index);
+        } else {
+            mSuspendedSessions.add(sessionId, sessionEffects);
+        }
+    } else {
+        if (index < 0) {
+            return;
+        }
+        sessionEffects = mSuspendedSessions.valueAt(index);
+    }
+
+
+    int key = EffectChain::kKeyForSuspendAll;
+    if (type != NULL) {
+        key = type->timeLow;
+    }
+    index = sessionEffects.indexOfKey(key);
+
+    sp<SuspendedSessionDesc> desc;
+    if (suspend) {
+        if (index >= 0) {
+            desc = sessionEffects.valueAt(index);
+        } else {
+            desc = new SuspendedSessionDesc();
+            if (type != NULL) {
+                desc->mType = *type;
+            }
+            sessionEffects.add(key, desc);
+            ALOGV("updateSuspendedSessions_l() suspend adding effect %08x", key);
+        }
+        desc->mRefCount++;
+    } else {
+        if (index < 0) {
+            return;
+        }
+        desc = sessionEffects.valueAt(index);
+        if (--desc->mRefCount == 0) {
+            ALOGV("updateSuspendedSessions_l() restore removing effect %08x", key);
+            sessionEffects.removeItemsAt(index);
+            if (sessionEffects.isEmpty()) {
+                ALOGV("updateSuspendedSessions_l() restore removing session %d",
+                                 sessionId);
+                mSuspendedSessions.removeItem(sessionId);
+            }
+        }
+    }
+    if (!sessionEffects.isEmpty()) {
+        mSuspendedSessions.replaceValueFor(sessionId, sessionEffects);
+    }
+!!!808972.cpp!!!	checkSuspendOnAddEffectChain_l(in chain : sp<EffectChain>) : void
+    ssize_t index = mSuspendedSessions.indexOfKey(chain->sessionId());
+    if (index < 0) {
+        return;
+    }
+
+    const KeyedVector <int, sp<SuspendedSessionDesc> >& sessionEffects =
+            mSuspendedSessions.valueAt(index);
+
+    for (size_t i = 0; i < sessionEffects.size(); i++) {
+        sp<SuspendedSessionDesc> desc = sessionEffects.valueAt(i);
+        for (int j = 0; j < desc->mRefCount; j++) {
+            if (sessionEffects.keyAt(i) == EffectChain::kKeyForSuspendAll) {
+                chain->setEffectSuspendedAll_l(true);
+            } else {
+                ALOGV("checkSuspendOnAddEffectChain_l() suspending effects %08x",
+                    desc->mType.timeLow);
+                chain->setEffectSuspended_l(&desc->mType, true);
+            }
+        }
+    }

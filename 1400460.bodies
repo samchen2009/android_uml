@@ -1,0 +1,323 @@
+class NetworkStatsCollection
+!!!8566156.java!!!	NetworkStatsCollection(in bucketDuration : long)
+        mBucketDuration = bucketDuration;
+        reset();
+!!!8566284.java!!!	reset() : void
+        mStats.clear();
+        mStartMillis = Long.MAX_VALUE;
+        mEndMillis = Long.MIN_VALUE;
+        mTotalBytes = 0;
+        mDirty = false;
+!!!8566412.java!!!	getStartMillis() : long
+        return mStartMillis;
+!!!8566540.java!!!	getFirstAtomicBucketMillis() : long
+        if (mStartMillis == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        } else {
+            return mStartMillis + mBucketDuration;
+        }
+!!!8566668.java!!!	getEndMillis() : long
+        return mEndMillis;
+!!!8566796.java!!!	getTotalBytes() : long
+        return mTotalBytes;
+!!!8566924.java!!!	isDirty() : boolean
+        return mDirty;
+!!!8567052.java!!!	clearDirty() : void
+        mDirty = false;
+!!!8567180.java!!!	isEmpty() : boolean
+        return mStartMillis == Long.MAX_VALUE && mEndMillis == Long.MIN_VALUE;
+!!!8567308.java!!!	getHistory(inout template : NetworkTemplate, in uid : int, in set : int, in tag : int, in fields : int) : NetworkStatsHistory
+        return getHistory(template, uid, set, tag, fields, Long.MIN_VALUE, Long.MAX_VALUE);
+!!!8567436.java!!!	getHistory(inout template : NetworkTemplate, in uid : int, in set : int, in tag : int, in fields : int, in start : long, in end : long) : NetworkStatsHistory
+        final NetworkStatsHistory combined = new NetworkStatsHistory(
+                mBucketDuration, estimateBuckets(), fields);
+        for (Map.Entry<Key, NetworkStatsHistory> entry : mStats.entrySet()) {
+            final Key key = entry.getKey();
+            final boolean setMatches = set == SET_ALL || key.set == set;
+            if (key.uid == uid && setMatches && key.tag == tag
+                    && templateMatches(template, key.ident)) {
+                combined.recordHistory(entry.getValue(), start, end);
+            }
+        }
+        return combined;
+!!!8567564.java!!!	getSummary(inout template : NetworkTemplate, in start : long, in end : long) : NetworkStats
+        final long now = System.currentTimeMillis();
+
+        final NetworkStats stats = new NetworkStats(end - start, 24);
+        final NetworkStats.Entry entry = new NetworkStats.Entry();
+        NetworkStatsHistory.Entry historyEntry = null;
+
+        // shortcut when we know stats will be empty
+        if (start == end) return stats;
+
+        for (Map.Entry<Key, NetworkStatsHistory> mapEntry : mStats.entrySet()) {
+            final Key key = mapEntry.getKey();
+            if (templateMatches(template, key.ident)) {
+                final NetworkStatsHistory history = mapEntry.getValue();
+                historyEntry = history.getValues(start, end, now, historyEntry);
+
+                entry.iface = IFACE_ALL;
+                entry.uid = key.uid;
+                entry.set = key.set;
+                entry.tag = key.tag;
+                entry.rxBytes = historyEntry.rxBytes;
+                entry.rxPackets = historyEntry.rxPackets;
+                entry.txBytes = historyEntry.txBytes;
+                entry.txPackets = historyEntry.txPackets;
+                entry.operations = historyEntry.operations;
+
+                if (!entry.isEmpty()) {
+                    stats.combineValues(entry);
+                }
+            }
+        }
+
+        return stats;
+!!!8567692.java!!!	recordData(inout ident : NetworkIdentitySet, in uid : int, in set : int, in tag : int, in start : long, in end : long, inout entry : Entry) : void
+        final NetworkStatsHistory history = findOrCreateHistory(ident, uid, set, tag);
+        history.recordData(start, end, entry);
+        noteRecordedHistory(history.getStart(), history.getEnd(), entry.rxBytes + entry.txBytes);
+!!!8567820.java!!!	recordHistory(inout key : Key, inout history : NetworkStatsHistory) : void
+        if (history.size() == 0) return;
+        noteRecordedHistory(history.getStart(), history.getEnd(), history.getTotalBytes());
+
+        NetworkStatsHistory target = mStats.get(key);
+        if (target == null) {
+            target = new NetworkStatsHistory(history.getBucketDuration());
+            mStats.put(key, target);
+        }
+        target.recordEntireHistory(history);
+!!!8567948.java!!!	recordCollection(inout another : NetworkStatsCollection) : void
+        for (Map.Entry<Key, NetworkStatsHistory> entry : another.mStats.entrySet()) {
+            recordHistory(entry.getKey(), entry.getValue());
+        }
+!!!8568076.java!!!	findOrCreateHistory(inout ident : NetworkIdentitySet, in uid : int, in set : int, in tag : int) : NetworkStatsHistory
+        final Key key = new Key(ident, uid, set, tag);
+        final NetworkStatsHistory existing = mStats.get(key);
+
+        // update when no existing, or when bucket duration changed
+        NetworkStatsHistory updated = null;
+        if (existing == null) {
+            updated = new NetworkStatsHistory(mBucketDuration, 10);
+        } else if (existing.getBucketDuration() != mBucketDuration) {
+            updated = new NetworkStatsHistory(existing, mBucketDuration);
+        }
+
+        if (updated != null) {
+            mStats.put(key, updated);
+            return updated;
+        } else {
+            return existing;
+        }
+!!!8568204.java!!!	read(inout in : InputStream) : void
+        read(new DataInputStream(in));
+!!!8568332.java!!!	read(inout in : DataInputStream) : void
+        // verify file magic header intact
+        final int magic = in.readInt();
+        if (magic != FILE_MAGIC) {
+            throw new ProtocolException("unexpected magic: " + magic);
+        }
+
+        final int version = in.readInt();
+        switch (version) {
+            case VERSION_UNIFIED_INIT: {
+                // uid := size *(NetworkIdentitySet size *(uid set tag NetworkStatsHistory))
+                final int identSize = in.readInt();
+                for (int i = 0; i < identSize; i++) {
+                    final NetworkIdentitySet ident = new NetworkIdentitySet(in);
+
+                    final int size = in.readInt();
+                    for (int j = 0; j < size; j++) {
+                        final int uid = in.readInt();
+                        final int set = in.readInt();
+                        final int tag = in.readInt();
+
+                        final Key key = new Key(ident, uid, set, tag);
+                        final NetworkStatsHistory history = new NetworkStatsHistory(in);
+                        recordHistory(key, history);
+                    }
+                }
+                break;
+            }
+            default: {
+                throw new ProtocolException("unexpected version: " + version);
+            }
+        }
+!!!8568460.java!!!	write(inout out : DataOutputStream) : void
+        // cluster key lists grouped by ident
+        final HashMap<NetworkIdentitySet, ArrayList<Key>> keysByIdent = Maps.newHashMap();
+        for (Key key : mStats.keySet()) {
+            ArrayList<Key> keys = keysByIdent.get(key.ident);
+            if (keys == null) {
+                keys = Lists.newArrayList();
+                keysByIdent.put(key.ident, keys);
+            }
+            keys.add(key);
+        }
+
+        out.writeInt(FILE_MAGIC);
+        out.writeInt(VERSION_UNIFIED_INIT);
+
+        out.writeInt(keysByIdent.size());
+        for (NetworkIdentitySet ident : keysByIdent.keySet()) {
+            final ArrayList<Key> keys = keysByIdent.get(ident);
+            ident.writeToStream(out);
+
+            out.writeInt(keys.size());
+            for (Key key : keys) {
+                final NetworkStatsHistory history = mStats.get(key);
+                out.writeInt(key.uid);
+                out.writeInt(key.set);
+                out.writeInt(key.tag);
+                history.writeToStream(out);
+            }
+        }
+
+        out.flush();
+!!!8568588.java!!!	readLegacyNetwork(inout file : File) : void
+        final AtomicFile inputFile = new AtomicFile(file);
+
+        DataInputStream in = null;
+        try {
+            in = new DataInputStream(new BufferedInputStream(inputFile.openRead()));
+
+            // verify file magic header intact
+            final int magic = in.readInt();
+            if (magic != FILE_MAGIC) {
+                throw new ProtocolException("unexpected magic: " + magic);
+            }
+
+            final int version = in.readInt();
+            switch (version) {
+                case VERSION_NETWORK_INIT: {
+                    // network := size *(NetworkIdentitySet NetworkStatsHistory)
+                    final int size = in.readInt();
+                    for (int i = 0; i < size; i++) {
+                        final NetworkIdentitySet ident = new NetworkIdentitySet(in);
+                        final NetworkStatsHistory history = new NetworkStatsHistory(in);
+
+                        final Key key = new Key(ident, UID_ALL, SET_ALL, TAG_NONE);
+                        recordHistory(key, history);
+                    }
+                    break;
+                }
+                default: {
+                    throw new ProtocolException("unexpected version: " + version);
+                }
+            }
+        } catch (FileNotFoundException e) {
+            // missing stats is okay, probably first boot
+        } finally {
+            IoUtils.closeQuietly(in);
+        }
+!!!8568716.java!!!	readLegacyUid(inout file : File, inout onlyTags : boolean) : void
+        final AtomicFile inputFile = new AtomicFile(file);
+
+        DataInputStream in = null;
+        try {
+            in = new DataInputStream(new BufferedInputStream(inputFile.openRead()));
+
+            // verify file magic header intact
+            final int magic = in.readInt();
+            if (magic != FILE_MAGIC) {
+                throw new ProtocolException("unexpected magic: " + magic);
+            }
+
+            final int version = in.readInt();
+            switch (version) {
+                case VERSION_UID_INIT: {
+                    // uid := size *(UID NetworkStatsHistory)
+
+                    // drop this data version, since we don't have a good
+                    // mapping into NetworkIdentitySet.
+                    break;
+                }
+                case VERSION_UID_WITH_IDENT: {
+                    // uid := size *(NetworkIdentitySet size *(UID NetworkStatsHistory))
+
+                    // drop this data version, since this version only existed
+                    // for a short time.
+                    break;
+                }
+                case VERSION_UID_WITH_TAG:
+                case VERSION_UID_WITH_SET: {
+                    // uid := size *(NetworkIdentitySet size *(uid set tag NetworkStatsHistory))
+                    final int identSize = in.readInt();
+                    for (int i = 0; i < identSize; i++) {
+                        final NetworkIdentitySet ident = new NetworkIdentitySet(in);
+
+                        final int size = in.readInt();
+                        for (int j = 0; j < size; j++) {
+                            final int uid = in.readInt();
+                            final int set = (version >= VERSION_UID_WITH_SET) ? in.readInt()
+                                    : SET_DEFAULT;
+                            final int tag = in.readInt();
+
+                            final Key key = new Key(ident, uid, set, tag);
+                            final NetworkStatsHistory history = new NetworkStatsHistory(in);
+
+                            if ((tag == TAG_NONE) != onlyTags) {
+                                recordHistory(key, history);
+                            }
+                        }
+                    }
+                    break;
+                }
+                default: {
+                    throw new ProtocolException("unexpected version: " + version);
+                }
+            }
+        } catch (FileNotFoundException e) {
+            // missing stats is okay, probably first boot
+        } finally {
+            IoUtils.closeQuietly(in);
+        }
+!!!8568844.java!!!	removeUids(inout uids : int) : void
+        final ArrayList<Key> knownKeys = Lists.newArrayList();
+        knownKeys.addAll(mStats.keySet());
+
+        // migrate all UID stats into special "removed" bucket
+        for (Key key : knownKeys) {
+            if (ArrayUtils.contains(uids, key.uid)) {
+                // only migrate combined TAG_NONE history
+                if (key.tag == TAG_NONE) {
+                    final NetworkStatsHistory uidHistory = mStats.get(key);
+                    final NetworkStatsHistory removedHistory = findOrCreateHistory(
+                            key.ident, UID_REMOVED, SET_DEFAULT, TAG_NONE);
+                    removedHistory.recordEntireHistory(uidHistory);
+                }
+                mStats.remove(key);
+                mDirty = true;
+            }
+        }
+!!!8568972.java!!!	noteRecordedHistory(in startMillis : long, in endMillis : long, in totalBytes : long) : void
+        if (startMillis < mStartMillis) mStartMillis = startMillis;
+        if (endMillis > mEndMillis) mEndMillis = endMillis;
+        mTotalBytes += totalBytes;
+        mDirty = true;
+!!!8569100.java!!!	estimateBuckets() : int
+        return (int) (Math.min(mEndMillis - mStartMillis, DateUtils.WEEK_IN_MILLIS * 5)
+                / mBucketDuration);
+!!!8569228.java!!!	dump(inout pw : IndentingPrintWriter) : void
+        final ArrayList<Key> keys = Lists.newArrayList();
+        keys.addAll(mStats.keySet());
+        Collections.sort(keys);
+
+        for (Key key : keys) {
+            pw.print("ident="); pw.print(key.ident.toString());
+            pw.print(" uid="); pw.print(key.uid);
+            pw.print(" set="); pw.print(NetworkStats.setToString(key.set));
+            pw.print(" tag="); pw.println(NetworkStats.tagToString(key.tag));
+
+            final NetworkStatsHistory history = mStats.get(key);
+            pw.increaseIndent();
+            history.dump(pw, true);
+            pw.decreaseIndent();
+        }
+!!!8569356.java!!!	templateMatches(inout template : NetworkTemplate, inout identSet : NetworkIdentitySet) : boolean
+        for (NetworkIdentity ident : identSet) {
+            if (template.matches(ident)) {
+                return true;
+            }
+        }
+        return false;

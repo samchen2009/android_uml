@@ -1,0 +1,168 @@
+class AudioGroup
+!!!2034572.cpp!!!	AudioGroup()
+    mMode = ON_HOLD;
+    mChain = NULL;
+    mEventQueue = -1;
+    mDtmfEvent = -1;
+    mDeviceSocket = -1;
+    mNetworkThread = new NetworkThread(this);
+    mDeviceThread = new DeviceThread(this);
+    mPlatformHasAec = checkPlatformAec();
+!!!2034700.cpp!!!	~AudioGroup()
+    mNetworkThread->requestExitAndWait();
+    mDeviceThread->requestExitAndWait();
+    close(mEventQueue);
+    close(mDeviceSocket);
+    while (mChain) {
+        AudioStream *next = mChain->mNext;
+        delete mChain;
+        mChain = next;
+    }
+    ALOGD("group[%d] is dead", mDeviceSocket);
+!!!2034828.cpp!!!	set(in sampleRate : int, in sampleCount : int) : bool
+    mEventQueue = epoll_create(2);
+    if (mEventQueue == -1) {
+        ALOGE("epoll_create: %s", strerror(errno));
+        return false;
+    }
+
+    mSampleRate = sampleRate;
+    mSampleCount = sampleCount;
+
+    // Create device socket.
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) {
+        ALOGE("socketpair: %s", strerror(errno));
+        return false;
+    }
+    mDeviceSocket = pair[0];
+
+    // Create device stream.
+    mChain = new AudioStream;
+    if (!mChain->set(AudioStream::NORMAL, pair[1], NULL, NULL,
+        sampleRate, sampleCount, -1, -1)) {
+        close(pair[1]);
+        ALOGE("cannot initialize device stream");
+        return false;
+    }
+
+    // Give device socket a reasonable timeout.
+    timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000 * sampleCount / sampleRate * 500;
+    if (setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
+        ALOGE("setsockopt: %s", strerror(errno));
+        return false;
+    }
+
+    // Add device stream into event queue.
+    epoll_event event;
+    event.events = EPOLLIN;
+    event.data.ptr = mChain;
+    if (epoll_ctl(mEventQueue, EPOLL_CTL_ADD, pair[1], &event)) {
+        ALOGE("epoll_ctl: %s", strerror(errno));
+        return false;
+    }
+
+    // Anything else?
+    ALOGD("stream[%d] joins group[%d]", pair[1], pair[0]);
+    return true;
+!!!2034956.cpp!!!	setMode(in mode : int) : bool
+    if (mode < 0 || mode > LAST_MODE) {
+        return false;
+    }
+    // FIXME: temporary code to overcome echo and mic gain issues on herring and tuna boards.
+    // Must be modified/removed when the root cause of the issue is fixed in the hardware or
+    // driver
+    char value[PROPERTY_VALUE_MAX];
+    property_get("ro.product.board", value, "");
+    if (mode == NORMAL &&
+            (!strcmp(value, "herring") || !strcmp(value, "tuna"))) {
+        mode = ECHO_SUPPRESSION;
+    }
+    if (mMode == mode) {
+        return true;
+    }
+
+    mDeviceThread->requestExitAndWait();
+    ALOGD("group[%d] switches from mode %d to %d", mDeviceSocket, mMode, mode);
+    mMode = mode;
+    return (mode == ON_HOLD) || mDeviceThread->start();
+!!!2035084.cpp!!!	sendDtmf(in event : int) : bool
+    if (event < 0 || event > 15) {
+        return false;
+    }
+
+    // DTMF is rarely used, so we try to make it as lightweight as possible.
+    // Using volatile might be dodgy, but using a pipe or pthread primitives
+    // or stop-set-restart threads seems too heavy. Will investigate later.
+    timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 100000000;
+    for (int i = 0; mDtmfEvent != -1 && i < 20; ++i) {
+        nanosleep(&ts, NULL);
+    }
+    if (mDtmfEvent != -1) {
+        return false;
+    }
+    mDtmfEvent = event;
+    nanosleep(&ts, NULL);
+    return true;
+!!!2035212.cpp!!!	add(inout stream : AudioStream) : bool
+    mNetworkThread->requestExitAndWait();
+
+    epoll_event event;
+    event.events = EPOLLIN;
+    event.data.ptr = stream;
+    if (epoll_ctl(mEventQueue, EPOLL_CTL_ADD, stream->mSocket, &event)) {
+        ALOGE("epoll_ctl: %s", strerror(errno));
+        return false;
+    }
+
+    stream->mNext = mChain->mNext;
+    mChain->mNext = stream;
+    if (!mNetworkThread->start()) {
+        // Only take over the stream when succeeded.
+        mChain->mNext = stream->mNext;
+        return false;
+    }
+
+    ALOGD("stream[%d] joins group[%d]", stream->mSocket, mDeviceSocket);
+    return true;
+!!!2035340.cpp!!!	remove(inout stream : AudioStream) : bool
+    mNetworkThread->requestExitAndWait();
+
+    for (AudioStream *chain = mChain; chain->mNext; chain = chain->mNext) {
+        if (chain->mNext == stream) {
+            if (epoll_ctl(mEventQueue, EPOLL_CTL_DEL, stream->mSocket, NULL)) {
+                ALOGE("epoll_ctl: %s", strerror(errno));
+                return false;
+            }
+            chain->mNext = stream->mNext;
+            ALOGD("stream[%d] leaves group[%d]", stream->mSocket, mDeviceSocket);
+            delete stream;
+            break;
+        }
+    }
+
+    // Do not start network thread if there is only one stream.
+    if (!mChain->mNext || !mNetworkThread->start()) {
+        return false;
+    }
+    return true;
+!!!2035596.cpp!!!	checkPlatformAec() : bool
+    effect_descriptor_t fxDesc;
+    uint32_t numFx;
+
+    if (AudioEffect::queryNumberEffects(&numFx) != NO_ERROR) {
+        return false;
+    }
+    for (uint32_t i = 0; i < numFx; i++) {
+        if (AudioEffect::queryEffect(i, &fxDesc) != NO_ERROR) {
+            continue;
+        }
+        if (memcmp(&fxDesc.type, FX_IID_AEC, sizeof(effect_uuid_t)) == 0) {
+            return true;
+        }
+    }
+    return false;

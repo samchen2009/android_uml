@@ -1,0 +1,384 @@
+class AbstractDeviceControllerService
+!!!12204428.java!!!	onStartCommand(in intent : Intent, in flags : int, in startId : int) : int
+        if (intent != null) {
+            final String action = intent.getAction();
+            // Process the intent based on the action.
+            if (MediaDevicesConstants.ACTION_START_DISCOVERY.equals(action)) {
+                reportDeviceState(true);
+            } else if (MediaDevicesConstants.ACTION_STOP_DISCOVERY.equals(action)) {
+                // If no devices are paired, then we can safely stop the service because
+                // we know we aren't going to be activated by any MediaDevice APIs.
+                if (mSettings.getPairedDeviceIds().size() == 0) {
+                    stopSelfResult(startId);
+                    return START_NOT_STICKY;
+                }
+            } else if (MediaDevicesConstants.ACTION_UNPAIR_DEVICE.equals(action)) {
+                unpairDevice(MediaDevicesIntents.getDeviceId(intent));
+            } else if (MediaDevicesConstants.ACTION_WRITE_LINEUP.equals(action)) {
+                String deviceId = intent.getStringExtra(MediaDevicesConstants.EXTRA_DEVICE_ID);
+                mLog.d("got a WRITE_LINEUP intent: " + intent + "(, deviceId=" + deviceId);
+                if (!TextUtils.isEmpty(deviceId)) {
+                    writeLineup(deviceId);
+                }
+            } else if (MediaDevicesConstants.ACTION_UPDATE_CHANNELS.equals(action)) {
+                String deviceId = intent.getStringExtra(MediaDevicesConstants.EXTRA_DEVICE_ID);
+                mLog.d("Got " + action + " for " + deviceId);
+                checkForChannelUpdatesIfNecessary(deviceId);
+            }
+        } else {
+            // If this is true, then the service is being restarted. If so, just
+            // reconnect to the paired devices.
+            reconnectToPairedDevices();
+        }
+
+        // We start sticky because if this service is stopped, we want to get
+        // restarted at some point.
+        return START_STICKY;
+!!!12204556.java!!!	onCreate() : void
+        super.onCreate();
+
+        mDevices = Collections.synchronizedMap(new HashMap<String, Device>());
+        mControllers = Collections.synchronizedMap(
+                new HashMap<String, AbstractDeviceController>());
+        mSettings = buildSettings();
+        mHandler = new Handler();
+        mControllerContext = new DeviceControllerContext() {
+                @Override
+                public final Context getApplicationContext() {
+                    return AbstractDeviceControllerService.this.getApplicationContext();
+                }
+
+                @Override
+                public final Handler getHandler() {
+                    return AbstractDeviceControllerService.this.mHandler;
+                }
+            };
+!!!12204684.java!!!	onDestroy() : void
+        mLog.d("onDestroy");
+        for (AbstractDeviceController controller : mControllers.values()) {
+            controller.destroy();
+        }
+        mControllers.clear();
+
+        mHandler.removeCallbacksAndMessages(null);
+        mHandler = null;
+
+        mControllerContext = null;
+
+        super.onDestroy();
+!!!12204812.java!!!	onBind(in intent : Intent) : IBinder
+        if (MediaDevicesConstants.ACTION_ACQUIRE_DEVICE.equals(intent.getAction())) {
+            final String deviceId = MediaDevicesIntents.getDeviceId(intent);
+            Device device = findDeviceById(deviceId);
+            if (device == null) {
+                return null;
+            }
+            return new DeviceControllerStub(device);
+        } else {
+            if (mLocalBinder == null) {
+                mLocalBinder = buildLocalBinder();
+            }
+            return mLocalBinder;
+        }
+!!!12204940.java!!!	buildLocalBinder() : Binder
+        return null;
+!!!12205068.java!!!	onScheduleRecordingRequested(in deviceId : String, in tvUri : Uri) : void
+        // No-op by default
+!!!12205196.java!!!	getController(in deviceId : String) : AbstractDeviceController
+        return lookupController(deviceId, false);
+!!!12205324.java!!!	getOrCreateController(in deviceId : String) : AbstractDeviceController
+        return lookupController(deviceId, true);
+!!!12205452.java!!!	lookupController(in deviceId : String, in autoCreate : boolean) : AbstractDeviceController
+        AbstractDeviceController controller = mControllers.get(deviceId);
+
+        if ((controller == null) && autoCreate) {
+            final Device device = findDeviceById(deviceId);
+            if (device == null) {
+                // Cannot construct a controller for a nonexistent device.
+                return null;
+            }
+
+            controller = buildController(device);
+            controller.setListener(this);
+            mControllers.put(deviceId, controller);
+        }
+        return controller;
+!!!12205708.java!!!	destroyController(inout controller : AbstractDeviceController) : void
+        String deviceId = controller.getDeviceId();
+        controller.release();
+        controller.destroy();
+        mControllers.remove(deviceId);
+        Device.offline(this, deviceId);
+!!!12205836.java!!!	addDevice(inout device : Device) : void
+        mDevices.put(device.getId(), device);
+        Device.online(this, device);
+!!!12205964.java!!!	removeDevice(in deviceId : String) : void
+        // TODO(mlindner): We need to tear down all the controllers that are
+        // using this device.
+        if (mDevices.remove(deviceId) != null) {
+            Device.offline(this, deviceId);
+        }
+        // Remove any channel update alarm for this device.
+        final AlarmManager alarmManager = (AlarmManager) getSystemService(
+                Context.ALARM_SERVICE);
+        alarmManager.cancel(buildAlarmIntent(deviceId));
+!!!12206092.java!!!	findDeviceById(in id : String) : Device
+        for (Device device : mDevices.values()) {
+            if (device.getId().equals(id)) {
+                return device;
+            }
+        }
+        return null;
+!!!12206220.java!!!	pairDevice(in deviceId : String) : void
+        // Create controller if necessary.
+        AbstractDeviceController controller = getOrCreateController(deviceId);
+        if (controller != null) {
+            mSettings.setDevicePaired(deviceId, true);
+        }
+!!!12206348.java!!!	unpairDevice(in deviceId : String) : void
+        mSettings.setDevicePaired(deviceId, false);
+        StreamUtils.deleteDeviceStreams(getContentResolver(), deviceId);
+!!!12206476.java!!!	reportDeviceState(inout online : boolean) : void
+        for (Device device : mDevices.values()) {
+            DeviceLocator.reportDevice(getApplicationContext(), device, online);
+        }
+!!!12206604.java!!!	reconnectToPairedDevices() : void
+        for (String deviceId : mSettings.getPairedDeviceIds()) {
+            getOrCreateController(deviceId);
+        }
+!!!12206732.java!!!	getSettings() : MediaDeviceSettings
+        return mSettings;
+!!!12206860.java!!!	buildSettings() : MediaDeviceSettings
+        return new BasicMediaDeviceSettings(this);
+!!!12206988.java!!!	getChannelStats(in deviceId : String) : ChannelStats
+        int totalCount = StreamUtils.countDeviceStreams(getContentResolver(),
+                deviceId, Streams.STREAM_TYPE_CHANNEL);
+        int disabledCount = StreamUtils.countDisabledDeviceStreams(getContentResolver(),
+                deviceId, Streams.STREAM_TYPE_CHANNEL);
+        long lastUpdateTime = mSettings.getLong(deviceId,
+                MediaDeviceSettings.KEY_LAST_CHANNEL_UPDATE, 0);
+
+        return new ChannelStats(totalCount, totalCount - disabledCount, lastUpdateTime);
+!!!12207116.java!!!	setChannelUpdateInterval(in deviceId : String, in interval : long) : void
+        long oldInterval = mSettings.getLong(deviceId,
+                MediaDeviceSettings.KEY_CHANNEL_UPDATE_INTERVAL, 0);
+        if (oldInterval == interval) return;
+
+        final AlarmManager alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        mSettings.setLong(deviceId, MediaDeviceSettings.KEY_CHANNEL_UPDATE_INTERVAL,
+                interval);
+
+        PendingIntent intent = buildAlarmIntent(deviceId);
+        if (interval > 0) {
+            final long time = System.currentTimeMillis() + interval + 1;
+            alarmManager.setInexactRepeating(AlarmManager.RTC, time, interval,
+                    intent);
+        } else {
+            alarmManager.cancel(intent);
+        }
+!!!12207244.java!!!	getDeviceControllerContext() : DeviceControllerContext
+        return mControllerContext;
+!!!12207372.java!!!	checkForChannelUpdatesIfNecessary(in deviceId : String) : void
+        boolean updateRequired = false;
+
+        final Device device = findDeviceById(deviceId);
+        if (device == null) {
+            return;
+        }
+
+        if (!device.hasCapability(Capability.USES_CHANNEL_LINEUP)) {
+            // This device does not have any channels to update
+            return;
+        }
+
+        final long interval = mSettings.getLong(deviceId,
+                MediaDeviceSettings.KEY_CHANNEL_UPDATE_INTERVAL, 0);
+        if (interval == 0) {
+            return;  // No updates needed
+        }
+
+        final long now = System.currentTimeMillis();
+        final long lastUpdate = mSettings.getLong(deviceId,
+                MediaDeviceSettings.KEY_LAST_CHANNEL_UPDATE, 0);
+
+        if ((lastUpdate == 0) || ((lastUpdate + interval) < now)) {
+            mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String lineupId = getLineupIdForDevice(deviceId);
+                        if (lineupId == null) return;
+
+                        mChannelUpdateLock.lock();
+
+                        List<Channel> channels = loadChannelList(deviceId, lineupId, true);
+                        if (channels != null) {
+                            mSettings.setLong(deviceId,
+                                    MediaDeviceSettings.KEY_LAST_CHANNEL_UPDATE, now);
+                            if (!channels.isEmpty()) {
+                                updateChannels(deviceId, channels);
+                            }
+                            onChannelUpdateComplete(deviceId);
+                        } else {
+                            onChannelUpdateFailed(deviceId);
+                        }
+
+                        mChannelUpdateLock.unlock();
+                    }
+                });
+        }
+!!!12207500.java!!!	onChannelUpdateComplete(in deviceId : String) : void
+        // No-op by default.
+!!!12207628.java!!!	onChannelUpdateFailed(in deviceId : String) : void
+        // No-op by default.
+!!!12207756.java!!!	writeLineup(in deviceId : String) : void
+        mLog.d("writeLineup() deviceId=" + deviceId);
+        // Make sure the controller exists.
+        AbstractDeviceController controller = getOrCreateController(deviceId);
+        if (controller == null) {
+            mLog.w("Can't find a device for that ID.");
+            // No such device!
+            return;
+        }
+
+        final long now = System.currentTimeMillis();
+        mSettings.setLong(deviceId, MediaDeviceSettings.KEY_LAST_CHANNEL_UPDATE, now);
+
+        mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    final String lineupId = getLineupIdForDevice(deviceId);
+                    mLog.d("deviceId=" + deviceId + ", lineupId=" + lineupId);
+                    if (lineupId == null) return;
+
+                    mChannelUpdateLock.lock();
+
+                    List<Channel> channels = loadChannelList(deviceId, lineupId, false);
+                    if (channels != null) {
+                        mSettings.setLong(deviceId,
+                                MediaDeviceSettings.KEY_LAST_CHANNEL_UPDATE, now);
+                        replaceChannels(deviceId, channels);
+                        onChannelUpdateComplete(deviceId);
+                    } else {
+                        onChannelUpdateFailed(deviceId);
+                    }
+
+                    mChannelUpdateLock.unlock();
+                }
+            });
+!!!12207884.java!!!	buildAlarmIntent(in deviceId : String) : PendingIntent
+        Intent intent = new Intent(MediaDevicesConstants.ACTION_UPDATE_CHANNELS)
+                .setClass(getApplicationContext(), getClass())
+                .putExtra(MediaDevicesConstants.EXTRA_DEVICE_ID, deviceId);
+        return PendingIntent.getService(getApplicationContext(), 0,
+                intent, PendingIntent.FLAG_CANCEL_CURRENT);
+!!!12209804.java!!!	loadChannelList(in deviceId : String, in lineupId : String, inout updateOnly : boolean) : Channel
+        return null;
+!!!12209932.java!!!	replaceChannels(in deviceId : String, in channels : List<Channel>) : void
+        ContentResolver resolver = getContentResolver();
+
+        // Delete all old channels.
+        final String selection = StreamsColumns.DEVICE_ID + " = ? AND "
+                + StreamsColumns.STREAM_TYPE + " = ?";
+        final String[] selectionArgs = new String[] {
+                deviceId, String.valueOf(Streams.STREAM_TYPE_CHANNEL) };
+
+        resolver.delete(Streams.STREAMS_URI, selection, selectionArgs);
+
+        // Bulk insert new channels in batches (too many inserts can crash
+        // SQLite).
+        ArrayList<ContentValues> contentValues =
+                new ArrayList<ContentValues>(DEFAULT_CHANNEL_INSERT_SIZE);
+        for (Channel channel : channels) {
+            prepareChannelForInsertOrUpdate(channel);
+            contentValues.add(StreamUtils.buildContentValuesFromChannel(channel, deviceId));
+            if ((contentValues.size() == DEFAULT_CHANNEL_INSERT_SIZE)) {
+                resolver.bulkInsert(Streams.STREAMS_URI,
+                        contentValues.toArray(new ContentValues[] {}));
+                contentValues = new ArrayList<ContentValues>(
+                        DEFAULT_CHANNEL_INSERT_SIZE);
+            }
+        }
+        if (contentValues.size() > 0) {
+            resolver.bulkInsert(Streams.STREAMS_URI,
+                    contentValues.toArray(new ContentValues[] {}));
+        }
+!!!12210060.java!!!	updateChannels(in deviceId : String, in channels : List<Channel>) : void
+        ContentResolver resolver = getContentResolver();
+
+        final ArrayList<ContentValues> newValues = new ArrayList<ContentValues>();
+        final HashSet<String> oldUris = StreamUtils.getCurrentStreamUrls(resolver,
+                deviceId, Streams.STREAM_TYPE_CHANNEL);
+        final HashSet<String> newUris = new HashSet<String>();
+
+        // Loop through the new list looking for inserts and updates.
+        final String selection = new StringBuilder(StreamsColumns.URI).append(" = ? AND ")
+                .append(StreamsColumns.STREAM_TYPE).append(" = ?").toString();
+        String[] selectionArgs = new String[] {
+                null, String.valueOf(Streams.STREAM_TYPE_CHANNEL)
+        };
+
+        for (Channel channel : channels) {
+            prepareChannelForInsertOrUpdate(channel);
+            final ContentValues channelValues = StreamUtils.buildContentValuesFromChannel(channel,
+                deviceId);
+            final String uriString = channelValues.getAsString(StreamsColumns.URI);
+            newUris.add(uriString);
+            final Uri tvUri = Uri.parse(uriString);
+            Cursor c = null;
+            try {
+                c = StreamUtils.getStreamByUrl(resolver, tvUri);
+                if (c.moveToNext()) {
+                    // There is an existing channel. Check if there are changes
+                    // and if so, take the current enabled status, update the
+                    // values, then update the database.
+                    if (hasMetaDataChanges(channelValues, c)) {
+                        channelValues.put(StreamsColumns.IS_DISABLED,
+                                c.getInt(Streams.IS_DISABLED_INDEX));
+                        selectionArgs[0] = uriString;
+                        resolver.update(Streams.STREAMS_URI, channelValues, selection,
+                                selectionArgs);
+                    }
+                } else {
+                    // Check what tier this is in.
+                    channelValues.put(StreamsColumns.IS_DISABLED,
+                            isDefaultEnabledTier(channel.getTier()) ? 0 : 1);
+                    newValues.add(channelValues);
+                }
+            } finally {
+                if (c != null) {
+                    c.close();
+                }
+            }
+        }
+
+        // Insert new values.
+        resolver.bulkInsert(Streams.STREAMS_URI,
+                newValues.toArray(new ContentValues[] {}));
+
+        // Delete old values.
+        for (String oldUri : oldUris) {
+            if (!newUris.contains(oldUri)) {
+                selectionArgs[0] = oldUri;
+                resolver.delete(Streams.STREAMS_URI, selection, selectionArgs);
+            }
+        }
+!!!12210188.java!!!	hasMetaDataChanges(in channelValues : ContentValues, in c : Cursor) : boolean
+        return !(channelValues.getAsString(StreamsColumns.NAME)
+                    .equals(c.getString(Streams.NAME_INDEX))
+                && channelValues.getAsString(StreamsColumns.SUB_NAME)
+                    .equals(c.getString(Streams.SUB_NAME_INDEX)));
+!!!12210316.java!!!	isDefaultEnabledTier(in tier : TmsChannelTier) : boolean
+        return (tier == TmsChannelTier.BASIC) || (tier == TmsChannelTier.EXTENDED);
+!!!12210444.java!!!	prepareChannelForInsertOrUpdate(inout channel : Channel) : void
+        // No-op by default.
+!!!12210572.java!!!	getLineupIdForDevice(in deviceId : String) : String
+        String lineupId = null;
+
+        Cursor cursor = getContentResolver().query(Devices.getDeviceUri(deviceId),
+                DEVICE_LINEUP_PROJECTION, null, null, null);
+        if (cursor.moveToNext()) {
+            lineupId = cursor.getString(0);
+        }
+        cursor.close();
+
+        return lineupId;

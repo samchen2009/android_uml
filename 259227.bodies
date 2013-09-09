@@ -1,0 +1,828 @@
+class ConcurrentSkipListMap
+!!!1476891.java!!!	initialize() : void
+        keySet = null;
+        entrySet = null;
+        values = null;
+        descendingMap = null;
+        randomSeed = seedGenerator.nextInt() | 0x0100; // ensure nonzero
+        head = new HeadIndex<K,V>(new Node<K,V>(null, BASE_HEADER, null),
+                                  null, null, 1);
+!!!1477019.java!!!	casHead(inout cmp : HeadIndex, inout val : HeadIndex) : boolean
+        return UNSAFE.compareAndSwapObject(this, headOffset, cmp, val);
+!!!1479451.java!!!	comparable(inout key : Object) : Comparable
+        if (key == null)
+            throw new NullPointerException();
+        if (comparator != null)
+            return new ComparableUsingComparator<K>((K)key, comparator);
+        else
+            return (Comparable<? super K>)key;
+!!!1479579.java!!!	compare(inout k1 : K, inout k2 : K) : int
+        Comparator<? super K> cmp = comparator;
+        if (cmp != null)
+            return cmp.compare(k1, k2);
+        else
+            return ((Comparable<? super K>)k1).compareTo(k2);
+!!!1479707.java!!!	inHalfOpenRange(inout key : K, inout least : K, inout fence : K) : boolean
+        if (key == null)
+            throw new NullPointerException();
+        return ((least == null || compare(key, least) >= 0) &&
+                (fence == null || compare(key, fence) <  0));
+!!!1479835.java!!!	inOpenRange(inout key : K, inout least : K, inout fence : K) : boolean
+        if (key == null)
+            throw new NullPointerException();
+        return ((least == null || compare(key, least) >= 0) &&
+                (fence == null || compare(key, fence) <= 0));
+!!!1479963.java!!!	findPredecessor(inout key : Comparable) : Node
+        if (key == null)
+            throw new NullPointerException(); // don't postpone errors
+        for (;;) {
+            Index<K,V> q = head;
+            Index<K,V> r = q.right;
+            for (;;) {
+                if (r != null) {
+                    Node<K,V> n = r.node;
+                    K k = n.key;
+                    if (n.value == null) {
+                        if (!q.unlink(r))
+                            break;           // restart
+                        r = q.right;         // reread r
+                        continue;
+                    }
+                    if (key.compareTo(k) > 0) {
+                        q = r;
+                        r = r.right;
+                        continue;
+                    }
+                }
+                Index<K,V> d = q.down;
+                if (d != null) {
+                    q = d;
+                    r = d.right;
+                } else
+                    return q.node;
+            }
+        }
+!!!1480091.java!!!	findNode(inout key : Comparable) : Node
+        for (;;) {
+            Node<K,V> b = findPredecessor(key);
+            Node<K,V> n = b.next;
+            for (;;) {
+                if (n == null)
+                    return null;
+                Node<K,V> f = n.next;
+                if (n != b.next)                // inconsistent read
+                    break;
+                Object v = n.value;
+                if (v == null) {                // n is deleted
+                    n.helpDelete(b, f);
+                    break;
+                }
+                if (v == n || b.value == null)  // b is deleted
+                    break;
+                int c = key.compareTo(n.key);
+                if (c == 0)
+                    return n;
+                if (c < 0)
+                    return null;
+                b = n;
+                n = f;
+            }
+        }
+!!!1480219.java!!!	doGet(inout okey : Object) : V
+        Comparable<? super K> key = comparable(okey);
+        /*
+         * Loop needed here and elsewhere in case value field goes
+         * null just as it is about to be returned, in which case we
+         * lost a race with a deletion, so must retry.
+         */
+        for (;;) {
+            Node<K,V> n = findNode(key);
+            if (n == null)
+                return null;
+            Object v = n.value;
+            if (v != null)
+                return (V)v;
+        }
+!!!1480347.java!!!	doPut(inout kkey : K, inout value : V, inout onlyIfAbsent : boolean) : V
+        Comparable<? super K> key = comparable(kkey);
+        for (;;) {
+            Node<K,V> b = findPredecessor(key);
+            Node<K,V> n = b.next;
+            for (;;) {
+                if (n != null) {
+                    Node<K,V> f = n.next;
+                    if (n != b.next)               // inconsistent read
+                        break;
+                    Object v = n.value;
+                    if (v == null) {               // n is deleted
+                        n.helpDelete(b, f);
+                        break;
+                    }
+                    if (v == n || b.value == null) // b is deleted
+                        break;
+                    int c = key.compareTo(n.key);
+                    if (c > 0) {
+                        b = n;
+                        n = f;
+                        continue;
+                    }
+                    if (c == 0) {
+                        if (onlyIfAbsent || n.casValue(v, value))
+                            return (V)v;
+                        else
+                            break; // restart if lost race to replace value
+                    }
+                    // else c < 0; fall through
+                }
+
+                Node<K,V> z = new Node<K,V>(kkey, value, n);
+                if (!b.casNext(n, z))
+                    break;         // restart if lost race to append to b
+                int level = randomLevel();
+                if (level > 0)
+                    insertIndex(z, level);
+                return null;
+            }
+        }
+!!!1480475.java!!!	randomLevel() : int
+        int x = randomSeed;
+        x ^= x << 13;
+        x ^= x >>> 17;
+        randomSeed = x ^= x << 5;
+        if ((x & 0x80000001) != 0) // test highest and lowest bits
+            return 0;
+        int level = 1;
+        while (((x >>>= 1) & 1) != 0) ++level;
+        return level;
+!!!1480603.java!!!	insertIndex(inout z : Node, in level : int) : void
+        HeadIndex<K,V> h = head;
+        int max = h.level;
+
+        if (level <= max) {
+            Index<K,V> idx = null;
+            for (int i = 1; i <= level; ++i)
+                idx = new Index<K,V>(z, idx, null);
+            addIndex(idx, h, level);
+
+        } else { // Add a new level
+            /*
+             * To reduce interference by other threads checking for
+             * empty levels in tryReduceLevel, new levels are added
+             * with initialized right pointers. Which in turn requires
+             * keeping levels in an array to access them while
+             * creating new head index nodes from the opposite
+             * direction.
+             */
+            level = max + 1;
+            Index<K,V>[] idxs = (Index<K,V>[])new Index<?,?>[level+1];
+            Index<K,V> idx = null;
+            for (int i = 1; i <= level; ++i)
+                idxs[i] = idx = new Index<K,V>(z, idx, null);
+
+            HeadIndex<K,V> oldh;
+            int k;
+            for (;;) {
+                oldh = head;
+                int oldLevel = oldh.level;
+                if (level <= oldLevel) { // lost race to add level
+                    k = level;
+                    break;
+                }
+                HeadIndex<K,V> newh = oldh;
+                Node<K,V> oldbase = oldh.node;
+                for (int j = oldLevel+1; j <= level; ++j)
+                    newh = new HeadIndex<K,V>(oldbase, newh, idxs[j], j);
+                if (casHead(oldh, newh)) {
+                    k = oldLevel;
+                    break;
+                }
+            }
+            addIndex(idxs[k], oldh, k);
+        }
+!!!1480731.java!!!	addIndex(inout idx : Index, inout h : HeadIndex, in indexLevel : int) : void
+        // Track next level to insert in case of retries
+        int insertionLevel = indexLevel;
+        Comparable<? super K> key = comparable(idx.node.key);
+        if (key == null) throw new NullPointerException();
+
+        // Similar to findPredecessor, but adding index nodes along
+        // path to key.
+        for (;;) {
+            int j = h.level;
+            Index<K,V> q = h;
+            Index<K,V> r = q.right;
+            Index<K,V> t = idx;
+            for (;;) {
+                if (r != null) {
+                    Node<K,V> n = r.node;
+                    // compare before deletion check avoids needing recheck
+                    int c = key.compareTo(n.key);
+                    if (n.value == null) {
+                        if (!q.unlink(r))
+                            break;
+                        r = q.right;
+                        continue;
+                    }
+                    if (c > 0) {
+                        q = r;
+                        r = r.right;
+                        continue;
+                    }
+                }
+
+                if (j == insertionLevel) {
+                    // Don't insert index if node already deleted
+                    if (t.indexesDeletedNode()) {
+                        findNode(key); // cleans up
+                        return;
+                    }
+                    if (!q.link(r, t))
+                        break; // restart
+                    if (--insertionLevel == 0) {
+                        // need final deletion check before return
+                        if (t.indexesDeletedNode())
+                            findNode(key);
+                        return;
+                    }
+                }
+
+                if (--j >= insertionLevel && j < indexLevel)
+                    t = t.down;
+                q = q.down;
+                r = q.right;
+            }
+        }
+!!!1480859.java!!!	doRemove(inout okey : Object, inout value : Object) : V
+        Comparable<? super K> key = comparable(okey);
+        for (;;) {
+            Node<K,V> b = findPredecessor(key);
+            Node<K,V> n = b.next;
+            for (;;) {
+                if (n == null)
+                    return null;
+                Node<K,V> f = n.next;
+                if (n != b.next)                    // inconsistent read
+                    break;
+                Object v = n.value;
+                if (v == null) {                    // n is deleted
+                    n.helpDelete(b, f);
+                    break;
+                }
+                if (v == n || b.value == null)      // b is deleted
+                    break;
+                int c = key.compareTo(n.key);
+                if (c < 0)
+                    return null;
+                if (c > 0) {
+                    b = n;
+                    n = f;
+                    continue;
+                }
+                if (value != null && !value.equals(v))
+                    return null;
+                if (!n.casValue(v, null))
+                    break;
+                if (!n.appendMarker(f) || !b.casNext(n, f))
+                    findNode(key);                  // Retry via findNode
+                else {
+                    findPredecessor(key);           // Clean index
+                    if (head.right == null)
+                        tryReduceLevel();
+                }
+                return (V)v;
+            }
+        }
+!!!1480987.java!!!	tryReduceLevel() : void
+        HeadIndex<K,V> h = head;
+        HeadIndex<K,V> d;
+        HeadIndex<K,V> e;
+        if (h.level > 3 &&
+            (d = (HeadIndex<K,V>)h.down) != null &&
+            (e = (HeadIndex<K,V>)d.down) != null &&
+            e.right == null &&
+            d.right == null &&
+            h.right == null &&
+            casHead(h, d) && // try to set
+            h.right != null) // recheck
+            casHead(d, h);   // try to backout
+!!!1481115.java!!!	findFirst() : Node
+        for (;;) {
+            Node<K,V> b = head.node;
+            Node<K,V> n = b.next;
+            if (n == null)
+                return null;
+            if (n.value != null)
+                return n;
+            n.helpDelete(b, n.next);
+        }
+!!!1481243.java!!!	doRemoveFirstEntry() : Entry
+        for (;;) {
+            Node<K,V> b = head.node;
+            Node<K,V> n = b.next;
+            if (n == null)
+                return null;
+            Node<K,V> f = n.next;
+            if (n != b.next)
+                continue;
+            Object v = n.value;
+            if (v == null) {
+                n.helpDelete(b, f);
+                continue;
+            }
+            if (!n.casValue(v, null))
+                continue;
+            if (!n.appendMarker(f) || !b.casNext(n, f))
+                findFirst(); // retry
+            clearIndexToFirst();
+            return new AbstractMap.SimpleImmutableEntry<K,V>(n.key, (V)v);
+        }
+!!!1481371.java!!!	clearIndexToFirst() : void
+        for (;;) {
+            Index<K,V> q = head;
+            for (;;) {
+                Index<K,V> r = q.right;
+                if (r != null && r.indexesDeletedNode() && !q.unlink(r))
+                    break;
+                if ((q = q.down) == null) {
+                    if (head.right == null)
+                        tryReduceLevel();
+                    return;
+                }
+            }
+        }
+!!!1481499.java!!!	findLast() : Node
+        /*
+         * findPredecessor can't be used to traverse index level
+         * because this doesn't use comparisons.  So traversals of
+         * both levels are folded together.
+         */
+        Index<K,V> q = head;
+        for (;;) {
+            Index<K,V> d, r;
+            if ((r = q.right) != null) {
+                if (r.indexesDeletedNode()) {
+                    q.unlink(r);
+                    q = head; // restart
+                }
+                else
+                    q = r;
+            } else if ((d = q.down) != null) {
+                q = d;
+            } else {
+                Node<K,V> b = q.node;
+                Node<K,V> n = b.next;
+                for (;;) {
+                    if (n == null)
+                        return b.isBaseHeader() ? null : b;
+                    Node<K,V> f = n.next;            // inconsistent read
+                    if (n != b.next)
+                        break;
+                    Object v = n.value;
+                    if (v == null) {                 // n is deleted
+                        n.helpDelete(b, f);
+                        break;
+                    }
+                    if (v == n || b.value == null)   // b is deleted
+                        break;
+                    b = n;
+                    n = f;
+                }
+                q = head; // restart
+            }
+        }
+!!!1481627.java!!!	findPredecessorOfLast() : Node
+        for (;;) {
+            Index<K,V> q = head;
+            for (;;) {
+                Index<K,V> d, r;
+                if ((r = q.right) != null) {
+                    if (r.indexesDeletedNode()) {
+                        q.unlink(r);
+                        break;    // must restart
+                    }
+                    // proceed as far across as possible without overshooting
+                    if (r.node.next != null) {
+                        q = r;
+                        continue;
+                    }
+                }
+                if ((d = q.down) != null)
+                    q = d;
+                else
+                    return q.node;
+            }
+        }
+!!!1481755.java!!!	doRemoveLastEntry() : Entry
+        for (;;) {
+            Node<K,V> b = findPredecessorOfLast();
+            Node<K,V> n = b.next;
+            if (n == null) {
+                if (b.isBaseHeader())               // empty
+                    return null;
+                else
+                    continue; // all b's successors are deleted; retry
+            }
+            for (;;) {
+                Node<K,V> f = n.next;
+                if (n != b.next)                    // inconsistent read
+                    break;
+                Object v = n.value;
+                if (v == null) {                    // n is deleted
+                    n.helpDelete(b, f);
+                    break;
+                }
+                if (v == n || b.value == null)      // b is deleted
+                    break;
+                if (f != null) {
+                    b = n;
+                    n = f;
+                    continue;
+                }
+                if (!n.casValue(v, null))
+                    break;
+                K key = n.key;
+                Comparable<? super K> ck = comparable(key);
+                if (!n.appendMarker(f) || !b.casNext(n, f))
+                    findNode(ck);                  // Retry via findNode
+                else {
+                    findPredecessor(ck);           // Clean index
+                    if (head.right == null)
+                        tryReduceLevel();
+                }
+                return new AbstractMap.SimpleImmutableEntry<K,V>(key, (V)v);
+            }
+        }
+!!!1481883.java!!!	findNear(inout kkey : K, in rel : int) : Node
+        Comparable<? super K> key = comparable(kkey);
+        for (;;) {
+            Node<K,V> b = findPredecessor(key);
+            Node<K,V> n = b.next;
+            for (;;) {
+                if (n == null)
+                    return ((rel & LT) == 0 || b.isBaseHeader()) ? null : b;
+                Node<K,V> f = n.next;
+                if (n != b.next)                  // inconsistent read
+                    break;
+                Object v = n.value;
+                if (v == null) {                  // n is deleted
+                    n.helpDelete(b, f);
+                    break;
+                }
+                if (v == n || b.value == null)    // b is deleted
+                    break;
+                int c = key.compareTo(n.key);
+                if ((c == 0 && (rel & EQ) != 0) ||
+                    (c <  0 && (rel & LT) == 0))
+                    return n;
+                if ( c <= 0 && (rel & LT) != 0)
+                    return b.isBaseHeader() ? null : b;
+                b = n;
+                n = f;
+            }
+        }
+!!!1482011.java!!!	getNear(inout key : K, in rel : int) : SimpleImmutableEntry
+        for (;;) {
+            Node<K,V> n = findNear(key, rel);
+            if (n == null)
+                return null;
+            AbstractMap.SimpleImmutableEntry<K,V> e = n.createSnapshot();
+            if (e != null)
+                return e;
+        }
+!!!1482139.java!!!	ConcurrentSkipListMap()
+        this.comparator = null;
+        initialize();
+!!!1482267.java!!!	ConcurrentSkipListMap(inout comparator : Comparator)
+        this.comparator = comparator;
+        initialize();
+!!!1482395.java!!!	ConcurrentSkipListMap(inout m : Map)
+        this.comparator = null;
+        initialize();
+        putAll(m);
+!!!1482523.java!!!	ConcurrentSkipListMap(inout m : SortedMap)
+        this.comparator = m.comparator();
+        initialize();
+        buildFromSorted(m);
+!!!1482651.java!!!	clone() : ConcurrentSkipListMap
+        try {
+            @SuppressWarnings("unchecked")
+            ConcurrentSkipListMap<K,V> clone =
+                (ConcurrentSkipListMap<K,V>) super.clone();
+            clone.initialize();
+            clone.buildFromSorted(this);
+            return clone;
+        } catch (CloneNotSupportedException e) {
+            throw new InternalError();
+        }
+!!!1482779.java!!!	buildFromSorted(inout map : SortedMap) : void
+        if (map == null)
+            throw new NullPointerException();
+
+        HeadIndex<K,V> h = head;
+        Node<K,V> basepred = h.node;
+
+        // Track the current rightmost node at each level. Uses an
+        // ArrayList to avoid committing to initial or maximum level.
+        ArrayList<Index<K,V>> preds = new ArrayList<Index<K,V>>();
+
+        // initialize
+        for (int i = 0; i <= h.level; ++i)
+            preds.add(null);
+        Index<K,V> q = h;
+        for (int i = h.level; i > 0; --i) {
+            preds.set(i, q);
+            q = q.down;
+        }
+
+        Iterator<? extends Map.Entry<? extends K, ? extends V>> it =
+            map.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<? extends K, ? extends V> e = it.next();
+            int j = randomLevel();
+            if (j > h.level) j = h.level + 1;
+            K k = e.getKey();
+            V v = e.getValue();
+            if (k == null || v == null)
+                throw new NullPointerException();
+            Node<K,V> z = new Node<K,V>(k, v, null);
+            basepred.next = z;
+            basepred = z;
+            if (j > 0) {
+                Index<K,V> idx = null;
+                for (int i = 1; i <= j; ++i) {
+                    idx = new Index<K,V>(z, idx, null);
+                    if (i > h.level)
+                        h = new HeadIndex<K,V>(h.node, h, idx, i);
+
+                    if (i < preds.size()) {
+                        preds.get(i).right = idx;
+                        preds.set(i, idx);
+                    } else
+                        preds.add(idx);
+                }
+            }
+        }
+        head = h;
+!!!1482907.java!!!	writeObject(inout s : ObjectOutputStream) : void
+        // Write out the Comparator and any hidden stuff
+        s.defaultWriteObject();
+
+        // Write out keys and values (alternating)
+        for (Node<K,V> n = findFirst(); n != null; n = n.next) {
+            V v = n.getValidValue();
+            if (v != null) {
+                s.writeObject(n.key);
+                s.writeObject(v);
+            }
+        }
+        s.writeObject(null);
+!!!1483035.java!!!	readObject(in s : ObjectInputStream) : void
+        // Read in the Comparator and any hidden stuff
+        s.defaultReadObject();
+        // Reset transients
+        initialize();
+
+        /*
+         * This is nearly identical to buildFromSorted, but is
+         * distinct because readObject calls can't be nicely adapted
+         * as the kind of iterator needed by buildFromSorted. (They
+         * can be, but doing so requires type cheats and/or creation
+         * of adaptor classes.) It is simpler to just adapt the code.
+         */
+
+        HeadIndex<K,V> h = head;
+        Node<K,V> basepred = h.node;
+        ArrayList<Index<K,V>> preds = new ArrayList<Index<K,V>>();
+        for (int i = 0; i <= h.level; ++i)
+            preds.add(null);
+        Index<K,V> q = h;
+        for (int i = h.level; i > 0; --i) {
+            preds.set(i, q);
+            q = q.down;
+        }
+
+        for (;;) {
+            Object k = s.readObject();
+            if (k == null)
+                break;
+            Object v = s.readObject();
+            if (v == null)
+                throw new NullPointerException();
+            K key = (K) k;
+            V val = (V) v;
+            int j = randomLevel();
+            if (j > h.level) j = h.level + 1;
+            Node<K,V> z = new Node<K,V>(key, val, null);
+            basepred.next = z;
+            basepred = z;
+            if (j > 0) {
+                Index<K,V> idx = null;
+                for (int i = 1; i <= j; ++i) {
+                    idx = new Index<K,V>(z, idx, null);
+                    if (i > h.level)
+                        h = new HeadIndex<K,V>(h.node, h, idx, i);
+
+                    if (i < preds.size()) {
+                        preds.get(i).right = idx;
+                        preds.set(i, idx);
+                    } else
+                        preds.add(idx);
+                }
+            }
+        }
+        head = h;
+!!!1483163.java!!!	containsKey(inout key : Object) : boolean
+        return doGet(key) != null;
+!!!1483291.java!!!	get(inout key : Object) : V
+        return doGet(key);
+!!!1483419.java!!!	put(inout key : K, inout value : V) : V
+        if (value == null)
+            throw new NullPointerException();
+        return doPut(key, value, false);
+!!!1483547.java!!!	remove(inout key : Object) : V
+        return doRemove(key, null);
+!!!1483675.java!!!	containsValue(inout value : Object) : boolean
+        if (value == null)
+            throw new NullPointerException();
+        for (Node<K,V> n = findFirst(); n != null; n = n.next) {
+            V v = n.getValidValue();
+            if (v != null && value.equals(v))
+                return true;
+        }
+        return false;
+!!!1483803.java!!!	size() : int
+        long count = 0;
+        for (Node<K,V> n = findFirst(); n != null; n = n.next) {
+            if (n.getValidValue() != null)
+                ++count;
+        }
+        return (count >= Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) count;
+!!!1483931.java!!!	isEmpty() : boolean
+        return findFirst() == null;
+!!!1484059.java!!!	clear() : void
+        initialize();
+!!!1484187.java!!!	keySet() : NavigableSet
+        KeySet<K> ks = keySet;
+        return (ks != null) ? ks : (keySet = new KeySet<K>(this));
+!!!1484315.java!!!	navigableKeySet() : NavigableSet
+        KeySet<K> ks = keySet;
+        return (ks != null) ? ks : (keySet = new KeySet<K>(this));
+!!!1484443.java!!!	values() : Collection
+        Values<V> vs = values;
+        return (vs != null) ? vs : (values = new Values<V>(this));
+!!!1484571.java!!!	entrySet() : Set
+        EntrySet<K,V> es = entrySet;
+        return (es != null) ? es : (entrySet = new EntrySet<K,V>(this));
+!!!1484699.java!!!	descendingMap() : ConcurrentNavigableMap
+        ConcurrentNavigableMap<K,V> dm = descendingMap;
+        return (dm != null) ? dm : (descendingMap = new SubMap<K,V>
+                                    (this, null, false, null, false, true));
+!!!1484827.java!!!	descendingKeySet() : NavigableSet
+        return descendingMap().navigableKeySet();
+!!!1484955.java!!!	equals(inout o : Object) : boolean
+        if (o == this)
+            return true;
+        if (!(o instanceof Map))
+            return false;
+        Map<?,?> m = (Map<?,?>) o;
+        try {
+            for (Map.Entry<K,V> e : this.entrySet())
+                if (! e.getValue().equals(m.get(e.getKey())))
+                    return false;
+            for (Map.Entry<?,?> e : m.entrySet()) {
+                Object k = e.getKey();
+                Object v = e.getValue();
+                if (k == null || v == null || !v.equals(get(k)))
+                    return false;
+            }
+            return true;
+        } catch (ClassCastException unused) {
+            return false;
+        } catch (NullPointerException unused) {
+            return false;
+        }
+!!!1485083.java!!!	putIfAbsent(inout key : K, inout value : V) : V
+        if (value == null)
+            throw new NullPointerException();
+        return doPut(key, value, true);
+!!!1485211.java!!!	remove(inout key : Object, inout value : Object) : boolean
+        if (key == null)
+            throw new NullPointerException();
+        if (value == null)
+            return false;
+        return doRemove(key, value) != null;
+!!!1485339.java!!!	replace(inout key : K, inout oldValue : V, inout newValue : V) : boolean
+        if (oldValue == null || newValue == null)
+            throw new NullPointerException();
+        Comparable<? super K> k = comparable(key);
+        for (;;) {
+            Node<K,V> n = findNode(k);
+            if (n == null)
+                return false;
+            Object v = n.value;
+            if (v != null) {
+                if (!oldValue.equals(v))
+                    return false;
+                if (n.casValue(v, newValue))
+                    return true;
+            }
+        }
+!!!1485467.java!!!	replace(inout key : K, inout value : V) : V
+        if (value == null)
+            throw new NullPointerException();
+        Comparable<? super K> k = comparable(key);
+        for (;;) {
+            Node<K,V> n = findNode(k);
+            if (n == null)
+                return null;
+            Object v = n.value;
+            if (v != null && n.casValue(v, value))
+                return (V)v;
+        }
+!!!1485595.java!!!	comparator() : Comparator
+        return comparator;
+!!!1485723.java!!!	firstKey() : K
+        Node<K,V> n = findFirst();
+        if (n == null)
+            throw new NoSuchElementException();
+        return n.key;
+!!!1485851.java!!!	lastKey() : K
+        Node<K,V> n = findLast();
+        if (n == null)
+            throw new NoSuchElementException();
+        return n.key;
+!!!1485979.java!!!	subMap(inout fromKey : K, inout fromInclusive : boolean, inout toKey : K, inout toInclusive : boolean) : ConcurrentNavigableMap
+        if (fromKey == null || toKey == null)
+            throw new NullPointerException();
+        return new SubMap<K,V>
+            (this, fromKey, fromInclusive, toKey, toInclusive, false);
+!!!1486107.java!!!	headMap(inout toKey : K, inout inclusive : boolean) : ConcurrentNavigableMap
+        if (toKey == null)
+            throw new NullPointerException();
+        return new SubMap<K,V>
+            (this, null, false, toKey, inclusive, false);
+!!!1486235.java!!!	tailMap(inout fromKey : K, inout inclusive : boolean) : ConcurrentNavigableMap
+        if (fromKey == null)
+            throw new NullPointerException();
+        return new SubMap<K,V>
+            (this, fromKey, inclusive, null, false, false);
+!!!1486363.java!!!	subMap(inout fromKey : K, inout toKey : K) : ConcurrentNavigableMap
+        return subMap(fromKey, true, toKey, false);
+!!!1486491.java!!!	headMap(inout toKey : K) : ConcurrentNavigableMap
+        return headMap(toKey, false);
+!!!1486619.java!!!	tailMap(inout fromKey : K) : ConcurrentNavigableMap
+        return tailMap(fromKey, true);
+!!!1486747.java!!!	lowerEntry(inout key : K) : Entry
+        return getNear(key, LT);
+!!!1486875.java!!!	lowerKey(inout key : K) : K
+        Node<K,V> n = findNear(key, LT);
+        return (n == null) ? null : n.key;
+!!!1487003.java!!!	floorEntry(inout key : K) : Entry
+        return getNear(key, LT|EQ);
+!!!1487131.java!!!	floorKey(inout key : K) : K
+        Node<K,V> n = findNear(key, LT|EQ);
+        return (n == null) ? null : n.key;
+!!!1487259.java!!!	ceilingEntry(inout key : K) : Entry
+        return getNear(key, GT|EQ);
+!!!1487387.java!!!	ceilingKey(inout key : K) : K
+        Node<K,V> n = findNear(key, GT|EQ);
+        return (n == null) ? null : n.key;
+!!!1487515.java!!!	higherEntry(inout key : K) : Entry
+        return getNear(key, GT);
+!!!1487643.java!!!	higherKey(inout key : K) : K
+        Node<K,V> n = findNear(key, GT);
+        return (n == null) ? null : n.key;
+!!!1487771.java!!!	firstEntry() : Entry
+        for (;;) {
+            Node<K,V> n = findFirst();
+            if (n == null)
+                return null;
+            AbstractMap.SimpleImmutableEntry<K,V> e = n.createSnapshot();
+            if (e != null)
+                return e;
+        }
+!!!1487899.java!!!	lastEntry() : Entry
+        for (;;) {
+            Node<K,V> n = findLast();
+            if (n == null)
+                return null;
+            AbstractMap.SimpleImmutableEntry<K,V> e = n.createSnapshot();
+            if (e != null)
+                return e;
+        }
+!!!1488027.java!!!	pollFirstEntry() : Entry
+        return doRemoveFirstEntry();
+!!!1488155.java!!!	pollLastEntry() : Entry
+        return doRemoveLastEntry();
+!!!1489179.java!!!	keyIterator() : Iterator
+        return new KeyIterator();
+!!!1489307.java!!!	valueIterator() : Iterator
+        return new ValueIterator();
+!!!1489435.java!!!	entryIterator() : Iterator
+        return new EntryIterator();
+!!!1489563.java!!!	toList(inout c : Collection) : List
+        // Using size() here would be a pessimization.
+        List<E> list = new ArrayList<E>();
+        for (E e : c)
+            list.add(e);
+        return list;

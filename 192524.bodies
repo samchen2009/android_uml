@@ -1,0 +1,205 @@
+class TimedEventQueue
+!!!669836.cpp!!!	~TimedEventQueue()
+    stop();
+!!!669964.cpp!!!	start() : void
+    if (mRunning) {
+        return;
+    }
+
+    mStopped = false;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    pthread_create(&mThread, &attr, ThreadWrapper, this);
+
+    pthread_attr_destroy(&attr);
+
+    mRunning = true;
+!!!670092.cpp!!!	stop(in flush : bool = false) : void
+    if (!mRunning) {
+        return;
+    }
+
+    if (flush) {
+        postEventToBack(new StopEvent);
+    } else {
+        postTimedEvent(new StopEvent, INT64_MIN);
+    }
+
+    void *dummy;
+    pthread_join(mThread, &dummy);
+
+    mQueue.clear();
+
+    mRunning = false;
+!!!670220.cpp!!!	postEvent(in event : sp<Event>) : event_id
+    // Reserve an earlier timeslot an INT64_MIN to be able to post
+    // the StopEvent to the absolute head of the queue.
+    return postTimedEvent(event, INT64_MIN + 1);
+!!!670348.cpp!!!	postEventToBack(in event : sp<Event>) : event_id
+    return postTimedEvent(event, INT64_MAX);
+!!!670476.cpp!!!	postEventWithDelay(in event : sp<Event>, in delay_us : int64_t) : event_id
+    CHECK(delay_us >= 0);
+    return postTimedEvent(event, ALooper::GetNowUs() + delay_us);
+!!!670604.cpp!!!	postTimedEvent(in event : sp<Event>, in realtime_us : int64_t) : event_id
+    Mutex::Autolock autoLock(mLock);
+
+    event->setEventID(mNextEventID++);
+
+    List<QueueItem>::iterator it = mQueue.begin();
+    while (it != mQueue.end() && realtime_us >= (*it).realtime_us) {
+        ++it;
+    }
+
+    QueueItem item;
+    item.event = event;
+    item.realtime_us = realtime_us;
+
+    if (it == mQueue.begin()) {
+        mQueueHeadChangedCondition.signal();
+    }
+
+    mQueue.insert(it, item);
+
+    mQueueNotEmptyCondition.signal();
+
+    return event->eventID();
+!!!670732.cpp!!!	cancelEvent(in id : event_id) : bool
+    if (id == 0) {
+        return false;
+    }
+
+    cancelEvents(&MatchesEventID, &id, true /* stopAfterFirstMatch */);
+
+    // if MatchesEventID found a match, it will have set id to 0
+    // (which is not a valid event_id).
+
+    return id == 0;
+!!!670860.cpp!!!	cancelEvents(in predicate : bool (*)(void *cookie, const sp<Event> &event), inout cookie : void, in stopAfterFirstMatch : bool = false) : void
+    Mutex::Autolock autoLock(mLock);
+
+    List<QueueItem>::iterator it = mQueue.begin();
+    while (it != mQueue.end()) {
+        if (!(*predicate)(cookie, (*it).event)) {
+            ++it;
+            continue;
+        }
+
+        if (it == mQueue.begin()) {
+            mQueueHeadChangedCondition.signal();
+        }
+
+        ALOGV("cancelling event %d", (*it).event->eventID());
+
+        (*it).event->setEventID(0);
+        it = mQueue.erase(it);
+
+        if (stopAfterFirstMatch) {
+            return;
+        }
+    }
+!!!671244.cpp!!!	ThreadWrapper(inout me : void) : void
+
+    androidSetThreadPriority(0, ANDROID_PRIORITY_FOREGROUND);
+
+    static_cast<TimedEventQueue *>(me)->threadEntry();
+
+    return NULL;
+!!!671372.cpp!!!	threadEntry() : void
+    prctl(PR_SET_NAME, (unsigned long)"TimedEventQueue", 0, 0, 0);
+
+    for (;;) {
+        int64_t now_us = 0;
+        sp<Event> event;
+
+        {
+            Mutex::Autolock autoLock(mLock);
+
+            if (mStopped) {
+                break;
+            }
+
+            while (mQueue.empty()) {
+                mQueueNotEmptyCondition.wait(mLock);
+            }
+
+            event_id eventID = 0;
+            for (;;) {
+                if (mQueue.empty()) {
+                    // The only event in the queue could have been cancelled
+                    // while we were waiting for its scheduled time.
+                    break;
+                }
+
+                List<QueueItem>::iterator it = mQueue.begin();
+                eventID = (*it).event->eventID();
+
+                now_us = ALooper::GetNowUs();
+                int64_t when_us = (*it).realtime_us;
+
+                int64_t delay_us;
+                if (when_us < 0 || when_us == INT64_MAX) {
+                    delay_us = 0;
+                } else {
+                    delay_us = when_us - now_us;
+                }
+
+                if (delay_us <= 0) {
+                    break;
+                }
+
+                static int64_t kMaxTimeoutUs = 10000000ll;  // 10 secs
+                bool timeoutCapped = false;
+                if (delay_us > kMaxTimeoutUs) {
+                    ALOGW("delay_us exceeds max timeout: %lld us", delay_us);
+
+                    // We'll never block for more than 10 secs, instead
+                    // we will split up the full timeout into chunks of
+                    // 10 secs at a time. This will also avoid overflow
+                    // when converting from us to ns.
+                    delay_us = kMaxTimeoutUs;
+                    timeoutCapped = true;
+                }
+
+                status_t err = mQueueHeadChangedCondition.waitRelative(
+                        mLock, delay_us * 1000ll);
+
+                if (!timeoutCapped && err == -ETIMEDOUT) {
+                    // We finally hit the time this event is supposed to
+                    // trigger.
+                    now_us = ALooper::GetNowUs();
+                    break;
+                }
+            }
+
+            // The event w/ this id may have been cancelled while we're
+            // waiting for its trigger-time, in that case
+            // removeEventFromQueue_l will return NULL.
+            // Otherwise, the QueueItem will be removed
+            // from the queue and the referenced event returned.
+            event = removeEventFromQueue_l(eventID);
+        }
+
+        if (event != NULL) {
+            // Fire event with the lock NOT held.
+            event->fire(this, now_us);
+        }
+    }
+!!!671500.cpp!!!	removeEventFromQueue_l(in id : event_id) : sp<Event>
+    for (List<QueueItem>::iterator it = mQueue.begin();
+         it != mQueue.end(); ++it) {
+        if ((*it).event->eventID() == id) {
+            sp<Event> event = (*it).event;
+            event->setEventID(0);
+
+            mQueue.erase(it);
+
+            return event;
+        }
+    }
+
+    ALOGW("Event %d was not found in the queue, already cancelled?", id);
+
+    return NULL;

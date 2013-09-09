@@ -1,0 +1,655 @@
+class WifiDisplaySource::PlaybackSession
+!!!738956.cpp!!!	init(in clientIP : char, in clientRtp : int32_t, in clientRtcp : int32_t, in transportMode : TransportMode, in usePCMAudio : bool) : status_t
+    status_t err = setupPacketizer(usePCMAudio);
+
+    if (err != OK) {
+        return err;
+    }
+
+    sp<AMessage> notify = new AMessage(kWhatSenderNotify, id());
+    mSender = new Sender(mNetSession, notify);
+
+    mSenderLooper = new ALooper;
+    mSenderLooper->setName("sender_looper");
+
+    mSenderLooper->start(
+            false /* runOnCallingThread */,
+            false /* canCallJava */,
+            PRIORITY_AUDIO);
+
+    mSenderLooper->registerHandler(mSender);
+
+    err = mSender->init(clientIP, clientRtp, clientRtcp, transportMode);
+
+    if (err != OK) {
+        return err;
+    }
+
+    updateLiveness();
+
+    return OK;
+!!!739084.cpp!!!	destroyAsync() : void
+    ALOGI("destroyAsync");
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        mTracks.valueAt(i)->stopAsync();
+    }
+!!!739212.cpp!!!	getRTPPort() : int32_t
+    return mSender->getRTPPort();
+!!!739340.cpp!!!	getLastLifesignUs() : int64_t
+    return mLastLifesignUs;
+!!!739468.cpp!!!	updateLiveness() : void
+    mLastLifesignUs = ALooper::GetNowUs();
+!!!739596.cpp!!!	play() : status_t
+    updateLiveness();
+
+    (new AMessage(kWhatResume, id()))->post();
+
+    return OK;
+!!!739724.cpp!!!	finishPlay() : status_t
+    // XXX Give the dongle a second to bind its sockets.
+    (new AMessage(kWhatFinishPlay, id()))->post(1000000ll);
+    return OK;
+!!!739852.cpp!!!	pause() : status_t
+    updateLiveness();
+
+    (new AMessage(kWhatPause, id()))->post();
+
+    return OK;
+!!!739980.cpp!!!	getSurfaceTexture() : sp<ISurfaceTexture>
+    return mBufferQueue;
+!!!740108.cpp!!!	width() : int32_t
+#if USE_1080P
+    return 1920;
+#else
+    return 1280;
+#endif
+!!!740236.cpp!!!	height() : int32_t
+#if USE_1080P
+    return 1080;
+#else
+    return 720;
+#endif
+!!!740364.cpp!!!	requestIDRFrame() : void
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        const sp<Track> &track = mTracks.valueAt(i);
+
+        track->requestIDRFrame();
+    }
+!!!740492.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatConverterNotify:
+        {
+            if (mWeAreDead) {
+                ALOGV("dropping msg '%s' because we're dead",
+                      msg->debugString().c_str());
+
+                break;
+            }
+
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            size_t trackIndex;
+            CHECK(msg->findSize("trackIndex", &trackIndex));
+
+            if (what == Converter::kWhatAccessUnit) {
+                const sp<Track> &track = mTracks.valueFor(trackIndex);
+
+                ssize_t packetizerTrackIndex = track->packetizerTrackIndex();
+
+                if (packetizerTrackIndex < 0) {
+                    sp<AMessage> trackFormat = track->getFormat()->dup();
+                    if (mHDCP != NULL && !track->isAudio()) {
+                        // HDCP2.0 _and_ HDCP 2.1 specs say to set the version
+                        // inside the HDCP descriptor to 0x20!!!
+                        trackFormat->setInt32("hdcp-version", 0x20);
+                    }
+                    packetizerTrackIndex = mPacketizer->addTrack(trackFormat);
+
+                    CHECK_GE(packetizerTrackIndex, 0);
+
+                    track->setPacketizerTrackIndex(packetizerTrackIndex);
+
+                    if (allTracksHavePacketizerIndex()) {
+                        status_t err = packetizeQueuedAccessUnits();
+
+                        if (err != OK) {
+                            notifySessionDead();
+                            break;
+                        }
+                    }
+                }
+
+                sp<ABuffer> accessUnit;
+                CHECK(msg->findBuffer("accessUnit", &accessUnit));
+
+                if (!allTracksHavePacketizerIndex()) {
+                    track->queueAccessUnit(accessUnit);
+                    break;
+                }
+
+                track->queueOutputBuffer(accessUnit);
+
+                drainAccessUnits();
+                break;
+            } else if (what == Converter::kWhatEOS) {
+                CHECK_EQ(what, Converter::kWhatEOS);
+
+                ALOGI("output EOS on track %d", trackIndex);
+
+                ssize_t index = mTracks.indexOfKey(trackIndex);
+                CHECK_GE(index, 0);
+
+                const sp<Converter> &converter =
+                    mTracks.valueAt(index)->converter();
+                looper()->unregisterHandler(converter->id());
+
+                mTracks.removeItemsAt(index);
+
+                if (mTracks.isEmpty()) {
+                    ALOGI("Reached EOS");
+                }
+            } else {
+                CHECK_EQ(what, Converter::kWhatError);
+
+                status_t err;
+                CHECK(msg->findInt32("err", &err));
+
+                ALOGE("converter signaled error %d", err);
+
+                notifySessionDead();
+            }
+            break;
+        }
+
+        case kWhatSenderNotify:
+        {
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            if (what == Sender::kWhatInitDone) {
+                onFinishPlay2();
+            } else if (what == Sender::kWhatSessionDead) {
+                notifySessionDead();
+            } else {
+                TRESPASS();
+            }
+
+            break;
+        }
+
+        case kWhatFinishPlay:
+        {
+            onFinishPlay();
+            break;
+        }
+
+        case kWhatTrackNotify:
+        {
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            size_t trackIndex;
+            CHECK(msg->findSize("trackIndex", &trackIndex));
+
+            if (what == Track::kWhatStopped) {
+                ALOGI("Track %d stopped", trackIndex);
+
+                sp<Track> track = mTracks.valueFor(trackIndex);
+                looper()->unregisterHandler(track->id());
+                mTracks.removeItem(trackIndex);
+                track.clear();
+
+                if (!mTracks.isEmpty()) {
+                    ALOGI("not all tracks are stopped yet");
+                    break;
+                }
+
+                mSenderLooper->unregisterHandler(mSender->id());
+                mSender.clear();
+                mSenderLooper.clear();
+
+                mPacketizer.clear();
+
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("what", kWhatSessionDestroyed);
+                notify->post();
+            }
+            break;
+        }
+
+        case kWhatPacketize:
+        {
+            size_t trackIndex;
+            CHECK(msg->findSize("trackIndex", &trackIndex));
+
+            sp<ABuffer> accessUnit;
+            CHECK(msg->findBuffer("accessUnit", &accessUnit));
+
+#if 0
+            if ((ssize_t)trackIndex == mVideoTrackIndex) {
+                int64_t nowUs = ALooper::GetNowUs();
+                static int64_t prevNowUs = 0ll;
+
+                ALOGI("sending AU, dNowUs=%lld us", nowUs - prevNowUs);
+
+                prevNowUs = nowUs;
+            }
+#endif
+
+            break;
+        }
+
+        case kWhatPause:
+        {
+            if (mPaused) {
+                break;
+            }
+
+            for (size_t i = 0; i < mTracks.size(); ++i) {
+                mTracks.editValueAt(i)->pause();
+            }
+
+            mPaused = true;
+            break;
+        }
+
+        case kWhatResume:
+        {
+            if (!mPaused) {
+                break;
+            }
+
+            for (size_t i = 0; i < mTracks.size(); ++i) {
+                mTracks.editValueAt(i)->resume();
+            }
+
+            mPaused = false;
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!740620.cpp!!!	setupPacketizer(in usePCMAudio : bool) : status_t
+    mPacketizer = new TSPacketizer;
+
+    status_t err = addVideoSource();
+
+    if (err != OK) {
+        return err;
+    }
+
+    return addAudioSource(usePCMAudio);
+!!!740748.cpp!!!	addSource(in isVideo : bool, in source : sp<MediaSource>, in isRepeaterSource : bool, in usePCMAudio : bool, inout numInputBuffers : size_t) : status_t
+    CHECK(!usePCMAudio || !isVideo);
+    CHECK(!isRepeaterSource || isVideo);
+
+    sp<ALooper> pullLooper = new ALooper;
+    pullLooper->setName("pull_looper");
+
+    pullLooper->start(
+            false /* runOnCallingThread */,
+            false /* canCallJava */,
+            PRIORITY_AUDIO);
+
+    sp<ALooper> codecLooper = new ALooper;
+    codecLooper->setName("codec_looper");
+
+    codecLooper->start(
+            false /* runOnCallingThread */,
+            false /* canCallJava */,
+            PRIORITY_AUDIO);
+
+    size_t trackIndex;
+
+    sp<AMessage> notify;
+
+    trackIndex = mTracks.size();
+
+    sp<AMessage> format;
+    status_t err = convertMetaDataToMessage(source->getFormat(), &format);
+    CHECK_EQ(err, (status_t)OK);
+
+    if (isVideo) {
+        format->setInt32("store-metadata-in-buffers", true);
+
+        format->setInt32(
+                "color-format", OMX_COLOR_FormatAndroidOpaque);
+    }
+
+    notify = new AMessage(kWhatConverterNotify, id());
+    notify->setSize("trackIndex", trackIndex);
+
+    sp<Converter> converter =
+        new Converter(notify, codecLooper, format, usePCMAudio);
+
+    err = converter->initCheck();
+    if (err != OK) {
+        ALOGE("%s converter returned err %d", isVideo ? "video" : "audio", err);
+        return err;
+    }
+
+    looper()->registerHandler(converter);
+
+    notify = new AMessage(Converter::kWhatMediaPullerNotify, converter->id());
+    notify->setSize("trackIndex", trackIndex);
+
+    sp<MediaPuller> puller = new MediaPuller(source, notify);
+    pullLooper->registerHandler(puller);
+
+    if (numInputBuffers != NULL) {
+        *numInputBuffers = converter->getInputBufferCount();
+    }
+
+    notify = new AMessage(kWhatTrackNotify, id());
+    notify->setSize("trackIndex", trackIndex);
+
+    sp<Track> track = new Track(
+            notify, pullLooper, codecLooper, puller, converter);
+
+    if (isRepeaterSource) {
+        track->setRepeaterSource(static_cast<RepeaterSource *>(source.get()));
+    }
+
+    looper()->registerHandler(track);
+
+    mTracks.add(trackIndex, track);
+
+    if (isVideo) {
+        mVideoTrackIndex = trackIndex;
+    }
+
+    return OK;
+!!!740876.cpp!!!	addVideoSource() : status_t
+    sp<SurfaceMediaSource> source = new SurfaceMediaSource(width(), height());
+
+    source->setUseAbsoluteTimestamps();
+
+#if 1
+    sp<RepeaterSource> videoSource =
+        new RepeaterSource(source, 30.0 /* rateHz */);
+#endif
+
+#if 1
+    size_t numInputBuffers;
+    status_t err = addSource(
+            true /* isVideo */, videoSource, true /* isRepeaterSource */,
+            false /* usePCMAudio */, &numInputBuffers);
+#else
+    size_t numInputBuffers;
+    status_t err = addSource(
+            true /* isVideo */, source, false /* isRepeaterSource */,
+            false /* usePCMAudio */, &numInputBuffers);
+#endif
+
+    if (err != OK) {
+        return err;
+    }
+
+    err = source->setMaxAcquiredBufferCount(numInputBuffers);
+    CHECK_EQ(err, (status_t)OK);
+
+    mBufferQueue = source->getBufferQueue();
+
+    return OK;
+!!!741004.cpp!!!	addAudioSource(in usePCMAudio : bool) : status_t
+    sp<AudioSource> audioSource = new AudioSource(
+            AUDIO_SOURCE_REMOTE_SUBMIX,
+            48000 /* sampleRate */,
+            2 /* channelCount */);
+
+    if (audioSource->initCheck() == OK) {
+        return addSource(
+                false /* isVideo */, audioSource, false /* isRepeaterSource */,
+                usePCMAudio, NULL /* numInputBuffers */);
+    }
+
+    ALOGW("Unable to instantiate audio source");
+
+    return OK;
+!!!741260.cpp!!!	onFinishPlay() : status_t
+    return mSender->finishInit();
+!!!741388.cpp!!!	onFinishPlay2() : status_t
+    mSender->scheduleSendSR();
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        CHECK_EQ((status_t)OK, mTracks.editValueAt(i)->start());
+    }
+
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kWhatSessionEstablished);
+    notify->post();
+
+    return OK;
+!!!741516.cpp!!!	allTracksHavePacketizerIndex() : bool
+    if (mAllTracksHavePacketizerIndex) {
+        return true;
+    }
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        if (mTracks.valueAt(i)->packetizerTrackIndex() < 0) {
+            return false;
+        }
+    }
+
+    mAllTracksHavePacketizerIndex = true;
+
+    return true;
+!!!741644.cpp!!!	packetizeAccessUnit(in trackIndex : size_t, in accessUnit : sp<ABuffer>, inout packets : sp<ABuffer>) : status_t
+    const sp<Track> &track = mTracks.valueFor(trackIndex);
+
+    uint32_t flags = 0;
+
+    bool isHDCPEncrypted = false;
+    uint64_t inputCTR;
+    uint8_t HDCP_private_data[16];
+
+    bool manuallyPrependSPSPPS =
+        !track->isAudio()
+        && track->converter()->needToManuallyPrependSPSPPS()
+        && IsIDR(accessUnit);
+
+    if (mHDCP != NULL && !track->isAudio()) {
+        isHDCPEncrypted = true;
+
+        if (manuallyPrependSPSPPS) {
+            accessUnit = mPacketizer->prependCSD(
+                    track->packetizerTrackIndex(), accessUnit);
+        }
+
+        status_t err = mHDCP->encrypt(
+                accessUnit->data(), accessUnit->size(),
+                trackIndex  /* streamCTR */,
+                &inputCTR,
+                accessUnit->data());
+
+        if (err != OK) {
+            ALOGE("Failed to HDCP-encrypt media data (err %d)",
+                  err);
+
+            return err;
+        }
+
+        HDCP_private_data[0] = 0x00;
+
+        HDCP_private_data[1] =
+            (((trackIndex >> 30) & 3) << 1) | 1;
+
+        HDCP_private_data[2] = (trackIndex >> 22) & 0xff;
+
+        HDCP_private_data[3] =
+            (((trackIndex >> 15) & 0x7f) << 1) | 1;
+
+        HDCP_private_data[4] = (trackIndex >> 7) & 0xff;
+
+        HDCP_private_data[5] =
+            ((trackIndex & 0x7f) << 1) | 1;
+
+        HDCP_private_data[6] = 0x00;
+
+        HDCP_private_data[7] =
+            (((inputCTR >> 60) & 0x0f) << 1) | 1;
+
+        HDCP_private_data[8] = (inputCTR >> 52) & 0xff;
+
+        HDCP_private_data[9] =
+            (((inputCTR >> 45) & 0x7f) << 1) | 1;
+
+        HDCP_private_data[10] = (inputCTR >> 37) & 0xff;
+
+        HDCP_private_data[11] =
+            (((inputCTR >> 30) & 0x7f) << 1) | 1;
+
+        HDCP_private_data[12] = (inputCTR >> 22) & 0xff;
+
+        HDCP_private_data[13] =
+            (((inputCTR >> 15) & 0x7f) << 1) | 1;
+
+        HDCP_private_data[14] = (inputCTR >> 7) & 0xff;
+
+        HDCP_private_data[15] =
+            ((inputCTR & 0x7f) << 1) | 1;
+
+#if 0
+        ALOGI("HDCP_private_data:");
+        hexdump(HDCP_private_data, sizeof(HDCP_private_data));
+
+        ABitReader br(HDCP_private_data, sizeof(HDCP_private_data));
+        CHECK_EQ(br.getBits(13), 0);
+        CHECK_EQ(br.getBits(2), (trackIndex >> 30) & 3);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(15), (trackIndex >> 15) & 0x7fff);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(15), trackIndex & 0x7fff);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(11), 0);
+        CHECK_EQ(br.getBits(4), (inputCTR >> 60) & 0xf);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(15), (inputCTR >> 45) & 0x7fff);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(15), (inputCTR >> 30) & 0x7fff);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(15), (inputCTR >> 15) & 0x7fff);
+        CHECK_EQ(br.getBits(1), 1u);
+        CHECK_EQ(br.getBits(15), inputCTR & 0x7fff);
+        CHECK_EQ(br.getBits(1), 1u);
+#endif
+
+        flags |= TSPacketizer::IS_ENCRYPTED;
+    } else if (manuallyPrependSPSPPS) {
+        flags |= TSPacketizer::PREPEND_SPS_PPS_TO_IDR_FRAMES;
+    }
+
+    int64_t timeUs = ALooper::GetNowUs();
+    if (mPrevTimeUs < 0ll || mPrevTimeUs + 100000ll <= timeUs) {
+        flags |= TSPacketizer::EMIT_PCR;
+        flags |= TSPacketizer::EMIT_PAT_AND_PMT;
+
+        mPrevTimeUs = timeUs;
+    }
+
+    mPacketizer->packetize(
+            track->packetizerTrackIndex(), accessUnit, packets, flags,
+            !isHDCPEncrypted ? NULL : HDCP_private_data,
+            !isHDCPEncrypted ? 0 : sizeof(HDCP_private_data),
+            track->isAudio() ? 2 : 0 /* numStuffingBytes */);
+
+    return OK;
+!!!741772.cpp!!!	packetizeQueuedAccessUnits() : status_t
+    for (;;) {
+        bool gotMoreData = false;
+        for (size_t i = 0; i < mTracks.size(); ++i) {
+            size_t trackIndex = mTracks.keyAt(i);
+            const sp<Track> &track = mTracks.valueAt(i);
+
+            sp<ABuffer> accessUnit = track->dequeueAccessUnit();
+            if (accessUnit != NULL) {
+                track->queueOutputBuffer(accessUnit);
+                gotMoreData = true;
+            }
+        }
+
+        if (!gotMoreData) {
+            break;
+        }
+    }
+
+    return OK;
+!!!741900.cpp!!!	notifySessionDead() : void
+    // Inform WifiDisplaySource of our premature death (wish).
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kWhatSessionDead);
+    notify->post();
+
+    mWeAreDead = true;
+!!!742028.cpp!!!	drainAccessUnits() : void
+    ALOGV("audio/video has %d/%d buffers ready.",
+            mTracks.valueFor(1)->countQueuedOutputBuffers(),
+            mTracks.valueFor(0)->countQueuedOutputBuffers());
+
+    while (drainAccessUnit()) {
+    }
+!!!742156.cpp!!!	drainAccessUnit() : bool
+    ssize_t minTrackIndex = -1;
+    int64_t minTimeUs = -1ll;
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        const sp<Track> &track = mTracks.valueAt(i);
+
+        int64_t timeUs;
+        if (track->hasOutputBuffer(&timeUs)) {
+            if (minTrackIndex < 0 || timeUs < minTimeUs) {
+                minTrackIndex = mTracks.keyAt(i);
+                minTimeUs = timeUs;
+            }
+        }
+#if SUSPEND_VIDEO_IF_IDLE
+        else if (!track->isSuspended()) {
+            // We still consider this track "live", so it should keep
+            // delivering output data whose time stamps we'll have to
+            // consider for proper interleaving.
+            return false;
+        }
+#else
+        else {
+            // We need access units available on all tracks to be able to
+            // dequeue the earliest one.
+            return false;
+        }
+#endif
+    }
+
+    if (minTrackIndex < 0) {
+        return false;
+    }
+
+    const sp<Track> &track = mTracks.valueFor(minTrackIndex);
+    sp<ABuffer> accessUnit = track->dequeueOutputBuffer();
+
+    sp<ABuffer> packets;
+    status_t err = packetizeAccessUnit(minTrackIndex, accessUnit, &packets);
+
+    if (err != OK) {
+        notifySessionDead();
+        return false;
+    }
+
+    if ((ssize_t)minTrackIndex == mVideoTrackIndex) {
+        packets->meta()->setInt32("isVideo", 1);
+    }
+    mSender->queuePackets(minTimeUs, packets);
+
+#if 0
+    if (minTrackIndex == mVideoTrackIndex) {
+        int64_t nowUs = ALooper::GetNowUs();
+
+        // Latency from "data acquired" to "ready to send if we wanted to".
+        ALOGI("[%s] latencyUs = %lld ms",
+              minTrackIndex == mVideoTrackIndex ? "video" : "audio",
+              (nowUs - minTimeUs) / 1000ll);
+    }
+#endif
+
+    return true;

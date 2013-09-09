@@ -1,0 +1,204 @@
+class LocationHandler
+!!!8278924.java!!!	processNewLocation(inout location : Location) : void
+            Message msg = obtainMessage(MSG_PROCESS_NEW_LOCATION, location);
+            sendMessage(msg);
+!!!8279052.java!!!	enableLocationUpdates() : void
+            sendEmptyMessage(MSG_ENABLE_LOCATION_UPDATES);
+!!!8279180.java!!!	requestLocationUpdate() : void
+            sendEmptyMessage(MSG_GET_NEW_LOCATION_UPDATE);
+!!!8279308.java!!!	requestTwilightUpdate() : void
+            sendEmptyMessage(MSG_DO_TWILIGHT_UPDATE);
+!!!8279436.java!!!	handleMessage(inout msg : Message) : void
+            switch (msg.what) {
+                case MSG_PROCESS_NEW_LOCATION: {
+                    final Location location = (Location)msg.obj;
+                    final boolean hasMoved = hasMoved(mLocation, location);
+                    final boolean hasBetterAccuracy = mLocation == null
+                            || location.getAccuracy() < mLocation.getAccuracy();
+                    if (DEBUG) {
+                        Slog.d(TAG, "Processing new location: " + location
+                               + ", hasMoved=" + hasMoved
+                               + ", hasBetterAccuracy=" + hasBetterAccuracy);
+                    }
+                    if (hasMoved || hasBetterAccuracy) {
+                        setLocation(location);
+                    }
+                    break;
+                }
+
+                case MSG_GET_NEW_LOCATION_UPDATE:
+                    if (!mNetworkListenerEnabled) {
+                        // Don't do anything -- we are still trying to get a
+                        // location.
+                        return;
+                    }
+                    if ((mLastNetworkRegisterTime + MIN_LOCATION_UPDATE_MS) >=
+                            SystemClock.elapsedRealtime()) {
+                        // Don't do anything -- it hasn't been long enough
+                        // since we last requested an update.
+                        return;
+                    }
+
+                    // Unregister the current location monitor, so we can
+                    // register a new one for it to get an immediate update.
+                    mNetworkListenerEnabled = false;
+                    mLocationManager.removeUpdates(mEmptyLocationListener);
+
+                    // Fall through to re-register listener.
+                case MSG_ENABLE_LOCATION_UPDATES:
+                    // enable network provider to receive at least location updates for a given
+                    // distance.
+                    boolean networkLocationEnabled;
+                    try {
+                        networkLocationEnabled =
+                            mLocationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+                    } catch (Exception e) {
+                        // we may get IllegalArgumentException if network location provider
+                        // does not exist or is not yet installed.
+                        networkLocationEnabled = false;
+                    }
+                    if (!mNetworkListenerEnabled && networkLocationEnabled) {
+                        mNetworkListenerEnabled = true;
+                        mLastNetworkRegisterTime = SystemClock.elapsedRealtime();
+                        mLocationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,
+                                LOCATION_UPDATE_MS, 0, mEmptyLocationListener);
+
+                        if (!mDidFirstInit) {
+                            mDidFirstInit = true;
+                            if (mLocation == null) {
+                                retrieveLocation();
+                            }
+                        }
+                    }
+
+                    // enable passive provider to receive updates from location fixes (gps
+                    // and network).
+                    boolean passiveLocationEnabled;
+                    try {
+                        passiveLocationEnabled =
+                            mLocationManager.isProviderEnabled(LocationManager.PASSIVE_PROVIDER);
+                    } catch (Exception e) {
+                        // we may get IllegalArgumentException if passive location provider
+                        // does not exist or is not yet installed.
+                        passiveLocationEnabled = false;
+                    }
+
+                    if (!mPassiveListenerEnabled && passiveLocationEnabled) {
+                        mPassiveListenerEnabled = true;
+                        mLocationManager.requestLocationUpdates(LocationManager.PASSIVE_PROVIDER,
+                                0, LOCATION_UPDATE_DISTANCE_METER , mLocationListener);
+                    }
+
+                    if (!(mNetworkListenerEnabled && mPassiveListenerEnabled)) {
+                        mLastUpdateInterval *= 1.5;
+                        if (mLastUpdateInterval == 0) {
+                            mLastUpdateInterval = LOCATION_UPDATE_ENABLE_INTERVAL_MIN;
+                        } else if (mLastUpdateInterval > LOCATION_UPDATE_ENABLE_INTERVAL_MAX) {
+                            mLastUpdateInterval = LOCATION_UPDATE_ENABLE_INTERVAL_MAX;
+                        }
+                        sendEmptyMessageDelayed(MSG_ENABLE_LOCATION_UPDATES, mLastUpdateInterval);
+                    }
+                    break;
+
+                case MSG_DO_TWILIGHT_UPDATE:
+                    updateTwilightState();
+                    break;
+            }
+!!!8279564.java!!!	retrieveLocation() : void
+            Location location = null;
+            final Iterator<String> providers =
+                    mLocationManager.getProviders(new Criteria(), true).iterator();
+            while (providers.hasNext()) {
+                final Location lastKnownLocation =
+                        mLocationManager.getLastKnownLocation(providers.next());
+                // pick the most recent location
+                if (location == null || (lastKnownLocation != null &&
+                        location.getElapsedRealtimeNanos() <
+                        lastKnownLocation.getElapsedRealtimeNanos())) {
+                    location = lastKnownLocation;
+                }
+            }
+
+            // In the case there is no location available (e.g. GPS fix or network location
+            // is not available yet), the longitude of the location is estimated using the timezone,
+            // latitude and accuracy are set to get a good average.
+            if (location == null) {
+                Time currentTime = new Time();
+                currentTime.set(System.currentTimeMillis());
+                double lngOffset = FACTOR_GMT_OFFSET_LONGITUDE *
+                        (currentTime.gmtoff - (currentTime.isDst > 0 ? 3600 : 0));
+                location = new Location("fake");
+                location.setLongitude(lngOffset);
+                location.setLatitude(0);
+                location.setAccuracy(417000.0f);
+                location.setTime(System.currentTimeMillis());
+                location.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+
+                if (DEBUG) {
+                    Slog.d(TAG, "Estimated location from timezone: " + location);
+                }
+            }
+
+            setLocation(location);
+!!!8279692.java!!!	setLocation(inout location : Location) : void
+            mLocation = location;
+            updateTwilightState();
+!!!8279820.java!!!	updateTwilightState() : void
+            if (mLocation == null) {
+                setTwilightState(null);
+                return;
+            }
+
+            final long now = System.currentTimeMillis();
+
+            // calculate yesterday's twilight
+            mTwilightCalculator.calculateTwilight(now - DateUtils.DAY_IN_MILLIS,
+                    mLocation.getLatitude(), mLocation.getLongitude());
+            final long yesterdaySunset = mTwilightCalculator.mSunset;
+
+            // calculate today's twilight
+            mTwilightCalculator.calculateTwilight(now,
+                    mLocation.getLatitude(), mLocation.getLongitude());
+            final boolean isNight = (mTwilightCalculator.mState == TwilightCalculator.NIGHT);
+            final long todaySunrise = mTwilightCalculator.mSunrise;
+            final long todaySunset = mTwilightCalculator.mSunset;
+
+            // calculate tomorrow's twilight
+            mTwilightCalculator.calculateTwilight(now + DateUtils.DAY_IN_MILLIS,
+                    mLocation.getLatitude(), mLocation.getLongitude());
+            final long tomorrowSunrise = mTwilightCalculator.mSunrise;
+
+            // set twilight state
+            TwilightState state = new TwilightState(isNight, yesterdaySunset,
+                    todaySunrise, todaySunset, tomorrowSunrise);
+            if (DEBUG) {
+                Slog.d(TAG, "Updating twilight state: " + state);
+            }
+            setTwilightState(state);
+
+            // schedule next update
+            long nextUpdate = 0;
+            if (todaySunrise == -1 || todaySunset == -1) {
+                // In the case the day or night never ends the update is scheduled 12 hours later.
+                nextUpdate = now + 12 * DateUtils.HOUR_IN_MILLIS;
+            } else {
+                // add some extra time to be on the safe side.
+                nextUpdate += DateUtils.MINUTE_IN_MILLIS;
+
+                if (now > todaySunset) {
+                    nextUpdate += tomorrowSunrise;
+                } else if (now > todaySunrise) {
+                    nextUpdate += todaySunset;
+                } else {
+                    nextUpdate += todaySunrise;
+                }
+            }
+
+            if (DEBUG) {
+                Slog.d(TAG, "Next update in " + (nextUpdate - now) + " ms");
+            }
+
+            Intent updateIntent = new Intent(ACTION_UPDATE_TWILIGHT_STATE);
+            PendingIntent pendingIntent = PendingIntent.getBroadcast(mContext, 0, updateIntent, 0);
+            mAlarmManager.cancel(pendingIntent);
+            mAlarmManager.set(AlarmManager.RTC_WAKEUP, nextUpdate, pendingIntent);

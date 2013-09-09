@@ -1,0 +1,1095 @@
+class QicCameraHardware
+!!!11056908.cpp!!!	setCallbacks(in notify_cb : camera_notify_callback, in data_cb : camera_data_callback, in data_cb_timestamp : camera_data_timestamp_callback, in get_memory : camera_request_memory, inout user : void) : void
+    mNotifyCb = notify_cb;
+    mDataCb = data_cb;
+    mDataCbTimestamp = data_cb_timestamp;
+    mGetMemoryCb = get_memory;
+    mCallbackCookie = user;
+!!!11057036.cpp!!!	enableMsgType(in msgType : int32_t) : void
+    LOGI("%s : msgType = 0x%x, mMsgEnabled before = 0x%x",
+         __func__, msgType, mMsgEnabled);
+    mPreviewLock.lock();
+    mMsgEnabled |= msgType;
+    mPreviewLock.unlock();
+!!!11057164.cpp!!!	disableMsgType(in msgType : int32_t) : void
+    LOGV("%s : msgType = 0x%x, mMsgEnabled before = 0x%x",
+         __func__, msgType, mMsgEnabled);
+    mPreviewLock.lock();
+    mMsgEnabled &= ~msgType;
+    mPreviewLock.unlock();
+!!!11057292.cpp!!!	msgTypeEnabled(in msgType : int32_t) : bool
+    LOGV("enter %s", __func__);
+    return (mMsgEnabled & msgType);
+!!!11057420.cpp!!!	startPreview() : status_t
+    int ret = NO_ERROR;
+    LOGV("enter %s", __func__);
+
+    if (waitCaptureCompletion() != NO_ERROR) {
+        return TIMED_OUT;
+    }
+
+    mPreviewLock.lock();
+
+    if (mPreviewRunning) {
+        // already running
+        LOGE("%s : preview thread already running", __func__);
+        mPreviewLock.unlock();
+        return INVALID_OPERATION;
+    }
+
+    mPreviewRunning = true;
+    mPreviewStartDeferred = false;
+
+    if (!mPreviewWindow) {
+        mPreviewStartDeferred = true;
+        mPreviewLock.unlock();
+        return NO_ERROR;
+    }
+
+    ret = startPreviewInternal();
+    mPreviewLock.unlock();
+
+    return ret;
+!!!11057548.cpp!!!	stopPreview() : void
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mPreviewLock);
+    stopPreviewInternal();
+!!!11057676.cpp!!!	previewEnabled() : bool
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mPreviewLock);
+    return mPreviewRunning;
+!!!11057804.cpp!!!	startRecording() : status_t
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mRecordLock);
+
+    if (mRecordRunning) {
+        return NO_ERROR;
+    }
+
+    if (mRecordHeap) {
+        mRecordHeap->release(mRecordHeap);
+        mRecordHeap = 0;
+    }
+
+    const char* videoFormat = mParameters.get(CameraParameters::KEY_VIDEO_FRAME_FORMAT);
+    int memSize;
+
+    if (mAVCRecording) {
+        mRecordFrameSize = ((mRecordingWidth * mRecordingHeight) >> 1) + 2 * sizeof(int);
+        memSize = mRecordFrameSize;
+    } else if (!strcmp(videoFormat, CameraParameters::PIXEL_FORMAT_YUV420SP)) {
+        mRecordFrameSize = mRecordingWidth * mRecordingHeight * 3 / 2;
+        memSize = mRecordFrameSize + sizeof(struct addrs);
+    } else if (!strcmp(videoFormat, CameraParameters::PIXEL_FORMAT_YUV420P)) {
+        mRecordFrameSize = mRecordingWidth * mRecordingHeight * 3 / 2;
+        memSize = mRecordFrameSize + sizeof(struct addrs);
+    } else if (!strcmp(videoFormat, CameraParameters::PIXEL_FORMAT_YUV422I)) {
+        mRecordFrameSize = mRecordingWidth * mRecordingHeight * 2;
+        memSize = mRecordFrameSize + sizeof(struct addrs);
+    } else {
+        LOGE("ERR(%s): do not support pixel format %s", __func__, videoFormat);
+        return UNKNOWN_ERROR;
+    }
+
+    mRecordHeap = mGetMemoryCb(-1, memSize, MAX_QIC_VIDEO_BUFFERS, NULL);
+
+    if (!mRecordHeap) {
+        LOGE("ERR(%s): Record heap creation fail", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    resetRecordingIndexes();
+
+    if (mAVCRecording) {
+        // when use AVC encode output
+        if (mQicCamera->startRecord()) {
+            LOGE("ERR(%s): failed on Qic camera start record", __func__);
+            mRecordRunning = false;
+            return UNKNOWN_ERROR;
+        }
+
+        mRecordingExited = false;
+
+        if (mRecordingThread->run("CameraRecordingThread", PRIORITY_DEFAULT) != NO_ERROR) {
+            LOGE("%s : couldn't run recording thread", __func__);
+        }
+    } else {
+        //TODO:use preview yuv frame, call software H264 encoder
+        //TODO: buffer number is different from AVC output mode
+        mRecordRunning = true;
+    }
+
+    return NO_ERROR;
+!!!11057932.cpp!!!	stopRecording() : void
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mRecordLock);
+
+    if (mAVCRecording) {
+        if (mRecordRunning == true) {
+            mRecordingExited = true;
+            mRecordingThread->join();
+        }
+    } else {
+        mRecordRunning = false;
+    }
+!!!11058060.cpp!!!	recordingEnabled() : bool
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mRecordLock);
+    return mRecordRunning;
+!!!11058188.cpp!!!	releaseRecordingFrame(in opaque : void) : void
+    if (mAVCRecording) {
+        int *index = (int *)(opaque);
+        LOGV("releaseRecordingFrame %d", *index);
+        releaseRecordingIndex(*index);
+    } else {
+        struct addrs *addrs = (struct addrs *)((char*)opaque + mRecordFrameSize);
+        releaseRecordingIndex(addrs->buf_index);
+    }
+
+!!!11058316.cpp!!!	autoFocus() : status_t
+    LOGV("enter %s", __func__);
+
+    mFocusCondition.signal();
+    return NO_ERROR;
+!!!11058444.cpp!!!	cancelAutoFocus() : status_t
+    LOGV("enter %s", __func__);
+
+    if (mPreviewRunning && mPreviewStartDeferred) {
+        return NO_ERROR;
+    }
+
+    if (mQicCamera->cancelAutoFocus() < 0) {
+        LOGE("ERR(%s): Fail on mQicCamera->cancelAutoFocus", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    return NO_ERROR;
+!!!11058572.cpp!!!	takePictureWrapper() : status_t
+    LOGE("enter %s", __func__);
+
+    if (mCaptureInProgress) {
+        LOGE("ERR(%s): the previous capture have not finished.", __func__);
+        return INVALID_OPERATION;
+    }
+
+    stopPreview();
+
+    mQicCamera->setFrameCallBack(&staticGetJpeg);
+
+    if (mQicCamera->startCapture()) {
+        LOGE("ERR(%s): failed on qic camera startCapture", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    if (waitCaptureCompletion() != NO_ERROR) {
+        return TIMED_OUT;
+    }
+
+    // add lock for mPictureCount
+    mPictureCount = 0;
+
+    if (mPictureThread->run("CameraPictureThread", PRIORITY_DEFAULT) != NO_ERROR) {
+        LOGE("ERR(%s): failed to run cameraPictureThread", __func__);
+        return INVALID_OPERATION;
+    }
+
+    mCaptureLock.lock();
+    mCaptureInProgress = true;
+    mCaptureLock.unlock();
+
+    return NO_ERROR;
+!!!11058700.cpp!!!	cancelPicture() : status_t
+    LOGV("enter %s", __func__);
+
+    if (mPictureThread.get()) {
+        mPictureThread->requestExit();
+        mPictureCount = 2;
+        mPictureThread->requestExitAndWait();
+        mPictureCount = 0;
+    }
+
+    return NO_ERROR;
+!!!11058828.cpp!!!	dump(in fd : int) : status_t
+    LOGV("enter %s", __func__);
+
+    return NO_ERROR;
+!!!11058956.cpp!!!	setParameters(in params : CameraParameters) : status_t
+    //params.dump();
+    //  if someone calls us while picture thread is running, it could screw
+    //  up the sensor quite a bit so return error.
+    if (waitCaptureCompletion() != NO_ERROR) {
+        return TIMED_OUT;
+    }
+
+    int width, height;
+    status_t ret = NO_ERROR;
+
+    //config need stop current session
+    //FIXME: check if input params valid
+    LOGV("enter %s", __func__);
+    params.getVideoSize(&width, &height);
+    mParameters.setVideoSize(width, height);
+    mQicCamera->setVideoSize(width, height);
+    params.getPreviewSize(&width, &height);
+    mParameters.setPreviewSize(width, height);
+    mQicCamera->setPreviewSize(width, height);
+
+    const char *newStrPreviewFormat = params.getPreviewFormat();
+    LOGI("%s : newPreviewFormat = %s", __func__, newStrPreviewFormat);
+
+    int newPreviewFormat = V4L2_PIX_FMT_YUYV;
+
+    if (newStrPreviewFormat != NULL) {
+        if (!strcmp(newStrPreviewFormat, CameraParameters::PIXEL_FORMAT_YUV422I)) {
+            newPreviewFormat = V4L2_PIX_FMT_YUYV;
+        } else if (!strcmp(newStrPreviewFormat, CameraParameters::PIXEL_FORMAT_YUV420SP)) {
+            newPreviewFormat = V4L2_PIX_FMT_NV12;
+        } else if (!strcmp(newStrPreviewFormat, CameraParameters::PIXEL_FORMAT_YUV420P)) {
+            newPreviewFormat = V4L2_PIX_FMT_YUV420;
+        } else {
+            LOGE("Unsupported preview color format: %s", newStrPreviewFormat);
+            return BAD_VALUE;
+        }
+    } else {
+        newPreviewFormat = V4L2_PIX_FMT_YUYV;
+    }
+
+    mQicCamera->setPreviewPixelFormat(newPreviewFormat);
+
+    //frame rate
+    int newFrameRate = params.getPreviewFrameRate();
+    char supportFrameRate[4];
+    sprintf(supportFrameRate, "%d", newFrameRate);
+
+    if (!strstr(mParameters.get(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES),
+                supportFrameRate)) {
+        LOGE("ERR(%s): Fail on set FPS. Support=%s, Set FPS =%d", __func__,
+             mParameters.get(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES), newFrameRate);
+        ret = UNKNOWN_ERROR;
+    } else {
+        mParameters.setPreviewFrameRate(newFrameRate);
+        mQicCamera->setFrameRate(DEV_ID_0, newFrameRate);
+    }
+
+    //saturation
+    int newSat = params.getInt("saturation");
+
+    if (0 <= newSat && newSat != mParameters.getInt("saturation")) {
+        if (mQicCamera->setSaturation(newSat) < 0) {
+            LOGE("ERR(%s):Fail on qiccamera set saturation (%d)", __func__, newSat);
+            ret = UNKNOWN_ERROR;
+        }
+
+        mParameters.set("saturation", newSat);
+    }
+
+    //awb/wbt
+    if (strcmp(params.get(CameraParameters::KEY_WHITE_BALANCE),
+               mParameters.get(CameraParameters::KEY_WHITE_BALANCE))) {
+        if (!strcmp(params.get(CameraParameters::KEY_WHITE_BALANCE),
+                    CameraParameters::WHITE_BALANCE_AUTO)) {
+            mQicCamera->setWBT(WB_MODE_AUTO, AWB_ENABLE);
+            mParameters.set(CameraParameters::KEY_WHITE_BALANCE,
+                            CameraParameters::WHITE_BALANCE_AUTO);
+        } else {
+            mQicCamera->setWBT(WB_MODE_AUTO, AWB_DISABLE);
+            mParameters.set(CameraParameters::KEY_WHITE_BALANCE,
+                            CameraParameters::WHITE_BALANCE_DAYLIGHT);
+        }
+    }
+
+    int newWbt = params.getInt("white_bal_temp");
+
+    if ((newWbt != mParameters.getInt("white_bal_temp")) &&
+        (strcmp(params.get(CameraParameters::KEY_WHITE_BALANCE),
+                CameraParameters::WHITE_BALANCE_AUTO))) {
+
+        mQicCamera->setWBT(WB_MODE_MANUAL, newWbt);
+        mParameters.set("white_bal_temp", newWbt);
+    }
+
+    //ae
+    if (strcmp(params.get("ae-enable"), mParameters.get("ae-enable"))) {
+        if (!strcmp(params.get("ae-enable"), "on")) {
+            mQicCamera->setExposure(EXPO_MODE_AUTO, AE_ENABLE);
+            mParameters.set("ae-enable", "on");
+        } else {
+            mQicCamera->setExposure(EXPO_MODE_AUTO, AE_DISABLE);
+            mParameters.set("ae-enable", "off");
+        }
+    }
+
+    int newExpo = params.getInt(CameraParameters::KEY_EXPOSURE_COMPENSATION);
+
+    if (newExpo != mParameters.getInt(CameraParameters::KEY_EXPOSURE_COMPENSATION) &&
+        strcmp(mParameters.get("ae-enable"), "on")) {
+        mQicCamera->setExposure(EXPO_MODE_MANUAL, newExpo);
+        mParameters.set(CameraParameters::KEY_EXPOSURE_COMPENSATION, newExpo);
+    }
+
+    //zoom
+    int newZoom = params.getInt(CameraParameters::KEY_ZOOM);
+
+    if (newZoom != mParameters.getInt(CameraParameters::KEY_ZOOM)) {
+        if (mQicCamera->setZoom(newZoom) < 0) {
+            LOGE("ERR(%s):Fail on qiccamera set zoom(%d)", __func__, newZoom);
+            ret = UNKNOWN_ERROR;
+        }
+
+        mParameters.set(CameraParameters::KEY_ZOOM, newZoom);
+    }
+
+    //pan and tilt
+    //this need zoom control support, so it can only work under VGA
+    if (params.get("pan") && params.get("tilt")) {
+        int pan = params.getInt("pan");
+        int tilt = params.getInt("tilt");
+        //TODO: make sure the current resolution is under VGA
+        mQicCamera->setPanTilt(pan, tilt);
+    }
+
+    return ret;
+!!!11059084.cpp!!!	getParameters() : CameraParameters
+    mParameters.dump();
+    return mParameters;
+!!!11059212.cpp!!!	sendCommand(in command : int32_t, in arg1 : int32_t, in arg2 : int32_t) : status_t
+    LOGD("enter %s, command: %d, arg1: %d, arg2: %d", __func__, command, arg1, arg2);
+
+    // TODO: more encoder parameters.
+    switch (command) {
+    case 0:
+        if(mFramerate == (unsigned int)arg1)
+            return NO_ERROR;
+
+        if(arg1 > 30)
+            return BAD_VALUE;
+
+        if (mRecordRunning && !mRecordingExited) {
+            if (mQicCamera->setFrameRate(DEV_ID_1, arg1)) {
+                LOGE("ERR(%s): failed on qiccamera set frame rate", __func__);
+                return BAD_VALUE;
+            }
+
+            mFramerate = arg1;
+        }
+
+        return NO_ERROR;
+
+    case 1:
+        if(mBitrate == (unsigned int)arg1)
+            return NO_ERROR;
+
+        if (arg1 > 1300000)
+            return BAD_VALUE;
+
+        if (mRecordRunning && !mRecordingExited) {
+            if (mQicCamera->setBitRate(DEV_ID_1, arg1)) {
+                LOGE("ERR(%s):failed on qiccamera set bit rate", __func__);
+                return BAD_VALUE;
+            }
+
+            mBitrate = arg1;
+        }
+
+        return NO_ERROR;
+
+    case 2:
+        if (mRecordRunning && !mRecordingExited) {
+            if (mQicCamera->requestIFrame(DEV_ID_1)) {
+                LOGE("ERR(%s):failed on qiccamera set bit rate", __func__);
+                return BAD_VALUE;
+            }
+        }
+
+        return NO_ERROR;
+
+    case 100:
+        // This is a hook. If command 100 returns NO_ERROR, that means it is a a camera with
+        // built-in AVC encoder.
+        LOGE("set AVC encoder enable[%d]", mAVCRecording);
+        mAVCRecording = (arg1 != 0);
+        mQicCamera->setAVCOutputEnable(mAVCRecording);
+        mQicCamera->queryCap();
+        initDefaultParameters(mCameraId);
+        return NO_ERROR;
+
+    default:
+        LOGD("fail to set command: %d", command);
+        break;
+    }
+
+    return BAD_VALUE;
+
+!!!11059340.cpp!!!	setPreviewWindow(inout w : preview_stream_ops) : status_t
+    int min_bufs;
+    int previewBufferNumber = mQicCamera->getPreviewBufferCount();
+    LOGV("enter %s", __func__);
+
+    mPreviewWindow = w;
+
+    if (!w) {
+        LOGE("preview window is NULL!");
+        return OK;
+    }
+
+    mPreviewLock.lock();
+
+    if (mPreviewRunning && !mPreviewStartDeferred) {
+        LOGI("stop preview (window change)");
+        stopPreviewInternal();
+    }
+
+    if (w->get_min_undequeued_buffer_count(w, &min_bufs)) {
+        LOGE("%s: could not retrieve min undequeued buffer count", __func__);
+        mPreviewLock.unlock();
+        return INVALID_OPERATION;
+    }
+
+    if (min_bufs >= previewBufferNumber) {
+        LOGE("%s: min undequeued buffer count %d is too high (expecting at most %d)",
+             __func__, min_bufs, previewBufferNumber);
+    }
+
+    if (w->set_buffer_count(w, previewBufferNumber)) {
+        LOGE("%s: could not set buffer count", __func__);
+        mPreviewLock.unlock();
+        return INVALID_OPERATION;
+    }
+
+    int preview_width, preview_height;
+    mParameters.getPreviewSize(&preview_width, &preview_height);
+    int hal_pixel_format = HAL_PIXEL_FORMAT_YCbCr_422_I;
+
+    const char *str_preview_format = mParameters.getPreviewFormat();
+
+    if (w->set_usage(w, GRALLOC_USAGE_SW_WRITE_OFTEN)) {
+        LOGE("%s: could not set usage on gralloc buffer", __func__);
+        mPreviewLock.unlock();
+        return INVALID_OPERATION;
+    }
+
+    if (w->set_buffers_geometry(w, preview_width, preview_height,
+                                hal_pixel_format)) {
+        LOGE("%s: could not set buffers geometry to %s",
+             __func__, str_preview_format);
+        mPreviewLock.unlock();
+        return INVALID_OPERATION;
+    }
+
+    if (mPreviewRunning && mPreviewStartDeferred) {
+        LOGV("start/resume preview");
+        status_t ret = startPreviewInternal();
+
+        if (ret == OK) {
+            mPreviewStartDeferred = false;
+        }
+    }
+
+    mPreviewLock.unlock();
+
+    return OK;
+!!!11059468.cpp!!!	storeMetaDataInBuffers(in enable : bool) : status_t
+    // TODO: implement this
+    return INVALID_OPERATION;
+!!!11059596.cpp!!!	release() : void
+    LOGV("enter %s", __func__);
+
+    mPreviewLock.lock();
+
+    if (mPreviewRunning) {
+        stopPreviewInternal();
+        mPreviewThread.clear();
+    }
+
+    mPreviewLock.unlock();
+
+    mRecordLock.lock();
+
+    if (mRecordRunning == true) {
+        mRecordingExited = true;
+        mRecordingThread->join();
+        mRecordingThread.clear();
+    }
+
+    mRecordLock.unlock();
+
+    if (mAutoFocusThread != NULL) {
+        mFocusLock.lock();
+        mAutoFocusThread->requestExit();
+        mExitAutoFocusThread = true;
+        mFocusCondition.signal();
+        mFocusLock.unlock();
+        mAutoFocusThread->requestExitAndWait();
+        mAutoFocusThread.clear();
+    }
+
+    if (mPictureThread != NULL) {
+        mPictureThread->requestExit();
+        mPictureCount = 2;
+        mPictureThread->requestExitAndWait();
+        mPictureCount = 0;
+        mPictureThread.clear();
+    }
+
+    if (mRawHeap) {
+        mRawHeap->release(mRawHeap);
+        mRawHeap = NULL;
+    }
+
+    if (mRecordHeap) {
+        mRecordHeap->release(mRecordHeap);
+        mRecordHeap = NULL;
+    }
+
+    if (mJpegHeap) {
+        mJpegHeap->release(mRecordHeap);
+        mJpegHeap = NULL;
+    }
+
+    mAVCRecording = false;
+    mQicCamera->deInitCamera();
+!!!11059724.cpp!!!	getCameraId() : int
+    return mCameraId;
+!!!11059852.cpp!!!	QicCameraHardware(in cameraId : int, inout dev : camera_device_t)
+    LOGV("enter %s", __func__);
+    int ret = 0;
+
+    if (!mGrallocHal) {
+        if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, (const hw_module_t **)&mGrallocHal))
+            LOGE("ERR(%s):Fail on loading gralloc HAL", __func__);
+    }
+
+    memset(&mRecordFrameStatus, 0, sizeof(mRecordFrameStatus));
+    mThiz = this;
+
+    mExitAutoFocusThread = false;
+    mPictureCount = 0;
+    mCaptureInProgress = false;
+
+    mQicCamera = QicCamera::createInstance();
+    mQicCamera->queryCap();
+    initDefaultParameters(cameraId);
+    mPreviewThread = new PreviewThread(this);
+    mRecordingThread = new RecordingThread(this);
+    mAutoFocusThread = new AutoFocusThread(this);
+    mPictureThread = new PictureThread(this);
+!!!11059980.cpp!!!	~QicCameraHardware()
+    LOGV("enter %s", __func__);
+    QicCamera::destory();
+    mQicCamera = NULL;
+!!!11060364.cpp!!!	startPreviewInternal() : status_t
+    LOGV("enter %s", __func__);
+
+    mQicCamera->setFrameCallBack(&staticGetFrames);
+
+    if (mQicCamera->initCamera()) {
+        LOGE("ERR(%s): failed on initCamera", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    if (mQicCamera->startPreview()) {
+        LOGE("ERR(%s): failed on qicCamera start preview", __func__);
+        mPreviewLock.lock();
+        mPreviewRunning = false;
+        mPreviewLock.unlock();
+        return UNKNOWN_ERROR;
+    }
+
+    if (mPreviewThread->run("CameraPreviewThread", PRIORITY_DEFAULT) != NO_ERROR) {
+        LOGE("%s : couldn't run preview thread", __func__);
+        return INVALID_OPERATION;
+    }
+
+    return NO_ERROR;
+!!!11060492.cpp!!!	stopPreviewInternal() : status_t
+    LOGV("enter %s", __func__);
+
+    if (mPreviewRunning) {
+        if (mPreviewThread != NULL) {
+            mPreviewRunning = false;
+            mPreviewThread->join();
+        }
+    } else {
+        LOGI("camera preview already has been stopped");
+    }
+
+    return NO_ERROR;
+!!!11060620.cpp!!!	previewThreadWrapper() : int
+    status_t ret = NO_ERROR;
+    LOGV("enter %s", __func__);
+
+    while (mPreviewRunning) {
+        ret = mQicCamera->getPreview();
+
+        if (ret < 0) {
+            LOGE("ERR(%s): failed on mQicCamera getPreview", __func__);
+            goto exit;
+        }
+    }
+
+    if (mQicCamera->stopPreview()) {
+        LOGE("qic_stop_capture YUYV error");
+        ret = UNKNOWN_ERROR;
+        goto exit;
+    }
+
+exit:
+    return ret;
+!!!11061004.cpp!!!	recordingThreadWrapper() : int
+    LOGV("enter %s", __func__);
+    status_t ret = NO_ERROR;
+    mRecordLock.lock();
+    mRecordRunning = true;
+    mRecordLock.unlock();
+
+    while (!mRecordingExited) {
+        ret = mQicCamera->getRecordFrame();
+
+        if (ret < 0) {
+            LOGE("ERR(%s): failed on mQicCamera getRecordFrame", __func__);
+            goto exit;
+        }
+    }
+
+exit:
+
+    if (mQicCamera->stopRecord()) {
+        LOGE("ERR(%s): failed on qic stop record()", __func__);
+        ret = UNKNOWN_ERROR;
+    }
+
+    mRecordLock.lock();
+    mRecordRunning = false;
+    mRecordLock.unlock();
+    return ret;
+!!!11061132.cpp!!!	resetRecordingIndexes() : void
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mRecordingIndexLock);
+
+    for (int index = 0; index < MAX_QIC_VIDEO_BUFFERS; index++) {
+        mRecordFrameStatus[index] = 0;
+    }
+!!!11061260.cpp!!!	getRecordingIndex() : int
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mRecordingIndexLock);
+
+    for (int index = 0; index < MAX_QIC_VIDEO_BUFFERS; index++) {
+        if (mRecordFrameStatus[index] == 0) {
+            mRecordFrameStatus[index] = 1;
+            return index;
+        }
+    }
+
+    //if there is no buffer for recording frame, we drop it
+    LOGE("no enough buffer, drop frame!!");
+    return -1;
+!!!11061388.cpp!!!	releaseRecordingIndex(in index : int) : void
+    LOGV("enter %s", __func__);
+    Mutex::Autolock lock(mRecordingIndexLock);
+    mRecordFrameStatus[index] = 0;
+!!!11061900.cpp!!!	autoFocusThread() : int
+    int count = 0;
+    int afStatus = 0;
+
+    LOGV("enter %s", __func__);
+    mFocusLock.lock();
+
+    if (mExitAutoFocusThread) {
+        mFocusLock.unlock();
+        LOGI("%s: exiting on request0", __func__);
+        return NO_ERROR;
+    }
+
+    mFocusCondition.wait(mFocusLock);
+
+    if (mExitAutoFocusThread) {
+        mFocusLock.unlock();
+        LOGI("%s: exiting on request1", __func__);
+        return NO_ERROR;
+    }
+
+    mFocusLock.unlock();
+
+    if (mQicCamera->setAutoFocus() < 0) {
+        LOGE("ERR(%s): Fail on mQicCamera->setAutoFocus()", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    afStatus = mQicCamera->getAutoFocusResult();
+
+    if (afStatus == 0x01) {
+        LOGV("%s: AF sucess!!", __func__);
+
+        if (mMsgEnabled & CAMERA_MSG_FOCUS) {
+            mNotifyCb(CAMERA_MSG_FOCUS, true, 0, mCallbackCookie);
+        }
+    } else if (afStatus == 0x02) {
+        LOGV("%s: AF cancelled!!", __func__);
+
+        if (mMsgEnabled & CAMERA_MSG_FOCUS) {
+            mNotifyCb(CAMERA_MSG_FOCUS, false, 0, mCallbackCookie);
+        }
+    } else {
+        LOGE("%s:AF Failed", __func__);
+
+        if (mMsgEnabled & CAMERA_MSG_FOCUS) {
+            mNotifyCb(CAMERA_MSG_FOCUS, false, 0, mCallbackCookie);
+        }
+    }
+
+    return NO_ERROR;
+!!!11062284.cpp!!!	pictureThread() : int
+    LOGE("enter %s", __func__);
+    int ret = NO_ERROR;
+
+    while (mPictureCount < 2) {
+        ret = mQicCamera->getPicture();
+
+        if (ret < 0) {
+            LOGE("ERR(%s): failed to get capture frames", __func__);
+            goto exit;
+        }
+
+        //TODO: add lock for mPictureCount
+        mPictureCount++;
+    }
+
+exit:
+    mQicCamera->stopCapture();
+    mCaptureLock.lock();
+    mCaptureInProgress = false;
+    mCaptureCondition.broadcast();
+    mCaptureLock.unlock();
+    //TODO: add lock for mPictureCount
+    mPictureCount = 0;
+    ret = NO_ERROR;
+
+    return ret;
+!!!11062412.cpp!!!	waitCaptureCompletion() : status_t
+    // 5 seconds timeout
+    nsecs_t endTime = 5000000000LL + systemTime(SYSTEM_TIME_MONOTONIC);
+    Mutex::Autolock lock(mCaptureLock);
+
+    while (mCaptureInProgress) {
+        nsecs_t remainingTime = endTime - systemTime(SYSTEM_TIME_MONOTONIC);
+
+        if (remainingTime <= 0) {
+            LOGE("Timed out waiting picture thread.");
+            return TIMED_OUT;
+        }
+
+        LOGD("Waiting for picture thread to complete.");
+        mCaptureCondition.waitRelative(mCaptureLock, remainingTime);
+    }
+
+    return NO_ERROR;
+!!!11062668.cpp!!!	initDefaultParameters(in cameraId : int) : void
+
+    CameraParameters p;
+    String8 parameterString;
+
+    LOGV("enter %s", __func__);
+
+    // TODO: implement this. If YUV and AVC work together, YUV should be smaller than VGA.
+    unsigned int previewMaxWidth   = 320;
+    unsigned int previewMaxHeight  = 240;
+    unsigned int snapshotMaxWidth  = 640;
+    unsigned int snapshotMaxHeight = 480;
+
+    p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_SIZES, mQicCamera->getSupportPreviewSize());
+
+    if(mQicCamera->getMaxPreviewSize(&previewMaxWidth, &previewMaxHeight) < 0) {
+        LOGE("ERR(%s):failed to get max preview size", __func__);
+    }
+
+    p.setPreviewSize(previewMaxWidth, previewMaxHeight);
+    //set default preview format to YUV422I
+    p.setPreviewFormat(CameraParameters::PIXEL_FORMAT_YUV422I);
+    parameterString = CameraParameters::PIXEL_FORMAT_YUV420SP;
+    parameterString.append(",");
+    parameterString.append(CameraParameters::PIXEL_FORMAT_YUV420P);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::PIXEL_FORMAT_YUV422I);
+    p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS, parameterString.string());
+    p.setPreviewFrameRate(20);
+
+    mQicCamera->setPreviewSize(previewMaxWidth, previewMaxHeight);
+    mQicCamera->setFrameRate(DEV_ID_0, 20);
+
+    p.set(CameraParameters::KEY_SUPPORTED_VIDEO_SIZES, mQicCamera->getSupportVideoSize());
+    p.setVideoSize(640, 480);
+    //p.set(CameraParameters::KEY_VIDEO_FRAME_FORMAT, CameraParameters::PIXEL_FORMAT_YUV422I);
+    p.set(CameraParameters::KEY_VIDEO_FRAME_FORMAT, CameraParameters::PIXEL_FORMAT_YUV420P);
+    p.set(CameraParameters::KEY_PREFERRED_PREVIEW_SIZE_FOR_VIDEO, "640x480");
+
+    mQicCamera->setVideoSize(640, 480);
+    //TODO: set video format to QicCamera
+
+    // TODO: implement JPEG snapshot.
+    p.set(CameraParameters::KEY_SUPPORTED_PICTURE_SIZES, "640x480");
+    p.setPictureFormat(CameraParameters::PIXEL_FORMAT_JPEG);
+    p.setPictureSize(snapshotMaxWidth, snapshotMaxHeight);
+    p.set(CameraParameters::KEY_JPEG_QUALITY, "100"); // maximum quality
+    p.set(CameraParameters::KEY_SUPPORTED_PICTURE_FORMATS, CameraParameters::PIXEL_FORMAT_JPEG);
+
+    parameterString = CameraParameters::FOCUS_MODE_AUTO;
+    parameterString.append(",");
+    parameterString.append(CameraParameters::FOCUS_MODE_INFINITY);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::FOCUS_MODE_MACRO);
+    p.set(CameraParameters::KEY_SUPPORTED_FOCUS_MODES, parameterString.string());
+    p.set(CameraParameters::KEY_FOCUS_MODE, CameraParameters::FOCUS_MODE_AUTO);
+    // TODO: implement JPEG snapshot.
+    p.set(CameraParameters::KEY_SUPPORTED_JPEG_THUMBNAIL_SIZES, "256x144,0x0");
+    p.set(CameraParameters::KEY_JPEG_THUMBNAIL_WIDTH, "256");
+    p.set(CameraParameters::KEY_JPEG_THUMBNAIL_HEIGHT, "144");
+    p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES, "15,20,30");
+
+    p.set(CameraParameters::KEY_ZOOM_SUPPORTED, "true");
+    p.set(CameraParameters::KEY_ZOOM_RATIOS, "100");
+    p.set(CameraParameters::KEY_MAX_ZOOM, "9");
+    p.set(CameraParameters::KEY_ZOOM, "0");
+    mQicCamera->setZoom(0);
+
+    //awb&wbt
+    parameterString = CameraParameters::WHITE_BALANCE_AUTO;
+    p.set(CameraParameters::KEY_SUPPORTED_WHITE_BALANCE, parameterString.string());
+    p.set(CameraParameters::KEY_WHITE_BALANCE, parameterString.string());
+    //TODO: default white balance is 3700+2800=6500(daylight)
+    p.set("white_bal_temp", 3000);
+    mQicCamera->setWBT(WB_MODE_AUTO, AWB_ENABLE);
+
+    // Set default expposure to 0, min==max==0 mean can not set exposure
+    p.set(CameraParameters::KEY_EXPOSURE_COMPENSATION, "600");
+    p.set(CameraParameters::KEY_MAX_EXPOSURE_COMPENSATION, "1250");
+    p.set(CameraParameters::KEY_MIN_EXPOSURE_COMPENSATION, "0");
+    p.set(CameraParameters::KEY_EXPOSURE_COMPENSATION_STEP, "1");
+    p.set("ae-enable", "on");
+    mQicCamera->setExposure(EXPO_MODE_AUTO, AE_ENABLE);
+
+
+    // TODO: implement this.
+    parameterString = CameraParameters::EFFECT_NONE;
+    p.set(CameraParameters::KEY_SUPPORTED_EFFECTS, parameterString.string());
+
+    // TODO: implement this.
+    parameterString = CameraParameters::FLASH_MODE_OFF;
+    p.set(CameraParameters::KEY_SUPPORTED_FLASH_MODES, parameterString.string());
+    p.set(CameraParameters::KEY_FLASH_MODE, CameraParameters::FLASH_MODE_OFF);
+
+    parameterString = CameraParameters::SCENE_MODE_AUTO;
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_PORTRAIT);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_LANDSCAPE);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_NIGHT);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_BEACH);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_SNOW);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_SUNSET);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_FIREWORKS);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_SPORTS);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_PARTY);
+    parameterString.append(",");
+    parameterString.append(CameraParameters::SCENE_MODE_CANDLELIGHT);
+    p.set(CameraParameters::KEY_SUPPORTED_SCENE_MODES, parameterString.string());
+    p.set(CameraParameters::KEY_SCENE_MODE, CameraParameters::SCENE_MODE_AUTO);
+
+    // TODO: implement this.
+    p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE, "(10000,30000)");
+    p.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "10000,30000");
+
+    p.set(CameraParameters::KEY_FOCAL_LENGTH, "1.5");
+    p.set(CameraParameters::KEY_JPEG_THUMBNAIL_QUALITY, "100");
+    p.set(CameraParameters::KEY_ROTATION, 0);
+
+    p.set(CameraParameters::KEY_EFFECT, CameraParameters::EFFECT_NONE);
+
+    p.set(CameraParameters::KEY_HORIZONTAL_VIEW_ANGLE, "51.2");
+    p.set(CameraParameters::KEY_VERTICAL_VIEW_ANGLE, "39.4");
+
+    p.set(CameraParameters::KEY_VIDEO_SNAPSHOT_SUPPORTED, "false");
+
+    // TODO:get this capbility form QicCamera
+    // saturation range:0~63, default is 32
+    p.set("saturation-min", 0);
+    p.set("saturation-max", 63);
+    p.set("saturation", 32);
+    mQicCamera->setSaturation(32);
+
+    mParameters = p;
+    setParameters(p);
+!!!11062796.cpp!!!	getFrames(in dev_id : uint, in length : uint, inout data : char, in timestamp : ulong) : void
+    LOGV("enter %s", __func__);
+    struct addrs* addrs;
+    nsecs_t ts;
+
+    switch (dev_id) {
+    case DEV_ID_1:
+        LOGV(" %s:%d, data=%p, length=%d", __func__, __LINE__, data, length);
+        assert(mAVCRecording);
+
+        // H.264/AVC stream
+        if (mRecordRunning) {
+            int index = getRecordingIndex();
+            LOGV(" getRecordingIndex %d", index);
+
+            if (index == -1) {
+                break;
+            }
+
+            if (mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) {
+                int offset = (((mRecordingWidth * mRecordingHeight) >> 1)
+                              + 2 * sizeof(int)) * index;
+                int *begin = (int *)((char *)mRecordHeap->data + offset);
+                *begin = index;
+                *(begin + 1) = length;
+                memcpy((void*)(begin + 2), data, length);
+                mDataCbTimestamp(timestamp, CAMERA_MSG_VIDEO_FRAME, mRecordHeap,
+                                 index, mCallbackCookie);
+            } else {
+                releaseRecordingIndex(index);
+            }
+        }
+
+        break;
+
+    case DEV_ID_0:
+        if (mPreviewWindow && mGrallocHal) {
+            buffer_handle_t *buf_handle;
+            int stride;
+
+            if (0 != mPreviewWindow->dequeue_buffer(mPreviewWindow, &buf_handle, &stride)) {
+                LOGE("Could not dequeue gralloc buffer!\n");
+                goto callbacks;
+            }
+
+            void *vaddr;
+            int width, height;
+            mParameters.getPreviewSize(&width, &height);
+            ts = systemTime(SYSTEM_TIME_MONOTONIC);
+            LOGE("timestamp = %lld", ts);
+
+            if (!mGrallocHal->lock(mGrallocHal,
+                                   *buf_handle,
+                                   GRALLOC_USAGE_SW_WRITE_OFTEN,
+                                   0, 0, width, height, &vaddr)) {
+                memcpy(vaddr, data, length);
+                mGrallocHal->unlock(mGrallocHal, *buf_handle);
+            } else {
+                LOGE("%s: could not obtain gralloc buffer", __func__);
+            }
+
+            if (0 != mPreviewWindow->enqueue_buffer(mPreviewWindow, buf_handle)) {
+                LOGE("Could not enqueue gralloc buffer!\n");
+                goto callbacks;
+            }
+        }
+
+callbacks:
+
+        // TODO: implement this.
+        if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
+        }
+
+        if (!mAVCRecording && mRecordRunning) {
+            int index = getRecordingIndex();
+            LOGV(" getRecordingIndex %d", index);
+
+            if (index == -1) {
+                break;
+            }
+
+            if (mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) {
+                const char* videoFormat = mParameters.get(CameraParameters::KEY_VIDEO_FRAME_FORMAT);
+
+                int offset = (mRecordFrameSize + sizeof(struct addrs)) * index;
+                addrs = (struct addrs*)((unsigned char*)mRecordHeap->data +
+                                        offset +
+                                        mRecordFrameSize);
+                addrs->type = kMetadataBufferTypeCameraSource;
+                addrs->buf_index = index;
+                unsigned char *begin = ((unsigned char *)mRecordHeap->data + offset);
+
+                if (!strcmp(videoFormat, CameraParameters::PIXEL_FORMAT_YUV420SP)) {
+                    yuyv422_to_yuv420sp((unsigned char*)data,
+                                        begin,
+                                        mRecordingWidth,
+                                        mRecordingHeight);
+                    mRecordHeap->size = mRecordFrameSize + sizeof(struct addrs);
+                } else if (!strcmp(videoFormat, CameraParameters::PIXEL_FORMAT_YUV420P)) {
+                    yuyv422_to_yuv420((unsigned char*)data,
+                                      begin,
+                                      mRecordingWidth,
+                                      mRecordingHeight);
+                    mRecordHeap->size = mRecordFrameSize + sizeof(struct addrs);
+                } else if (!strcmp(videoFormat, CameraParameters::PIXEL_FORMAT_YUV422I)) {
+                    memcpy(begin, data, mRecordFrameSize);
+                } else {
+                    LOGE("ERR(%s): not support pixel format %s", __func__, videoFormat);
+                    break;
+                }
+
+                mDataCbTimestamp(ts, CAMERA_MSG_VIDEO_FRAME, mRecordHeap,
+                                 index, mCallbackCookie);
+            } else {
+                releaseRecordingIndex(index);
+            }
+
+        }
+
+        break;
+
+    default:
+        LOGE("dev_id is wrong");
+        break;
+
+    }
+!!!11062924.cpp!!!	getJpeg(in dev_id : uint, in length : uint, inout data : char, in timestamp : ulong) : void
+    LOGE("enter %s", __func__);
+
+    //skip the first jpeg picture
+    if (mPictureCount == 1) {
+        //alloc memory for jpeg file
+        mJpegHeap = mGetMemoryCb(-1, length, 1, 0);
+
+        if (!mJpegHeap) {
+            LOGE("ERR(%s): failed to alloc memory for jpeg", __func__);
+            return;
+        }
+
+        memcpy(mJpegHeap->data, data, length);
+#ifdef DUMP_FILE
+        FILE* fp = fopen("/data/capture.jpg", "w+");
+
+        if (fp == NULL) {
+            LOGE("ERR(%s): failed to create file /data/capture.jpg", __func__);
+        } else {
+            fwrite(mJpegHeap->data, length, 1, fp);
+            LOGE("save jpeg image to file");
+            fclose(fp);
+        }
+
+#endif
+
+        //TODO: implement get YUV frame
+        if (mMsgEnabled & CAMERA_MSG_RAW_IMAGE) {
+            //mDataCb(CAMERA_MSG_RAW_IMAGE, mRawHeap, 0, NULL, mCallbackCookie);
+        } else if (mMsgEnabled & CAMERA_MSG_RAW_IMAGE_NOTIFY) {
+            //mNotifyCb(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mCallbackCookie);
+        }
+
+        if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
+            mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, mJpegHeap, 0, NULL, mCallbackCookie);
+        }
+
+        mJpegHeap->release(mJpegHeap);
+        mJpegHeap = NULL;
+    }
+

@@ -1,0 +1,318 @@
+class MPEG2TSWriter::SourceInfo
+!!!1866380.cpp!!!	start(in notify : sp<AMessage>) : void
+    mLooper->registerHandler(this);
+    mLooper->start();
+
+    mNotify = notify;
+
+    (new AMessage(kWhatStart, id()))->post();
+!!!1866508.cpp!!!	stop() : void
+    mLooper->unregisterHandler(id());
+    mLooper->stop();
+
+    mSource->stop();
+!!!1866636.cpp!!!	streamType() : uint
+    return mStreamType;
+!!!1866764.cpp!!!	incrementContinuityCounter() : uint
+    if (++mContinuityCounter == 16) {
+        mContinuityCounter = 0;
+    }
+
+    return mContinuityCounter;
+!!!1866892.cpp!!!	readMore() : void
+    (new AMessage(kWhatRead, id()))->post();
+!!!1867020.cpp!!!	lastAccessUnit() : sp<ABuffer>
+    return mLastAccessUnit;
+!!!1867148.cpp!!!	lastAccessUnitTimeUs() : int64_t
+    if (mLastAccessUnit == NULL) {
+        return -1;
+    }
+
+    int64_t timeUs;
+    CHECK(mLastAccessUnit->meta()->findInt64("timeUs", &timeUs));
+
+    return timeUs;
+!!!1867276.cpp!!!	setLastAccessUnit(in accessUnit : sp<ABuffer>) : void
+    mLastAccessUnit = accessUnit;
+!!!1867404.cpp!!!	setEOSReceived() : void
+    CHECK(!mEOSReceived);
+    mEOSReceived = true;
+!!!1867532.cpp!!!	eosReceived() : bool
+    return mEOSReceived;
+!!!1867660.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatStart:
+        {
+            status_t err = mSource->start();
+            if (err != OK) {
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("what", kNotifyStartFailed);
+                notify->post();
+                break;
+            }
+
+            extractCodecSpecificData();
+
+            readMore();
+            break;
+        }
+
+        case kWhatRead:
+        {
+            MediaBuffer *buffer;
+            status_t err = mSource->read(&buffer);
+
+            if (err != OK && err != INFO_FORMAT_CHANGED) {
+                if (mStreamType == 0x0f) {
+                    flushAACFrames();
+                }
+
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("what", kNotifyReachedEOS);
+                notify->setInt32("status", err);
+                notify->post();
+                break;
+            }
+
+            if (err == OK) {
+                if (mStreamType == 0x0f && mAACCodecSpecificData == NULL) {
+                    // The first buffer contains codec specific data.
+
+                    CHECK_GE(buffer->range_length(), 2u);
+
+                    mAACCodecSpecificData = new ABuffer(buffer->range_length());
+
+                    memcpy(mAACCodecSpecificData->data(),
+                           (const uint8_t *)buffer->data()
+                            + buffer->range_offset(),
+                           buffer->range_length());
+                } else if (buffer->range_length() > 0) {
+                    if (mStreamType == 0x0f) {
+                        if (!appendAACFrames(buffer)) {
+                            msg->post();
+                        }
+                    } else {
+                        postAVCFrame(buffer);
+                    }
+                } else {
+                    readMore();
+                }
+
+                buffer->release();
+                buffer = NULL;
+            }
+
+            // Do not read more data until told to.
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!1867788.cpp!!!	extractCodecSpecificData() : void
+    sp<MetaData> meta = mSource->getFormat();
+
+    const char *mime;
+    CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+    if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
+        uint32_t type;
+        const void *data;
+        size_t size;
+        if (!meta->findData(kKeyESDS, &type, &data, &size)) {
+            // Codec specific data better be in the first data buffer.
+            return;
+        }
+
+        ESDS esds((const char *)data, size);
+        CHECK_EQ(esds.InitCheck(), (status_t)OK);
+
+        const uint8_t *codec_specific_data;
+        size_t codec_specific_data_size;
+        esds.getCodecSpecificInfo(
+                (const void **)&codec_specific_data, &codec_specific_data_size);
+
+        CHECK_GE(codec_specific_data_size, 2u);
+
+        mAACCodecSpecificData = new ABuffer(codec_specific_data_size);
+
+        memcpy(mAACCodecSpecificData->data(), codec_specific_data,
+               codec_specific_data_size);
+
+        return;
+    }
+
+    if (strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)) {
+        return;
+    }
+
+    uint32_t type;
+    const void *data;
+    size_t size;
+    if (!meta->findData(kKeyAVCC, &type, &data, &size)) {
+        // Codec specific data better be part of the data stream then.
+        return;
+    }
+
+    sp<ABuffer> out = new ABuffer(1024);
+    out->setRange(0, 0);
+
+    const uint8_t *ptr = (const uint8_t *)data;
+
+    size_t numSeqParameterSets = ptr[5] & 31;
+
+    ptr += 6;
+    size -= 6;
+
+    for (size_t i = 0; i < numSeqParameterSets; ++i) {
+        CHECK(size >= 2);
+        size_t length = U16_AT(ptr);
+
+        ptr += 2;
+        size -= 2;
+
+        CHECK(size >= length);
+
+        CHECK_LE(out->size() + 4 + length, out->capacity());
+        memcpy(out->data() + out->size(), "\x00\x00\x00\x01", 4);
+        memcpy(out->data() + out->size() + 4, ptr, length);
+        out->setRange(0, out->size() + length + 4);
+
+        ptr += length;
+        size -= length;
+    }
+
+    CHECK(size >= 1);
+    size_t numPictureParameterSets = *ptr;
+    ++ptr;
+    --size;
+
+    for (size_t i = 0; i < numPictureParameterSets; ++i) {
+        CHECK(size >= 2);
+        size_t length = U16_AT(ptr);
+
+        ptr += 2;
+        size -= 2;
+
+        CHECK(size >= length);
+
+        CHECK_LE(out->size() + 4 + length, out->capacity());
+        memcpy(out->data() + out->size(), "\x00\x00\x00\x01", 4);
+        memcpy(out->data() + out->size() + 4, ptr, length);
+        out->setRange(0, out->size() + length + 4);
+
+        ptr += length;
+        size -= length;
+    }
+
+    out->meta()->setInt64("timeUs", 0ll);
+
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kNotifyBuffer);
+    notify->setBuffer("buffer", out);
+    notify->setInt32("oob", true);
+    notify->post();
+!!!1867916.cpp!!!	appendAACFrames(inout buffer : MediaBuffer) : bool
+    bool accessUnitPosted = false;
+
+    if (mAACBuffer != NULL
+            && mAACBuffer->size() + 7 + buffer->range_length()
+                    > mAACBuffer->capacity()) {
+        accessUnitPosted = flushAACFrames();
+    }
+
+    if (mAACBuffer == NULL) {
+        size_t alloc = 4096;
+        if (buffer->range_length() + 7 > alloc) {
+            alloc = 7 + buffer->range_length();
+        }
+
+        mAACBuffer = new ABuffer(alloc);
+
+        int64_t timeUs;
+        CHECK(buffer->meta_data()->findInt64(kKeyTime, &timeUs));
+
+        mAACBuffer->meta()->setInt64("timeUs", timeUs);
+        mAACBuffer->meta()->setInt32("isSync", true);
+
+        mAACBuffer->setRange(0, 0);
+    }
+
+    const uint8_t *codec_specific_data = mAACCodecSpecificData->data();
+
+    unsigned profile = (codec_specific_data[0] >> 3) - 1;
+
+    unsigned sampling_freq_index =
+        ((codec_specific_data[0] & 7) << 1)
+        | (codec_specific_data[1] >> 7);
+
+    unsigned channel_configuration =
+        (codec_specific_data[1] >> 3) & 0x0f;
+
+    uint8_t *ptr = mAACBuffer->data() + mAACBuffer->size();
+
+    const uint32_t aac_frame_length = buffer->range_length() + 7;
+
+    *ptr++ = 0xff;
+    *ptr++ = 0xf1;  // b11110001, ID=0, layer=0, protection_absent=1
+
+    *ptr++ =
+        profile << 6
+        | sampling_freq_index << 2
+        | ((channel_configuration >> 2) & 1);  // private_bit=0
+
+    // original_copy=0, home=0, copyright_id_bit=0, copyright_id_start=0
+    *ptr++ =
+        (channel_configuration & 3) << 6
+        | aac_frame_length >> 11;
+    *ptr++ = (aac_frame_length >> 3) & 0xff;
+    *ptr++ = (aac_frame_length & 7) << 5;
+
+    // adts_buffer_fullness=0, number_of_raw_data_blocks_in_frame=0
+    *ptr++ = 0;
+
+    memcpy(ptr,
+           (const uint8_t *)buffer->data() + buffer->range_offset(),
+           buffer->range_length());
+
+    ptr += buffer->range_length();
+
+    mAACBuffer->setRange(0, ptr - mAACBuffer->data());
+
+    return accessUnitPosted;
+!!!1868044.cpp!!!	flushAACFrames() : bool
+    if (mAACBuffer == NULL) {
+        return false;
+    }
+
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kNotifyBuffer);
+    notify->setBuffer("buffer", mAACBuffer);
+    notify->post();
+
+    mAACBuffer.clear();
+
+    return true;
+!!!1868172.cpp!!!	postAVCFrame(inout buffer : MediaBuffer) : void
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kNotifyBuffer);
+
+    sp<ABuffer> copy =
+        new ABuffer(buffer->range_length());
+    memcpy(copy->data(),
+           (const uint8_t *)buffer->data()
+            + buffer->range_offset(),
+           buffer->range_length());
+
+    int64_t timeUs;
+    CHECK(buffer->meta_data()->findInt64(kKeyTime, &timeUs));
+    copy->meta()->setInt64("timeUs", timeUs);
+
+    int32_t isSync;
+    if (buffer->meta_data()->findInt32(kKeyIsSyncFrame, &isSync)
+            && isSync != 0) {
+        copy->meta()->setInt32("isSync", true);
+    }
+
+    notify->setBuffer("buffer", copy);
+    notify->post();

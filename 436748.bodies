@@ -1,0 +1,190 @@
+class PathRenderer
+!!!1113228.cpp!!!	computePathBounds(in path : SkPath, in paint : SkPaint) : SkRect
+    SkRect bounds = path.getBounds();
+    if (paint->getStyle() != SkPaint::kFill_Style) {
+        float outset = paint->getStrokeWidth() * 0.5f;
+        bounds.outset(outset, outset);
+    }
+    return bounds;
+!!!1113356.cpp!!!	convexPathVertices(in path : SkPath, in paint : SkPaint, in transform : mat4, inout vertexBuffer : VertexBuffer) : void
+    ATRACE_CALL();
+
+    SkPaint::Style style = paint->getStyle();
+    bool isAA = paint->isAntiAlias();
+
+    float inverseScaleX, inverseScaleY;
+    computeInverseScales(transform, inverseScaleX, inverseScaleY);
+
+    Vector<Vertex> tempVertices;
+    float threshInvScaleX = inverseScaleX;
+    float threshInvScaleY = inverseScaleY;
+    if (style == SkPaint::kStroke_Style) {
+        // alter the bezier recursion threshold values we calculate in order to compensate for
+        // expansion done after the path vertices are found
+        SkRect bounds = path.getBounds();
+        if (!bounds.isEmpty()) {
+            threshInvScaleX *= bounds.width() / (bounds.width() + paint->getStrokeWidth());
+            threshInvScaleY *= bounds.height() / (bounds.height() + paint->getStrokeWidth());
+        }
+    }
+
+    // force close if we're filling the path, since fill path expects closed perimeter.
+    bool forceClose = style != SkPaint::kStroke_Style;
+    bool wasClosed = convexPathPerimeterVertices(path, forceClose, threshInvScaleX * threshInvScaleX,
+            threshInvScaleY * threshInvScaleY, tempVertices);
+
+    if (!tempVertices.size()) {
+        // path was empty, return without allocating vertex buffer
+        return;
+    }
+
+#if VERTEX_DEBUG
+    for (unsigned int i = 0; i < tempVertices.size(); i++) {
+        ALOGD("orig path: point at %f %f", tempVertices[i].position[0], tempVertices[i].position[1]);
+    }
+#endif
+
+    if (style == SkPaint::kStroke_Style) {
+        float halfStrokeWidth = paint->getStrokeWidth() * 0.5f;
+        if (!isAA) {
+            if (wasClosed) {
+                getStrokeVerticesFromPerimeter(tempVertices, halfStrokeWidth, vertexBuffer,
+                        inverseScaleX, inverseScaleY);
+            } else {
+                getStrokeVerticesFromUnclosedVertices(tempVertices, halfStrokeWidth, vertexBuffer,
+                        inverseScaleX, inverseScaleY);
+            }
+
+        } else {
+            if (wasClosed) {
+                getStrokeVerticesFromPerimeterAA(tempVertices, halfStrokeWidth, vertexBuffer,
+                        inverseScaleX, inverseScaleY);
+            } else {
+                getStrokeVerticesFromUnclosedVerticesAA(tempVertices, halfStrokeWidth, vertexBuffer,
+                        inverseScaleX, inverseScaleY);
+            }
+        }
+    } else {
+        // For kStrokeAndFill style, the path should be adjusted externally, as it will be treated as a fill here.
+        if (!isAA) {
+            getFillVerticesFromPerimeter(tempVertices, vertexBuffer);
+        } else {
+            getFillVerticesFromPerimeterAA(tempVertices, vertexBuffer, inverseScaleX, inverseScaleY);
+        }
+    }
+!!!1113484.cpp!!!	convexPathPerimeterVertices(in path : SkPath, in forceClose : bool, in sqrInvScaleX : float, in sqrInvScaleY : float, inout outputVertices : Vector<Vertex>) : bool
+    ATRACE_CALL();
+
+    // TODO: to support joins other than sharp miter, join vertices should be labelled in the
+    // perimeter, or resolved into more vertices. Reconsider forceClose-ing in that case.
+    SkPath::Iter iter(path, forceClose);
+    SkPoint pts[4];
+    SkPath::Verb v;
+    Vertex* newVertex = 0;
+    while (SkPath::kDone_Verb != (v = iter.next(pts))) {
+            switch (v) {
+                case SkPath::kMove_Verb:
+                    pushToVector(outputVertices, pts[0].x(), pts[0].y());
+                    ALOGV("Move to pos %f %f", pts[0].x(), pts[0].y());
+                    break;
+                case SkPath::kClose_Verb:
+                    ALOGV("Close at pos %f %f", pts[0].x(), pts[0].y());
+                    break;
+                case SkPath::kLine_Verb:
+                    ALOGV("kLine_Verb %f %f -> %f %f",
+                            pts[0].x(), pts[0].y(),
+                            pts[1].x(), pts[1].y());
+
+                    pushToVector(outputVertices, pts[1].x(), pts[1].y());
+                    break;
+                case SkPath::kQuad_Verb:
+                    ALOGV("kQuad_Verb");
+                    recursiveQuadraticBezierVertices(
+                            pts[0].x(), pts[0].y(),
+                            pts[2].x(), pts[2].y(),
+                            pts[1].x(), pts[1].y(),
+                            sqrInvScaleX, sqrInvScaleY, outputVertices);
+                    break;
+                case SkPath::kCubic_Verb:
+                    ALOGV("kCubic_Verb");
+                    recursiveCubicBezierVertices(
+                            pts[0].x(), pts[0].y(),
+                            pts[1].x(), pts[1].y(),
+                            pts[3].x(), pts[3].y(),
+                            pts[2].x(), pts[2].y(),
+                        sqrInvScaleX, sqrInvScaleY, outputVertices);
+                    break;
+                default:
+                    break;
+            }
+    }
+
+    int size = outputVertices.size();
+    if (size >= 2 && outputVertices[0].position[0] == outputVertices[size - 1].position[0] &&
+            outputVertices[0].position[1] == outputVertices[size - 1].position[1]) {
+        outputVertices.pop();
+        return true;
+    }
+    return false;
+!!!1113612.cpp!!!	recursiveQuadraticBezierVertices(in ax : float, in ay : float, in bx : float, in by : float, in cx : float, in cy : float, in sqrInvScaleX : float, in sqrInvScaleY : float, inout outputVertices : Vector<Vertex>) : void
+    float dx = bx - ax;
+    float dy = by - ay;
+    float d = (cx - bx) * dy - (cy - by) * dx;
+
+    if (d * d < THRESHOLD * THRESHOLD * (dx * dx * sqrInvScaleY + dy * dy * sqrInvScaleX)) {
+        // below thresh, draw line by adding endpoint
+        pushToVector(outputVertices, bx, by);
+    } else {
+        float acx = (ax + cx) * 0.5f;
+        float bcx = (bx + cx) * 0.5f;
+        float acy = (ay + cy) * 0.5f;
+        float bcy = (by + cy) * 0.5f;
+
+        // midpoint
+        float mx = (acx + bcx) * 0.5f;
+        float my = (acy + bcy) * 0.5f;
+
+        recursiveQuadraticBezierVertices(ax, ay, mx, my, acx, acy,
+                sqrInvScaleX, sqrInvScaleY, outputVertices);
+        recursiveQuadraticBezierVertices(mx, my, bx, by, bcx, bcy,
+                sqrInvScaleX, sqrInvScaleY, outputVertices);
+    }
+!!!1113740.cpp!!!	recursiveCubicBezierVertices(in p1x : float, in p1y : float, in c1x : float, in c1y : float, in p2x : float, in p2y : float, in c2x : float, in c2y : float, in sqrInvScaleX : float, in sqrInvScaleY : float, inout outputVertices : Vector<Vertex>) : void
+    float dx = p2x - p1x;
+    float dy = p2y - p1y;
+    float d1 = fabs((c1x - p2x) * dy - (c1y - p2y) * dx);
+    float d2 = fabs((c2x - p2x) * dy - (c2y - p2y) * dx);
+    float d = d1 + d2;
+
+    // multiplying by sqrInvScaleY/X equivalent to multiplying in dimensional scale factors
+
+    if (d * d < THRESHOLD * THRESHOLD * (dx * dx * sqrInvScaleY + dy * dy * sqrInvScaleX)) {
+        // below thresh, draw line by adding endpoint
+        pushToVector(outputVertices, p2x, p2y);
+    } else {
+        float p1c1x = (p1x + c1x) * 0.5f;
+        float p1c1y = (p1y + c1y) * 0.5f;
+        float p2c2x = (p2x + c2x) * 0.5f;
+        float p2c2y = (p2y + c2y) * 0.5f;
+
+        float c1c2x = (c1x + c2x) * 0.5f;
+        float c1c2y = (c1y + c2y) * 0.5f;
+
+        float p1c1c2x = (p1c1x + c1c2x) * 0.5f;
+        float p1c1c2y = (p1c1y + c1c2y) * 0.5f;
+
+        float p2c1c2x = (p2c2x + c1c2x) * 0.5f;
+        float p2c1c2y = (p2c2y + c1c2y) * 0.5f;
+
+        float mx = (p1c1c2x + p2c1c2x) * 0.5f;
+        float my = (p1c1c2y + p2c1c2y) * 0.5f;
+
+        recursiveCubicBezierVertices(
+                p1x, p1y, p1c1x, p1c1y,
+                mx, my, p1c1c2x, p1c1c2y,
+                sqrInvScaleX, sqrInvScaleY, outputVertices);
+        recursiveCubicBezierVertices(
+                mx, my, p2c1c2x, p2c1c2y,
+                p2x, p2y, p2c2x, p2c2y,
+                sqrInvScaleX, sqrInvScaleY, outputVertices);
+    }

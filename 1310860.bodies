@@ -1,0 +1,164 @@
+class EnableAccessibilityController
+!!!7754252.java!!!	EnableAccessibilityController(inout context : Context)
+        mContext = context;
+        mUserManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
+        mTts = new TextToSpeech(context, new TextToSpeech.OnInitListener() {
+            @Override
+            public void onInit(int status) {
+                if (mDestroyed) {
+                    mTts.shutdown();
+                }
+            }
+        });
+        mTone = RingtoneManager.getRingtone(context, Settings.System.DEFAULT_NOTIFICATION_URI);
+        mTone.setStreamType(AudioManager.STREAM_MUSIC);
+        mTouchSlop = context.getResources().getDimensionPixelSize(
+                R.dimen.accessibility_touch_slop);
+!!!7754380.java!!!	canEnableAccessibilityViaGesture(inout context : Context) : boolean
+        AccessibilityManager accessibilityManager = AccessibilityManager.getInstance(context);
+        // Accessibility is enabled and there is an enabled speaking
+        // accessibility service, then we have nothing to do.
+        if (accessibilityManager.isEnabled()
+                && !accessibilityManager.getEnabledAccessibilityServiceList(
+                        AccessibilityServiceInfo.FEEDBACK_SPOKEN).isEmpty()) {
+            return false;
+        }
+        // If the global gesture is enabled and there is a speaking service
+        // installed we are good to go, otherwise there is nothing to do.
+        return Settings.Global.getInt(context.getContentResolver(),
+                Settings.Global.ENABLE_ACCESSIBILITY_GLOBAL_GESTURE_ENABLED, 0) == 1
+                && !getInstalledSpeakingAccessibilityServices(context).isEmpty();
+!!!7754508.java!!!	getInstalledSpeakingAccessibilityServices(inout context : Context) : AccessibilityServiceInfo
+        List<AccessibilityServiceInfo> services = new ArrayList<AccessibilityServiceInfo>();
+        services.addAll(AccessibilityManager.getInstance(context)
+                .getInstalledAccessibilityServiceList());
+        Iterator<AccessibilityServiceInfo> iterator = services.iterator();
+        while (iterator.hasNext()) {
+            AccessibilityServiceInfo service = iterator.next();
+            if ((service.feedbackType & AccessibilityServiceInfo.FEEDBACK_SPOKEN) == 0) {
+                iterator.remove();
+            }
+        }
+        return services;
+!!!7754636.java!!!	onDestroy() : void
+        mDestroyed = true;
+!!!7754764.java!!!	onInterceptTouchEvent(inout event : MotionEvent) : boolean
+        if (event.getActionMasked() == MotionEvent.ACTION_POINTER_DOWN
+                && event.getPointerCount() == 2) {
+            mFirstPointerDownX = event.getX(0);
+            mFirstPointerDownY = event.getY(0);
+            mSecondPointerDownX = event.getX(1);
+            mSecondPointerDownY = event.getY(1);
+            mHandler.sendEmptyMessageDelayed(MESSAGE_SPEAK_WARNING,
+                    SPEAK_WARNING_DELAY_MILLIS);
+            mHandler.sendEmptyMessageDelayed(MESSAGE_ENABLE_ACCESSIBILITY,
+                   ENABLE_ACCESSIBILITY_DELAY_MILLIS);
+            return true;
+        }
+        return false;
+!!!7754892.java!!!	onTouchEvent(inout event : MotionEvent) : boolean
+        final int pointerCount = event.getPointerCount();
+        final int action = event.getActionMasked();
+        if (mCanceled) {
+            if (action == MotionEvent.ACTION_UP) {
+                mCanceled = false;
+            }
+            return true;
+        }
+        switch (action) {
+            case MotionEvent.ACTION_POINTER_DOWN: {
+                if (pointerCount > 2) {
+                    cancel();
+                }
+            } break;
+            case MotionEvent.ACTION_MOVE: {
+                final float firstPointerMove = MathUtils.dist(event.getX(0),
+                        event.getY(0), mFirstPointerDownX, mFirstPointerDownY);
+                if (Math.abs(firstPointerMove) > mTouchSlop) {
+                    cancel();
+                }
+                final float secondPointerMove = MathUtils.dist(event.getX(1),
+                        event.getY(1), mSecondPointerDownX, mSecondPointerDownY);
+                if (Math.abs(secondPointerMove) > mTouchSlop) {
+                    cancel();
+                }
+            } break;
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_CANCEL: {
+                cancel();
+            } break;
+        }
+        return true;
+!!!7755020.java!!!	cancel() : void
+        mCanceled = true;
+        if (mHandler.hasMessages(MESSAGE_SPEAK_WARNING)) {
+            mHandler.removeMessages(MESSAGE_SPEAK_WARNING);
+        } else if (mHandler.hasMessages(MESSAGE_ENABLE_ACCESSIBILITY)) {
+            mHandler.sendEmptyMessage(MESSAGE_SPEAK_ENABLE_CANCELED);
+        }
+        mHandler.removeMessages(MESSAGE_ENABLE_ACCESSIBILITY);
+!!!7755148.java!!!	enableAccessibility() : void
+        List<AccessibilityServiceInfo> services = getInstalledSpeakingAccessibilityServices(
+                mContext);
+        if (services.isEmpty()) {
+            return;
+        }
+        boolean keyguardLocked = false;
+        try {
+            keyguardLocked = mWindowManager.isKeyguardLocked();
+        } catch (RemoteException re) {
+            /* ignore */
+        }
+
+        final boolean hasMoreThanOneUser = mUserManager.getUsers().size() > 1;
+
+        AccessibilityServiceInfo service = services.get(0);
+        boolean enableTouchExploration = (service.flags
+                & AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE) != 0;
+        // Try to find a service supporting explore by touch.
+        if (!enableTouchExploration) {
+            final int serviceCount = services.size();
+            for (int i = 1; i < serviceCount; i++) {
+                AccessibilityServiceInfo candidate = services.get(i);
+                if ((candidate.flags & AccessibilityServiceInfo
+                        .FLAG_REQUEST_TOUCH_EXPLORATION_MODE) != 0) {
+                    enableTouchExploration = true;
+                    service = candidate;
+                    break;
+                }
+            }
+        }
+
+        ServiceInfo serviceInfo = service.getResolveInfo().serviceInfo;
+        ComponentName componentName = new ComponentName(serviceInfo.packageName, serviceInfo.name);
+        if (!keyguardLocked || !hasMoreThanOneUser) {
+            final int userId = ActivityManager.getCurrentUser();
+            String enabledServiceString = componentName.flattenToString();
+            ContentResolver resolver = mContext.getContentResolver();
+            // Enable one speaking accessibility service.
+            Settings.Secure.putStringForUser(resolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                    enabledServiceString, userId);
+            // Allow the services we just enabled to toggle touch exploration.
+            Settings.Secure.putStringForUser(resolver,
+                    Settings.Secure.TOUCH_EXPLORATION_GRANTED_ACCESSIBILITY_SERVICES,
+                    enabledServiceString, userId);
+            // Enable touch exploration.
+            if (enableTouchExploration) {
+                Settings.Secure.putIntForUser(resolver, Settings.Secure.TOUCH_EXPLORATION_ENABLED,
+                        1, userId);
+            }
+            // Enable accessibility script injection (AndroidVox) for web content.
+            Settings.Secure.putIntForUser(resolver, Settings.Secure.ACCESSIBILITY_SCRIPT_INJECTION,
+                    1, userId);
+            // Turn on accessibility mode last.
+            Settings.Secure.putIntForUser(resolver, Settings.Secure.ACCESSIBILITY_ENABLED,
+                    1, userId);
+        } else if (keyguardLocked) {
+            try {
+                mAccessibilityManager.temporaryEnableAccessibilityStateUntilKeyguardRemoved(
+                        componentName, enableTouchExploration);
+            } catch (RemoteException re) {
+                /* ignore */
+            }
+        }

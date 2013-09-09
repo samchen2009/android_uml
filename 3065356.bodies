@@ -1,0 +1,146 @@
+class SmoothStreamingSession
+!!!12689036.java!!!	SmoothStreamingSession(inout streamInfo : StreamElement, inout handler : Handler)
+        this.mQualityChanged = false;
+        this.mPacketReceived = false;
+        this.mStreamInfo = streamInfo;
+        this.mHandler = handler;
+
+        this.mReformatter = SmoothStreamingSampleReformatter.create(streamInfo);
+        this.mQueue = new ConcurrentLinkedQueue<SmoothStreamSample>();
+        this.mParser = new SmoothStreamingFragmentParser();
+
+        mBitrates = new ArrayList<Integer>(streamInfo.getTracks().size());
+        for (TrackElement track : streamInfo.getTracks()) {
+            mBitrates.add(track.getBitrate());
+        }
+
+        reset();
+!!!12689164.java!!!	reset() : void
+        mUsed = false;
+        mPacketReceived = false;
+        mFrameHistory = null;
+        mFrameHistory = new LinkedList<Integer>();
+
+        mAllQueuedFrames = 0;
+        mCurrentFragmentIndex = 0;
+        mRequested = 0;
+!!!12689292.java!!!	setUsed(inout used : boolean) : void
+        this.mUsed = used;
+!!!12689420.java!!!	consumeBandwidth(in availableBandwidth : long, inout useLowset : boolean) : long
+        int level = -1;
+        int oldLevel = mStreamInfo.getCurrentTrack();
+        if (useLowset) {
+            level = mBitrates.size() - 1;
+        } else {
+            level = getProperBandwidthIndex(availableBandwidth);
+        }
+
+        if (oldLevel > level) {
+            level = Math.max(oldLevel - 1, 0);
+        } else if (oldLevel < level) {
+            level = Math.min(oldLevel + 1, mBitrates.size() - 1);
+        }
+
+        if (oldLevel == -1) {
+            level = mBitrates.size() - 1;
+        }
+
+        if (oldLevel != level) {
+            // For the first round, just set level.
+            setQualityLevel(level);
+        }
+
+        return Math.max(availableBandwidth - mBitrates.get(level), 0);
+!!!12689548.java!!!	setQualityLevel(in level : int) : void
+        if (mStreamInfo.getCurrentTrack() != level) {
+            mQualityChanged = true;
+            mStreamInfo.setCurrentTrack(level);
+        }
+!!!12689676.java!!!	getProperBandwidthIndex(in availableBandwidth : long) : int
+        if (mCurrentFragmentIndex < sMaxBufferingSize) {
+            return mBitrates.size() - 1;
+        }
+
+        for (int i = 0; i < mBitrates.size(); ++i) {
+            if (availableBandwidth > mBitrates.get(i)) {
+                return i;
+            }
+        }
+
+        return mBitrates.size() - 1;
+!!!12689804.java!!!	isReceived() : boolean
+        return mPacketReceived;
+!!!12689932.java!!!	mayDownloadNext() : void
+        if (!shouldDownloadNext()) {
+            return;
+        }
+
+        Message msg = Message.obtain();
+        msg.what = SmoothStreamingConstants.SS_REQUEST_DOWNLOAD;
+        msg.arg1 = mStreamInfo.getTrackId();
+        msg.obj = buildRequest();
+
+        mRequested++;
+        mCurrentFragmentIndex++;
+
+        mQualityChanged = false;
+        if (mCurrentFragmentIndex == mStreamInfo.getFragments().size() - 1) {
+            mUsed = false;
+        }
+
+        mHandler.sendMessage(msg);
+!!!12690060.java!!!	buildRequest() : SmoothStreamingDataRequest
+        SmoothStreamingDataRequest request = new SmoothStreamingDataRequest();
+        request.url = mStreamInfo.buildRequestUrl(mCurrentFragmentIndex);
+        request.trackId = mStreamInfo.getTrackId();
+        request.frameNo = mCurrentFragmentIndex;
+        request.qualityLevel = mStreamInfo.getCurrentTrack();
+        request.qualityChanged = mQualityChanged;
+        return request;
+!!!12690188.java!!!	dequeueSample() : SmoothStreamSample
+        return mQueue.poll();
+!!!12690316.java!!!	isUsed() : boolean
+        return mUsed;
+!!!12690444.java!!!	shouldDownloadNext() : boolean
+        if (!mUsed) {
+            return false;
+        }
+
+        if (mRequested > sMaxBufferingSize - 1) {
+            return false;
+        }
+
+        if (mFrameHistory.size() < sMaxBufferingSize) {
+            return true;
+        }
+
+        int oldestFrames = mFrameHistory.peek();
+        int size = mQueue.size();
+        return mAllQueuedFrames - oldestFrames > mQueue.size();
+!!!12690572.java!!!	updateFrameCount(in newFrames : int) : void
+        if (mFrameHistory.size() >= sMaxBufferingSize) {
+            mAllQueuedFrames -= mFrameHistory.poll();
+        }
+        mFrameHistory.add(newFrames);
+        mAllQueuedFrames += newFrames;
+!!!12690700.java!!!	getType() : StreamType
+        return mStreamInfo.getType();
+!!!12690828.java!!!	handleFragmentData(inout req : SmoothStreamingDataRequest, inout buffer : ByteBuffer) : void
+        if (req.qualityChanged) {
+            SmoothStreamSample firstSample = mReformatter.createStartFrame(req.qualityLevel,
+                    req.frameNo);
+            if (firstSample != null) {
+                List<SmoothStreamSample> samples = new ArrayList<SmoothStreamSample>(1);
+                samples.add(firstSample);
+                queueSamples(samples);
+            }
+        }
+
+        SmoothStreamingFragmentParser.TrackInfo track = mParser.parse(buffer);
+        queueSamples(mReformatter.reformatSamples(track, buffer, req.frameNo, req.qualityLevel));
+        mRequested--;
+
+        mPacketReceived = true;
+!!!12690956.java!!!	queueSamples(inout samples : List<SmoothStreamSample>) : void
+        updateFrameCount(samples.size());
+        mQueue.addAll(samples);

@@ -1,0 +1,302 @@
+class IpRemoteControlService
+!!!13402124.java!!!	onBind(inout intent : Intent) : IBinder
+        return mBinder;
+!!!13402252.java!!!	onCreate() : void
+        super.onCreate();
+
+        clients = new ArrayList<ProtocolHandler>();
+
+        WindowManager wm = (WindowManager) getSystemService(
+                Context.WINDOW_SERVICE);
+        Display disp = wm.getDefaultDisplay();
+        mScreenWidth = disp.getWidth();
+        mScreenHeight = disp.getHeight();
+
+        Log.v(LOG_TAG, "Got display width = " + mScreenWidth + ", height = "
+                + mScreenHeight);
+
+        HandlerThread thread = new HandlerThread(
+                "IpRemoteControlServiceHandlerThread");
+        thread.start();
+        mServiceHandler = new ServiceHandler(thread.getLooper());
+        mServiceHandler.sendAction(Action.INITIALIZE);
+        mSettings = new Settings(getContext(), true) {
+            @Override
+            public void onRequestsEnabledChanged(boolean enabled) {
+                if (!enabled) {
+                    mServiceHandler.sendAction(Action.STOP_PAIRING_SERVER);
+                } else {
+                    mServiceHandler.sendAction(Action.START_PAIRING_SERVER);
+                }
+            }
+        };
+        mDiscoveryProxy = new DiscoveryProxy(getContext());
+!!!13402380.java!!!	onStartCommand(inout intent : Intent, in flags : int, in startId : int) : int
+        super.onStartCommand(intent, flags, startId);
+
+        String action = intent != null ? intent.getAction() : "";
+        if (ACTION_CLEAR.equals(action)) {
+            mServiceHandler.sendAction(Action.CLEAR_KEY_STORE);
+        } else if (ACTION_CANCEL_PAIRING.equals(action)) {
+            mServiceHandler.sendAction(Action.CANCEL_PAIRING_SESSION);
+        } else if (ACTION_REMOVE_CERTIFICATE.equals(action)) {
+            final String id = intent.getStringExtra(EXTRA_CERTIFICATE_ID);
+            Runnable r = new Runnable() {
+              @Override
+              public void run() {
+                  removeCertificate(id);
+                  synchronized (this) {
+                      this.notifyAll();
+                  }
+              }
+            };
+
+            mServiceHandler.post(r);
+            synchronized (r) {
+              try {
+                r.wait();
+              } catch (InterruptedException e) {
+                //
+              }
+            }
+        } else {
+            mServiceHandler.sendAction(Action.START_SERVERS);
+            startAdvertising();
+        }
+
+        return START_STICKY;
+!!!13402508.java!!!	startServer() : void
+        if (mTcpListener != null) {
+            Log.v(LOG_TAG, "Server already started.");
+        } else {
+            Log.v(LOG_TAG, "Starting up server.");
+
+            final SSLServerSocket tcpSocket;
+            final ServerSocket plainSocket;
+
+            try {
+                tcpSocket = getSslServerSocket(ANYMOTE_TCP_PORT);
+
+                if (ALLOW_INSECURE_IP_PROTOCOL) {
+                    plainSocket = getPlainServerSocket(ANYMOTE_INSECURE_PORT);
+                }
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to start", e);
+            } catch (GeneralSecurityException e) {
+                throw new IllegalStateException("Failed to start", e);
+            }
+            Log.i(LOG_TAG, "Created TCP socket listening on port "
+                    + tcpSocket.getLocalPort());
+
+            mTcpListener = new TcpListenerThread(tcpSocket);
+            mTcpListener.start();
+
+            if (ALLOW_INSECURE_IP_PROTOCOL) {
+                mPlainListener = new TcpListenerThread(plainSocket);
+                mPlainListener.start();
+            }
+        }
+!!!13402636.java!!!	startPairingServer() : void
+        if (mPairingServer != null) {
+            Log.v(LOG_TAG, "Pairing server already started.");
+        } else {
+            Log.v(LOG_TAG, "Starting up pairing server.");
+            mPairingServer = new PairingServer(ANYMOTE_PAIRING_PORT,
+                    WireFormat.PROTOCOL_BUFFERS, mKeyStoreManager,
+                    createPairingDelegate());
+            mPairingServer.start();
+        }
+!!!13402764.java!!!	maybeStartPairingServer() : void
+        Settings settings = new Settings(this);
+        if (settings.areRequestsEnabled()) {
+            startPairingServer();
+        } else {
+            Log.v(LOG_TAG, "Pairing has been disabled - not starting");
+        }
+!!!13402892.java!!!	stopServer() : void
+        if (mTcpListener != null) {
+            mTcpListener.stopAccepting();
+            mTcpListener = null;
+        }
+
+        if (mPlainListener != null) {
+            mPlainListener.stopAccepting();
+            mPlainListener = null;
+        }
+!!!13403020.java!!!	stopPairingServer() : void
+        if (mPairingServer != null) {
+            mPairingServer.stopAccepting();
+            mPairingServer = null;
+        }
+!!!13403148.java!!!	removeCertificate(in id : String) : void
+        Certificate removedCertificate =
+            mKeyStoreManager.removeCertificate(id);
+
+        if (removedCertificate != null) {
+            Log.d(LOG_TAG, "Removed certificate, restarting server...");
+            stopServer();
+            ProtocolHandler foundHandler = null;
+
+            for (ProtocolHandler handler : clients) {
+                if (handler.verifyCertificate(removedCertificate)) {
+                    foundHandler = handler;
+                    break;
+                }
+            }
+
+            if (foundHandler != null) {
+                foundHandler.teardown();
+                clients.remove(foundHandler);
+            }
+            startServer();
+        }
+!!!13403276.java!!!	onDestroy() : void
+        stopAdvertising();
+        mServiceHandler.getLooper().quit();
+        mServiceHandler = null;
+        stopPairingServer();
+        stopServer();
+        if (mKeyStoreManager != null) {
+            mKeyStoreManager.store();
+            mKeyStoreManager = null;
+        }
+        // TODO(dziekon): Disconnect clients if protocol introduces "bye"
+        // message.
+        //        disconnectClients();
+        super.onDestroy();
+!!!13403404.java!!!	startAdvertising() : void
+        if (!mIsAdvertising) {
+            Log.v(LOG_TAG, "Starting advertising");
+            try {
+                mDiscoveryProxy.bind();
+                mDiscoveryProxy.registerAdvertiser(Services.create(
+                    ANYMOTE_TRIVIAL_SERVICE, ANYMOTE_TCP_PORT));
+                mDiscoveryProxy.registerAdvertiser(Services.create(
+                    ANYMOTE_TCP_SERVICE, ANYMOTE_TCP_PORT));
+
+                if (ALLOW_INSECURE_IP_PROTOCOL) {
+                    mDiscoveryProxy.registerAdvertiser(Services.create(
+                        ANYMOTE_INSECURE_TRIVIAL_SERVICE, ANYMOTE_INSECURE_PORT));
+                    mDiscoveryProxy.registerAdvertiser(Services.create(
+                        ANYMOTE_INSECURE_TCP_SERVICE, ANYMOTE_INSECURE_PORT));
+                }
+
+                mIsAdvertising = true;
+            } catch (DiscoveryException e) {
+                Log.e(LOG_TAG, "IP remote service registration failed.", e);
+            }
+        } else {
+            Log.v(LOG_TAG, "Not starting advertising");
+        }
+!!!13403532.java!!!	stopAdvertising() : void
+        if (mIsAdvertising) {
+            Log.v(LOG_TAG, "Stopping advertising");
+            try {
+                mDiscoveryProxy.unregisterAdvertiser(ANYMOTE_TRIVIAL_SERVICE);
+                mDiscoveryProxy.unregisterAdvertiser(ANYMOTE_TCP_SERVICE);
+
+                if (ALLOW_INSECURE_IP_PROTOCOL) {
+                    mDiscoveryProxy.unregisterAdvertiser(ANYMOTE_INSECURE_TCP_SERVICE);
+                    mDiscoveryProxy.unregisterAdvertiser(ANYMOTE_INSECURE_TRIVIAL_SERVICE);
+                }
+                mDiscoveryProxy.unbind();
+                mIsAdvertising = false;
+            } catch (DiscoveryException e) {
+                Log.e(LOG_TAG, "IP remote service unregistration failed.", e);
+            }
+        } else {
+            Log.v(LOG_TAG, "Not stopping advertising.");
+        }
+!!!13404044.java!!!	newClientConnection(inout clientSocket : Socket) : void
+        Log.d(LOG_TAG, "Received connection for anymote protocol.");
+        // TODO(dziekon): add limiting number of concurrent connections.
+        ProtocolHandler client = new ProtocolHandler(this, clientSocket, INPUT_BRIDGE);
+        clients.add(client);
+!!!13404172.java!!!	getSslServerSocket(in port : int) : SSLServerSocket
+        // Build a new key store based on the key store manager.
+        KeyManager[] keyManagers = mKeyStoreManager.getKeyManagers();
+        TrustManager[] trustManagers = mKeyStoreManager.getTrustManagers();
+
+        // Create a new SSLContext, using the new KeyManagers and TrustManagers
+        // as the sources of keys and trust decisions, respectively.
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(keyManagers, trustManagers, null);
+
+        // Finally, build a new SSLServerSocketFactory from the SSLContext, and
+        // then generate a new SSLServerSocket from it.
+        SSLServerSocket sock = (SSLServerSocket) sslContext
+                .getServerSocketFactory().createServerSocket(port);
+        sock.setNeedClientAuth(true); // clients must present a cert
+        sock.setUseClientMode(false); // should be the default
+        return sock;
+!!!13404300.java!!!	getPlainServerSocket(in port : int) : ServerSocket
+        if (ALLOW_INSECURE_IP_PROTOCOL) {
+            return new ServerSocket(port);
+        }
+        return null;
+!!!13404428.java!!!	createPairingDelegate() : Delegate
+        return new PairingServer.Delegate() {
+
+            @Override
+            public void presentSecret(String name, String secret) {
+                showPairingUi(secret, name);
+            }
+
+            @Override
+            public void onRejected() {
+                dismissPairingUi();
+            }
+
+            @Override
+            public void onPaired(String id, String name) {
+                PairedRemote device = new PairedRemote(getContext(), id, name);
+                mSettings.addDevice(device);
+                dismissPairingUi();
+                showSuccessMessage(device);
+                EventLogger.logPaired(name);
+            }
+
+            @Override
+            public void onFailed(String name) {
+                dismissPairingUi();
+                EventLogger.logPairingFailed(name);
+            }
+        };
+!!!13404556.java!!!	getContext() : Context
+        return getApplicationContext();
+!!!13404684.java!!!	showPairingUi(in code : String, in name : String) : void
+        startActivity(new Intent(getContext(), PairingCodeActivity.class)
+                .putExtra(PairingCodeActivity.EXTRA_CODE, code)
+                .putExtra(PairingCodeActivity.EXTRA_CLIENT_NAME, name)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+!!!13404812.java!!!	dismissPairingUi() : void
+        PairingCodeActivity.dismiss(getContext());
+!!!13404940.java!!!	showSuccessMessage(inout device : PairedRemote) : void
+        String template = getContext().getString(
+                R.string.toast_successful_pairing);
+        CharSequence message = TextUtils.expandTemplate(
+                template, device.getName());
+        Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+!!!13405068.java!!!	broadcastShowSoftKeyboard(inout listener : SoftInputListener, in inputType : int, in imeAction : int, in hint : String) : void
+        for (ProtocolHandler client : clients) {
+            client.setRemoteInputListener(listener);
+            client.onRequireSoftKeyboard(inputType, imeAction, hint);
+        }
+!!!13405196.java!!!	broadcastHideSoftKeyboard() : void
+        for (ProtocolHandler client : clients) {
+            client.setRemoteInputListener(null);
+            client.onDismissSoftKeyboard();
+        }
+!!!13405324.java!!!	broadcastSoftInputContent(inout origin : Object, in content : String, in selectionStart : int, in selectionEnd : int) : void
+        for (ProtocolHandler client : clients) {
+            if (!client.isOrigin(origin)) {
+                client.onSoftInputContent(content, selectionStart, selectionEnd);
+            }
+        }
+!!!13405452.java!!!	broadcastSoftInputUpdate(inout origin : Object, in content : String, in changeLocation : int, in replaced : int, in inserted : int, in selectionStart : int, in selectionEnd : int) : void
+        for (ProtocolHandler client : clients) {
+            if (!client.isOrigin(origin)) {
+                client.onSoftInputUpdate(content,
+                        changeLocation, replaced, inserted, selectionStart, selectionEnd);
+            }
+        }

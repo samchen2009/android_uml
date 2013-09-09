@@ -1,0 +1,461 @@
+class BackDropperFilter
+!!!7113356.java!!!	BackDropperFilter(in name : String)
+        super(name);
+
+        mLogVerbose = Log.isLoggable(TAG, Log.VERBOSE);
+
+        String adjStr = SystemProperties.get("ro.media.effect.bgdropper.adj");
+        if (adjStr.length() > 0) {
+            try {
+                mAcceptStddev += Float.parseFloat(adjStr);
+                if (mLogVerbose) {
+                    Log.v(TAG, "Adjusting accept threshold by " + adjStr +
+                            ", now " + mAcceptStddev);
+                }
+            } catch (NumberFormatException e) {
+                Log.e(TAG,
+                        "Badly formatted property ro.media.effect.bgdropper.adj: " + adjStr);
+            }
+        }
+!!!7113484.java!!!	setupPorts() : void
+        // Inputs.
+        // TODO: Target should be GPU, but relaxed for now.
+        FrameFormat imageFormat = ImageFormat.create(ImageFormat.COLORSPACE_RGBA,
+                                                     FrameFormat.TARGET_UNSPECIFIED);
+        for (String inputName : mInputNames) {
+            addMaskedInputPort(inputName, imageFormat);
+        }
+        // Normal outputs
+        for (String outputName : mOutputNames) {
+            addOutputBasedOnInput(outputName, "video");
+        }
+
+        // Debug outputs
+        if (mProvideDebugOutputs) {
+            for (String outputName : mDebugOutputNames) {
+                addOutputBasedOnInput(outputName, "video");
+            }
+        }
+!!!7113612.java!!!	getOutputFormat(in portName : String, inout inputFormat : FrameFormat) : FrameFormat
+        // Create memory format based on video input.
+        MutableFrameFormat format = inputFormat.mutableCopy();
+        // Is this a debug output port? If so, leave dimensions unspecified.
+        if (!Arrays.asList(mOutputNames).contains(portName)) {
+            format.setDimensions(FrameFormat.SIZE_UNSPECIFIED, FrameFormat.SIZE_UNSPECIFIED);
+        }
+        return format;
+!!!7113740.java!!!	createMemoryFormat(inout inputFormat : FrameFormat) : boolean
+        // We can't resize because that would require re-learning.
+        if (mMemoryFormat != null) {
+            return false;
+        }
+
+        if (inputFormat.getWidth() == FrameFormat.SIZE_UNSPECIFIED ||
+            inputFormat.getHeight() == FrameFormat.SIZE_UNSPECIFIED) {
+            throw new RuntimeException("Attempting to process input frame with unknown size");
+        }
+
+        mMaskFormat = inputFormat.mutableCopy();
+        int maskWidth = (int)Math.pow(2, mMaskWidthExp);
+        int maskHeight = (int)Math.pow(2, mMaskHeightExp);
+        mMaskFormat.setDimensions(maskWidth, maskHeight);
+
+        mPyramidDepth = Math.max(mMaskWidthExp, mMaskHeightExp);
+        mMemoryFormat = mMaskFormat.mutableCopy();
+        int widthExp = Math.max(mMaskWidthExp, pyramidLevel(inputFormat.getWidth()));
+        int heightExp = Math.max(mMaskHeightExp, pyramidLevel(inputFormat.getHeight()));
+        mPyramidDepth = Math.max(widthExp, heightExp);
+        int memWidth = Math.max(maskWidth, (int)Math.pow(2, widthExp));
+        int memHeight = Math.max(maskHeight, (int)Math.pow(2, heightExp));
+        mMemoryFormat.setDimensions(memWidth, memHeight);
+        mSubsampleLevel = mPyramidDepth - Math.max(mMaskWidthExp, mMaskHeightExp);
+
+        if (mLogVerbose) {
+            Log.v(TAG, "Mask frames size " + maskWidth + " x " + maskHeight);
+            Log.v(TAG, "Pyramid levels " + widthExp + " x " + heightExp);
+            Log.v(TAG, "Memory frames size " + memWidth + " x " + memHeight);
+        }
+
+        mAverageFormat = inputFormat.mutableCopy();
+        mAverageFormat.setDimensions(1,1);
+        return true;
+!!!7113868.java!!!	prepare(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Preparing BackDropperFilter!");
+
+        mBgMean = new GLFrame[2];
+        mBgVariance = new GLFrame[2];
+        mMaskVerify = new GLFrame[2];
+        copyShaderProgram = ShaderProgram.createIdentity(context);
+!!!7113996.java!!!	allocateFrames(inout inputFormat : FrameFormat, inout context : FilterContext) : void
+        if (!createMemoryFormat(inputFormat)) {
+            return;  // All set.
+        }
+        if (mLogVerbose) Log.v(TAG, "Allocating BackDropperFilter frames");
+
+        // Create initial background model values
+        int numBytes = mMaskFormat.getSize();
+        byte[] initialBgMean = new byte[numBytes];
+        byte[] initialBgVariance = new byte[numBytes];
+        byte[] initialMaskVerify = new byte[numBytes];
+        for (int i = 0; i < numBytes; i++) {
+            initialBgMean[i] = (byte)128;
+            initialBgVariance[i] = (byte)10;
+            initialMaskVerify[i] = (byte)0;
+        }
+
+        // Get frames to store background model in
+        for (int i = 0; i < 2; i++) {
+            mBgMean[i] = (GLFrame)context.getFrameManager().newFrame(mMaskFormat);
+            mBgMean[i].setData(initialBgMean, 0, numBytes);
+
+            mBgVariance[i] = (GLFrame)context.getFrameManager().newFrame(mMaskFormat);
+            mBgVariance[i].setData(initialBgVariance, 0, numBytes);
+
+            mMaskVerify[i] = (GLFrame)context.getFrameManager().newFrame(mMaskFormat);
+            mMaskVerify[i].setData(initialMaskVerify, 0, numBytes);
+        }
+
+        // Get frames to store other textures in
+        if (mLogVerbose) Log.v(TAG, "Done allocating texture for Mean and Variance objects!");
+
+        mDistance = (GLFrame)context.getFrameManager().newFrame(mMaskFormat);
+        mMask = (GLFrame)context.getFrameManager().newFrame(mMaskFormat);
+        mAutoWB = (GLFrame)context.getFrameManager().newFrame(mAverageFormat);
+        mVideoInput = (GLFrame)context.getFrameManager().newFrame(mMemoryFormat);
+        mBgInput = (GLFrame)context.getFrameManager().newFrame(mMemoryFormat);
+        mMaskAverage = (GLFrame)context.getFrameManager().newFrame(mAverageFormat);
+
+        // Create shader programs
+        mBgDistProgram = new ShaderProgram(context, mSharedUtilShader + mBgDistanceShader);
+        mBgDistProgram.setHostValue("subsample_level", (float)mSubsampleLevel);
+
+        mBgMaskProgram = new ShaderProgram(context, mSharedUtilShader + mBgMaskShader);
+        mBgMaskProgram.setHostValue("accept_variance", mAcceptStddev * mAcceptStddev);
+        float[] yuvWeights = { mLumScale, mChromaScale };
+        mBgMaskProgram.setHostValue("yuv_weights", yuvWeights );
+        mBgMaskProgram.setHostValue("scale_lrg", mHierarchyLrgScale);
+        mBgMaskProgram.setHostValue("scale_mid", mHierarchyMidScale);
+        mBgMaskProgram.setHostValue("scale_sml", mHierarchySmlScale);
+        mBgMaskProgram.setHostValue("exp_lrg", (float)(mSubsampleLevel + mHierarchyLrgExp));
+        mBgMaskProgram.setHostValue("exp_mid", (float)(mSubsampleLevel + mHierarchyMidExp));
+        mBgMaskProgram.setHostValue("exp_sml", (float)(mSubsampleLevel + mHierarchySmlExp));
+
+        if (mUseTheForce) {
+            mBgSubtractProgram = new ShaderProgram(context, mSharedUtilShader + mBgSubtractShader + mBgSubtractForceShader);
+        } else {
+            mBgSubtractProgram = new ShaderProgram(context, mSharedUtilShader + mBgSubtractShader + "}\n");
+        }
+        mBgSubtractProgram.setHostValue("bg_fit_transform", DEFAULT_BG_FIT_TRANSFORM);
+        mBgSubtractProgram.setHostValue("mask_blend_bg", mMaskBg);
+        mBgSubtractProgram.setHostValue("mask_blend_fg", mMaskFg);
+        mBgSubtractProgram.setHostValue("exposure_change", mExposureChange);
+        mBgSubtractProgram.setHostValue("whitebalanceblue_change", mWhiteBalanceBlueChange);
+        mBgSubtractProgram.setHostValue("whitebalancered_change", mWhiteBalanceRedChange);
+
+
+        mBgUpdateMeanProgram = new ShaderProgram(context, mSharedUtilShader + mUpdateBgModelMeanShader);
+        mBgUpdateMeanProgram.setHostValue("subsample_level", (float)mSubsampleLevel);
+
+        mBgUpdateVarianceProgram = new ShaderProgram(context, mSharedUtilShader + mUpdateBgModelVarianceShader);
+        mBgUpdateVarianceProgram.setHostValue("subsample_level", (float)mSubsampleLevel);
+
+        mCopyOutProgram = ShaderProgram.createIdentity(context);
+
+        mAutomaticWhiteBalanceProgram = new ShaderProgram(context, mSharedUtilShader + mAutomaticWhiteBalance);
+        mAutomaticWhiteBalanceProgram.setHostValue("pyramid_depth", (float)mPyramidDepth);
+        mAutomaticWhiteBalanceProgram.setHostValue("autowb_toggle", mAutoWBToggle);
+
+        mMaskVerifyProgram = new ShaderProgram(context, mSharedUtilShader + mMaskVerifyShader);
+        mMaskVerifyProgram.setHostValue("verify_rate", mVerifyRate);
+
+        if (mLogVerbose) Log.v(TAG, "Shader width set to " + mMemoryFormat.getWidth());
+
+        mRelativeAspect = 1.f;
+
+        mFrameCount = 0;
+        mStartLearning = true;
+!!!7114124.java!!!	process(inout context : FilterContext) : void
+        // Grab inputs and ready intermediate frames and outputs.
+        Frame video = pullInput("video");
+        Frame background = pullInput("background");
+        allocateFrames(video.getFormat(), context);
+
+        // Update learning rate after initial learning period
+        if (mStartLearning) {
+            if (mLogVerbose) Log.v(TAG, "Starting learning");
+            mBgUpdateMeanProgram.setHostValue("bg_adapt_rate", mAdaptRateLearning);
+            mBgUpdateMeanProgram.setHostValue("fg_adapt_rate", mAdaptRateLearning);
+            mBgUpdateVarianceProgram.setHostValue("bg_adapt_rate", mAdaptRateLearning);
+            mBgUpdateVarianceProgram.setHostValue("fg_adapt_rate", mAdaptRateLearning);
+            mFrameCount = 0;
+        }
+
+        // Select correct pingpong buffers
+        int inputIndex = mPingPong ? 0 : 1;
+        int outputIndex = mPingPong ? 1 : 0;
+        mPingPong = !mPingPong;
+
+        // Check relative aspect ratios
+        updateBgScaling(video, background, mBackgroundFitModeChanged);
+        mBackgroundFitModeChanged = false;
+
+        // Make copies for input frames to GLFrames
+
+        copyShaderProgram.process(video, mVideoInput);
+        copyShaderProgram.process(background, mBgInput);
+
+        mVideoInput.generateMipMap();
+        mVideoInput.setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                        GLES20.GL_LINEAR_MIPMAP_NEAREST);
+
+        mBgInput.generateMipMap();
+        mBgInput.setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                     GLES20.GL_LINEAR_MIPMAP_NEAREST);
+
+        if (mStartLearning) {
+            copyShaderProgram.process(mVideoInput, mBgMean[inputIndex]);
+            mStartLearning = false;
+        }
+
+        // Process shaders
+        Frame[] distInputs = { mVideoInput, mBgMean[inputIndex], mBgVariance[inputIndex] };
+        mBgDistProgram.process(distInputs, mDistance);
+        mDistance.generateMipMap();
+        mDistance.setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                      GLES20.GL_LINEAR_MIPMAP_NEAREST);
+
+        mBgMaskProgram.process(mDistance, mMask);
+        mMask.generateMipMap();
+        mMask.setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                  GLES20.GL_LINEAR_MIPMAP_NEAREST);
+
+        Frame[] autoWBInputs = { mVideoInput, mBgInput };
+        mAutomaticWhiteBalanceProgram.process(autoWBInputs, mAutoWB);
+
+        if (mFrameCount <= mLearningDuration) {
+            // During learning
+            pushOutput("video", video);
+
+            if (mFrameCount == mLearningDuration - mLearningVerifyDuration) {
+                copyShaderProgram.process(mMask, mMaskVerify[outputIndex]);
+
+                mBgUpdateMeanProgram.setHostValue("bg_adapt_rate", mAdaptRateBg);
+                mBgUpdateMeanProgram.setHostValue("fg_adapt_rate", mAdaptRateFg);
+                mBgUpdateVarianceProgram.setHostValue("bg_adapt_rate", mAdaptRateBg);
+                mBgUpdateVarianceProgram.setHostValue("fg_adapt_rate", mAdaptRateFg);
+
+
+            } else if (mFrameCount > mLearningDuration - mLearningVerifyDuration) {
+                // In the learning verification stage, compute background masks and a weighted average
+                //   with weights grow exponentially with time
+                Frame[] maskVerifyInputs = {mMaskVerify[inputIndex], mMask};
+                mMaskVerifyProgram.process(maskVerifyInputs, mMaskVerify[outputIndex]);
+                mMaskVerify[outputIndex].generateMipMap();
+                mMaskVerify[outputIndex].setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                                             GLES20.GL_LINEAR_MIPMAP_NEAREST);
+            }
+
+            if (mFrameCount == mLearningDuration) {
+                // In the last verification frame, verify if the verification mask is almost blank
+                // If not, restart learning
+                copyShaderProgram.process(mMaskVerify[outputIndex], mMaskAverage);
+                ByteBuffer mMaskAverageByteBuffer = mMaskAverage.getData();
+                byte[] mask_average = mMaskAverageByteBuffer.array();
+                int bi = (int)(mask_average[3] & 0xFF);
+
+                if (mLogVerbose) {
+                    Log.v(TAG,
+                            String.format("Mask_average is %d, threshold is %d",
+                                    bi, DEFAULT_LEARNING_DONE_THRESHOLD));
+                }
+
+                if (bi >= DEFAULT_LEARNING_DONE_THRESHOLD) {
+                    mStartLearning = true;                                      // Restart learning
+                } else {
+                  if (mLogVerbose) Log.v(TAG, "Learning done");
+                  if (mLearningDoneListener != null) {
+                      mLearningDoneListener.onLearningDone(this);
+                   }
+                }
+            }
+        } else {
+            Frame output = context.getFrameManager().newFrame(video.getFormat());
+            Frame[] subtractInputs = { video, background, mMask, mAutoWB };
+            mBgSubtractProgram.process(subtractInputs, output);
+            pushOutput("video", output);
+            output.release();
+        }
+
+        // Compute mean and variance of the background
+        if (mFrameCount < mLearningDuration - mLearningVerifyDuration ||
+            mAdaptRateBg > 0.0 || mAdaptRateFg > 0.0) {
+            Frame[] meanUpdateInputs = { mVideoInput, mBgMean[inputIndex], mMask };
+            mBgUpdateMeanProgram.process(meanUpdateInputs, mBgMean[outputIndex]);
+            mBgMean[outputIndex].generateMipMap();
+            mBgMean[outputIndex].setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                                     GLES20.GL_LINEAR_MIPMAP_NEAREST);
+
+            Frame[] varianceUpdateInputs = {
+              mVideoInput, mBgMean[inputIndex], mBgVariance[inputIndex], mMask
+            };
+            mBgUpdateVarianceProgram.process(varianceUpdateInputs, mBgVariance[outputIndex]);
+            mBgVariance[outputIndex].generateMipMap();
+            mBgVariance[outputIndex].setTextureParameter(GLES20.GL_TEXTURE_MIN_FILTER,
+                                                         GLES20.GL_LINEAR_MIPMAP_NEAREST);
+        }
+
+        // Provide debug output to two smaller viewers
+        if (mProvideDebugOutputs) {
+            Frame dbg1 = context.getFrameManager().newFrame(video.getFormat());
+            mCopyOutProgram.process(video, dbg1);
+            pushOutput("debug1", dbg1);
+            dbg1.release();
+
+            Frame dbg2 = context.getFrameManager().newFrame(mMemoryFormat);
+            mCopyOutProgram.process(mMask, dbg2);
+            pushOutput("debug2", dbg2);
+            dbg2.release();
+        }
+
+        mFrameCount++;
+
+        if (mLogVerbose) {
+            if (mFrameCount % 30 == 0) {
+                if (startTime == -1) {
+                    context.getGLEnvironment().activate();
+                    GLES20.glFinish();
+                    startTime = SystemClock.elapsedRealtime();
+                } else {
+                    context.getGLEnvironment().activate();
+                    GLES20.glFinish();
+                    long endTime = SystemClock.elapsedRealtime();
+                    Log.v(TAG, "Avg. frame duration: " + String.format("%.2f",(endTime-startTime)/30.) +
+                          " ms. Avg. fps: " + String.format("%.2f", 1000./((endTime-startTime)/30.)) );
+                    startTime = endTime;
+                }
+            }
+        }
+!!!7114252.java!!!	close(inout context : FilterContext) : void
+        if (mMemoryFormat == null) {
+            return;
+        }
+
+        if (mLogVerbose) Log.v(TAG, "Filter Closing!");
+        for (int i = 0; i < 2; i++) {
+            mBgMean[i].release();
+            mBgVariance[i].release();
+            mMaskVerify[i].release();
+        }
+        mDistance.release();
+        mMask.release();
+        mAutoWB.release();
+        mVideoInput.release();
+        mBgInput.release();
+        mMaskAverage.release();
+
+        mMemoryFormat = null;
+!!!7114380.java!!!	relearn() : void
+        // Let the processing thread know about learning restart
+        mStartLearning = true;
+!!!7114508.java!!!	fieldPortValueUpdated(in name : String, inout context : FilterContext) : void
+        // TODO: Many of these can be made ProgramPorts!
+        if (name.equals("backgroundFitMode")) {
+            mBackgroundFitModeChanged = true;
+        } else if (name.equals("acceptStddev")) {
+            mBgMaskProgram.setHostValue("accept_variance", mAcceptStddev * mAcceptStddev);
+        } else if (name.equals("hierLrgScale")) {
+            mBgMaskProgram.setHostValue("scale_lrg", mHierarchyLrgScale);
+        } else if (name.equals("hierMidScale")) {
+            mBgMaskProgram.setHostValue("scale_mid", mHierarchyMidScale);
+        } else if (name.equals("hierSmlScale")) {
+            mBgMaskProgram.setHostValue("scale_sml", mHierarchySmlScale);
+        } else if (name.equals("hierLrgExp")) {
+            mBgMaskProgram.setHostValue("exp_lrg", (float)(mSubsampleLevel + mHierarchyLrgExp));
+        } else if (name.equals("hierMidExp")) {
+            mBgMaskProgram.setHostValue("exp_mid", (float)(mSubsampleLevel + mHierarchyMidExp));
+        } else if (name.equals("hierSmlExp")) {
+            mBgMaskProgram.setHostValue("exp_sml", (float)(mSubsampleLevel + mHierarchySmlExp));
+        } else if (name.equals("lumScale") || name.equals("chromaScale")) {
+            float[] yuvWeights = { mLumScale, mChromaScale };
+            mBgMaskProgram.setHostValue("yuv_weights", yuvWeights );
+        } else if (name.equals("maskBg")) {
+            mBgSubtractProgram.setHostValue("mask_blend_bg", mMaskBg);
+        } else if (name.equals("maskFg")) {
+            mBgSubtractProgram.setHostValue("mask_blend_fg", mMaskFg);
+        } else if (name.equals("exposureChange")) {
+            mBgSubtractProgram.setHostValue("exposure_change", mExposureChange);
+        } else if (name.equals("whitebalanceredChange")) {
+            mBgSubtractProgram.setHostValue("whitebalancered_change", mWhiteBalanceRedChange);
+        } else if (name.equals("whitebalanceblueChange")) {
+            mBgSubtractProgram.setHostValue("whitebalanceblue_change", mWhiteBalanceBlueChange);
+        } else if (name.equals("autowbToggle")){
+            mAutomaticWhiteBalanceProgram.setHostValue("autowb_toggle", mAutoWBToggle);
+        }
+!!!7114636.java!!!	updateBgScaling(inout video : Frame, inout background : Frame, inout fitModeChanged : boolean) : void
+        float foregroundAspect = (float)video.getFormat().getWidth() / video.getFormat().getHeight();
+        float backgroundAspect = (float)background.getFormat().getWidth() / background.getFormat().getHeight();
+        float currentRelativeAspect = foregroundAspect/backgroundAspect;
+        if (currentRelativeAspect != mRelativeAspect || fitModeChanged) {
+            mRelativeAspect = currentRelativeAspect;
+            float xMin = 0.f, xWidth = 1.f, yMin = 0.f, yWidth = 1.f;
+            switch (mBackgroundFitMode) {
+                case BACKGROUND_STRETCH:
+                    // Just map 1:1
+                    break;
+                case BACKGROUND_FIT:
+                    if (mRelativeAspect > 1.0f) {
+                        // Foreground is wider than background, scale down
+                        // background in X
+                        xMin = 0.5f - 0.5f * mRelativeAspect;
+                        xWidth = 1.f * mRelativeAspect;
+                    } else {
+                        // Foreground is taller than background, scale down
+                        // background in Y
+                        yMin = 0.5f - 0.5f / mRelativeAspect;
+                        yWidth = 1 / mRelativeAspect;
+                    }
+                    break;
+                case BACKGROUND_FILL_CROP:
+                    if (mRelativeAspect > 1.0f) {
+                        // Foreground is wider than background, crop
+                        // background in Y
+                        yMin = 0.5f - 0.5f / mRelativeAspect;
+                        yWidth = 1.f / mRelativeAspect;
+                    } else {
+                        // Foreground is taller than background, crop
+                        // background in X
+                        xMin = 0.5f - 0.5f * mRelativeAspect;
+                        xWidth = mRelativeAspect;
+                    }
+                    break;
+            }
+            // If mirroring is required (for ex. the camera mirrors the preview
+            // in the front camera)
+            // TODO: Backdropper does not attempt to apply any other transformation
+            // than just flipping. However, in the current state, it's "x-axis" is always aligned
+            // with the Camera's width. Hence, we need to define the mirroring based on the camera
+            // orientation. In the future, a cleaner design would be to cast away all the rotation
+            // in a separate place.
+            if (mMirrorBg) {
+                if (mLogVerbose) Log.v(TAG, "Mirroring the background!");
+                // Mirroring in portrait
+                if (mOrientation == 0 || mOrientation == 180) {
+                    xWidth = -xWidth;
+                    xMin = 1.0f - xMin;
+                } else {
+                    // Mirroring in landscape
+                    yWidth = -yWidth;
+                    yMin = 1.0f - yMin;
+                }
+            }
+            if (mLogVerbose) Log.v(TAG, "bgTransform: xMin, yMin, xWidth, yWidth : " +
+                    xMin + ", " + yMin + ", " + xWidth + ", " + yWidth +
+                    ", mRelAspRatio = " + mRelativeAspect);
+            // The following matrix is the transpose of the actual matrix
+            float[] bgTransform = {xWidth, 0.f, 0.f,
+                                   0.f, yWidth, 0.f,
+                                   xMin, yMin,  1.f};
+            mBgSubtractProgram.setHostValue("bg_fit_transform", bgTransform);
+        }
+!!!7114764.java!!!	pyramidLevel(in size : int) : int
+        return (int)Math.floor(Math.log10(size) / Math.log10(2)) - 1;

@@ -1,0 +1,338 @@
+class HttpURLConnectionImpl
+!!!2097819.java!!!	HttpURLConnectionImpl(inout url : URL, in port : int)
+        super(url);
+        defaultPort = port;
+!!!2097947.java!!!	HttpURLConnectionImpl(inout url : URL, in port : int, inout proxy : Proxy)
+        this(url, port);
+        this.proxy = proxy;
+!!!2098075.java!!!	connect() : void
+        initHttpEngine();
+        try {
+            httpEngine.sendRequest();
+        } catch (IOException e) {
+            httpEngineFailure = e;
+            throw e;
+        }
+!!!2098203.java!!!	disconnect() : void
+        // Calling disconnect() before a connection exists should have no effect.
+        if (httpEngine != null) {
+            // We close the response body here instead of in
+            // HttpEngine.release because that is called when input
+            // has been completely read from the underlying socket.
+            // However the response body can be a GZIPInputStream that
+            // still has unread data.
+            if (httpEngine.hasResponse()) {
+                IoUtils.closeQuietly(httpEngine.getResponseBody());
+            }
+            httpEngine.release(false);
+        }
+!!!2098331.java!!!	getErrorStream() : InputStream
+        try {
+            HttpEngine response = getResponse();
+            if (response.hasResponseBody()
+                    && response.getResponseCode() >= HTTP_BAD_REQUEST) {
+                return response.getResponseBody();
+            }
+            return null;
+        } catch (IOException e) {
+            return null;
+        }
+!!!2098459.java!!!	getHeaderField(in position : int) : String
+        try {
+            return getResponse().getResponseHeaders().getHeaders().getValue(position);
+        } catch (IOException e) {
+            return null;
+        }
+!!!2098587.java!!!	getHeaderField(inout fieldName : String) : String
+        try {
+            RawHeaders rawHeaders = getResponse().getResponseHeaders().getHeaders();
+            return fieldName == null
+                    ? rawHeaders.getStatusLine()
+                    : rawHeaders.get(fieldName);
+        } catch (IOException e) {
+            return null;
+        }
+!!!2098715.java!!!	getHeaderFieldKey(in position : int) : String
+        try {
+            return getResponse().getResponseHeaders().getHeaders().getFieldName(position);
+        } catch (IOException e) {
+            return null;
+        }
+!!!2098843.java!!!	getHeaderFields() : Map
+        try {
+            return getResponse().getResponseHeaders().getHeaders().toMultimap();
+        } catch (IOException e) {
+            return null;
+        }
+!!!2098971.java!!!	getRequestProperties() : Map
+        if (connected) {
+            throw new IllegalStateException(
+                    "Cannot access request header fields after connection is set");
+        }
+        return rawRequestHeaders.toMultimap();
+!!!2099099.java!!!	getInputStream() : InputStream
+        if (!doInput) {
+            throw new ProtocolException("This protocol does not support input");
+        }
+
+        HttpEngine response = getResponse();
+
+        /*
+         * if the requested file does not exist, throw an exception formerly the
+         * Error page from the server was returned if the requested file was
+         * text/html this has changed to return FileNotFoundException for all
+         * file types
+         */
+        if (getResponseCode() >= HTTP_BAD_REQUEST) {
+            throw new FileNotFoundException(url.toString());
+        }
+
+        InputStream result = response.getResponseBody();
+        if (result == null) {
+            throw new IOException("No response body exists; responseCode=" + getResponseCode());
+        }
+        return result;
+!!!2099227.java!!!	getOutputStream() : OutputStream
+        connect();
+
+        OutputStream result = httpEngine.getRequestBody();
+        if (result == null) {
+            throw new ProtocolException("method does not support a request body: " + method);
+        } else if (httpEngine.hasResponse()) {
+            throw new ProtocolException("cannot write request body after response has been read");
+        }
+
+        return result;
+!!!2099355.java!!!	getPermission() : Permission
+        String connectToAddress = getConnectToHost() + ":" + getConnectToPort();
+        return new SocketPermission(connectToAddress, "connect, resolve");
+!!!2099483.java!!!	getConnectToHost() : String
+        return usingProxy()
+                ? ((InetSocketAddress) proxy.address()).getHostName()
+                : getURL().getHost();
+!!!2099611.java!!!	getConnectToPort() : int
+        int hostPort = usingProxy()
+                ? ((InetSocketAddress) proxy.address()).getPort()
+                : getURL().getPort();
+        return hostPort < 0 ? getDefaultPort() : hostPort;
+!!!2099739.java!!!	getRequestProperty(inout field : String) : String
+        if (field == null) {
+            return null;
+        }
+        return rawRequestHeaders.get(field);
+!!!2099867.java!!!	initHttpEngine() : void
+        if (httpEngineFailure != null) {
+            throw httpEngineFailure;
+        } else if (httpEngine != null) {
+            return;
+        }
+
+        connected = true;
+        try {
+            if (doOutput) {
+                if (method == HttpEngine.GET) {
+                    // they are requesting a stream to write to. This implies a POST method
+                    method = HttpEngine.POST;
+                } else if (method != HttpEngine.POST && method != HttpEngine.PUT) {
+                    // If the request method is neither POST nor PUT, then you're not writing
+                    throw new ProtocolException(method + " does not support writing");
+                }
+            }
+            httpEngine = newHttpEngine(method, rawRequestHeaders, null, null);
+        } catch (IOException e) {
+            httpEngineFailure = e;
+            throw e;
+        }
+!!!2099995.java!!!	newHttpEngine(inout method : String, inout requestHeaders : RawHeaders, inout connection : HttpConnection, inout requestBody : RetryableOutputStream) : HttpEngine
+        return new HttpEngine(this, method, requestHeaders, connection, requestBody);
+!!!2100123.java!!!	getResponse() : HttpEngine
+        initHttpEngine();
+
+        if (httpEngine.hasResponse()) {
+            return httpEngine;
+        }
+
+        while (true) {
+            try {
+                httpEngine.sendRequest();
+                httpEngine.readResponse();
+            } catch (IOException e) {
+                /*
+                 * If the connection was recycled, its staleness may have caused
+                 * the failure. Silently retry with a different connection.
+                 */
+                OutputStream requestBody = httpEngine.getRequestBody();
+                if (httpEngine.hasRecycledConnection()
+                        && (requestBody == null || requestBody instanceof RetryableOutputStream)) {
+                    httpEngine.release(false);
+                    httpEngine = newHttpEngine(method, rawRequestHeaders, null,
+                            (RetryableOutputStream) requestBody);
+                    continue;
+                }
+                httpEngineFailure = e;
+                throw e;
+            }
+
+            Retry retry = processResponseHeaders();
+            if (retry == Retry.NONE) {
+                httpEngine.automaticallyReleaseConnectionToPool();
+                return httpEngine;
+            }
+
+            /*
+             * The first request was insufficient. Prepare for another...
+             */
+            String retryMethod = method;
+            OutputStream requestBody = httpEngine.getRequestBody();
+
+            /*
+             * Although RFC 2616 10.3.2 specifies that a HTTP_MOVED_PERM
+             * redirect should keep the same method, Chrome, Firefox and the
+             * RI all issue GETs when following any redirect.
+             */
+            int responseCode = getResponseCode();
+            if (responseCode == HTTP_MULT_CHOICE || responseCode == HTTP_MOVED_PERM
+                    || responseCode == HTTP_MOVED_TEMP || responseCode == HTTP_SEE_OTHER) {
+                retryMethod = HttpEngine.GET;
+                requestBody = null;
+            }
+
+            if (requestBody != null && !(requestBody instanceof RetryableOutputStream)) {
+                throw new HttpRetryException("Cannot retry streamed HTTP body",
+                        httpEngine.getResponseCode());
+            }
+
+            if (retry == Retry.DIFFERENT_CONNECTION) {
+                httpEngine.automaticallyReleaseConnectionToPool();
+            } else {
+                httpEngine.markConnectionAsRecycled();
+            }
+
+            httpEngine.release(true);
+
+            httpEngine = newHttpEngine(retryMethod, rawRequestHeaders,
+                    httpEngine.getConnection(), (RetryableOutputStream) requestBody);
+        }
+!!!2100251.java!!!	getHttpEngine() : HttpEngine
+        return httpEngine;
+!!!2100379.java!!!	processResponseHeaders() : Retry
+        switch (getResponseCode()) {
+        case HTTP_PROXY_AUTH:
+            if (!usingProxy()) {
+                throw new IOException(
+                        "Received HTTP_PROXY_AUTH (407) code while not using proxy");
+            }
+            // fall-through
+        case HTTP_UNAUTHORIZED:
+            boolean credentialsFound = processAuthHeader(getResponseCode(),
+                    httpEngine.getResponseHeaders(), rawRequestHeaders);
+            return credentialsFound ? Retry.SAME_CONNECTION : Retry.NONE;
+
+        case HTTP_MULT_CHOICE:
+        case HTTP_MOVED_PERM:
+        case HTTP_MOVED_TEMP:
+        case HTTP_SEE_OTHER:
+            if (!getInstanceFollowRedirects()) {
+                return Retry.NONE;
+            }
+            if (++redirectionCount > HttpEngine.MAX_REDIRECTS) {
+                throw new ProtocolException("Too many redirects");
+            }
+            String location = getHeaderField("Location");
+            if (location == null) {
+                return Retry.NONE;
+            }
+            URL previousUrl = url;
+            url = new URL(previousUrl, location);
+            if (!previousUrl.getProtocol().equals(url.getProtocol())) {
+                return Retry.NONE; // the scheme changed; don't retry.
+            }
+            if (previousUrl.getHost().equals(url.getHost())
+                    && previousUrl.getEffectivePort() == url.getEffectivePort()) {
+                return Retry.SAME_CONNECTION;
+            } else {
+                return Retry.DIFFERENT_CONNECTION;
+            }
+
+        default:
+            return Retry.NONE;
+        }
+!!!2100507.java!!!	processAuthHeader(in responseCode : int, inout response : ResponseHeaders, inout successorRequestHeaders : RawHeaders) : boolean
+        if (responseCode != HTTP_PROXY_AUTH && responseCode != HTTP_UNAUTHORIZED) {
+            throw new IllegalArgumentException("Bad response code: " + responseCode);
+        }
+
+        // keep asking for username/password until authorized
+        String challengeHeader = responseCode == HTTP_PROXY_AUTH
+                ? "Proxy-Authenticate"
+                : "WWW-Authenticate";
+        String credentials = getAuthorizationCredentials(response.getHeaders(), challengeHeader);
+        if (credentials == null) {
+            return false; // could not find credentials, end request cycle
+        }
+
+        // add authorization credentials, bypassing the already-connected check
+        String fieldName = responseCode == HTTP_PROXY_AUTH
+                ? "Proxy-Authorization"
+                : "Authorization";
+        successorRequestHeaders.set(fieldName, credentials);
+        return true;
+!!!2100635.java!!!	getAuthorizationCredentials(inout responseHeaders : RawHeaders, inout challengeHeader : String) : String
+        List<Challenge> challenges = HeaderParser.parseChallenges(responseHeaders, challengeHeader);
+        if (challenges.isEmpty()) {
+            throw new IOException("No authentication challenges found");
+        }
+
+        for (Challenge challenge : challenges) {
+            // use the global authenticator to get the password
+            PasswordAuthentication auth = Authenticator.requestPasswordAuthentication(
+                    getConnectToInetAddress(), getConnectToPort(), url.getProtocol(),
+                    challenge.realm, challenge.scheme);
+            if (auth == null) {
+                continue;
+            }
+
+            // base64 encode the username and password
+            String usernameAndPassword = auth.getUserName() + ":" + new String(auth.getPassword());
+            byte[] bytes = usernameAndPassword.getBytes(Charsets.ISO_8859_1);
+            String encoded = Base64.encode(bytes);
+            return challenge.scheme + " " + encoded;
+        }
+
+        return null;
+!!!2100763.java!!!	getConnectToInetAddress() : InetAddress
+        return usingProxy()
+                ? ((InetSocketAddress) proxy.address()).getAddress()
+                : InetAddress.getByName(getURL().getHost());
+!!!2100891.java!!!	getDefaultPort() : int
+        return defaultPort;
+!!!2101019.java!!!	getFixedContentLength() : int
+        return fixedContentLength;
+!!!2101147.java!!!	getChunkLength() : int
+        return chunkLength;
+!!!2101275.java!!!	getProxy() : Proxy
+        return proxy;
+!!!2101403.java!!!	setProxy(inout proxy : Proxy) : void
+        this.proxy = proxy;
+!!!2101531.java!!!	usingProxy() : boolean
+        return (proxy != null && proxy.type() != Proxy.Type.DIRECT);
+!!!2101659.java!!!	getResponseMessage() : String
+        return getResponse().getResponseHeaders().getHeaders().getResponseMessage();
+!!!2101787.java!!!	getResponseCode() : int
+        return getResponse().getResponseCode();
+!!!2101915.java!!!	setRequestProperty(inout field : String, inout newValue : String) : void
+        if (connected) {
+            throw new IllegalStateException("Cannot set request property after connection is made");
+        }
+        if (field == null) {
+            throw new NullPointerException("field == null");
+        }
+        rawRequestHeaders.set(field, newValue);
+!!!2102043.java!!!	addRequestProperty(inout field : String, inout value : String) : void
+        if (connected) {
+            throw new IllegalStateException("Cannot add request property after connection is made");
+        }
+        if (field == null) {
+            throw new NullPointerException("field == null");
+        }
+        rawRequestHeaders.add(field, value);

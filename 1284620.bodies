@@ -1,0 +1,709 @@
+class SettingsProvider
+!!!7566220.java!!!	settingMovedToGlobal(in name : String) : boolean
+        return sSecureGlobalKeys.contains(name) || sSystemGlobalKeys.contains(name);
+!!!7566604.java!!!	getUriFor(inout tableUri : Uri, inout values : ContentValues, in rowId : long) : Uri
+        if (tableUri.getPathSegments().size() != 1) {
+            throw new IllegalArgumentException("Invalid URI: " + tableUri);
+        }
+        String table = tableUri.getPathSegments().get(0);
+        if (TABLE_SYSTEM.equals(table) ||
+                TABLE_SECURE.equals(table) ||
+                TABLE_GLOBAL.equals(table)) {
+            String name = values.getAsString(Settings.NameValueTable.NAME);
+            return Uri.withAppendedPath(tableUri, name);
+        } else {
+            return ContentUris.withAppendedId(tableUri, rowId);
+        }
+!!!7566732.java!!!	sendNotify(inout uri : Uri, in userHandle : int) : void
+        // Update the system property *first*, so if someone is listening for
+        // a notification and then using the contract class to get their data,
+        // the system property will be updated and they'll get the new data.
+
+        boolean backedUpDataChanged = false;
+        String property = null, table = uri.getPathSegments().get(0);
+        final boolean isGlobal = table.equals(TABLE_GLOBAL);
+        if (table.equals(TABLE_SYSTEM)) {
+            property = Settings.System.SYS_PROP_SETTING_VERSION;
+            backedUpDataChanged = true;
+        } else if (table.equals(TABLE_SECURE)) {
+            property = Settings.Secure.SYS_PROP_SETTING_VERSION;
+            backedUpDataChanged = true;
+        } else if (isGlobal) {
+            property = Settings.Global.SYS_PROP_SETTING_VERSION;    // this one is global
+            backedUpDataChanged = true;
+        }
+
+        if (property != null) {
+            long version = SystemProperties.getLong(property, 0) + 1;
+            if (LOCAL_LOGV) Log.v(TAG, "property: " + property + "=" + version);
+            SystemProperties.set(property, Long.toString(version));
+        }
+
+        // Inform the backup manager about a data change
+        if (backedUpDataChanged) {
+            mBackupManager.dataChanged();
+        }
+        // Now send the notification through the content framework.
+
+        String notify = uri.getQueryParameter("notify");
+        if (notify == null || "true".equals(notify)) {
+            final int notifyTarget = isGlobal ? UserHandle.USER_ALL : userHandle;
+            final long oldId = Binder.clearCallingIdentity();
+            try {
+                getContext().getContentResolver().notifyChange(uri, null, true, notifyTarget);
+            } finally {
+                Binder.restoreCallingIdentity(oldId);
+            }
+            if (LOCAL_LOGV) Log.v(TAG, "notifying for " + notifyTarget + ": " + uri);
+        } else {
+            if (LOCAL_LOGV) Log.v(TAG, "notification suppressed: " + uri);
+        }
+!!!7566860.java!!!	checkWritePermissions(inout args : SqlArguments) : void
+        if ((TABLE_SECURE.equals(args.table) || TABLE_GLOBAL.equals(args.table)) &&
+            getContext().checkCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS) !=
+            PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException(
+                    String.format("Permission denial: writing to secure settings requires %1$s",
+                                  android.Manifest.permission.WRITE_SECURE_SETTINGS));
+        }
+!!!7567244.java!!!	onCreate() : boolean
+        mBackupManager = new BackupManager(getContext());
+        mUserManager = (UserManager) getContext().getSystemService(Context.USER_SERVICE);
+
+        establishDbTracking(UserHandle.USER_OWNER);
+
+        IntentFilter userFilter = new IntentFilter();
+        userFilter.addAction(Intent.ACTION_USER_REMOVED);
+        getContext().registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent.getAction().equals(Intent.ACTION_USER_REMOVED)) {
+                    final int userHandle = intent.getIntExtra(Intent.EXTRA_USER_HANDLE,
+                            UserHandle.USER_OWNER);
+                    if (userHandle != UserHandle.USER_OWNER) {
+                        onUserRemoved(userHandle);
+                    }
+                }
+            }
+        }, userFilter);
+        return true;
+!!!7567372.java!!!	onUserRemoved(in userHandle : int) : void
+        synchronized (this) {
+            // the db file itself will be deleted automatically, but we need to tear down
+            // our caches and other internal bookkeeping.
+            FileObserver observer = sObserverInstances.get(userHandle);
+            if (observer != null) {
+                observer.stopWatching();
+                sObserverInstances.delete(userHandle);
+            }
+
+            mOpenHelpers.delete(userHandle);
+            sSystemCaches.delete(userHandle);
+            sSecureCaches.delete(userHandle);
+            sKnownMutationsInFlight.delete(userHandle);
+        }
+!!!7567500.java!!!	establishDbTracking(in userHandle : int) : void
+        if (LOCAL_LOGV) {
+            Slog.i(TAG, "Installing settings db helper and caches for user " + userHandle);
+        }
+
+        DatabaseHelper dbhelper;
+
+        synchronized (this) {
+            dbhelper = mOpenHelpers.get(userHandle);
+            if (dbhelper == null) {
+                dbhelper = new DatabaseHelper(getContext(), userHandle);
+                mOpenHelpers.append(userHandle, dbhelper);
+
+                sSystemCaches.append(userHandle, new SettingsCache(TABLE_SYSTEM));
+                sSecureCaches.append(userHandle, new SettingsCache(TABLE_SECURE));
+                sKnownMutationsInFlight.append(userHandle, new AtomicInteger(0));
+            }
+        }
+
+        // Initialization of the db *outside* the locks.  It's possible that racing
+        // threads might wind up here, the second having read the cache entries
+        // written by the first, but that's benign: the SQLite helper implementation
+        // manages concurrency itself, and it's important that we not run the db
+        // initialization with any of our own locks held, so we're fine.
+        SQLiteDatabase db = dbhelper.getWritableDatabase();
+
+        // Watch for external modifications to the database files,
+        // keeping our caches in sync.  We synchronize the observer set
+        // separately, and of course it has to run after the db file
+        // itself was set up by the DatabaseHelper.
+        synchronized (sObserverInstances) {
+            if (sObserverInstances.get(userHandle) == null) {
+                SettingsFileObserver observer = new SettingsFileObserver(userHandle, db.getPath());
+                sObserverInstances.append(userHandle, observer);
+                observer.startWatching();
+            }
+        }
+
+        ensureAndroidIdIsSet(userHandle);
+
+        startAsyncCachePopulation(userHandle);
+!!!7567884.java!!!	startAsyncCachePopulation(in userHandle : int) : void
+        new CachePrefetchThread(userHandle).start();
+!!!7568012.java!!!	fullyPopulateCaches(in userHandle : int) : void
+        DatabaseHelper dbHelper = mOpenHelpers.get(userHandle);
+        // Only populate the globals cache once, for the owning user
+        if (userHandle == UserHandle.USER_OWNER) {
+            fullyPopulateCache(dbHelper, TABLE_GLOBAL, sGlobalCache);
+        }
+        fullyPopulateCache(dbHelper, TABLE_SECURE, sSecureCaches.get(userHandle));
+        fullyPopulateCache(dbHelper, TABLE_SYSTEM, sSystemCaches.get(userHandle));
+!!!7568140.java!!!	fullyPopulateCache(inout dbHelper : DatabaseHelper, in table : String, inout cache : SettingsCache) : void
+        SQLiteDatabase db = dbHelper.getReadableDatabase();
+        Cursor c = db.query(
+            table,
+            new String[] { Settings.NameValueTable.NAME, Settings.NameValueTable.VALUE },
+            null, null, null, null, null,
+            "" + (MAX_CACHE_ENTRIES + 1) /* limit */);
+        try {
+            synchronized (cache) {
+                cache.evictAll();
+                cache.setFullyMatchesDisk(true);  // optimistic
+                int rows = 0;
+                while (c.moveToNext()) {
+                    rows++;
+                    String name = c.getString(0);
+                    String value = c.getString(1);
+                    cache.populate(name, value);
+                }
+                if (rows > MAX_CACHE_ENTRIES) {
+                    // Somewhat redundant, as removeEldestEntry() will
+                    // have already done this, but to be explicit:
+                    cache.setFullyMatchesDisk(false);
+                    Log.d(TAG, "row count exceeds max cache entries for table " + table);
+                }
+                if (LOCAL_LOGV) Log.d(TAG, "cache for settings table '" + table
+                        + "' rows=" + rows + "; fullycached=" + cache.fullyMatchesDisk());
+            }
+        } finally {
+            c.close();
+        }
+!!!7568268.java!!!	ensureAndroidIdIsSet(in userHandle : int) : boolean
+        final Cursor c = queryForUser(Settings.Secure.CONTENT_URI,
+                new String[] { Settings.NameValueTable.VALUE },
+                Settings.NameValueTable.NAME + "=?",
+                new String[] { Settings.Secure.ANDROID_ID }, null,
+                userHandle);
+        try {
+            final String value = c.moveToNext() ? c.getString(0) : null;
+            if (value == null) {
+                final SecureRandom random = new SecureRandom();
+                final String newAndroidIdValue = Long.toHexString(random.nextLong());
+                final ContentValues values = new ContentValues();
+                values.put(Settings.NameValueTable.NAME, Settings.Secure.ANDROID_ID);
+                values.put(Settings.NameValueTable.VALUE, newAndroidIdValue);
+                final Uri uri = insertForUser(Settings.Secure.CONTENT_URI, values, userHandle);
+                if (uri == null) {
+                    Slog.e(TAG, "Unable to generate new ANDROID_ID for user " + userHandle);
+                    return false;
+                }
+                Slog.d(TAG, "Generated and saved new ANDROID_ID [" + newAndroidIdValue
+                        + "] for user " + userHandle);
+            }
+            return true;
+        } finally {
+            c.close();
+        }
+!!!7568396.java!!!	getOrConstructCache(in callingUser : int, inout which : SparseArray) : SettingsCache
+        getOrEstablishDatabase(callingUser); // ignore return value; we don't need it
+        return which.get(callingUser);
+!!!7568524.java!!!	getOrEstablishDatabase(in callingUser : int) : DatabaseHelper
+        long oldId = Binder.clearCallingIdentity();
+        try {
+            DatabaseHelper dbHelper = mOpenHelpers.get(callingUser);
+            if (null == dbHelper) {
+                establishDbTracking(callingUser);
+                dbHelper = mOpenHelpers.get(callingUser);
+            }
+            return dbHelper;
+        } finally {
+            Binder.restoreCallingIdentity(oldId);
+        }
+!!!7568652.java!!!	cacheForTable(in callingUser : int, in tableName : String) : SettingsCache
+        if (TABLE_SYSTEM.equals(tableName)) {
+            return getOrConstructCache(callingUser, sSystemCaches);
+        }
+        if (TABLE_SECURE.equals(tableName)) {
+            return getOrConstructCache(callingUser, sSecureCaches);
+        }
+        if (TABLE_GLOBAL.equals(tableName)) {
+            return sGlobalCache;
+        }
+        return null;
+!!!7568780.java!!!	invalidateCache(in callingUser : int, in tableName : String) : void
+        SettingsCache cache = cacheForTable(callingUser, tableName);
+        if (cache == null) {
+            return;
+        }
+        synchronized (cache) {
+            cache.evictAll();
+            cache.mCacheFullyMatchesDisk = false;
+        }
+!!!7568908.java!!!	call(in method : String, in request : String, inout args : Bundle) : Bundle
+        int callingUser = UserHandle.getCallingUserId();
+        if (args != null) {
+            int reqUser = args.getInt(Settings.CALL_METHOD_USER_KEY, callingUser);
+            if (reqUser != callingUser) {
+                callingUser = ActivityManager.handleIncomingUser(Binder.getCallingPid(),
+                        Binder.getCallingUid(), reqUser, false, true,
+                        "get/set setting for user", null);
+                if (LOCAL_LOGV) Slog.v(TAG, "   access setting for user " + callingUser);
+            }
+        }
+
+        // Note: we assume that get/put operations for moved-to-global names have already
+        // been directed to the new location on the caller side (otherwise we'd fix them
+        // up here).
+        DatabaseHelper dbHelper;
+        SettingsCache cache;
+
+        // Get methods
+        if (Settings.CALL_METHOD_GET_SYSTEM.equals(method)) {
+            if (LOCAL_LOGV) Slog.v(TAG, "call(system:" + request + ") for " + callingUser);
+            dbHelper = getOrEstablishDatabase(callingUser);
+            cache = sSystemCaches.get(callingUser);
+            return lookupValue(dbHelper, TABLE_SYSTEM, cache, request);
+        }
+        if (Settings.CALL_METHOD_GET_SECURE.equals(method)) {
+            if (LOCAL_LOGV) Slog.v(TAG, "call(secure:" + request + ") for " + callingUser);
+            dbHelper = getOrEstablishDatabase(callingUser);
+            cache = sSecureCaches.get(callingUser);
+            return lookupValue(dbHelper, TABLE_SECURE, cache, request);
+        }
+        if (Settings.CALL_METHOD_GET_GLOBAL.equals(method)) {
+            if (LOCAL_LOGV) Slog.v(TAG, "call(global:" + request + ") for " + callingUser);
+            // fast path: owner db & cache are immutable after onCreate() so we need not
+            // guard on the attempt to look them up
+            return lookupValue(getOrEstablishDatabase(UserHandle.USER_OWNER), TABLE_GLOBAL,
+                    sGlobalCache, request);
+        }
+
+        // Put methods - new value is in the args bundle under the key named by
+        // the Settings.NameValueTable.VALUE static.
+        final String newValue = (args == null)
+        ? null : args.getString(Settings.NameValueTable.VALUE);
+
+        final ContentValues values = new ContentValues();
+        values.put(Settings.NameValueTable.NAME, request);
+        values.put(Settings.NameValueTable.VALUE, newValue);
+        if (Settings.CALL_METHOD_PUT_SYSTEM.equals(method)) {
+            if (LOCAL_LOGV) Slog.v(TAG, "call_put(system:" + request + "=" + newValue + ") for " + callingUser);
+            insertForUser(Settings.System.CONTENT_URI, values, callingUser);
+        } else if (Settings.CALL_METHOD_PUT_SECURE.equals(method)) {
+            if (LOCAL_LOGV) Slog.v(TAG, "call_put(secure:" + request + "=" + newValue + ") for " + callingUser);
+            insertForUser(Settings.Secure.CONTENT_URI, values, callingUser);
+        } else if (Settings.CALL_METHOD_PUT_GLOBAL.equals(method)) {
+            if (LOCAL_LOGV) Slog.v(TAG, "call_put(global:" + request + "=" + newValue + ") for " + callingUser);
+            insertForUser(Settings.Global.CONTENT_URI, values, callingUser);
+        } else {
+            Slog.w(TAG, "call() with invalid method: " + method);
+        }
+
+        return null;
+!!!7569036.java!!!	lookupValue(inout dbHelper : DatabaseHelper, in table : String, in cache : SettingsCache, in key : String) : Bundle
+        if (cache == null) {
+           Slog.e(TAG, "cache is null for user " + UserHandle.getCallingUserId() + " : key=" + key);
+           return null;
+        }
+        synchronized (cache) {
+            Bundle value = cache.get(key);
+            if (value != null) {
+                if (value != TOO_LARGE_TO_CACHE_MARKER) {
+                    return value;
+                }
+                // else we fall through and read the value from disk
+            } else if (cache.fullyMatchesDisk()) {
+                // Fast path (very common).  Don't even try touch disk
+                // if we know we've slurped it all in.  Trying to
+                // touch the disk would mean waiting for yaffs2 to
+                // give us access, which could takes hundreds of
+                // milliseconds.  And we're very likely being called
+                // from somebody's UI thread...
+                return NULL_SETTING;
+            }
+        }
+
+        SQLiteDatabase db = dbHelper.getReadableDatabase();
+        Cursor cursor = null;
+        try {
+            cursor = db.query(table, COLUMN_VALUE, "name=?", new String[]{key},
+                              null, null, null, null);
+            if (cursor != null && cursor.getCount() == 1) {
+                cursor.moveToFirst();
+                return cache.putIfAbsent(key, cursor.getString(0));
+            }
+        } catch (SQLiteException e) {
+            Log.w(TAG, "settings lookup error", e);
+            return null;
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        cache.putIfAbsent(key, null);
+        return NULL_SETTING;
+!!!7569164.java!!!	query(inout url : Uri, inout select : String, in where : String, inout whereArgs : String, in sort : String) : Cursor
+        return queryForUser(url, select, where, whereArgs, sort, UserHandle.getCallingUserId());
+!!!7569292.java!!!	queryForUser(inout url : Uri, inout select : String, in where : String, inout whereArgs : String, in sort : String, in forUser : int) : Cursor
+        if (LOCAL_LOGV) Slog.v(TAG, "query(" + url + ") for user " + forUser);
+        SqlArguments args = new SqlArguments(url, where, whereArgs);
+        DatabaseHelper dbH;
+        dbH = getOrEstablishDatabase(
+                TABLE_GLOBAL.equals(args.table) ? UserHandle.USER_OWNER : forUser);
+        SQLiteDatabase db = dbH.getReadableDatabase();
+
+        // The favorites table was moved from this provider to a provider inside Home
+        // Home still need to query this table to upgrade from pre-cupcake builds
+        // However, a cupcake+ build with no data does not contain this table which will
+        // cause an exception in the SQL stack. The following line is a special case to
+        // let the caller of the query have a chance to recover and avoid the exception
+        if (TABLE_FAVORITES.equals(args.table)) {
+            return null;
+        } else if (TABLE_OLD_FAVORITES.equals(args.table)) {
+            args.table = TABLE_FAVORITES;
+            Cursor cursor = db.rawQuery("PRAGMA table_info(favorites);", null);
+            if (cursor != null) {
+                boolean exists = cursor.getCount() > 0;
+                cursor.close();
+                if (!exists) return null;
+            } else {
+                return null;
+            }
+        }
+
+        SQLiteQueryBuilder qb = new SQLiteQueryBuilder();
+        qb.setTables(args.table);
+
+        Cursor ret = qb.query(db, select, args.where, args.args, null, null, sort);
+        // the default Cursor interface does not support per-user observation
+        try {
+            AbstractCursor c = (AbstractCursor) ret;
+            c.setNotificationUri(getContext().getContentResolver(), url, forUser);
+        } catch (ClassCastException e) {
+            // details of the concrete Cursor implementation have changed and this code has
+            // not been updated to match -- complain and fail hard.
+            Log.wtf(TAG, "Incompatible cursor derivation!");
+            throw e;
+        }
+        return ret;
+!!!7569420.java!!!	getType(inout url : Uri) : String
+        // If SqlArguments supplies a where clause, then it must be an item
+        // (because we aren't supplying our own where clause).
+        SqlArguments args = new SqlArguments(url, null, null);
+        if (TextUtils.isEmpty(args.where)) {
+            return "vnd.android.cursor.dir/" + args.table;
+        } else {
+            return "vnd.android.cursor.item/" + args.table;
+        }
+!!!7569548.java!!!	bulkInsert(inout uri : Uri, inout values : ContentValues) : int
+        final int callingUser = UserHandle.getCallingUserId();
+        if (LOCAL_LOGV) Slog.v(TAG, "bulkInsert() for user " + callingUser);
+        SqlArguments args = new SqlArguments(uri);
+        if (TABLE_FAVORITES.equals(args.table)) {
+            return 0;
+        }
+        checkWritePermissions(args);
+        SettingsCache cache = cacheForTable(callingUser, args.table);
+
+        final AtomicInteger mutationCount = sKnownMutationsInFlight.get(callingUser);
+        mutationCount.incrementAndGet();
+        DatabaseHelper dbH = getOrEstablishDatabase(
+                TABLE_GLOBAL.equals(args.table) ? UserHandle.USER_OWNER : callingUser);
+        SQLiteDatabase db = dbH.getWritableDatabase();
+        db.beginTransaction();
+        try {
+            int numValues = values.length;
+            for (int i = 0; i < numValues; i++) {
+                if (db.insert(args.table, null, values[i]) < 0) return 0;
+                SettingsCache.populate(cache, values[i]);
+                if (LOCAL_LOGV) Log.v(TAG, args.table + " <- " + values[i]);
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+            mutationCount.decrementAndGet();
+        }
+
+        sendNotify(uri, callingUser);
+        return values.length;
+!!!7569676.java!!!	parseProviderList(inout url : Uri, inout initialValues : ContentValues) : boolean
+        String value = initialValues.getAsString(Settings.Secure.VALUE);
+        String newProviders = null;
+        if (value != null && value.length() > 1) {
+            char prefix = value.charAt(0);
+            if (prefix == '+' || prefix == '-') {
+                // skip prefix
+                value = value.substring(1);
+
+                // read list of enabled providers into "providers"
+                String providers = "";
+                String[] columns = {Settings.Secure.VALUE};
+                String where = Settings.Secure.NAME + "=\'" + Settings.Secure.LOCATION_PROVIDERS_ALLOWED + "\'";
+                Cursor cursor = query(url, columns, where, null, null);
+                if (cursor != null && cursor.getCount() == 1) {
+                    try {
+                        cursor.moveToFirst();
+                        providers = cursor.getString(0);
+                    } finally {
+                        cursor.close();
+                    }
+                }
+
+                int index = providers.indexOf(value);
+                int end = index + value.length();
+                // check for commas to avoid matching on partial string
+                if (index > 0 && providers.charAt(index - 1) != ',') index = -1;
+                if (end < providers.length() && providers.charAt(end) != ',') index = -1;
+
+                if (prefix == '+' && index < 0) {
+                    // append the provider to the list if not present
+                    if (providers.length() == 0) {
+                        newProviders = value;
+                    } else {
+                        newProviders = providers + ',' + value;
+                    }
+                } else if (prefix == '-' && index >= 0) {
+                    // remove the provider from the list if present
+                    // remove leading or trailing comma
+                    if (index > 0) {
+                        index--;
+                    } else if (end < providers.length()) {
+                        end++;
+                    }
+
+                    newProviders = providers.substring(0, index);
+                    if (end < providers.length()) {
+                        newProviders += providers.substring(end);
+                    }
+                } else {
+                    // nothing changed, so no need to update the database
+                    return false;
+                }
+
+                if (newProviders != null) {
+                    initialValues.put(Settings.Secure.VALUE, newProviders);
+                }
+            }
+        }
+
+        return true;
+!!!7569804.java!!!	insert(inout url : Uri, inout initialValues : ContentValues) : Uri
+        return insertForUser(url, initialValues, UserHandle.getCallingUserId());
+!!!7569932.java!!!	insertForUser(inout url : Uri, inout initialValues : ContentValues, in desiredUserHandle : int) : Uri
+        final int callingUser = UserHandle.getCallingUserId();
+        if (callingUser != desiredUserHandle) {
+            getContext().enforceCallingOrSelfPermission(
+                    android.Manifest.permission.INTERACT_ACROSS_USERS_FULL,
+                    "Not permitted to access settings for other users");
+        }
+
+        if (LOCAL_LOGV) Slog.v(TAG, "insert(" + url + ") for user " + desiredUserHandle
+                + " by " + callingUser);
+
+        SqlArguments args = new SqlArguments(url);
+        if (TABLE_FAVORITES.equals(args.table)) {
+            return null;
+        }
+
+        // Special case LOCATION_PROVIDERS_ALLOWED.
+        // Support enabling/disabling a single provider (using "+" or "-" prefix)
+        String name = initialValues.getAsString(Settings.Secure.NAME);
+        if (Settings.Secure.LOCATION_PROVIDERS_ALLOWED.equals(name)) {
+            if (!parseProviderList(url, initialValues)) return null;
+        }
+
+        // If this is an insert() of a key that has been migrated to the global store,
+        // redirect the operation to that store
+        if (name != null) {
+            if (sSecureGlobalKeys.contains(name) || sSystemGlobalKeys.contains(name)) {
+                if (!TABLE_GLOBAL.equals(args.table)) {
+                    if (LOCAL_LOGV) Slog.i(TAG, "Rewrite of insert() of now-global key " + name);
+                }
+                args.table = TABLE_GLOBAL;  // next condition will rewrite the user handle
+            }
+        }
+
+        // Check write permissions only after determining which table the insert will touch
+        checkWritePermissions(args);
+
+        // The global table is stored under the owner, always
+        if (TABLE_GLOBAL.equals(args.table)) {
+            desiredUserHandle = UserHandle.USER_OWNER;
+        }
+
+        SettingsCache cache = cacheForTable(desiredUserHandle, args.table);
+        String value = initialValues.getAsString(Settings.NameValueTable.VALUE);
+        if (SettingsCache.isRedundantSetValue(cache, name, value)) {
+            return Uri.withAppendedPath(url, name);
+        }
+
+        final AtomicInteger mutationCount = sKnownMutationsInFlight.get(desiredUserHandle);
+        mutationCount.incrementAndGet();
+        DatabaseHelper dbH = getOrEstablishDatabase(desiredUserHandle);
+        SQLiteDatabase db = dbH.getWritableDatabase();
+        final long rowId = db.insert(args.table, null, initialValues);
+        mutationCount.decrementAndGet();
+        if (rowId <= 0) return null;
+
+        SettingsCache.populate(cache, initialValues);  // before we notify
+
+        if (LOCAL_LOGV) Log.v(TAG, args.table + " <- " + initialValues
+                + " for user " + desiredUserHandle);
+        // Note that we use the original url here, not the potentially-rewritten table name
+        url = getUriFor(url, initialValues, rowId);
+        sendNotify(url, desiredUserHandle);
+        return url;
+!!!7570060.java!!!	delete(inout url : Uri, in where : String, inout whereArgs : String) : int
+        int callingUser = UserHandle.getCallingUserId();
+        if (LOCAL_LOGV) Slog.v(TAG, "delete() for user " + callingUser);
+        SqlArguments args = new SqlArguments(url, where, whereArgs);
+        if (TABLE_FAVORITES.equals(args.table)) {
+            return 0;
+        } else if (TABLE_OLD_FAVORITES.equals(args.table)) {
+            args.table = TABLE_FAVORITES;
+        } else if (TABLE_GLOBAL.equals(args.table)) {
+            callingUser = UserHandle.USER_OWNER;
+        }
+        checkWritePermissions(args);
+
+        final AtomicInteger mutationCount = sKnownMutationsInFlight.get(callingUser);
+        mutationCount.incrementAndGet();
+        DatabaseHelper dbH = getOrEstablishDatabase(callingUser);
+        SQLiteDatabase db = dbH.getWritableDatabase();
+        int count = db.delete(args.table, args.where, args.args);
+        mutationCount.decrementAndGet();
+        if (count > 0) {
+            invalidateCache(callingUser, args.table);  // before we notify
+            sendNotify(url, callingUser);
+        }
+        startAsyncCachePopulation(callingUser);
+        if (LOCAL_LOGV) Log.v(TAG, args.table + ": " + count + " row(s) deleted");
+        return count;
+!!!7570188.java!!!	update(inout url : Uri, inout initialValues : ContentValues, in where : String, inout whereArgs : String) : int
+        // NOTE: update() is never called by the front-end Settings API, and updates that
+        // wind up affecting rows in Secure that are globally shared will not have the
+        // intended effect (the update will be invisible to the rest of the system).
+        // This should have no practical effect, since writes to the Secure db can only
+        // be done by system code, and that code should be using the correct API up front.
+        int callingUser = UserHandle.getCallingUserId();
+        if (LOCAL_LOGV) Slog.v(TAG, "update() for user " + callingUser);
+        SqlArguments args = new SqlArguments(url, where, whereArgs);
+        if (TABLE_FAVORITES.equals(args.table)) {
+            return 0;
+        } else if (TABLE_GLOBAL.equals(args.table)) {
+            callingUser = UserHandle.USER_OWNER;
+        }
+        checkWritePermissions(args);
+
+        final AtomicInteger mutationCount = sKnownMutationsInFlight.get(callingUser);
+        mutationCount.incrementAndGet();
+        DatabaseHelper dbH = getOrEstablishDatabase(callingUser);
+        SQLiteDatabase db = dbH.getWritableDatabase();
+        int count = db.update(args.table, initialValues, args.where, args.args);
+        mutationCount.decrementAndGet();
+        if (count > 0) {
+            invalidateCache(callingUser, args.table);  // before we notify
+            sendNotify(url, callingUser);
+        }
+        startAsyncCachePopulation(callingUser);
+        if (LOCAL_LOGV) Log.v(TAG, args.table + ": " + count + " row(s) <- " + initialValues);
+        return count;
+!!!7570316.java!!!	openFile(inout uri : Uri, in mode : String) : ParcelFileDescriptor
+
+        /*
+         * When a client attempts to openFile the default ringtone or
+         * notification setting Uri, we will proxy the call to the current
+         * default ringtone's Uri (if it is in the DRM or media provider).
+         */
+        int ringtoneType = RingtoneManager.getDefaultType(uri);
+        // Above call returns -1 if the Uri doesn't match a default type
+        if (ringtoneType != -1) {
+            Context context = getContext();
+
+            // Get the current value for the default sound
+            Uri soundUri = RingtoneManager.getActualDefaultRingtoneUri(context, ringtoneType);
+
+            if (soundUri != null) {
+                // Only proxy the openFile call to drm or media providers
+                String authority = soundUri.getAuthority();
+                boolean isDrmAuthority = authority.equals(DrmStore.AUTHORITY);
+                if (isDrmAuthority || authority.equals(MediaStore.AUTHORITY)) {
+
+                    if (isDrmAuthority) {
+                        try {
+                            // Check DRM access permission here, since once we
+                            // do the below call the DRM will be checking our
+                            // permission, not our caller's permission
+                            DrmStore.enforceAccessDrmPermission(context);
+                        } catch (SecurityException e) {
+                            throw new FileNotFoundException(e.getMessage());
+                        }
+                    }
+
+                    return context.getContentResolver().openFileDescriptor(soundUri, mode);
+                }
+            }
+        }
+
+        return super.openFile(uri, mode);
+!!!7570444.java!!!	openAssetFile(inout uri : Uri, in mode : String) : AssetFileDescriptor
+
+        /*
+         * When a client attempts to openFile the default ringtone or
+         * notification setting Uri, we will proxy the call to the current
+         * default ringtone's Uri (if it is in the DRM or media provider).
+         */
+        int ringtoneType = RingtoneManager.getDefaultType(uri);
+        // Above call returns -1 if the Uri doesn't match a default type
+        if (ringtoneType != -1) {
+            Context context = getContext();
+
+            // Get the current value for the default sound
+            Uri soundUri = RingtoneManager.getActualDefaultRingtoneUri(context, ringtoneType);
+
+            if (soundUri != null) {
+                // Only proxy the openFile call to drm or media providers
+                String authority = soundUri.getAuthority();
+                boolean isDrmAuthority = authority.equals(DrmStore.AUTHORITY);
+                if (isDrmAuthority || authority.equals(MediaStore.AUTHORITY)) {
+
+                    if (isDrmAuthority) {
+                        try {
+                            // Check DRM access permission here, since once we
+                            // do the below call the DRM will be checking our
+                            // permission, not our caller's permission
+                            DrmStore.enforceAccessDrmPermission(context);
+                        } catch (SecurityException e) {
+                            throw new FileNotFoundException(e.getMessage());
+                        }
+                    }
+
+                    ParcelFileDescriptor pfd = null;
+                    try {
+                        pfd = context.getContentResolver().openFileDescriptor(soundUri, mode);
+                        return new AssetFileDescriptor(pfd, 0, -1);
+                    } catch (FileNotFoundException ex) {
+                        // fall through and open the fallback ringtone below
+                    }
+                }
+
+                try {
+                    return super.openAssetFile(soundUri, mode);
+                } catch (FileNotFoundException ex) {
+                    // Since a non-null Uri was specified, but couldn't be opened,
+                    // fall back to the built-in ringtone.
+                    return context.getResources().openRawResourceFd(
+                            com.android.internal.R.raw.fallbackring);
+                }
+            }
+            // no need to fall through and have openFile() try again, since we
+            // already know that will fail.
+            throw new FileNotFoundException(); // or return null ?
+        }
+
+        // Note that this will end up calling openFile() above.
+        return super.openAssetFile(uri, mode);

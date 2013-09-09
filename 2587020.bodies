@@ -1,0 +1,250 @@
+class AVSettings
+!!!10986764.cpp!!!	ReadSetting(in name : char, inout value : AVSettingValue, in persisted : bool = true) : status_t
+    ALOGV("ReadSetting name %s", name);
+    android::RWLock::AutoRLock observer_lock(mObserverLock);
+    android::RWLock::AutoRLock lock(mDBLock);
+    status_t ret = ReadSettingLocked(name, value, persisted);
+    return ret;
+!!!10986892.cpp!!!	WriteSetting(in name : char, in value : AVSettingValue, in notify : bool, in persisted : bool = true) : status_t
+    ALOGV("WriteSetting name %s, notify %d", name, notify);
+    status_t ret;
+    android::RWLock::AutoRLock observer_lock(mObserverLock);
+    do {
+        android::RWLock::AutoWLock lock(mDBLock);
+        ret = WriteSettingLocked(name, value, persisted);
+    } while(0);
+
+    if (ret == android::OK && notify) {
+        NotifyObservers(name, value);
+    }
+
+    return ret;
+!!!10987020.cpp!!!	NotifyValue(in name : char, in value : AVSettingValue) : void
+    android::RWLock::AutoRLock observer_lock(mObserverLock);
+    NotifyObservers(name, value);
+!!!10987148.cpp!!!	NotifyHandlerObservers(in name : char, in ext : int, in obj : Parcel) : void
+    ALOGV("NotifyHandlerObservers, name %s, ext %d", name, ext);
+    // Notify observers
+    for (size_t i = 0; i < handler_observers_.size(); ++i) {
+        const HandlerObserverList& ol = handler_observers_.valueAt(i);
+        for (size_t j = 0; j < ol.size(); ++j) {
+            sp<IAVSettingHandlerObserver> iobserver = ol.valueAt(j);
+            const String8& prefix = ol.keyAt(j);
+            if ((iobserver != 0) &&
+                (!strncmp(name, prefix.string(), prefix.length()))) {
+                iobserver->notify(ext, obj);
+            }
+        }
+    }
+!!!10987276.cpp!!!	RegisterObserver(in prefix : char, in iobserver : sp<IAVSettingObserver>) : status_t
+    if ((iobserver == 0) || (NULL == prefix)) {
+        return android::BAD_VALUE;
+    }
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+
+    ssize_t ndx = observers_.indexOfKey(iobserver->asBinder());
+
+    if (ndx < 0) {
+        // store a weakref
+        ndx = observers_.add(iobserver->asBinder(), ObserverList());
+        if (ndx >= 0)
+          iobserver->asBinder()->linkToDeath(this);
+    }
+
+    if (ndx < 0) {
+        ALOGE("Out of memory attempting to add settings observer with prefix"
+                " \"%s\"", prefix);
+        return android::NO_MEMORY;
+    }
+
+    ObserverList& ol = observers_.editValueAt(ndx);
+
+    String8 s8_prefix(prefix);
+    if (ol.indexOfKey(s8_prefix) == android::NAME_NOT_FOUND) {
+        ol.add(s8_prefix, iobserver);
+    }
+
+    return android::OK;
+!!!10987404.cpp!!!	RegisterHandlerObserver(in prefix : char, in iobserver : sp<IAVSettingHandlerObserver>) : status_t
+    if ((iobserver == 0) || (NULL == prefix)) {
+        return android::BAD_VALUE;
+    }
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+
+    ssize_t ndx = handler_observers_.indexOfKey(iobserver->asBinder());
+
+    if (ndx < 0) {
+        // store a weakref
+        ndx = handler_observers_.add(iobserver->asBinder(), HandlerObserverList());
+        if (ndx >= 0)
+          iobserver->asBinder()->linkToDeath(this);
+    }
+
+    if (ndx < 0) {
+        ALOGE("Out of memory attempting to add settings handler observer with prefix"
+                " \"%s\"", prefix);
+        return android::NO_MEMORY;
+    }
+
+    HandlerObserverList& ol = handler_observers_.editValueAt(ndx);
+
+    String8 s8_prefix(prefix);
+    if (ol.indexOfKey(s8_prefix) == android::NAME_NOT_FOUND) {
+        ol.add(s8_prefix, iobserver);
+    }
+
+    return android::OK;
+!!!10987532.cpp!!!	RegisterHandler(in prefix : char, in ihandler : sp<IAVSettingHandler>) : status_t
+    if (ihandler == 0) {
+        return android::BAD_VALUE;
+    }
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+    handlers_.add(ihandler->asBinder(), ihandler);
+    ihandler->asBinder()->linkToDeath(this);
+
+    String8 strPrefix(prefix);
+    if (registered_handlers_.indexOfKey(strPrefix) >= 0) {
+        ALOGE("Handler for %s already exists!", prefix);
+        return android::ALREADY_EXISTS;
+    }
+    ALOGD("Add handler for %s.xxx", prefix);
+    registered_handlers_.add(strPrefix, ihandler);
+
+    return android::OK;
+!!!10987660.cpp!!!	RemoveObserver(in obs : sp<IAVSettingObserver>) : void
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+    RemoveObserverLocked(obs->asBinder());
+!!!10987788.cpp!!!	RemoveHandlerObserver(in obs : sp<IAVSettingHandlerObserver>) : void
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+    RemoveObserverHandlerLocked(obs->asBinder());
+!!!10987916.cpp!!!	RemoveHandler(in handler : sp<IAVSettingHandler>) : void
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+    RemoveHandlerLocked(handler->asBinder());
+!!!10988044.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    const String16 sDump("android.permission.DUMP");
+    if (android::PermissionCache::checkCallingPermission(sDump) == false) {
+        return android::OK;
+    }
+    android::RWLock::AutoRLock observer_lock(mObserverLock);
+    android::RWLock::AutoRLock lock(mDBLock);
+    char buf[512];
+    int written;
+    const int bufSize = sizeof(buf);
+    written = snprintf(buf, sizeof(buf),
+                       "AVSettings has %d registered handler\n",
+                       registered_handlers_.size());
+    write(fd, buf, written < bufSize ? written : bufSize);
+    for (size_t i = 0; i < registered_handlers_.size(); ++i) {
+        sp<IAVSettingHandler> ihandler = registered_handlers_.valueAt(i);
+        snprintf(buf, sizeof(buf), "handler for %s is %p\n",
+                 registered_handlers_.keyAt(i).string(),
+                 ihandler->asBinder().get());
+        write(fd, buf, written < bufSize ? written : bufSize);
+    }
+
+    snprintf(buf, sizeof(buf), "AVSettings has %d observer entries\n",
+             observers_.size());
+    write(fd, buf, written < bufSize ? written : bufSize);
+    for (size_t i = 0; i < observers_.size(); ++i) {
+        const ObserverList& ol = observers_.valueAt(i);
+        snprintf(buf, sizeof(buf),
+                 "observer list at %d has %d elements\n", i, ol.size());
+        write(fd, buf, written < bufSize ? written : bufSize);
+        for (size_t j = 0; j < ol.size(); ++j) {
+            sp<IAVSettingObserver> iobs = ol.valueAt(j);
+            snprintf(buf, sizeof(buf), "iobserver for %s is %p\n",
+                     ol.keyAt(j).string(), iobs->asBinder().get());
+            write(fd, buf, written < bufSize ? written : bufSize);
+        }
+    }
+    for (size_t i = 0; i < handler_observers_.size(); ++i) {
+        const HandlerObserverList& ol = handler_observers_.valueAt(i);
+        snprintf(buf, sizeof(buf),
+                 "handlerobserver list at %d has %d elements\n", i, ol.size());
+        write(fd, buf, written < bufSize ? written : bufSize);
+        for (size_t j = 0; j < ol.size(); ++j) {
+            sp<IAVSettingHandlerObserver> iobs = ol.valueAt(j);
+            snprintf(buf, sizeof(buf), "iobserver for %s is %p\n",
+                     ol.keyAt(j).string(), iobs->asBinder().get());
+            write(fd, buf, written < bufSize ? written : bufSize);
+        }
+    }
+    return android::OK;
+!!!10988300.cpp!!!	NotifyObservers(in name : char, in value : AVSettingValue) : void
+    // Notify observers
+    for (size_t i = 0; i < observers_.size(); ++i) {
+        const ObserverList& ol = observers_.valueAt(i);
+        for (size_t j = 0; j < ol.size(); ++j) {
+            sp<IAVSettingObserver> iobserver = ol.valueAt(j);
+            const String8& prefix = ol.keyAt(j);
+            if ((iobserver != 0) &&
+                (!strncmp(name, prefix.string(), prefix.length()))) {
+                iobserver->OnSettingUpdate(name, value);
+            }
+        }
+    }
+!!!10988428.cpp!!!	GetHandlerFor(in name : char) : sp<IAVSettingHandler>
+    String8 str(name);
+    // Extract prefix from name
+    while (const char* dot = strrchr(str.string(), '.')) {
+        int len = dot - str.string();
+        String8 str_new(str.string(), len);
+        int index = registered_handlers_.indexOfKey(str_new);
+        if (index >= 0) {
+            return registered_handlers_.valueAt(index);
+        }
+        str = str_new;
+    }
+    // no prefix. Return NULL for now.
+    // We could also have a handler for top-level settings,
+    // i.e not in a namespace.
+    ALOGW("GetHandlerFor return null");
+    return NULL;
+!!!10988556.cpp!!!	ReadSettingLocked(in name : char, inout value : AVSettingValue, in persisted : bool) : status_t
+    const sp<IAVSettingHandler> handler = GetHandlerFor(name);
+    if (handler != 0) {
+        return handler->ReadSetting(name, value, persisted);
+    }
+    return android::NAME_NOT_FOUND;
+!!!10988684.cpp!!!	WriteSettingLocked(in name : char, in value : AVSettingValue, in persisted : bool) : status_t
+    const sp<IAVSettingHandler> handler = GetHandlerFor(name);
+    if (handler != 0) {
+        return handler->ApplySetting(name, value, persisted);
+    }
+
+    return android::OK;
+!!!10988812.cpp!!!	RemoveObserverLocked(in who : wp<IBinder>) : void
+    ssize_t index = observers_.indexOfKey(who);
+    if (index >= 0) {
+        observers_.removeItemsAt(index);
+    }
+!!!10988940.cpp!!!	RemoveObserverHandlerLocked(in who : wp<IBinder>) : void
+    ssize_t index = handler_observers_.indexOfKey(who);
+    if (index >= 0) {
+        handler_observers_.removeItemsAt(index);
+    }
+!!!10989068.cpp!!!	RemoveHandlerLocked(in who : wp<IBinder>) : void
+    int index = handlers_.indexOfKey(who);
+    if (index < 0) {
+        return;
+    }
+    const sp<IAVSettingHandler>& handler =
+            registered_handlers_.valueAt(index);
+    // Linear scan to find the handler. Implementing a reverse hash
+    // just for this case is not worth it since we expect to have a very
+    // small number of handlers. It's even debatable whether the list of
+    // handlers should be stored in a hashmap in the first place, but
+    // contrary to this function, GetHandlerFor will be invoked frequently
+    // and O(1) lookup is good to have.
+    for (size_t i = 0; i < registered_handlers_.size(); ) {
+        if (registered_handlers_.valueAt(i) == handler) {
+            registered_handlers_.removeItemsAt(i);
+        } else {
+            ++i;
+        }
+    }
+!!!10989196.cpp!!!	binderDied(in who : wp<IBinder>) : void
+    android::RWLock::AutoWLock observer_lock(mObserverLock);
+    RemoveObserverLocked(who);
+    RemoveObserverHandlerLocked(who);
+    RemoveHandlerLocked(who);

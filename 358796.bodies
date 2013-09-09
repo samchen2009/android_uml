@@ -1,0 +1,205 @@
+class WAVExtractor
+!!!672396.cpp!!!	WAVExtractor(in source : sp<DataSource>)
+    mInitCheck = init();
+!!!672524.cpp!!!	countTracks() : size_t
+    return mInitCheck == OK ? 1 : 0;
+!!!672652.cpp!!!	getTrack(in index : size_t) : sp<MediaSource>
+    if (mInitCheck != OK || index > 0) {
+        return NULL;
+    }
+
+    return new WAVSource(
+            mDataSource, mTrackMeta,
+            mWaveFormat, mBitsPerSample, mDataOffset, mDataSize);
+!!!672780.cpp!!!	getTrackMetaData(in index : size_t, in flags : uint32_t) : sp<MetaData>
+    if (mInitCheck != OK || index > 0) {
+        return NULL;
+    }
+
+    return mTrackMeta;
+!!!672908.cpp!!!	getMetaData() : sp<MetaData>
+    sp<MetaData> meta = new MetaData;
+
+    if (mInitCheck != OK) {
+        return meta;
+    }
+
+    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_CONTAINER_WAV);
+
+    return meta;
+!!!673164.cpp!!!	init() : status_t
+    uint8_t header[12];
+    if (mDataSource->readAt(
+                0, header, sizeof(header)) < (ssize_t)sizeof(header)) {
+        return NO_INIT;
+    }
+
+    if (memcmp(header, "RIFF", 4) || memcmp(&header[8], "WAVE", 4)) {
+        return NO_INIT;
+    }
+
+    size_t totalSize = U32_LE_AT(&header[4]);
+
+    off64_t offset = 12;
+    size_t remainingSize = totalSize;
+    while (remainingSize >= 8) {
+        uint8_t chunkHeader[8];
+        if (mDataSource->readAt(offset, chunkHeader, 8) < 8) {
+            return NO_INIT;
+        }
+
+        remainingSize -= 8;
+        offset += 8;
+
+        uint32_t chunkSize = U32_LE_AT(&chunkHeader[4]);
+
+        if (chunkSize > remainingSize) {
+            return NO_INIT;
+        }
+
+        if (!memcmp(chunkHeader, "fmt ", 4)) {
+            if (chunkSize < 16) {
+                return NO_INIT;
+            }
+
+            uint8_t formatSpec[40];
+            if (mDataSource->readAt(offset, formatSpec, 2) < 2) {
+                return NO_INIT;
+            }
+
+            mWaveFormat = U16_LE_AT(formatSpec);
+            if (mWaveFormat != WAVE_FORMAT_PCM
+                    && mWaveFormat != WAVE_FORMAT_ALAW
+                    && mWaveFormat != WAVE_FORMAT_MULAW
+                    && mWaveFormat != WAVE_FORMAT_EXTENSIBLE) {
+                return ERROR_UNSUPPORTED;
+            }
+
+            uint8_t fmtSize = 16;
+            if (mWaveFormat == WAVE_FORMAT_EXTENSIBLE) {
+                fmtSize = 40;
+            }
+            if (mDataSource->readAt(offset, formatSpec, fmtSize) < fmtSize) {
+                return NO_INIT;
+            }
+
+            mNumChannels = U16_LE_AT(&formatSpec[2]);
+            if (mWaveFormat != WAVE_FORMAT_EXTENSIBLE) {
+                if (mNumChannels != 1 && mNumChannels != 2) {
+                    ALOGW("More than 2 channels (%d) in non-WAVE_EXT, unknown channel mask",
+                            mNumChannels);
+                }
+            } else {
+                if (mNumChannels < 1 && mNumChannels > 8) {
+                    return ERROR_UNSUPPORTED;
+                }
+            }
+
+            mSampleRate = U32_LE_AT(&formatSpec[4]);
+
+            if (mSampleRate == 0) {
+                return ERROR_MALFORMED;
+            }
+
+            mBitsPerSample = U16_LE_AT(&formatSpec[14]);
+
+            if (mWaveFormat == WAVE_FORMAT_PCM
+                    || mWaveFormat == WAVE_FORMAT_EXTENSIBLE) {
+                if (mBitsPerSample != 8 && mBitsPerSample != 16
+                    && mBitsPerSample != 24) {
+                    return ERROR_UNSUPPORTED;
+                }
+            } else {
+                CHECK(mWaveFormat == WAVE_FORMAT_MULAW
+                        || mWaveFormat == WAVE_FORMAT_ALAW);
+                if (mBitsPerSample != 8) {
+                    return ERROR_UNSUPPORTED;
+                }
+            }
+
+            if (mWaveFormat == WAVE_FORMAT_EXTENSIBLE) {
+                uint16_t validBitsPerSample = U16_LE_AT(&formatSpec[18]);
+                if (validBitsPerSample != mBitsPerSample) {
+                    if (validBitsPerSample != 0) {
+                        ALOGE("validBits(%d) != bitsPerSample(%d) are not supported",
+                                validBitsPerSample, mBitsPerSample);
+                        return ERROR_UNSUPPORTED;
+                    } else {
+                        // we only support valitBitsPerSample == bitsPerSample but some WAV_EXT
+                        // writers don't correctly set the valid bits value, and leave it at 0.
+                        ALOGW("WAVE_EXT has 0 valid bits per sample, ignoring");
+                    }
+                }
+
+                mChannelMask = U32_LE_AT(&formatSpec[20]);
+                ALOGV("numChannels=%d channelMask=0x%x", mNumChannels, mChannelMask);
+                if ((mChannelMask >> 18) != 0) {
+                    ALOGE("invalid channel mask 0x%x", mChannelMask);
+                    return ERROR_MALFORMED;
+                }
+
+                if ((mChannelMask != CHANNEL_MASK_USE_CHANNEL_ORDER)
+                        && (popcount(mChannelMask) != mNumChannels)) {
+                    ALOGE("invalid number of channels (%d) in channel mask (0x%x)",
+                            popcount(mChannelMask), mChannelMask);
+                    return ERROR_MALFORMED;
+                }
+
+                // In a WAVE_EXT header, the first two bytes of the GUID stored at byte 24 contain
+                // the sample format, using the same definitions as a regular WAV header
+                mWaveFormat = U16_LE_AT(&formatSpec[24]);
+                if (mWaveFormat != WAVE_FORMAT_PCM
+                        && mWaveFormat != WAVE_FORMAT_ALAW
+                        && mWaveFormat != WAVE_FORMAT_MULAW) {
+                    return ERROR_UNSUPPORTED;
+                }
+                if (memcmp(&formatSpec[26], WAVEEXT_SUBFORMAT, 14)) {
+                    ALOGE("unsupported GUID");
+                    return ERROR_UNSUPPORTED;
+                }
+            }
+
+            mValidFormat = true;
+        } else if (!memcmp(chunkHeader, "data", 4)) {
+            if (mValidFormat) {
+                mDataOffset = offset;
+                mDataSize = chunkSize;
+
+                mTrackMeta = new MetaData;
+
+                switch (mWaveFormat) {
+                    case WAVE_FORMAT_PCM:
+                        mTrackMeta->setCString(
+                                kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_RAW);
+                        break;
+                    case WAVE_FORMAT_ALAW:
+                        mTrackMeta->setCString(
+                                kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_G711_ALAW);
+                        break;
+                    default:
+                        CHECK_EQ(mWaveFormat, (uint16_t)WAVE_FORMAT_MULAW);
+                        mTrackMeta->setCString(
+                                kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_G711_MLAW);
+                        break;
+                }
+
+                mTrackMeta->setInt32(kKeyChannelCount, mNumChannels);
+                mTrackMeta->setInt32(kKeyChannelMask, mChannelMask);
+                mTrackMeta->setInt32(kKeySampleRate, mSampleRate);
+
+                size_t bytesPerSample = mBitsPerSample >> 3;
+
+                int64_t durationUs =
+                    1000000LL * (mDataSize / (mNumChannels * bytesPerSample))
+                        / mSampleRate;
+
+                mTrackMeta->setInt64(kKeyDuration, durationUs);
+
+                return OK;
+            }
+        }
+
+        offset += chunkSize;
+    }
+
+    return NO_INIT;

@@ -1,0 +1,113 @@
+class NativeDisplayEventReceiver
+!!!1933964.cpp!!!	NativeDisplayEventReceiver(inout env : JNIEnv, in receiverObj : jobject, in messageQueue : sp<MessageQueue>)
+    ALOGV("receiver %p ~ Initializing input event receiver.", this);
+!!!1934092.cpp!!!	initialize() : status_t
+    status_t result = mReceiver.initCheck();
+    if (result) {
+        ALOGW("Failed to initialize display event receiver, status=%d", result);
+        return result;
+    }
+
+    int rc = mMessageQueue->getLooper()->addFd(mReceiver.getFd(), 0, ALOOPER_EVENT_INPUT,
+            this, NULL);
+    if (rc < 0) {
+        return UNKNOWN_ERROR;
+    }
+    return OK;
+!!!1934220.cpp!!!	dispose() : void
+    ALOGV("receiver %p ~ Disposing display event receiver.", this);
+
+    if (!mReceiver.initCheck()) {
+        mMessageQueue->getLooper()->removeFd(mReceiver.getFd());
+    }
+!!!1934348.cpp!!!	scheduleVsync() : status_t
+    if (!mWaitingForVsync) {
+        ALOGV("receiver %p ~ Scheduling vsync.", this);
+
+        // Drain all pending events.
+        nsecs_t vsyncTimestamp;
+        int32_t vsyncDisplayId;
+        uint32_t vsyncCount;
+        readLastVsyncMessage(&vsyncTimestamp, &vsyncDisplayId, &vsyncCount);
+
+        status_t status = mReceiver.requestNextVsync();
+        if (status) {
+            ALOGW("Failed to request next vsync, status=%d", status);
+            return status;
+        }
+
+        mWaitingForVsync = true;
+    }
+    return OK;
+!!!1934476.cpp!!!	~NativeDisplayEventReceiver()
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    env->DeleteGlobalRef(mReceiverObjGlobal);
+!!!1934604.cpp!!!	handleEvent(in receiveFd : int, in events : int, inout data : void) : int
+    if (events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) {
+        ALOGE("Display event receiver pipe was closed or an error occurred.  "
+                "events=0x%x", events);
+        return 0; // remove the callback
+    }
+
+    if (!(events & ALOOPER_EVENT_INPUT)) {
+        ALOGW("Received spurious callback for unhandled poll event.  "
+                "events=0x%x", events);
+        return 1; // keep the callback
+    }
+
+    // Drain all pending events, keep the last vsync.
+    nsecs_t vsyncTimestamp;
+    int32_t vsyncDisplayId;
+    uint32_t vsyncCount;
+    if (!readLastVsyncMessage(&vsyncTimestamp, &vsyncDisplayId, &vsyncCount)) {
+        ALOGV("receiver %p ~ Woke up but there was no vsync pulse!", this);
+        return 1; // keep the callback, did not obtain a vsync pulse
+    }
+
+    ALOGV("receiver %p ~ Vsync pulse: timestamp=%lld, id=%d, count=%d",
+            this, vsyncTimestamp, vsyncDisplayId, vsyncCount);
+    mWaitingForVsync = false;
+
+    dispatchVsync(vsyncTimestamp, vsyncDisplayId, vsyncCount);
+    return 1; // keep the callback
+!!!1934732.cpp!!!	readLastVsyncMessage(inout outTimestamp : nsecs_t, inout outId : int32_t, inout outCount : uint32_t) : bool
+    DisplayEventReceiver::Event buf[EVENT_BUFFER_SIZE];
+    ssize_t n;
+    while ((n = mReceiver.getEvents(buf, EVENT_BUFFER_SIZE)) > 0) {
+        ALOGV("receiver %p ~ Read %d events.", this, int(n));
+        while (n-- > 0) {
+            const DisplayEventReceiver::Event& ev = buf[n];
+            if (ev.header.type == DisplayEventReceiver::DISPLAY_EVENT_VSYNC) {
+                *outTimestamp = ev.header.timestamp;
+                *outId = ev.header.id;
+                *outCount = ev.vsync.count;
+                return true; // stop at last vsync in the buffer
+            }
+
+            if (ev.header.type == DisplayEventReceiver::DISPLAY_EVENT_HOTPLUG) {
+                dispatchHotplug(ev.header.timestamp, ev.header.id, ev.hotplug.connected);
+            }
+        }
+    }
+    if (n < 0) {
+        ALOGW("Failed to get events from display event receiver, status=%d", status_t(n));
+    }
+    return false;
+!!!1934860.cpp!!!	dispatchVsync(in timestamp : nsecs_t, in id : int32_t, in count : uint32_t) : void
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+
+    ALOGV("receiver %p ~ Invoking vsync handler.", this);
+    env->CallVoidMethod(mReceiverObjGlobal,
+            gDisplayEventReceiverClassInfo.dispatchVsync, timestamp, id, count);
+    ALOGV("receiver %p ~ Returned from vsync handler.", this);
+
+    mMessageQueue->raiseAndClearException(env, "dispatchVsync");
+!!!1934988.cpp!!!	dispatchHotplug(in timestamp : nsecs_t, in id : int32_t, in connected : bool) : void
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+
+    ALOGV("receiver %p ~ Invoking hotplug handler.", this);
+    env->CallVoidMethod(mReceiverObjGlobal,
+            gDisplayEventReceiverClassInfo.dispatchHotplug, timestamp, id, connected);
+    ALOGV("receiver %p ~ Returned from hotplug handler.", this);
+
+    mMessageQueue->raiseAndClearException(env, "dispatchHotplug");

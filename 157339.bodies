@@ -1,0 +1,144 @@
+class ProcessManager
+!!!372763.java!!!	ProcessManager()
+        // Spawn a thread to listen for signals from child processes.
+        Thread reaperThread = new Thread(ProcessManager.class.getName()) {
+            @Override public void run() {
+                watchChildren();
+            }
+        };
+        reaperThread.setDaemon(true);
+        reaperThread.start();
+!!!372891.java!!!	cleanUp() : void
+        ProcessReference reference;
+        while ((reference = referenceQueue.poll()) != null) {
+            synchronized (processReferences) {
+                processReferences.remove(reference.processId);
+            }
+        }
+!!!373019.java!!!	watchChildren() : void
+        MutableInt status = new MutableInt(-1);
+        while (true) {
+            try {
+                // Wait for children in our process group.
+                int pid = Libcore.os.waitpid(0, status, 0);
+
+                // Work out what onExit wants to hear.
+                int exitValue;
+                if (WIFEXITED(status.value)) {
+                    exitValue = WEXITSTATUS(status.value);
+                } else if (WIFSIGNALED(status.value)) {
+                    exitValue = WTERMSIG(status.value);
+                } else if (WIFSTOPPED(status.value)) {
+                    exitValue = WSTOPSIG(status.value);
+                } else {
+                    throw new AssertionError("unexpected status from waitpid: " + status.value);
+                }
+
+                onExit(pid, exitValue);
+            } catch (ErrnoException errnoException) {
+                if (errnoException.errno == ECHILD) {
+                    // Expected errno: there are no children to wait for.
+                    // onExit will sleep until it is informed of another child coming to life.
+                    waitForMoreChildren();
+                    continue;
+                } else {
+                    throw new AssertionError(errnoException);
+                }
+            }
+        }
+!!!373147.java!!!	onExit(in pid : int, in exitValue : int) : void
+        ProcessReference processReference = null;
+        synchronized (processReferences) {
+            cleanUp();
+            processReference = processReferences.remove(pid);
+        }
+        if (processReference != null) {
+            ProcessImpl process = processReference.get();
+            if (process != null) {
+                process.setExitValue(exitValue);
+            }
+        }
+!!!373275.java!!!	waitForMoreChildren() : void
+        synchronized (processReferences) {
+            if (processReferences.isEmpty()) {
+                // There are no eligible children; wait for one to be added.
+                // This wait will return because of the notifyAll call in exec.
+                try {
+                    processReferences.wait();
+                } catch (InterruptedException ex) {
+                    // This should never happen.
+                    throw new AssertionError("unexpected interrupt");
+                }
+            } else {
+                /*
+                 * A new child was spawned just before we entered
+                 * the synchronized block. We can just fall through
+                 * without doing anything special and land back in
+                 * the native waitpid().
+                 */
+            }
+        }
+!!!373531.java!!!	exec(inout taintedCommand : String, inout taintedEnvironment : String, inout workingDirectory : File, inout redirectErrorStream : boolean) : Process
+        // Make sure we throw the same exceptions as the RI.
+        if (taintedCommand == null) {
+            throw new NullPointerException("taintedCommand == null");
+        }
+        if (taintedCommand.length == 0) {
+            throw new IndexOutOfBoundsException("taintedCommand.length == 0");
+        }
+
+        // Handle security and safety by copying mutable inputs and checking them.
+        String[] command = taintedCommand.clone();
+        String[] environment = taintedEnvironment != null ? taintedEnvironment.clone() : null;
+
+        // Check we're not passing null Strings to the native exec.
+        for (int i = 0; i < command.length; i++) {
+            if (command[i] == null) {
+                throw new NullPointerException("taintedCommand[" + i + "] == null");
+            }
+        }
+        // The environment is allowed to be null or empty, but no element may be null.
+        if (environment != null) {
+            for (int i = 0; i < environment.length; i++) {
+                if (environment[i] == null) {
+                    throw new NullPointerException("taintedEnvironment[" + i + "] == null");
+                }
+            }
+        }
+
+        FileDescriptor in = new FileDescriptor();
+        FileDescriptor out = new FileDescriptor();
+        FileDescriptor err = new FileDescriptor();
+
+        String workingPath = (workingDirectory == null)
+                ? null
+                : workingDirectory.getPath();
+
+        // Ensure onExit() doesn't access the process map before we add our
+        // entry.
+        synchronized (processReferences) {
+            int pid;
+            try {
+                pid = exec(command, environment, workingPath, in, out, err, redirectErrorStream);
+            } catch (IOException e) {
+                IOException wrapper = new IOException("Error running exec()."
+                        + " Command: " + Arrays.toString(command)
+                        + " Working Directory: " + workingDirectory
+                        + " Environment: " + Arrays.toString(environment));
+                wrapper.initCause(e);
+                throw wrapper;
+            }
+            ProcessImpl process = new ProcessImpl(pid, in, out, err);
+            ProcessReference processReference = new ProcessReference(process, referenceQueue);
+            processReferences.put(pid, processReference);
+
+            /*
+             * This will wake up the child monitor thread in case there
+             * weren't previously any children to wait on.
+             */
+            processReferences.notifyAll();
+
+            return process;
+        }
+!!!376987.java!!!	getInstance() : ProcessManager
+        return instance;

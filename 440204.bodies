@@ -1,0 +1,217 @@
+class TextureCache
+!!!1140492.cpp!!!	TextureCache()
+    char property[PROPERTY_VALUE_MAX];
+    if (property_get(PROPERTY_TEXTURE_CACHE_SIZE, property, NULL) > 0) {
+        INIT_LOGD("  Setting texture cache size to %sMB", property);
+        setMaxSize(MB(atof(property)));
+    } else {
+        INIT_LOGD("  Using default texture cache size of %.2fMB", DEFAULT_TEXTURE_CACHE_SIZE);
+    }
+
+    if (property_get(PROPERTY_TEXTURE_CACHE_FLUSH_RATE, property, NULL) > 0) {
+        float flushRate = atof(property);
+        INIT_LOGD("  Setting texture cache flush rate to %.2f%%", flushRate * 100.0f);
+        setFlushRate(flushRate);
+    } else {
+        INIT_LOGD("  Using default texture cache flush rate of %.2f%%",
+                DEFAULT_TEXTURE_CACHE_FLUSH_RATE * 100.0f);
+    }
+
+    init();
+!!!1140620.cpp!!!	TextureCache(in maxByteSize : uint32_t)
+    init();
+!!!1140748.cpp!!!	~TextureCache()
+    mCache.clear();
+!!!1140876.cpp!!!	operator ()(inout bitmap : SkBitmap, inout texture : Texture) : void
+    // This will be called already locked
+    if (texture) {
+        mSize -= texture->bitmapSize;
+        TEXTURE_LOGD("TextureCache::callback: name, removed size, mSize = %d, %d, %d",
+                texture->id, texture->bitmapSize, mSize);
+        if (mDebugEnabled) {
+            ALOGD("Texture deleted, size = %d", texture->bitmapSize);
+        }
+        glDeleteTextures(1, &texture->id);
+        delete texture;
+    }
+!!!1141004.cpp!!!	get(inout bitmap : SkBitmap) : Texture
+    Texture* texture = mCache.get(bitmap);
+
+    if (!texture) {
+        if (bitmap->width() > mMaxTextureSize || bitmap->height() > mMaxTextureSize) {
+            ALOGW("Bitmap too large to be uploaded into a texture (%dx%d, max=%dx%d)",
+                    bitmap->width(), bitmap->height(), mMaxTextureSize, mMaxTextureSize);
+            return NULL;
+        }
+
+        const uint32_t size = bitmap->rowBytes() * bitmap->height();
+        // Don't even try to cache a bitmap that's bigger than the cache
+        if (size < mMaxSize) {
+            while (mSize + size > mMaxSize) {
+                mCache.removeOldest();
+            }
+        }
+
+        texture = new Texture;
+        texture->bitmapSize = size;
+        generateTexture(bitmap, texture, false);
+
+        if (size < mMaxSize) {
+            mSize += size;
+            TEXTURE_LOGD("TextureCache::get: create texture(%p): name, size, mSize = %d, %d, %d",
+                     bitmap, texture->id, size, mSize);
+            if (mDebugEnabled) {
+                ALOGD("Texture created, size = %d", size);
+            }
+            mCache.put(bitmap, texture);
+        } else {
+            texture->cleanup = true;
+        }
+    } else if (bitmap->getGenerationID() != texture->generation) {
+        generateTexture(bitmap, texture, true);
+    }
+
+    return texture;
+!!!1141132.cpp!!!	getTransient(inout bitmap : SkBitmap) : Texture
+    Texture* texture = new Texture;
+    texture->bitmapSize = bitmap->rowBytes() * bitmap->height();
+    texture->cleanup = true;
+
+    generateTexture(bitmap, texture, false);
+
+    return texture;
+!!!1141260.cpp!!!	remove(inout bitmap : SkBitmap) : void
+    mCache.remove(bitmap);
+!!!1141388.cpp!!!	removeDeferred(inout bitmap : SkBitmap) : void
+    Mutex::Autolock _l(mLock);
+    mGarbage.push(bitmap);
+!!!1141516.cpp!!!	clearGarbage() : void
+    Mutex::Autolock _l(mLock);
+    size_t count = mGarbage.size();
+    for (size_t i = 0; i < count; i++) {
+        mCache.remove(mGarbage.itemAt(i));
+    }
+    mGarbage.clear();
+!!!1141644.cpp!!!	clear() : void
+    mCache.clear();
+    TEXTURE_LOGD("TextureCache:clear(), mSize = %d", mSize);
+!!!1141772.cpp!!!	setMaxSize(in maxSize : uint32_t) : void
+    mMaxSize = maxSize;
+    while (mSize > mMaxSize) {
+        mCache.removeOldest();
+    }
+!!!1141900.cpp!!!	getMaxSize() : uint32_t
+    return mMaxSize;
+!!!1142028.cpp!!!	getSize() : uint32_t
+    return mSize;
+!!!1142156.cpp!!!	flush() : void
+    if (mFlushRate >= 1.0f || mCache.size() == 0) return;
+    if (mFlushRate <= 0.0f) {
+        clear();
+        return;
+    }
+
+    uint32_t targetSize = uint32_t(mSize * mFlushRate);
+    TEXTURE_LOGD("TextureCache::flush: target size: %d", targetSize);
+
+    while (mSize > targetSize) {
+        mCache.removeOldest();
+    }
+!!!1142284.cpp!!!	setFlushRate(in flushRate : float) : void
+    mFlushRate = fmaxf(0.0f, fminf(1.0f, flushRate));
+!!!1142412.cpp!!!	generateTexture(inout bitmap : SkBitmap, inout texture : Texture, in regenerate : bool = false) : void
+    SkAutoLockPixels alp(*bitmap);
+
+    if (!bitmap->readyToDraw()) {
+        ALOGE("Cannot generate texture from bitmap");
+        return;
+    }
+
+    // We could also enable mipmapping if both bitmap dimensions are powers
+    // of 2 but we'd have to deal with size changes. Let's keep this simple
+    const bool canMipMap = Caches::getInstance().extensions.hasNPot();
+
+    // If the texture had mipmap enabled but not anymore,
+    // force a glTexImage2D to discard the mipmap levels
+    const bool resize = !regenerate || bitmap->width() != int(texture->width) ||
+            bitmap->height() != int(texture->height) ||
+            (regenerate && canMipMap && texture->mipMap && !bitmap->hasHardwareMipMap());
+
+    if (!regenerate) {
+        glGenTextures(1, &texture->id);
+    }
+
+    texture->generation = bitmap->getGenerationID();
+    texture->width = bitmap->width();
+    texture->height = bitmap->height();
+
+    glBindTexture(GL_TEXTURE_2D, texture->id);
+
+    switch (bitmap->getConfig()) {
+    case SkBitmap::kA8_Config:
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        uploadToTexture(resize, GL_ALPHA, bitmap->rowBytesAsPixels(), texture->height,
+                GL_UNSIGNED_BYTE, bitmap->getPixels());
+        texture->blend = true;
+        break;
+    case SkBitmap::kRGB_565_Config:
+        glPixelStorei(GL_UNPACK_ALIGNMENT, bitmap->bytesPerPixel());
+        uploadToTexture(resize, GL_RGB, bitmap->rowBytesAsPixels(), texture->height,
+                GL_UNSIGNED_SHORT_5_6_5, bitmap->getPixels());
+        texture->blend = false;
+        break;
+    case SkBitmap::kARGB_8888_Config:
+        glPixelStorei(GL_UNPACK_ALIGNMENT, bitmap->bytesPerPixel());
+        uploadToTexture(resize, GL_RGBA, bitmap->rowBytesAsPixels(), texture->height,
+                GL_UNSIGNED_BYTE, bitmap->getPixels());
+        // Do this after calling getPixels() to make sure Skia's deferred
+        // decoding happened
+        texture->blend = !bitmap->isOpaque();
+        break;
+    case SkBitmap::kARGB_4444_Config:
+    case SkBitmap::kIndex8_Config:
+        glPixelStorei(GL_UNPACK_ALIGNMENT, bitmap->bytesPerPixel());
+        uploadLoFiTexture(resize, bitmap, texture->width, texture->height);
+        texture->blend = !bitmap->isOpaque();
+        break;
+    default:
+        ALOGW("Unsupported bitmap config: %d", bitmap->getConfig());
+        break;
+    }
+
+    if (canMipMap) {
+        texture->mipMap = bitmap->hasHardwareMipMap();
+        if (texture->mipMap) {
+            glGenerateMipmap(GL_TEXTURE_2D);
+        }
+    }
+
+    if (!regenerate) {
+        texture->setFilter(GL_NEAREST);
+        texture->setWrap(GL_CLAMP_TO_EDGE);
+    }
+!!!1142540.cpp!!!	uploadLoFiTexture(in resize : bool, inout bitmap : SkBitmap, in width : uint32_t, in height : uint32_t) : void
+    SkBitmap rgbaBitmap;
+    rgbaBitmap.setConfig(SkBitmap::kARGB_8888_Config, width, height);
+    rgbaBitmap.allocPixels();
+    rgbaBitmap.eraseColor(0);
+    rgbaBitmap.setIsOpaque(bitmap->isOpaque());
+
+    SkCanvas canvas(rgbaBitmap);
+    canvas.drawBitmap(*bitmap, 0.0f, 0.0f, NULL);
+
+    uploadToTexture(resize, GL_RGBA, rgbaBitmap.rowBytesAsPixels(), height,
+            GL_UNSIGNED_BYTE, rgbaBitmap.getPixels());
+!!!1142668.cpp!!!	uploadToTexture(in resize : bool, in format : GLenum, in width : GLsizei, in height : GLsizei, in type : GLenum, in data : GLvoid) : void
+    if (resize) {
+        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, type, data);
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, data);
+    }
+!!!1142796.cpp!!!	init() : void
+    mCache.setOnEntryRemovedListener(this);
+
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mMaxTextureSize);
+    INIT_LOGD("    Maximum texture dimension is %d pixels", mMaxTextureSize);
+
+    mDebugEnabled = readDebugLevel() & kDebugCaches;

@@ -1,0 +1,179 @@
+class LockdownVpnTracker
+!!!8554892.java!!!	isEnabled() : boolean
+        return KeyStore.getInstance().contains(Credentials.LOCKDOWN_VPN);
+!!!8555020.java!!!	LockdownVpnTracker(inout context : Context, inout netService : INetworkManagementService, inout connService : ConnectivityService, inout vpn : Vpn, inout profile : VpnProfile)
+        mContext = Preconditions.checkNotNull(context);
+        mNetService = Preconditions.checkNotNull(netService);
+        mConnService = Preconditions.checkNotNull(connService);
+        mVpn = Preconditions.checkNotNull(vpn);
+        mProfile = Preconditions.checkNotNull(profile);
+
+        final Intent resetIntent = new Intent(ACTION_LOCKDOWN_RESET);
+        resetIntent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
+        mResetIntent = PendingIntent.getBroadcast(mContext, 0, resetIntent, 0);
+!!!8555148.java!!!	handleStateChangedLocked() : void
+        Slog.d(TAG, "handleStateChanged()");
+
+        final NetworkInfo egressInfo = mConnService.getActiveNetworkInfoUnfiltered();
+        final LinkProperties egressProp = mConnService.getActiveLinkProperties();
+
+        final NetworkInfo vpnInfo = mVpn.getNetworkInfo();
+        final VpnConfig vpnConfig = mVpn.getLegacyVpnConfig();
+
+        // Restart VPN when egress network disconnected or changed
+        final boolean egressDisconnected = egressInfo == null
+                || State.DISCONNECTED.equals(egressInfo.getState());
+        final boolean egressChanged = egressProp == null
+                || !TextUtils.equals(mAcceptedEgressIface, egressProp.getInterfaceName());
+        if (egressDisconnected || egressChanged) {
+            clearSourceRulesLocked();
+            mAcceptedEgressIface = null;
+            mVpn.stopLegacyVpn();
+        }
+        if (egressDisconnected) return;
+
+        final int egressType = egressInfo.getType();
+        if (vpnInfo.getDetailedState() == DetailedState.FAILED) {
+            EventLogTags.writeLockdownVpnError(egressType);
+        }
+
+        if (mErrorCount > MAX_ERROR_COUNT) {
+            showNotification(R.string.vpn_lockdown_error, R.drawable.vpn_disconnected);
+
+        } else if (egressInfo.isConnected() && !vpnInfo.isConnectedOrConnecting()) {
+            if (mProfile.isValidLockdownProfile()) {
+                Slog.d(TAG, "Active network connected; starting VPN");
+                EventLogTags.writeLockdownVpnConnecting(egressType);
+                showNotification(R.string.vpn_lockdown_connecting, R.drawable.vpn_disconnected);
+
+                mAcceptedEgressIface = egressProp.getInterfaceName();
+                mVpn.startLegacyVpn(mProfile, KeyStore.getInstance(), egressProp);
+
+            } else {
+                Slog.e(TAG, "Invalid VPN profile; requires IP-based server and DNS");
+                showNotification(R.string.vpn_lockdown_error, R.drawable.vpn_disconnected);
+            }
+
+        } else if (vpnInfo.isConnected() && vpnConfig != null) {
+            final String iface = vpnConfig.interfaze;
+            final String sourceAddr = vpnConfig.addresses;
+
+            if (TextUtils.equals(iface, mAcceptedIface)
+                    && TextUtils.equals(sourceAddr, mAcceptedSourceAddr)) {
+                return;
+            }
+
+            Slog.d(TAG, "VPN connected using iface=" + iface + ", sourceAddr=" + sourceAddr);
+            EventLogTags.writeLockdownVpnConnected(egressType);
+            showNotification(R.string.vpn_lockdown_connected, R.drawable.vpn_connected);
+
+            try {
+                clearSourceRulesLocked();
+
+                mNetService.setFirewallInterfaceRule(iface, true);
+                mNetService.setFirewallEgressSourceRule(sourceAddr, true);
+
+                mErrorCount = 0;
+                mAcceptedIface = iface;
+                mAcceptedSourceAddr = sourceAddr;
+            } catch (RemoteException e) {
+                throw new RuntimeException("Problem setting firewall rules", e);
+            }
+
+            mConnService.sendConnectedBroadcast(augmentNetworkInfo(egressInfo));
+        }
+!!!8555276.java!!!	init() : void
+        synchronized (mStateLock) {
+            initLocked();
+        }
+!!!8555404.java!!!	initLocked() : void
+        Slog.d(TAG, "initLocked()");
+
+        mVpn.setEnableNotifications(false);
+
+        final IntentFilter resetFilter = new IntentFilter(ACTION_LOCKDOWN_RESET);
+        mContext.registerReceiver(mResetReceiver, resetFilter, CONNECTIVITY_INTERNAL, null);
+
+        try {
+            // TODO: support non-standard port numbers
+            mNetService.setFirewallEgressDestRule(mProfile.server, 500, true);
+            mNetService.setFirewallEgressDestRule(mProfile.server, 4500, true);
+        } catch (RemoteException e) {
+            throw new RuntimeException("Problem setting firewall rules", e);
+        }
+
+        synchronized (mStateLock) {
+            handleStateChangedLocked();
+        }
+!!!8555532.java!!!	shutdown() : void
+        synchronized (mStateLock) {
+            shutdownLocked();
+        }
+!!!8555660.java!!!	shutdownLocked() : void
+        Slog.d(TAG, "shutdownLocked()");
+
+        mAcceptedEgressIface = null;
+        mErrorCount = 0;
+
+        mVpn.stopLegacyVpn();
+        try {
+            mNetService.setFirewallEgressDestRule(mProfile.server, 500, false);
+            mNetService.setFirewallEgressDestRule(mProfile.server, 4500, false);
+        } catch (RemoteException e) {
+            throw new RuntimeException("Problem setting firewall rules", e);
+        }
+        clearSourceRulesLocked();
+        hideNotification();
+
+        mContext.unregisterReceiver(mResetReceiver);
+        mVpn.setEnableNotifications(true);
+!!!8555788.java!!!	reset() : void
+        synchronized (mStateLock) {
+            // cycle tracker, reset error count, and trigger retry
+            shutdownLocked();
+            initLocked();
+            handleStateChangedLocked();
+        }
+!!!8555916.java!!!	clearSourceRulesLocked() : void
+        try {
+            if (mAcceptedIface != null) {
+                mNetService.setFirewallInterfaceRule(mAcceptedIface, false);
+                mAcceptedIface = null;
+            }
+            if (mAcceptedSourceAddr != null) {
+                mNetService.setFirewallEgressSourceRule(mAcceptedSourceAddr, false);
+                mAcceptedSourceAddr = null;
+            }
+        } catch (RemoteException e) {
+            throw new RuntimeException("Problem setting firewall rules", e);
+        }
+!!!8556044.java!!!	onNetworkInfoChanged(inout info : NetworkInfo) : void
+        synchronized (mStateLock) {
+            handleStateChangedLocked();
+        }
+!!!8556172.java!!!	onVpnStateChanged(inout info : NetworkInfo) : void
+        if (info.getDetailedState() == DetailedState.FAILED) {
+            mErrorCount++;
+        }
+        synchronized (mStateLock) {
+            handleStateChangedLocked();
+        }
+!!!8556300.java!!!	augmentNetworkInfo(inout info : NetworkInfo) : NetworkInfo
+        if (info.isConnected()) {
+            final NetworkInfo vpnInfo = mVpn.getNetworkInfo();
+            info = new NetworkInfo(info);
+            info.setDetailedState(vpnInfo.getDetailedState(), vpnInfo.getReason(), null);
+        }
+        return info;
+!!!8556428.java!!!	showNotification(in titleRes : int, in iconRes : int) : void
+        final Notification.Builder builder = new Notification.Builder(mContext);
+        builder.setWhen(0);
+        builder.setSmallIcon(iconRes);
+        builder.setContentTitle(mContext.getString(titleRes));
+        builder.setContentText(mContext.getString(R.string.vpn_lockdown_reset));
+        builder.setContentIntent(mResetIntent);
+        builder.setPriority(Notification.PRIORITY_LOW);
+        builder.setOngoing(true);
+        NotificationManager.from(mContext).notify(TAG, 0, builder.build());
+!!!8556556.java!!!	hideNotification() : void
+        NotificationManager.from(mContext).cancel(TAG, 0);

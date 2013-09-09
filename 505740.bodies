@@ -1,0 +1,201 @@
+class ProcessState
+!!!1478284.cpp!!!	self() : sp<ProcessState>
+    Mutex::Autolock _l(gProcessMutex);
+    if (gProcess != NULL) {
+        return gProcess;
+    }
+    gProcess = new ProcessState;
+    return gProcess;
+!!!1478412.cpp!!!	setContextObject(in object : sp<IBinder>) : void
+    setContextObject(object, String16("default"));
+!!!1478540.cpp!!!	getContextObject(in caller : sp<IBinder>) : sp<IBinder>
+    return getStrongProxyForHandle(0);
+!!!1478668.cpp!!!	setContextObject(in object : sp<IBinder>, in name : String16) : void
+    AutoMutex _l(mLock);
+    mContexts.add(name, object);
+!!!1478796.cpp!!!	getContextObject(in name : String16, in caller : sp<IBinder>) : sp<IBinder>
+    mLock.lock();
+    sp<IBinder> object(
+        mContexts.indexOfKey(name) >= 0 ? mContexts.valueFor(name) : NULL);
+    mLock.unlock();
+    
+    //printf("Getting context object %s for %p\n", String8(name).string(), caller.get());
+    
+    if (object != NULL) return object;
+
+    // Don't attempt to retrieve contexts if we manage them
+    if (mManagesContexts) {
+        ALOGE("getContextObject(%s) failed, but we manage the contexts!\n",
+            String8(name).string());
+        return NULL;
+    }
+    
+    IPCThreadState* ipc = IPCThreadState::self();
+    {
+        Parcel data, reply;
+        // no interface token on this magic transaction
+        data.writeString16(name);
+        data.writeStrongBinder(caller);
+        status_t result = ipc->transact(0 /*magic*/, 0, data, &reply, 0);
+        if (result == NO_ERROR) {
+            object = reply.readStrongBinder();
+        }
+    }
+    
+    ipc->flushCommands();
+    
+    if (object != NULL) setContextObject(object, name);
+    return object;
+!!!1478924.cpp!!!	startThreadPool() : void
+    AutoMutex _l(mLock);
+    if (!mThreadPoolStarted) {
+        mThreadPoolStarted = true;
+        spawnPooledThread(true);
+    }
+!!!1479052.cpp!!!	isContextManager(in  : void) : bool
+    return mManagesContexts;
+!!!1479180.cpp!!!	becomeContextManager(in checkFunc : context_check_func, inout userData : void) : bool
+    if (!mManagesContexts) {
+        AutoMutex _l(mLock);
+        mBinderContextCheckFunc = checkFunc;
+        mBinderContextUserData = userData;
+
+        int dummy = 0;
+        status_t result = ioctl(mDriverFD, BINDER_SET_CONTEXT_MGR, &dummy);
+        if (result == 0) {
+            mManagesContexts = true;
+        } else if (result == -1) {
+            mBinderContextCheckFunc = NULL;
+            mBinderContextUserData = NULL;
+            ALOGE("Binder ioctl to become context manager failed: %s\n", strerror(errno));
+        }
+    }
+    return mManagesContexts;
+!!!1479308.cpp!!!	getStrongProxyForHandle(in handle : int32_t) : sp<IBinder>
+    sp<IBinder> result;
+
+    AutoMutex _l(mLock);
+
+    handle_entry* e = lookupHandleLocked(handle);
+
+    if (e != NULL) {
+        // We need to create a new BpBinder if there isn't currently one, OR we
+        // are unable to acquire a weak reference on this current one.  See comment
+        // in getWeakProxyForHandle() for more info about this.
+        IBinder* b = e->binder;
+        if (b == NULL || !e->refs->attemptIncWeak(this)) {
+            b = new BpBinder(handle); 
+            e->binder = b;
+            if (b) e->refs = b->getWeakRefs();
+            result = b;
+        } else {
+            // This little bit of nastyness is to allow us to add a primary
+            // reference to the remote proxy when this team doesn't have one
+            // but another team is sending the handle to us.
+            result.force_set(b);
+            e->refs->decWeak(this);
+        }
+    }
+
+    return result;
+!!!1479436.cpp!!!	getWeakProxyForHandle(in handle : int32_t) : wp<IBinder>
+    wp<IBinder> result;
+
+    AutoMutex _l(mLock);
+
+    handle_entry* e = lookupHandleLocked(handle);
+
+    if (e != NULL) {        
+        // We need to create a new BpBinder if there isn't currently one, OR we
+        // are unable to acquire a weak reference on this current one.  The
+        // attemptIncWeak() is safe because we know the BpBinder destructor will always
+        // call expungeHandle(), which acquires the same lock we are holding now.
+        // We need to do this because there is a race condition between someone
+        // releasing a reference on this BpBinder, and a new reference on its handle
+        // arriving from the driver.
+        IBinder* b = e->binder;
+        if (b == NULL || !e->refs->attemptIncWeak(this)) {
+            b = new BpBinder(handle);
+            result = b;
+            e->binder = b;
+            if (b) e->refs = b->getWeakRefs();
+        } else {
+            result = b;
+            e->refs->decWeak(this);
+        }
+    }
+
+    return result;
+!!!1479564.cpp!!!	expungeHandle(in handle : int32_t, inout binder : IBinder) : void
+    AutoMutex _l(mLock);
+    
+    handle_entry* e = lookupHandleLocked(handle);
+
+    // This handle may have already been replaced with a new BpBinder
+    // (if someone failed the AttemptIncWeak() above); we don't want
+    // to overwrite it.
+    if (e && e->binder == binder) e->binder = NULL;
+!!!1479692.cpp!!!	setArgs(in argc : int, in argv : char) : void
+    mArgC = argc;
+    mArgV = (const char **)argv;
+
+    mArgLen = 0;
+    for (int i=0; i<argc; i++) {
+        mArgLen += strlen(argv[i]) + 1;
+    }
+    mArgLen--;
+!!!1479820.cpp!!!	getArgC() : int
+    return mArgC;
+!!!1479948.cpp!!!	getArgV() : char
+    return mArgV;
+!!!1480076.cpp!!!	setArgV0(in txt : char) : void
+    if (mArgV != NULL) {
+        strncpy((char*)mArgV[0], txt, mArgLen);
+        set_process_name(txt);
+    }
+!!!1480204.cpp!!!	spawnPooledThread(in isMain : bool) : void
+    if (mThreadPoolStarted) {
+        int32_t s = android_atomic_add(1, &mThreadPoolSeq);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "Binder_%X", s);
+        ALOGV("Spawning new pooled thread, name=%s\n", buf);
+        sp<Thread> t = new PoolThread(isMain);
+        t->run(buf);
+    }
+!!!1480332.cpp!!!	setThreadPoolMaxThreadCount(in maxThreads : size_t) : status_t
+    status_t result = NO_ERROR;
+    if (ioctl(mDriverFD, BINDER_SET_MAX_THREADS, &maxThreads) == -1) {
+        result = -errno;
+        ALOGE("Binder ioctl to set max threads failed: %s", strerror(-result));
+    }
+    return result;
+!!!1480460.cpp!!!	ProcessState()
+    if (mDriverFD >= 0) {
+        // XXX Ideally, there should be a specific define for whether we
+        // have mmap (or whether we could possibly have the kernel module
+        // availabla).
+#if !defined(HAVE_WIN32_IPC)
+        // mmap the binder, providing a chunk of virtual address space to receive transactions.
+        mVMStart = mmap(0, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, mDriverFD, 0);
+        if (mVMStart == MAP_FAILED) {
+            // *sigh*
+            ALOGE("Using /dev/binder failed: unable to mmap transaction memory.\n");
+            close(mDriverFD);
+            mDriverFD = -1;
+        }
+#else
+        mDriverFD = -1;
+#endif
+    }
+
+    LOG_ALWAYS_FATAL_IF(mDriverFD < 0, "Binder driver could not be opened.  Terminating.");
+!!!1480972.cpp!!!	lookupHandleLocked(in handle : int32_t) : handle_entry
+    const size_t N=mHandleToObject.size();
+    if (N <= (size_t)handle) {
+        handle_entry e;
+        e.binder = NULL;
+        e.refs = NULL;
+        status_t err = mHandleToObject.insertAt(e, N, handle+1-N);
+        if (err < NO_ERROR) return NULL;
+    }
+    return &mHandleToObject.editItemAt(handle);

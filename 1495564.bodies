@@ -1,0 +1,173 @@
+class MemoryUsageTest
+!!!9184140.java!!!	testMemory() : void
+        MemoryUsageInstrumentation instrumentation =
+                (MemoryUsageInstrumentation) getInstrumentation();
+        Bundle args = instrumentation.getBundle();
+        mAm = ActivityManagerNative.getDefault();
+
+        createMappings();
+        parseArgs(args);
+
+        Bundle results = new Bundle();
+        for (String app : mNameToResultKey.keySet()) {
+            String processName;
+            try {
+                processName = startApp(app);
+                measureMemory(app, processName, results);
+                closeApp();
+            } catch (NameNotFoundException e) {
+                Log.i(TAG, "Application " + app + " not found");
+            }
+
+        }
+        instrumentation.sendStatus(0, results);
+!!!9184268.java!!!	parseArgs(inout args : Bundle) : void
+        mNameToResultKey = new HashMap<String, String>();
+        String appList = args.getString(KEY_APPS);
+
+        if (appList == null)
+            return;
+
+        String appNames[] = appList.split("\\|");
+        for (String pair : appNames) {
+            String[] parts = pair.split("\\^");
+            if (parts.length != 2) {
+                Log.e(TAG, "The apps key is incorectly formatted");
+                fail();
+            }
+
+            mNameToResultKey.put(parts[0], parts[1]);
+        }
+!!!9184396.java!!!	createMappings() : void
+        mNameToIntent = new HashMap<String, Intent>();
+        mNameToProcess = new HashMap<String, String>();
+
+        PackageManager pm = getInstrumentation().getContext()
+                .getPackageManager();
+        Intent intentToResolve = new Intent(Intent.ACTION_MAIN);
+        intentToResolve.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> ris = pm.queryIntentActivities(intentToResolve, 0);
+        if (ris == null || ris.isEmpty()) {
+            Log.i(TAG, "Could not find any apps");
+        } else {
+            for (ResolveInfo ri : ris) {
+                Log.i(TAG, "Name: " + ri.loadLabel(pm).toString()
+                        + " package: " + ri.activityInfo.packageName
+                        + " name: " + ri.activityInfo.name);
+                Intent startIntent = new Intent(intentToResolve);
+                startIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                startIntent.setClassName(ri.activityInfo.packageName,
+                        ri.activityInfo.name);
+                mNameToIntent.put(ri.loadLabel(pm).toString(), startIntent);
+                mNameToProcess.put(ri.loadLabel(pm).toString(),
+                        ri.activityInfo.processName);
+            }
+        }
+!!!9184524.java!!!	startApp(in appName : String) : String
+        Log.i(TAG, "Starting " + appName);
+
+        if (!mNameToProcess.containsKey(appName))
+            throw new NameNotFoundException("Could not find: " + appName);
+
+        String process = mNameToProcess.get(appName);
+        Intent startIntent = mNameToIntent.get(appName);
+
+        AppLaunchRunnable runnable = new AppLaunchRunnable(startIntent);
+        Thread t = new Thread(runnable);
+        t.start();
+        try {
+            t.join(JOIN_TIMEOUT);
+        } catch (InterruptedException e) {
+            // ignore
+        }
+
+        return process;
+!!!9184652.java!!!	closeApp() : void
+        Intent homeIntent = new Intent(Intent.ACTION_MAIN);
+        homeIntent.addCategory(Intent.CATEGORY_HOME);
+        homeIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        getInstrumentation().getContext().startActivity(homeIntent);
+        sleep(3000);
+!!!9184780.java!!!	measureMemory(in appName : String, in processName : String, inout results : Bundle) : void
+        List<Integer> pssData = new ArrayList<Integer>();
+        int pss = 0;
+        int iteration = 0;
+        while (iteration < MAX_ITERATIONS) {
+            sleep(SLEEP_TIME);
+            pss = getPss(processName);
+            Log.i(TAG, appName + "=" + pss);
+            if (pss < 0) {
+                reportError(appName, processName, results);
+                return;
+            }
+            pssData.add(pss);
+            if (iteration >= MIN_ITERATIONS && stabilized(pssData)) {
+                results.putInt(mNameToResultKey.get(appName), pss);
+                return;
+            }
+            iteration++;
+        }
+
+        Log.w(TAG, appName + " memory usage did not stabilize");
+        results.putInt(mNameToResultKey.get(appName), average(pssData));
+!!!9184908.java!!!	average(inout pssData : List<Integer>) : int
+        int sum = 0;
+        for (int sample : pssData) {
+            sum += sample;
+        }
+
+        return sum / pssData.size();
+!!!9185036.java!!!	stabilized(inout pssData : List<Integer>) : boolean
+        if (pssData.size() < 3)
+            return false;
+        int diff1 = Math.abs(pssData.get(pssData.size() - 1) - pssData.get(pssData.size() - 2));
+        int diff2 = Math.abs(pssData.get(pssData.size() - 2) - pssData.get(pssData.size() - 3));
+
+        Log.i(TAG, "diff1=" + diff1 + " diff2=" + diff2);
+
+        return (diff1 + diff2) < THRESHOLD;
+!!!9185164.java!!!	sleep(in time : int) : void
+        try {
+            Thread.sleep(time);
+        } catch (InterruptedException e) {
+            // ignore
+        }
+!!!9185292.java!!!	reportError(in appName : String, in processName : String, inout results : Bundle) : void
+        ActivityManager am = (ActivityManager) getInstrumentation()
+                .getContext().getSystemService(Context.ACTIVITY_SERVICE);
+        List<ProcessErrorStateInfo> crashes = am.getProcessesInErrorState();
+        if (crashes != null) {
+            for (ProcessErrorStateInfo crash : crashes) {
+                if (!crash.processName.equals(processName))
+                    continue;
+
+                Log.w(TAG, appName + " crashed: " + crash.shortMsg);
+                results.putString(mNameToResultKey.get(appName), crash.shortMsg);
+                return;
+            }
+        }
+
+        results.putString(mNameToResultKey.get(appName),
+                "Crashed for unknown reason");
+        Log.w(TAG, appName
+                + " not found in process list, most likely it is crashed");
+!!!9185420.java!!!	getPss(in processName : String) : int
+        ActivityManager am = (ActivityManager) getInstrumentation()
+                .getContext().getSystemService(Context.ACTIVITY_SERVICE);
+        List<RunningAppProcessInfo> apps = am.getRunningAppProcesses();
+
+        for (RunningAppProcessInfo proc : apps) {
+            if (!proc.processName.equals(processName)) {
+                continue;
+            }
+
+            int[] pids = {
+                    proc.pid };
+
+            MemoryInfo meminfo = am.getProcessMemoryInfo(pids)[0];
+            return meminfo.getTotalPss();
+
+        }
+        return -1;

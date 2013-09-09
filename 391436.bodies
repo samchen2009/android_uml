@@ -1,0 +1,114 @@
+class StateQueue
+!!!878476.cpp!!!	poll() : T
+    const T *next = (const T *) android_atomic_acquire_load((volatile int32_t *) &mNext);
+    if (next != mCurrent) {
+        mAck = next;    // no additional barrier needed
+        mCurrent = next;
+#ifdef STATE_QUEUE_DUMP
+        mObserverDump->mStateChanges++;
+#endif
+    }
+    return next;
+!!!878604.cpp!!!	begin() : T
+    ALOG_ASSERT(!mInMutation, "begin() called when in a mutation");
+    mInMutation = true;
+    return mMutating;
+!!!878732.cpp!!!	end(in didModify : bool = true) : void
+    ALOG_ASSERT(mInMutation, "end() called when not in a mutation");
+    ALOG_ASSERT(mIsInitialized || didModify, "first end() must modify for initialization");
+    if (didModify) {
+        mIsDirty = true;
+        mIsInitialized = true;
+    }
+    mInMutation = false;
+!!!878860.cpp!!!	push(in block : block_t = BLOCK_NEVER) : bool
+#define PUSH_BLOCK_ACK_NS    3000000L   // 3 ms: time between checks for ack in push()
+                                        //       FIXME should be configurable
+    static const struct timespec req = {0, PUSH_BLOCK_ACK_NS};
+
+    ALOG_ASSERT(!mInMutation, "push() called when in a mutation");
+
+#ifdef STATE_QUEUE_DUMP
+    if (block == BLOCK_UNTIL_ACKED) {
+        mMutatorDump->mPushAck++;
+    }
+#endif
+
+    if (mIsDirty) {
+
+#ifdef STATE_QUEUE_DUMP
+        mMutatorDump->mPushDirty++;
+#endif
+
+        // wait for prior push to be acknowledged
+        if (mExpecting != NULL) {
+#ifdef STATE_QUEUE_DUMP
+            unsigned count = 0;
+#endif
+            for (;;) {
+                const T *ack = (const T *) mAck;    // no additional barrier needed
+                if (ack == mExpecting) {
+                    // unnecessary as we're about to rewrite
+                    //mExpecting = NULL;
+                    break;
+                }
+                if (block == BLOCK_NEVER) {
+                    return false;
+                }
+#ifdef STATE_QUEUE_DUMP
+                if (count == 1) {
+                    mMutatorDump->mBlockedSequence++;
+                }
+                ++count;
+#endif
+                nanosleep(&req, NULL);
+            }
+#ifdef STATE_QUEUE_DUMP
+            if (count > 1) {
+                mMutatorDump->mBlockedSequence++;
+            }
+#endif
+        }
+
+        // publish
+        android_atomic_release_store((int32_t) mMutating, (volatile int32_t *) &mNext);
+        mExpecting = mMutating;
+
+        // copy with circular wraparound
+        if (++mMutating >= &mStates[kN]) {
+            mMutating = &mStates[0];
+        }
+        *mMutating = *mExpecting;
+        mIsDirty = false;
+
+    }
+
+    // optionally wait for this push or a prior push to be acknowledged
+    if (block == BLOCK_UNTIL_ACKED) {
+        if (mExpecting != NULL) {
+#ifdef STATE_QUEUE_DUMP
+            unsigned count = 0;
+#endif
+            for (;;) {
+                const T *ack = (const T *) mAck;    // no additional barrier needed
+                if (ack == mExpecting) {
+                    mExpecting = NULL;
+                    break;
+                }
+#ifdef STATE_QUEUE_DUMP
+                if (count == 1) {
+                    mMutatorDump->mBlockedSequence++;
+                }
+                ++count;
+#endif
+                nanosleep(&req, NULL);
+            }
+#ifdef STATE_QUEUE_DUMP
+            if (count > 1) {
+                mMutatorDump->mBlockedSequence++;
+            }
+#endif
+        }
+    }
+
+    return true;

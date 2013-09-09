@@ -1,0 +1,190 @@
+class ConsoleManagerThread
+!!!16215180.cpp!!!	ConsoleManagerThread(in flinger : sp<SurfaceFlinger>, in token : wp<IBinder>)
+    sSignalCatcherPid = 0;
+
+    // create a new console
+    char const * const ttydev = "/dev/tty0";
+    int fd = open(ttydev, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        ALOGE("Can't open %s, errno=%d (%s)", ttydev, errno, strerror(errno));
+        consoleFd = -errno;
+        return;
+    }
+    ALOGD("Open /dev/tty0 OK");
+
+    // to make sure that we are in text mode
+    int res = ioctl(fd, KDSETMODE, (void*) KD_TEXT);
+    if (res < 0) {
+        ALOGE("ioctl(%d, KDSETMODE, ...) failed, res %d (%s)",
+                fd, res, strerror(errno));
+    }
+
+    // get the current console
+    struct vt_stat vs;
+    res = ioctl(fd, VT_GETSTATE, &vs);
+    if (res < 0) {
+        ALOGE("ioctl(%d, VT_GETSTATE, ...) failed, res %d (%s)",
+                fd, res, strerror(errno));
+        consoleFd = -errno;
+        return;
+    }
+
+    // switch to console 7 (which is what X normaly uses)
+    int vtnum = 7;
+    do {
+        res = ioctl(fd, VT_ACTIVATE, (void*)vtnum);
+    } while(res < 0 && errno == EINTR);
+    if (res < 0) {
+        ALOGE("ioctl(%d, VT_ACTIVATE, ...) failed, %d (%s) for %d",
+                fd, errno, strerror(errno), vtnum);
+        consoleFd = -errno;
+        return;
+    }
+
+    do {
+        res = ioctl(fd, VT_WAITACTIVE, (void*)vtnum);
+    } while (res < 0 && errno == EINTR);
+    if (res < 0) {
+        ALOGE("ioctl(%d, VT_WAITACTIVE, ...) failed, %d %d %s for %d",
+                fd, res, errno, strerror(errno), vtnum);
+        consoleFd = -errno;
+        return;
+    }
+
+    // open the new console
+    close(fd);
+    fd = open(ttydev, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        ALOGE("Can't open new console %s", ttydev);
+        consoleFd = -errno;
+        return;
+    }
+
+    /* disable console line buffer, echo, ... */
+    struct termios ttyarg;
+    ioctl(fd, TCGETS , &ttyarg);
+    ttyarg.c_iflag = 0;
+    ttyarg.c_lflag = 0;
+    ioctl(fd, TCSETS , &ttyarg);
+
+    // set up signals so we're notified when the console changes
+    // we can't use SIGUSR1 because it's used by the java-vm
+    vm.mode = VT_PROCESS;
+    vm.waitv = 0;
+    vm.relsig = SIGUSR2;
+    vm.acqsig = SIGUNUSED;
+    vm.frsig = 0;
+
+    struct sigaction act;
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = sigHandler;
+    act.sa_flags = 0;
+    sigaction(vm.relsig, &act, NULL);
+
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = sigHandler;
+    act.sa_flags = 0;
+    sigaction(vm.acqsig, &act, NULL);
+
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, vm.relsig);
+    sigaddset(&mask, vm.acqsig);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    // switch to graphic mode
+    res = ioctl(fd, KDSETMODE, (void*)KD_GRAPHICS);
+    ALOGW_IF(res < 0,
+            "ioctl(%d, KDSETMODE, KD_GRAPHICS) failed, res %d", fd, res);
+
+    prev_vt_num = vs.v_active;
+    vt_num = vtnum;
+    consoleFd = fd;
+!!!16215308.cpp!!!	~ConsoleManagerThread()
+    if (consoleFd >= 0) {
+        int fd = consoleFd;
+        int res;
+        ioctl(fd, KDSETMODE, (void*)KD_TEXT);
+        do {
+            res = ioctl(fd, VT_ACTIVATE, (void*)prev_vt_num);
+        } while(res < 0 && errno == EINTR);
+        do {
+            res = ioctl(fd, VT_WAITACTIVE, (void*)prev_vt_num);
+        } while(res < 0 && errno == EINTR);
+        close(fd);
+        char const * const ttydev = "/dev/tty0";
+        fd = open(ttydev, O_RDWR | O_SYNC);
+        ioctl(fd, VT_DISALLOCATE, 0);
+        close(fd);
+    }
+!!!16215436.cpp!!!	releaseScreen() : status_t
+    int err = ioctl(consoleFd, VT_RELDISP, (void*)1);
+    ALOGE_IF(err < 0, "ioctl(%d, VT_RELDISP, 1) failed %d (%s)",
+        consoleFd, errno, strerror(errno));
+    return (err < 0) ? (-errno) : status_t(NO_ERROR);
+!!!16215564.cpp!!!	onFirstRef() : void
+    run("ConsoleManagerThread", PRIORITY_URGENT_DISPLAY);
+!!!16215692.cpp!!!	readyToRun() : status_t
+    if (consoleFd >= 0) {
+        sSignalCatcherPid = gettid();
+
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, vm.relsig);
+        sigaddset(&mask, vm.acqsig);
+        sigprocmask(SIG_BLOCK, &mask, NULL);
+
+        int res = ioctl(consoleFd, VT_SETMODE, &vm);
+        if (res < 0) {
+            ALOGE("ioctl(%d, VT_SETMODE, ...) failed, %d (%s)",
+                    consoleFd, errno, strerror(errno));
+        }
+        return NO_ERROR;
+    }
+    return consoleFd;
+!!!16215820.cpp!!!	requestExit() : void
+    Thread::requestExit();
+    if (sSignalCatcherPid != 0) {
+        // wake the thread up
+        kill(sSignalCatcherPid, SIGINT);
+        // wait for it...
+    }
+!!!16215948.cpp!!!	threadLoop() : bool
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, vm.relsig);
+    sigaddset(&mask, vm.acqsig);
+
+    int sig = 0;
+    sigwait(&mask, &sig);
+
+    hw_module_t const* mod;
+    gralloc_module_t const* gr = NULL;
+    status_t err = hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &mod);
+    if (!err) {
+        gr = reinterpret_cast<gralloc_module_t const*>(mod);
+        if (!gr->perform)
+            gr = NULL;
+    }
+
+    if (sig == vm.relsig) {
+        if (gr)
+            gr->perform(gr, GRALLOC_MODULE_PERFORM_LEAVE_VT);
+        mFlinger->screenReleased(mDisplayToken.promote());
+    } else if (sig == vm.acqsig) {
+        mFlinger->screenAcquired(mDisplayToken.promote());
+        if (gr)
+            gr->perform(gr, GRALLOC_MODULE_PERFORM_ENTER_VT);
+    }
+
+    return true;
+!!!16216076.cpp!!!	sigHandler(in sig : int) : void
+    // resend the signal to our signal catcher thread
+    ALOGW("received signal %d in thread %d, resending to %d",
+            sig, gettid(), sSignalCatcherPid);
+
+    // we absolutely need the delays below because without them
+    // our main thread never gets a chance to handle the signal.
+    usleep(10000);
+    kill(sSignalCatcherPid, sig);
+    usleep(10000);

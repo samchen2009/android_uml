@@ -1,0 +1,408 @@
+class BandwidthController
+!!!9963276.cpp!!!	setupIptablesHooks(in  : void) : int
+
+    /* Some of the initialCommands are allowed to fail */
+    runCommands(sizeof(IPT_FLUSH_COMMANDS) / sizeof(char*),
+            IPT_FLUSH_COMMANDS, RunCmdFailureOk);
+
+    runCommands(sizeof(IPT_CLEANUP_COMMANDS) / sizeof(char*),
+            IPT_CLEANUP_COMMANDS, RunCmdFailureOk);
+
+    runCommands(sizeof(IPT_SETUP_COMMANDS) / sizeof(char*),
+            IPT_SETUP_COMMANDS, RunCmdFailureBad);
+
+    return 0;
+!!!9963404.cpp!!!	enableBandwidthControl(in force : bool) : int
+    int res;
+    char value[PROPERTY_VALUE_MAX];
+
+    if (!force) {
+            property_get("persist.bandwidth.enable", value, "1");
+            if (!strcmp(value, "0"))
+                    return 0;
+    }
+
+    /* Let's pretend we started from scratch ... */
+    sharedQuotaIfaces.clear();
+    quotaIfaces.clear();
+    naughtyAppUids.clear();
+    globalAlertBytes = 0;
+    globalAlertTetherCount = 0;
+    sharedQuotaBytes = sharedAlertBytes = 0;
+
+    res = runCommands(sizeof(IPT_FLUSH_COMMANDS) / sizeof(char*),
+            IPT_FLUSH_COMMANDS, RunCmdFailureOk);
+
+    res |= runCommands(sizeof(IPT_BASIC_ACCOUNTING_COMMANDS) / sizeof(char*),
+            IPT_BASIC_ACCOUNTING_COMMANDS, RunCmdFailureBad);
+
+    return res;
+
+!!!9963532.cpp!!!	disableBandwidthControl(in  : void) : int
+    runCommands(sizeof(IPT_FLUSH_COMMANDS) / sizeof(char*),
+            IPT_FLUSH_COMMANDS, RunCmdFailureOk);
+    return 0;
+!!!9963660.cpp!!!	setInterfaceSharedQuota(in iface : char, in maxBytes : int64_t) : int
+    char cmd[MAX_CMD_LEN];
+    char ifn[MAX_IFACENAME_LEN];
+    int res = 0;
+    std::string quotaCmd;
+    std::string ifaceName;
+    ;
+    const char *costName = "shared";
+    std::list<std::string>::iterator it;
+
+    if (!maxBytes) {
+        /* Don't talk about -1, deprecate it. */
+        ALOGE("Invalid bytes value. 1..max_int64.");
+        return -1;
+    }
+    if (StrncpyAndCheck(ifn, iface, sizeof(ifn))) {
+        ALOGE("Interface name longer than %d", MAX_IFACENAME_LEN);
+        return -1;
+    }
+    ifaceName = ifn;
+
+    if (maxBytes == -1) {
+        return removeInterfaceSharedQuota(ifn);
+    }
+
+    /* Insert ingress quota. */
+    for (it = sharedQuotaIfaces.begin(); it != sharedQuotaIfaces.end(); it++) {
+        if (*it == ifaceName)
+            break;
+    }
+
+    if (it == sharedQuotaIfaces.end()) {
+        res |= prepCostlyIface(ifn, QuotaShared);
+        if (sharedQuotaIfaces.empty()) {
+            quotaCmd = makeIptablesQuotaCmd(IptOpInsert, costName, maxBytes);
+            res |= runIpxtablesCmd(quotaCmd.c_str(), IptRejectAdd);
+            if (res) {
+                ALOGE("Failed set quota rule");
+                goto fail;
+            }
+            sharedQuotaBytes = maxBytes;
+        }
+        sharedQuotaIfaces.push_front(ifaceName);
+
+    }
+
+    if (maxBytes != sharedQuotaBytes) {
+        res |= updateQuota(costName, maxBytes);
+        if (res) {
+            ALOGE("Failed update quota for %s", costName);
+            goto fail;
+        }
+        sharedQuotaBytes = maxBytes;
+    }
+    return 0;
+
+    fail:
+    /*
+     * TODO(jpa): once we get rid of iptables in favor of rtnetlink, reparse
+     * rules in the kernel to see which ones need cleaning up.
+     * For now callers needs to choose if they want to "ndc bandwidth enable"
+     * which resets everything.
+     */
+    removeInterfaceSharedQuota(ifn);
+    return -1;
+!!!9963788.cpp!!!	getInterfaceSharedQuota(inout bytes : int64_t) : int
+    return getInterfaceQuota("shared", bytes);
+!!!9963916.cpp!!!	removeInterfaceSharedQuota(in iface : char) : int
+    char ifn[MAX_IFACENAME_LEN];
+    int res = 0;
+    std::string ifaceName;
+    std::list<std::string>::iterator it;
+    const char *costName = "shared";
+
+    if (StrncpyAndCheck(ifn, iface, sizeof(ifn))) {
+        ALOGE("Interface name longer than %d", MAX_IFACENAME_LEN);
+        return -1;
+    }
+    ifaceName = ifn;
+
+    for (it = sharedQuotaIfaces.begin(); it != sharedQuotaIfaces.end(); it++) {
+        if (*it == ifaceName)
+            break;
+    }
+    if (it == sharedQuotaIfaces.end()) {
+        ALOGE("No such iface %s to delete", ifn);
+        return -1;
+    }
+
+    res |= cleanupCostlyIface(ifn, QuotaShared);
+    sharedQuotaIfaces.erase(it);
+
+    if (sharedQuotaIfaces.empty()) {
+        std::string quotaCmd;
+        quotaCmd = makeIptablesQuotaCmd(IptOpDelete, costName, sharedQuotaBytes);
+        res |= runIpxtablesCmd(quotaCmd.c_str(), IptRejectAdd);
+        sharedQuotaBytes = 0;
+        if (sharedAlertBytes) {
+            removeSharedAlert();
+            sharedAlertBytes = 0;
+        }
+    }
+    return res;
+!!!9964044.cpp!!!	setInterfaceQuota(in iface : char, in maxBytes : int64_t) : int
+    char ifn[MAX_IFACENAME_LEN];
+    int res = 0;
+    std::string ifaceName;
+    const char *costName;
+    std::list<QuotaInfo>::iterator it;
+    std::string quotaCmd;
+
+    if (!maxBytes) {
+        /* Don't talk about -1, deprecate it. */
+        ALOGE("Invalid bytes value. 1..max_int64.");
+        return -1;
+    }
+    if (maxBytes == -1) {
+        return removeInterfaceQuota(iface);
+    }
+
+    if (StrncpyAndCheck(ifn, iface, sizeof(ifn))) {
+        ALOGE("Interface name longer than %d", MAX_IFACENAME_LEN);
+        return -1;
+    }
+    ifaceName = ifn;
+    costName = iface;
+
+    /* Insert ingress quota. */
+    for (it = quotaIfaces.begin(); it != quotaIfaces.end(); it++) {
+        if (it->ifaceName == ifaceName)
+            break;
+    }
+
+    if (it == quotaIfaces.end()) {
+        res |= prepCostlyIface(ifn, QuotaUnique);
+        quotaCmd = makeIptablesQuotaCmd(IptOpInsert, costName, maxBytes);
+        res |= runIpxtablesCmd(quotaCmd.c_str(), IptRejectAdd);
+        if (res) {
+            ALOGE("Failed set quota rule");
+            goto fail;
+        }
+
+        quotaIfaces.push_front(QuotaInfo(ifaceName, maxBytes, 0));
+
+    } else {
+        res |= updateQuota(costName, maxBytes);
+        if (res) {
+            ALOGE("Failed update quota for %s", iface);
+            goto fail;
+        }
+        it->quota = maxBytes;
+    }
+    return 0;
+
+    fail:
+    /*
+     * TODO(jpa): once we get rid of iptables in favor of rtnetlink, reparse
+     * rules in the kernel to see which ones need cleaning up.
+     * For now callers needs to choose if they want to "ndc bandwidth enable"
+     * which resets everything.
+     */
+    removeInterfaceSharedQuota(ifn);
+    return -1;
+!!!9964172.cpp!!!	getInterfaceQuota(in costName : char, inout bytes : int64_t) : int
+    FILE *fp;
+    char *fname;
+    int scanRes;
+
+    asprintf(&fname, "/proc/net/xt_quota/%s", costName);
+    fp = fopen(fname, "r");
+    free(fname);
+    if (!fp) {
+        ALOGE("Reading quota %s failed (%s)", costName, strerror(errno));
+        return -1;
+    }
+    scanRes = fscanf(fp, "%lld", bytes);
+    ALOGV("Read quota res=%d bytes=%lld", scanRes, *bytes);
+    fclose(fp);
+    return scanRes == 1 ? 0 : -1;
+!!!9964300.cpp!!!	removeInterfaceQuota(in iface : char) : int
+
+    char ifn[MAX_IFACENAME_LEN];
+    int res = 0;
+    std::string ifaceName;
+    const char *costName;
+    std::list<QuotaInfo>::iterator it;
+
+    if (StrncpyAndCheck(ifn, iface, sizeof(ifn))) {
+        ALOGE("Interface name longer than %d", MAX_IFACENAME_LEN);
+        return -1;
+    }
+    ifaceName = ifn;
+    costName = iface;
+
+    for (it = quotaIfaces.begin(); it != quotaIfaces.end(); it++) {
+        if (it->ifaceName == ifaceName)
+            break;
+    }
+
+    if (it == quotaIfaces.end()) {
+        ALOGE("No such iface %s to delete", ifn);
+        return -1;
+    }
+
+    /* This also removes the quota command of CostlyIface chain. */
+    res |= cleanupCostlyIface(ifn, QuotaUnique);
+
+    quotaIfaces.erase(it);
+
+    return res;
+!!!9964428.cpp!!!	addNaughtyApps(in numUids : int, inout appUids : char) : int
+    return maninpulateNaughtyApps(numUids, appUids, NaughtyAppOpAdd);
+!!!9964556.cpp!!!	removeNaughtyApps(in numUids : int, inout appUids : char) : int
+    return maninpulateNaughtyApps(numUids, appUids, NaughtyAppOpRemove);
+!!!9964684.cpp!!!	setGlobalAlert(in bytes : int64_t) : int
+    const char *alertName = ALERT_GLOBAL_NAME;
+    int res = 0;
+
+    if (!bytes) {
+        ALOGE("Invalid bytes value. 1..max_int64.");
+        return -1;
+    }
+    if (globalAlertBytes) {
+        res = updateQuota(alertName, bytes);
+    } else {
+        res = runIptablesAlertCmd(IptOpInsert, alertName, bytes);
+        if (globalAlertTetherCount) {
+            ALOGV("setGlobalAlert for %d tether", globalAlertTetherCount);
+            res |= runIptablesAlertFwdCmd(IptOpInsert, alertName, bytes);
+        }
+    }
+    globalAlertBytes = bytes;
+    return res;
+!!!9964812.cpp!!!	removeGlobalAlert(in  : void) : int
+
+    const char *alertName = ALERT_GLOBAL_NAME;
+    int res = 0;
+
+    if (!globalAlertBytes) {
+        ALOGE("No prior alert set");
+        return -1;
+    }
+    res = runIptablesAlertCmd(IptOpDelete, alertName, globalAlertBytes);
+    if (globalAlertTetherCount) {
+        res |= runIptablesAlertFwdCmd(IptOpDelete, alertName, globalAlertBytes);
+    }
+    globalAlertBytes = 0;
+    return res;
+!!!9964940.cpp!!!	setGlobalAlertInForwardChain(in  : void) : int
+    const char *alertName = ALERT_GLOBAL_NAME;
+    int res = 0;
+
+    globalAlertTetherCount++;
+    ALOGV("setGlobalAlertInForwardChain(): %d tether", globalAlertTetherCount);
+
+    /*
+     * If there is no globalAlert active we are done.
+     * If there is an active globalAlert but this is not the 1st
+     * tether, we are also done.
+     */
+    if (!globalAlertBytes || globalAlertTetherCount != 1) {
+        return 0;
+    }
+
+    /* We only add the rule if this was the 1st tether added. */
+    res = runIptablesAlertFwdCmd(IptOpInsert, alertName, globalAlertBytes);
+    return res;
+!!!9965068.cpp!!!	removeGlobalAlertInForwardChain(in  : void) : int
+    int res = 0;
+    const char *alertName = ALERT_GLOBAL_NAME;
+
+    if (!globalAlertTetherCount) {
+        ALOGE("No prior alert set");
+        return -1;
+    }
+
+    globalAlertTetherCount--;
+    /*
+     * If there is no globalAlert active we are done.
+     * If there is an active globalAlert but there are more
+     * tethers, we are also done.
+     */
+    if (!globalAlertBytes || globalAlertTetherCount >= 1) {
+        return 0;
+    }
+
+    /* We only detete the rule if this was the last tether removed. */
+    res = runIptablesAlertFwdCmd(IptOpDelete, alertName, globalAlertBytes);
+    return res;
+!!!9965196.cpp!!!	setSharedAlert(in bytes : int64_t) : int
+    if (!sharedQuotaBytes) {
+        ALOGE("Need to have a prior shared quota set to set an alert");
+        return -1;
+    }
+    if (!bytes) {
+        ALOGE("Invalid bytes value. 1..max_int64.");
+        return -1;
+    }
+    return setCostlyAlert("shared", bytes, &sharedAlertBytes);
+!!!9965324.cpp!!!	removeSharedAlert(in  : void) : int
+    return removeCostlyAlert("shared", &sharedAlertBytes);
+!!!9965452.cpp!!!	setInterfaceAlert(in iface : char, in bytes : int64_t) : int
+    std::list<QuotaInfo>::iterator it;
+
+    if (!bytes) {
+        ALOGE("Invalid bytes value. 1..max_int64.");
+        return -1;
+    }
+    for (it = quotaIfaces.begin(); it != quotaIfaces.end(); it++) {
+        if (it->ifaceName == iface)
+            break;
+    }
+
+    if (it == quotaIfaces.end()) {
+        ALOGE("Need to have a prior interface quota set to set an alert");
+        return -1;
+    }
+
+    return setCostlyAlert(iface, bytes, &it->alert);
+!!!9965580.cpp!!!	removeInterfaceAlert(in iface : char) : int
+    std::list<QuotaInfo>::iterator it;
+
+    for (it = quotaIfaces.begin(); it != quotaIfaces.end(); it++) {
+        if (it->ifaceName == iface)
+            break;
+    }
+
+    if (it == quotaIfaces.end()) {
+        ALOGE("No prior alert set for interface %s", iface);
+        return -1;
+    }
+
+    return removeCostlyAlert(iface, &it->alert);
+!!!9965708.cpp!!!	getTetherStats(inout stats : TetherStats, inout extraProcessingInfo : std::string) : int
+    int res;
+    std::string fullCmd;
+    FILE *iptOutput;
+    const char *cmd;
+
+    if (stats.rxBytes != -1 || stats.txBytes != -1) {
+        ALOGE("Unexpected input stats. Byte counts should be -1.");
+        return -1;
+    }
+
+    /*
+     * Why not use some kind of lib to talk to iptables?
+     * Because the only libs are libiptc and libip6tc in iptables, and they are
+     * not easy to use. They require the known iptables match modules to be
+     * preloaded/linked, and require apparently a lot of wrapper code to get
+     * the wanted info.
+     */
+    fullCmd = IPTABLES_PATH;
+    fullCmd += " -nvx -L natctrl_FORWARD";
+    iptOutput = popen(fullCmd.c_str(), "r");
+    if (!iptOutput) {
+            ALOGE("Failed to run %s err=%s", fullCmd.c_str(), strerror(errno));
+            extraProcessingInfo += "Failed to run iptables.";
+        return -1;
+    }
+    res = parseForwardChainStats(stats, iptOutput, extraProcessingInfo);
+    pclose(iptOutput);
+
+    /* Currently NatController doesn't do ipv6 tethering, so we are done. */
+    return res;

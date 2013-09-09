@@ -1,0 +1,201 @@
+class AudioResamplerOrder1
+!!!1916300.cpp!!!	resample(inout out : int32_t, in outFrameCount : size_t, inout provider : AudioBufferProvider) : void
+
+    // should never happen, but we overflow if it does
+    // ALOG_ASSERT(outFrameCount < 32767);
+
+    // select the appropriate resampler
+    switch (mChannelCount) {
+    case 1:
+        resampleMono16(out, outFrameCount, provider);
+        break;
+    case 2:
+        resampleStereo16(out, outFrameCount, provider);
+        break;
+    }
+!!!1916556.cpp!!!	resampleMono16(inout out : int32_t, in outFrameCount : size_t, inout provider : AudioBufferProvider) : void
+
+    int32_t vl = mVolume[0];
+    int32_t vr = mVolume[1];
+
+    size_t inputIndex = mInputIndex;
+    uint32_t phaseFraction = mPhaseFraction;
+    uint32_t phaseIncrement = mPhaseIncrement;
+    size_t outputIndex = 0;
+    size_t outputSampleCount = outFrameCount * 2;
+    size_t inFrameCount = (outFrameCount*mInSampleRate)/mSampleRate;
+
+    // ALOGE("starting resample %d frames, inputIndex=%d, phaseFraction=%d, phaseIncrement=%d",
+    //      outFrameCount, inputIndex, phaseFraction, phaseIncrement);
+    while (outputIndex < outputSampleCount) {
+        // buffer is empty, fetch a new one
+        while (mBuffer.frameCount == 0) {
+            mBuffer.frameCount = inFrameCount;
+            provider->getNextBuffer(&mBuffer,
+                                    calculateOutputPTS(outputIndex / 2));
+            if (mBuffer.raw == NULL) {
+                mInputIndex = inputIndex;
+                mPhaseFraction = phaseFraction;
+                goto resampleMono16_exit;
+            }
+            // ALOGE("New buffer fetched: %d frames", mBuffer.frameCount);
+            if (mBuffer.frameCount >  inputIndex) break;
+
+            inputIndex -= mBuffer.frameCount;
+            mX0L = mBuffer.i16[mBuffer.frameCount-1];
+            provider->releaseBuffer(&mBuffer);
+            // mBuffer.frameCount == 0 now so we reload a new buffer
+        }
+        int16_t *in = mBuffer.i16;
+
+        // handle boundary case
+        while (inputIndex == 0) {
+            // ALOGE("boundary case");
+            int32_t sample = Interp(mX0L, in[0], phaseFraction);
+            out[outputIndex++] += vl * sample;
+            out[outputIndex++] += vr * sample;
+            Advance(&inputIndex, &phaseFraction, phaseIncrement);
+            if (outputIndex == outputSampleCount)
+                break;
+        }
+
+        // process input samples
+        // ALOGE("general case");
+
+#ifdef ASM_ARM_RESAMP1  // asm optimisation for ResamplerOrder1
+        if (inputIndex + 2 < mBuffer.frameCount) {
+            int32_t* maxOutPt;
+            int32_t maxInIdx;
+
+            maxOutPt = out + (outputSampleCount - 2);
+            maxInIdx = (int32_t)mBuffer.frameCount - 2;
+                AsmMono16Loop(in, maxOutPt, maxInIdx, outputIndex, out, inputIndex, vl, vr,
+                        phaseFraction, phaseIncrement);
+        }
+#endif  // ASM_ARM_RESAMP1
+
+        while (outputIndex < outputSampleCount && inputIndex < mBuffer.frameCount) {
+            int32_t sample = Interp(in[inputIndex-1], in[inputIndex],
+                    phaseFraction);
+            out[outputIndex++] += vl * sample;
+            out[outputIndex++] += vr * sample;
+            Advance(&inputIndex, &phaseFraction, phaseIncrement);
+        }
+
+
+        // ALOGE("loop done - outputIndex=%d, inputIndex=%d", outputIndex, inputIndex);
+
+        // if done with buffer, save samples
+        if (inputIndex >= mBuffer.frameCount) {
+            inputIndex -= mBuffer.frameCount;
+
+            // ALOGE("buffer done, new input index %d", inputIndex);
+
+            mX0L = mBuffer.i16[mBuffer.frameCount-1];
+            provider->releaseBuffer(&mBuffer);
+
+            // verify that the releaseBuffer resets the buffer frameCount
+            // ALOG_ASSERT(mBuffer.frameCount == 0);
+        }
+    }
+
+    // ALOGE("output buffer full - outputIndex=%d, inputIndex=%d", outputIndex, inputIndex);
+
+resampleMono16_exit:
+    // save state
+    mInputIndex = inputIndex;
+    mPhaseFraction = phaseFraction;
+!!!1916684.cpp!!!	resampleStereo16(inout out : int32_t, in outFrameCount : size_t, inout provider : AudioBufferProvider) : void
+
+    int32_t vl = mVolume[0];
+    int32_t vr = mVolume[1];
+
+    size_t inputIndex = mInputIndex;
+    uint32_t phaseFraction = mPhaseFraction;
+    uint32_t phaseIncrement = mPhaseIncrement;
+    size_t outputIndex = 0;
+    size_t outputSampleCount = outFrameCount * 2;
+    size_t inFrameCount = (outFrameCount*mInSampleRate)/mSampleRate;
+
+    // ALOGE("starting resample %d frames, inputIndex=%d, phaseFraction=%d, phaseIncrement=%d",
+    //      outFrameCount, inputIndex, phaseFraction, phaseIncrement);
+
+    while (outputIndex < outputSampleCount) {
+
+        // buffer is empty, fetch a new one
+        while (mBuffer.frameCount == 0) {
+            mBuffer.frameCount = inFrameCount;
+            provider->getNextBuffer(&mBuffer,
+                                    calculateOutputPTS(outputIndex / 2));
+            if (mBuffer.raw == NULL) {
+                goto resampleStereo16_exit;
+            }
+
+            // ALOGE("New buffer fetched: %d frames", mBuffer.frameCount);
+            if (mBuffer.frameCount > inputIndex) break;
+
+            inputIndex -= mBuffer.frameCount;
+            mX0L = mBuffer.i16[mBuffer.frameCount*2-2];
+            mX0R = mBuffer.i16[mBuffer.frameCount*2-1];
+            provider->releaseBuffer(&mBuffer);
+            // mBuffer.frameCount == 0 now so we reload a new buffer
+        }
+
+        int16_t *in = mBuffer.i16;
+
+        // handle boundary case
+        while (inputIndex == 0) {
+            // ALOGE("boundary case");
+            out[outputIndex++] += vl * Interp(mX0L, in[0], phaseFraction);
+            out[outputIndex++] += vr * Interp(mX0R, in[1], phaseFraction);
+            Advance(&inputIndex, &phaseFraction, phaseIncrement);
+            if (outputIndex == outputSampleCount)
+                break;
+        }
+
+        // process input samples
+        // ALOGE("general case");
+
+#ifdef ASM_ARM_RESAMP1  // asm optimisation for ResamplerOrder1
+        if (inputIndex + 2 < mBuffer.frameCount) {
+            int32_t* maxOutPt;
+            int32_t maxInIdx;
+
+            maxOutPt = out + (outputSampleCount - 2);   // 2 because 2 frames per loop
+            maxInIdx = mBuffer.frameCount - 2;
+            AsmStereo16Loop(in, maxOutPt, maxInIdx, outputIndex, out, inputIndex, vl, vr,
+                    phaseFraction, phaseIncrement);
+        }
+#endif  // ASM_ARM_RESAMP1
+
+        while (outputIndex < outputSampleCount && inputIndex < mBuffer.frameCount) {
+            out[outputIndex++] += vl * Interp(in[inputIndex*2-2],
+                    in[inputIndex*2], phaseFraction);
+            out[outputIndex++] += vr * Interp(in[inputIndex*2-1],
+                    in[inputIndex*2+1], phaseFraction);
+            Advance(&inputIndex, &phaseFraction, phaseIncrement);
+        }
+
+        // ALOGE("loop done - outputIndex=%d, inputIndex=%d", outputIndex, inputIndex);
+
+        // if done with buffer, save samples
+        if (inputIndex >= mBuffer.frameCount) {
+            inputIndex -= mBuffer.frameCount;
+
+            // ALOGE("buffer done, new input index %d", inputIndex);
+
+            mX0L = mBuffer.i16[mBuffer.frameCount*2-2];
+            mX0R = mBuffer.i16[mBuffer.frameCount*2-1];
+            provider->releaseBuffer(&mBuffer);
+
+            // verify that the releaseBuffer resets the buffer frameCount
+            // ALOG_ASSERT(mBuffer.frameCount == 0);
+        }
+    }
+
+    // ALOGE("output buffer full - outputIndex=%d, inputIndex=%d", outputIndex, inputIndex);
+
+resampleStereo16_exit:
+    // save state
+    mInputIndex = inputIndex;
+    mPhaseFraction = phaseFraction;

@@ -1,0 +1,355 @@
+class PairingSession
+!!!13154316.java!!!	PairingSession(inout protocol : PoloWireInterface, inout pairingContext : PairingContext)
+    mProtocol = protocol;
+    mPairingContext = pairingContext;
+    mState = ProtocolState.STATE_UNINITIALIZED;
+    mMessageQueue = new LinkedBlockingQueue<QueueMessage>();
+
+    Certificate clientCert = mPairingContext.getClientCertificate();
+    Certificate serverCert = mPairingContext.getServerCertificate();
+
+    mChallenge = new PoloChallengeResponse(clientCert, serverCert,
+        new PoloChallengeResponse.DebugLogger() {
+          public void debug(String message) {
+            logDebug(message);
+          }
+          public void verbose(String message) {
+            if (DEBUG_VERBOSE) {
+              // TODO(mikey): add a verbose log level to the logging listener.
+              // Not adding it now so that clients do not need to update
+              // interfaces.
+              logDebug(message);
+            }
+          }
+        });
+
+    mLocalOptions = new OptionsMessage();
+
+    if (mPairingContext.isServer()) {
+      mLocalOptions.setProtocolRolePreference(ProtocolRole.DISPLAY_DEVICE);
+    } else {
+      mLocalOptions.setProtocolRolePreference(ProtocolRole.INPUT_DEVICE);
+    }
+
+    mThread = new Thread(new Runnable() {
+      public void run() {
+        logDebug("Starting reader");
+        try {
+          while (!mAbort) {
+            try {
+              PoloMessage message = mProtocol.getNextMessage();
+              logDebug("Received: " + message.getClass());
+              mMessageQueue.put(new QueueMessage(message));
+            } catch (PoloException exception) {
+              logDebug("Exception while getting message: " + exception);
+              mMessageQueue.put(new QueueMessage(exception));
+              break;
+            } catch (IOException exception) {
+              logDebug("Exception while getting message: " + exception);
+              mMessageQueue.put(new QueueMessage(new PoloException(exception)));
+              break;
+            }
+          }
+        } catch (InterruptedException ie) {
+          logDebug("Interrupted: " + ie);
+        } finally {
+          logDebug("Reader is done");
+        }
+      }
+    });
+    mThread.start();
+!!!13154444.java!!!	teardown() : void
+    try {
+      // Send any error.
+      mProtocol.sendErrorMessage(new Exception());
+      mPairingContext.getPeerInputStream().close();
+      mPairingContext.getPeerOutputStream().close();
+    } catch (IOException e) {
+      // oh well.
+    }
+
+    // Unblock the blocking wait on the secret queue.
+    mAbort = true;
+    mThread.interrupt();
+!!!13154572.java!!!	log(inout level : LogLevel, in message : String) : void
+    if (mListener != null) {
+      mListener.onLogMessage(level, message);
+    }
+!!!13154700.java!!!	logDebug(in message : String) : void
+    log(LogLevel.LOG_DEBUG, message);
+!!!13154828.java!!!	logInfo(in message : String) : void
+    log(LogLevel.LOG_INFO, message);
+!!!13154956.java!!!	logError(in message : String) : void
+    log(LogLevel.LOG_ERROR, message);
+!!!13155084.java!!!	logWarning(in message : String) : void
+    log(LogLevel.LOG_WARNING, message);
+!!!13155212.java!!!	addInputEncoding(inout encoding : EncodingOption) : void
+    if (mState != ProtocolState.STATE_UNINITIALIZED) {
+      throw new IllegalStateException("Cannot add encodings once session " +
+          "has been started.");
+    }
+
+    if (encoding.getType() == EncodingType.ENCODING_QRCODE) {
+        logWarning("Encoding type: ENCODING_QRCODE is deprecated, ignoring it.");
+        return;
+    }
+
+    // Legal values of GAMMALEN must be:
+    // - an even number of bytes
+    // - at least 2 bytes
+    if ((encoding.getSymbolLength() < 2) ||
+        ((encoding.getSymbolLength() % 2) != 0)) {
+        // TODO(mikey): use a PoloException
+        throw new IllegalArgumentException("Bad symbol length: " +
+            encoding.getSymbolLength());
+    }
+      mLocalOptions.addInputEncoding(encoding);
+!!!13155340.java!!!	addOutputEncoding(inout encoding : EncodingOption) : void
+    if (mState != ProtocolState.STATE_UNINITIALIZED) {
+      throw new IllegalStateException("Cannot add encodings once session " +
+          "has been started.");
+    }
+
+    if (encoding.getType() == EncodingType.ENCODING_QRCODE) {
+        logWarning("Encoding type: ENCODING_QRCODE is deprecated, ignoring it.");
+        return;
+    }
+
+    mLocalOptions.addOutputEncoding(encoding);
+!!!13155468.java!!!	setState(inout newState : ProtocolState) : void
+    logInfo("New state: " + newState);
+    mState = newState;
+!!!13155596.java!!!	doPair(inout listener : PairingListener) : boolean
+    mListener = listener;
+    mListener.onSessionCreated(this);
+
+    if (mPairingContext.isServer()) {
+      logDebug("Protocol started (SERVER mode)");
+    } else {
+      logDebug("Protocol started (CLIENT mode)");
+    }
+
+    logDebug("Local options: " + mLocalOptions.toString());
+
+    Certificate clientCert = mPairingContext.getClientCertificate();
+    if (DEBUG_VERBOSE) {
+      logDebug("Client certificate:");
+      logDebug(clientCert.toString());
+    }
+
+    Certificate serverCert = mPairingContext.getServerCertificate();
+
+    if (DEBUG_VERBOSE) {
+      logDebug("Server certificate:");
+      logDebug(serverCert.toString());
+    }
+
+    boolean success = false;
+
+    try {
+      setState(ProtocolState.STATE_INITIALIZING);
+      doInitializationPhase();
+
+      setState(ProtocolState.STATE_CONFIGURING);
+      doConfigurationPhase();
+
+      setState(ProtocolState.STATE_PAIRING);
+      doPairingPhase();
+
+      success = true;
+    } catch (ProtocolErrorException e) {
+      logDebug("Remote protocol failure: " + e);
+    } catch (PoloException e) {
+      try {
+        logDebug("Local protocol failure, attempting to send error: " + e);
+        mProtocol.sendErrorMessage(e);
+      } catch (IOException e1) {
+        logDebug("Error message send failed");
+      }
+    } catch (IOException e) {
+      logDebug("IOException: " + e);
+    }
+
+    if (success) {
+      setState(ProtocolState.STATE_SUCCESS);
+    } else {
+      setState(ProtocolState.STATE_FAILURE);
+    }
+
+    mListener.onSessionEnded(this);
+    return success;
+!!!13155724.java!!!	hasCompleted() : boolean
+    switch (mState) {
+      case STATE_SUCCESS:
+      case STATE_FAILURE:
+        return true;
+      default:
+        return false;
+    }
+!!!13155852.java!!!	hasSucceeded() : boolean
+    return mState == ProtocolState.STATE_SUCCESS;
+!!!13155980.java!!!	getServiceName() : String
+    return mServiceName;
+!!!13156108.java!!!	setSecret(inout secret : byte) : boolean
+    if (!isInputDevice()) {
+      throw new IllegalStateException("Secret can only be set for " +
+          "input role session.");
+    } else if (mState != ProtocolState.STATE_PAIRING) {
+      throw new IllegalStateException("Secret can only be set while " +
+          "in pairing state.");
+    }
+    return mMessageQueue.offer(new QueueMessage(secret));
+!!!13156236.java!!!	doPairingPhase() : void
+    if (isInputDevice()) {
+      new Thread(new Runnable() {
+        public void run() {
+          logDebug("Calling listener for user input...");
+          try {
+            mListener.onPerformInputDeviceRole(PairingSession.this);
+          } catch (PoloException exception) {
+            logDebug("Sending exception: " + exception);
+            mMessageQueue.offer(new QueueMessage(exception));
+          } finally {
+            logDebug("Listener finished.");
+          }
+        }
+      }).start();
+
+      logDebug("Waiting for secret from Listener or ...");
+      QueueMessage message = waitForMessage();
+      if (message == null || !message.hasSecret()) {
+        throw new PoloException(
+            "Illegal state - no secret available: " + message);
+      }
+      byte[] userGamma = message.mSecret;
+      if (userGamma == null) {
+        throw new PoloException("Invalid secret.");
+      }
+
+      boolean match = mChallenge.checkGamma(userGamma);
+      if (match != true) {
+        throw new BadSecretException("Secret failed local check.");
+      }
+
+      byte[] userNonce = mChallenge.extractNonce(userGamma);
+      byte[] genAlpha = mChallenge.getAlpha(userNonce);
+
+      logDebug("Sending Secret reply...");
+      SecretMessage secretMessage = new SecretMessage(genAlpha);
+      mProtocol.sendMessage(secretMessage);
+
+      logDebug("Waiting for SecretAck...");
+      SecretAckMessage secretAck =
+          (SecretAckMessage) getNextMessage(PoloMessageType.SECRET_ACK);
+
+      if (VERIFY_SECRET_ACK) {
+        byte[] inbandAlpha = secretAck.getSecret();
+        if (!Arrays.equals(inbandAlpha, genAlpha)) {
+          throw new BadSecretException("Inband secret did not match. " +
+              "Expected [" + PoloUtil.bytesToHexString(genAlpha) +
+              "], got [" + PoloUtil.bytesToHexString(inbandAlpha) + "]");
+        }
+      }
+    } else {
+      int symbolLength = mSessionConfig.getEncoding().getSymbolLength();
+      int nonceLength = symbolLength / 2;
+      int bytesNeeded = nonceLength / mEncoder.symbolsPerByte();
+
+      byte[] nonce = new byte[bytesNeeded];
+      SecureRandom random;
+      try {
+        random = SecureRandom.getInstance("SHA1PRNG");
+      } catch (NoSuchAlgorithmException e) {
+        throw new PoloException(e);
+      }
+      random.nextBytes(nonce);
+
+      // Display gamma
+      logDebug("Calling listener to display output...");
+      byte[] gamma = mChallenge.getGamma(nonce);
+      mListener.onPerformOutputDeviceRole(this, gamma);
+
+      logDebug("Waiting for Secret...");
+      SecretMessage secretMessage =
+          (SecretMessage) getNextMessage(PoloMessageType.SECRET);
+
+      byte[] localAlpha = mChallenge.getAlpha(nonce);
+      byte[] inbandAlpha = secretMessage.getSecret();
+      boolean matched = Arrays.equals(localAlpha, inbandAlpha);
+
+      if (!matched) {
+        throw new BadSecretException("Inband secret did not match. " +
+            "Expected [" + PoloUtil.bytesToHexString(localAlpha) +
+            "], got [" + PoloUtil.bytesToHexString(inbandAlpha) + "]");
+      }
+
+      logDebug("Sending SecretAck...");
+      byte[] genAlpha = mChallenge.getAlpha(nonce);
+      SecretAckMessage secretAck = new SecretAckMessage(inbandAlpha);
+      mProtocol.sendMessage(secretAck);
+    }
+!!!13156364.java!!!	getEncoder() : SecretEncoder
+    return mEncoder;
+!!!13156492.java!!!	setConfiguration(inout message : ConfigurationMessage) : void
+    if (message == null || message.getEncoding() == null) {
+      throw new NoConfigurationException("No configuration is possible.");
+    }
+    if (message.getEncoding().getSymbolLength() % 2 != 0) {
+      throw new PoloException("Symbol length must be even.");
+    }
+    if (message.getEncoding().getSymbolLength() < 2) {
+      throw new PoloException("Symbol length must be >= 2 symbols.");
+    }
+    switch (message.getEncoding().getType()) {
+      case ENCODING_HEXADECIMAL:
+        mEncoder = new HexadecimalEncoder();
+        break;
+      default:
+        throw new PoloException("Unsupported encoding type.");
+    }
+    mSessionConfig = message;
+!!!13156620.java!!!	getLocalRole() : ProtocolRole
+    assert (mSessionConfig != null);
+    if (!mPairingContext.isServer()) {
+      return mSessionConfig.getClientRole();
+    } else {
+      return (mSessionConfig.getClientRole() == ProtocolRole.DISPLAY_DEVICE) ?
+          ProtocolRole.INPUT_DEVICE : ProtocolRole.DISPLAY_DEVICE;
+    }
+!!!13156748.java!!!	isInputDevice() : boolean
+    return (getLocalRole() == ProtocolRole.INPUT_DEVICE);
+!!!13156876.java!!!	hasPeerName() : boolean
+    return mPeerName != null;
+!!!13157004.java!!!	getPeerName() : String
+    return mPeerName;
+!!!13157132.java!!!	getNextMessage(inout type : PoloMessageType) : PoloMessage
+    QueueMessage message = waitForMessage();
+    if (message != null && message.hasPoloMessage()) {
+      if (!type.equals(message.mPoloMessage.getType())) {
+        throw new PoloException(
+            "Unexpected message type: " + message.mPoloMessage.getType());
+      }
+      return message.mPoloMessage;
+    }
+    throw new PoloException("Invalid state - expected polo message");
+!!!13157260.java!!!	waitForMessage() : QueueMessage
+    while (!mAbort) {
+      try {
+        QueueMessage message = mMessageQueue.poll(SECRET_POLL_TIMEOUT_MS,
+            TimeUnit.MILLISECONDS);
+
+        if (message != null) {
+          if (message.hasPoloException()) {
+            throw new PoloException(message.mPoloException);
+          }
+          return message;
+        }
+      } catch (InterruptedException e) {
+        break;
+      }
+    }
+
+    // Aborted or interrupted.
+    return null;
+!!!13157388.java!!!	sendMessage(inout message : PoloMessage) : void
+    mProtocol.sendMessage(message);

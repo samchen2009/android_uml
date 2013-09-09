@@ -1,0 +1,154 @@
+class DisconnectedState
+!!!9760652.java!!!	setScanAlarm(inout enabled : boolean) : void
+            if (enabled == mAlarmEnabled) return;
+            if (enabled) {
+                if (mFrameworkScanIntervalMs > 0) {
+                    mAlarmManager.setRepeating(AlarmManager.RTC_WAKEUP,
+                            System.currentTimeMillis() + mFrameworkScanIntervalMs,
+                            mFrameworkScanIntervalMs,
+                            mScanIntent);
+                    mAlarmEnabled = true;
+                }
+            } else {
+                mAlarmManager.cancel(mScanIntent);
+                mAlarmEnabled = false;
+            }
+!!!9760780.java!!!	enter() : void
+            if (DBG) log(getName() + "\n");
+            EventLog.writeEvent(EVENTLOG_WIFI_STATE_CHANGED, getName());
+
+            // We dont scan frequently if this is a temporary disconnect
+            // due to p2p
+            if (mTemporarilyDisconnectWifi) {
+                mWifiP2pChannel.sendMessage(WifiP2pService.DISCONNECT_WIFI_RESPONSE);
+                return;
+            }
+
+            mFrameworkScanIntervalMs = Settings.Global.getLong(mContext.getContentResolver(),
+                    Settings.Global.WIFI_FRAMEWORK_SCAN_INTERVAL_MS,
+                    mDefaultFrameworkScanIntervalMs);
+            /*
+             * We initiate background scanning if it is enabled, otherwise we
+             * initiate an infrequent scan that wakes up the device to ensure
+             * a user connects to an access point on the move
+             */
+            if (mEnableBackgroundScan) {
+                /* If a regular scan result is pending, do not initiate background
+                 * scan until the scan results are returned. This is needed because
+                 * initiating a background scan will cancel the regular scan and
+                 * scan results will not be returned until background scanning is
+                 * cleared
+                 */
+                if (!mScanResultIsPending) {
+                    mWifiNative.enableBackgroundScan(true);
+                }
+            } else {
+                setScanAlarm(true);
+            }
+
+            /**
+             * If we have no networks saved, the supplicant stops doing the periodic scan.
+             * The scans are useful to notify the user of the presence of an open network.
+             * Note that these are not wake up scans.
+             */
+            if (!mP2pConnected.get() && mWifiConfigStore.getConfiguredNetworks().size() == 0) {
+                sendMessageDelayed(obtainMessage(CMD_NO_NETWORKS_PERIODIC_SCAN,
+                            ++mPeriodicScanToken, 0), mSupplicantScanIntervalMs);
+            }
+!!!9760908.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) log(getName() + message.toString() + "\n");
+            boolean ret = HANDLED;
+            switch (message.what) {
+                case CMD_NO_NETWORKS_PERIODIC_SCAN:
+                    if (mP2pConnected.get()) break;
+                    if (message.arg1 == mPeriodicScanToken &&
+                            mWifiConfigStore.getConfiguredNetworks().size() == 0) {
+                        sendMessage(CMD_START_SCAN);
+                        sendMessageDelayed(obtainMessage(CMD_NO_NETWORKS_PERIODIC_SCAN,
+                                    ++mPeriodicScanToken, 0), mSupplicantScanIntervalMs);
+                    }
+                    break;
+                case WifiManager.FORGET_NETWORK:
+                case CMD_REMOVE_NETWORK:
+                    // Set up a delayed message here. After the forget/remove is handled
+                    // the handled delayed message will determine if there is a need to
+                    // scan and continue
+                    sendMessageDelayed(obtainMessage(CMD_NO_NETWORKS_PERIODIC_SCAN,
+                                ++mPeriodicScanToken, 0), mSupplicantScanIntervalMs);
+                    ret = NOT_HANDLED;
+                    break;
+                case CMD_SET_SCAN_MODE:
+                    if (message.arg1 == SCAN_ONLY_MODE) {
+                        mWifiNative.setScanResultHandling(message.arg1);
+                        //Supplicant disconnect to prevent further connects
+                        mWifiNative.disconnect();
+                        mIsScanMode = true;
+                        transitionTo(mScanModeState);
+                    }
+                    break;
+                case CMD_ENABLE_BACKGROUND_SCAN:
+                    mEnableBackgroundScan = (message.arg1 == 1);
+                    if (mEnableBackgroundScan) {
+                        mWifiNative.enableBackgroundScan(true);
+                        setScanAlarm(false);
+                    } else {
+                        mWifiNative.enableBackgroundScan(false);
+                        setScanAlarm(true);
+                    }
+                    break;
+                    /* Ignore network disconnect */
+                case WifiMonitor.NETWORK_DISCONNECTION_EVENT:
+                    break;
+                case WifiMonitor.SUPPLICANT_STATE_CHANGE_EVENT:
+                    StateChangeResult stateChangeResult = (StateChangeResult) message.obj;
+                    setNetworkDetailedState(WifiInfo.getDetailedStateOf(stateChangeResult.state));
+                    /* ConnectModeState does the rest of the handling */
+                    ret = NOT_HANDLED;
+                    break;
+                case CMD_START_SCAN:
+                    /* Disable background scan temporarily during a regular scan */
+                    if (mEnableBackgroundScan) {
+                        mWifiNative.enableBackgroundScan(false);
+                    }
+                    /* Handled in parent state */
+                    ret = NOT_HANDLED;
+                    break;
+                case WifiMonitor.SCAN_RESULTS_EVENT:
+                    /* Re-enable background scan when a pending scan result is received */
+                    if (mEnableBackgroundScan && mScanResultIsPending) {
+                        mWifiNative.enableBackgroundScan(true);
+                    }
+                    /* Handled in parent state */
+                    ret = NOT_HANDLED;
+                    break;
+                case WifiP2pService.P2P_CONNECTION_CHANGED:
+                    NetworkInfo info = (NetworkInfo) message.obj;
+                    mP2pConnected.set(info.isConnected());
+                    if (mP2pConnected.get()) {
+                        int defaultInterval = mContext.getResources().getInteger(
+                                R.integer.config_wifi_scan_interval_p2p_connected);
+                        long scanIntervalMs = Settings.Global.getLong(mContext.getContentResolver(),
+                                Settings.Global.WIFI_SCAN_INTERVAL_WHEN_P2P_CONNECTED_MS,
+                                defaultInterval);
+                        mWifiNative.setScanInterval((int) scanIntervalMs/1000);
+                    } else if (mWifiConfigStore.getConfiguredNetworks().size() == 0) {
+                        if (DBG) log("Turn on scanning after p2p disconnected");
+                        sendMessageDelayed(obtainMessage(CMD_NO_NETWORKS_PERIODIC_SCAN,
+                                    ++mPeriodicScanToken, 0), mSupplicantScanIntervalMs);
+                    }
+                case CMD_RECONNECT:
+                case CMD_REASSOCIATE:
+                    // Drop a third party reconnect/reassociate if we are
+                    // tempoarily disconnected for p2p
+                    if (mTemporarilyDisconnectWifi) ret = NOT_HANDLED;
+                    break;
+                default:
+                    ret = NOT_HANDLED;
+            }
+            return ret;
+!!!9761036.java!!!	exit() : void
+            /* No need for a background scan upon exit from a disconnected state */
+            if (mEnableBackgroundScan) {
+                mWifiNative.enableBackgroundScan(false);
+            }
+            setScanAlarm(false);

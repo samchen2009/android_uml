@@ -1,0 +1,184 @@
+class TetherMasterUtilState
+!!!8487180.java!!!	processMessage(inout m : Message) : boolean
+                return false;
+!!!8487308.java!!!	enableString(in apnType : int) : String
+                switch (apnType) {
+                case ConnectivityManager.TYPE_MOBILE_DUN:
+                    return Phone.FEATURE_ENABLE_DUN_ALWAYS;
+                case ConnectivityManager.TYPE_MOBILE:
+                case ConnectivityManager.TYPE_MOBILE_HIPRI:
+                    return Phone.FEATURE_ENABLE_HIPRI;
+                }
+                return null;
+!!!8487436.java!!!	turnOnUpstreamMobileConnection(in apnType : int) : boolean
+                boolean retValue = true;
+                if (apnType == ConnectivityManager.TYPE_NONE) return false;
+                if (apnType != mMobileApnReserved) turnOffUpstreamMobileConnection();
+                int result = PhoneConstants.APN_REQUEST_FAILED;
+                String enableString = enableString(apnType);
+                if (enableString == null) return false;
+                try {
+                    result = mConnService.startUsingNetworkFeature(ConnectivityManager.TYPE_MOBILE,
+                            enableString, new Binder());
+                } catch (Exception e) {
+                }
+                switch (result) {
+                case PhoneConstants.APN_ALREADY_ACTIVE:
+                case PhoneConstants.APN_REQUEST_STARTED:
+                    mMobileApnReserved = apnType;
+                    Message m = obtainMessage(CMD_CELL_CONNECTION_RENEW);
+                    m.arg1 = ++mCurrentConnectionSequence;
+                    sendMessageDelayed(m, CELL_CONNECTION_RENEW_MS);
+                    break;
+                case PhoneConstants.APN_REQUEST_FAILED:
+                default:
+                    retValue = false;
+                    break;
+                }
+
+                return retValue;
+!!!8487564.java!!!	turnOffUpstreamMobileConnection() : boolean
+                // ignore pending renewal requests
+                ++mCurrentConnectionSequence;
+                if (mMobileApnReserved != ConnectivityManager.TYPE_NONE) {
+                    try {
+                        mConnService.stopUsingNetworkFeature(ConnectivityManager.TYPE_MOBILE,
+                                enableString(mMobileApnReserved));
+                    } catch (Exception e) {
+                        return false;
+                    }
+                    mMobileApnReserved = ConnectivityManager.TYPE_NONE;
+                }
+                return true;
+!!!8487692.java!!!	turnOnMasterTetherSettings() : boolean
+                try {
+                    mNMService.setIpForwardingEnabled(true);
+                } catch (Exception e) {
+                    transitionTo(mSetIpForwardingEnabledErrorState);
+                    return false;
+                }
+                try {
+                    mNMService.startTethering(mDhcpRange);
+                } catch (Exception e) {
+                    try {
+                        mNMService.stopTethering();
+                        mNMService.startTethering(mDhcpRange);
+                    } catch (Exception ee) {
+                        transitionTo(mStartTetheringErrorState);
+                        return false;
+                    }
+                }
+                try {
+                    mNMService.setDnsForwarders(mDefaultDnsServers);
+                } catch (Exception e) {
+                    transitionTo(mSetDnsForwardersErrorState);
+                    return false;
+                }
+                return true;
+!!!8487820.java!!!	turnOffMasterTetherSettings() : boolean
+                try {
+                    mNMService.stopTethering();
+                } catch (Exception e) {
+                    transitionTo(mStopTetheringErrorState);
+                    return false;
+                }
+                try {
+                    mNMService.setIpForwardingEnabled(false);
+                } catch (Exception e) {
+                    transitionTo(mSetIpForwardingDisabledErrorState);
+                    return false;
+                }
+                transitionTo(mInitialState);
+                return true;
+!!!8487948.java!!!	chooseUpstreamType(inout tryCell : boolean) : void
+                int upType = ConnectivityManager.TYPE_NONE;
+                String iface = null;
+
+                updateConfiguration();
+
+                synchronized (mPublicSync) {
+                    if (VDBG) {
+                        Log.d(TAG, "chooseUpstreamType has upstream iface types:");
+                        for (Integer netType : mUpstreamIfaceTypes) {
+                            Log.d(TAG, " " + netType);
+                        }
+                    }
+
+                    for (Integer netType : mUpstreamIfaceTypes) {
+                        NetworkInfo info = null;
+                        try {
+                            info = mConnService.getNetworkInfo(netType.intValue());
+                        } catch (RemoteException e) { }
+                        if ((info != null) && info.isConnected()) {
+                            upType = netType.intValue();
+                            break;
+                        }
+                    }
+                }
+
+                if (DBG) {
+                    Log.d(TAG, "chooseUpstreamType(" + tryCell + "), preferredApn ="
+                            + mPreferredUpstreamMobileApn + ", got type=" + upType);
+                }
+
+                // if we're on DUN, put our own grab on it
+                if (upType == ConnectivityManager.TYPE_MOBILE_DUN ||
+                        upType == ConnectivityManager.TYPE_MOBILE_HIPRI) {
+                    turnOnUpstreamMobileConnection(upType);
+                } else if (upType != ConnectivityManager.TYPE_NONE) {
+                    /* If we've found an active upstream connection that's not DUN/HIPRI
+                     * we should stop any outstanding DUN/HIPRI start requests.
+                     *
+                     * If we found NONE we don't want to do this as we want any previous
+                     * requests to keep trying to bring up something we can use.
+                     */
+                    turnOffUpstreamMobileConnection();
+                }
+
+                if (upType == ConnectivityManager.TYPE_NONE) {
+                    boolean tryAgainLater = true;
+                    if ((tryCell == TRY_TO_SETUP_MOBILE_CONNECTION) &&
+                            (turnOnUpstreamMobileConnection(mPreferredUpstreamMobileApn) == true)) {
+                        // we think mobile should be coming up - don't set a retry
+                        tryAgainLater = false;
+                    }
+                    if (tryAgainLater) {
+                        sendMessageDelayed(CMD_RETRY_UPSTREAM, UPSTREAM_SETTLE_TIME_MS);
+                    }
+                } else {
+                    LinkProperties linkProperties = null;
+                    try {
+                        linkProperties = mConnService.getLinkProperties(upType);
+                    } catch (RemoteException e) { }
+                    if (linkProperties != null) {
+                        iface = linkProperties.getInterfaceName();
+                        String[] dnsServers = mDefaultDnsServers;
+                        Collection<InetAddress> dnses = linkProperties.getDnses();
+                        if (dnses != null) {
+                            // we currently only handle IPv4
+                            ArrayList<InetAddress> v4Dnses =
+                                    new ArrayList<InetAddress>(dnses.size());
+                            for (InetAddress dnsAddress : dnses) {
+                                if (dnsAddress instanceof Inet4Address) {
+                                    v4Dnses.add(dnsAddress);
+                                }
+                            }
+                            if (v4Dnses.size() > 0) {
+                                dnsServers = NetworkUtils.makeStrings(v4Dnses);
+                            }
+                        }
+                        try {
+                            mNMService.setDnsForwarders(dnsServers);
+                        } catch (Exception e) {
+                            transitionTo(mSetDnsForwardersErrorState);
+                        }
+                    }
+                }
+                notifyTetheredOfNewUpstreamIface(iface);
+!!!8488076.java!!!	notifyTetheredOfNewUpstreamIface(in ifaceName : String) : void
+                if (DBG) Log.d(TAG, "notifying tethered with iface =" + ifaceName);
+                mUpstreamIfaceName = ifaceName;
+                for (TetherInterfaceSM sm : mNotifyList) {
+                    sm.sendMessage(TetherInterfaceSM.CMD_TETHER_CONNECTION_CHANGED,
+                            ifaceName);
+                }

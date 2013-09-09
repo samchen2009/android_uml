@@ -1,0 +1,156 @@
+class TextLayoutCache
+!!!953740.cpp!!!	TextLayoutCache(inout shaper : TextLayoutShaper)
+    init();
+!!!953868.cpp!!!	~TextLayoutCache()
+    mCache.clear();
+!!!954124.cpp!!!	operator ()(inout text : TextLayoutCacheKey, inout desc : sp<TextLayoutValue>) : void
+    size_t totalSizeToDelete = text.getSize() + desc->getSize();
+    mSize -= totalSizeToDelete;
+    if (mDebugEnabled) {
+        ALOGD("Cache value %p deleted, size = %d", desc.get(), totalSizeToDelete);
+    }
+!!!954252.cpp!!!	getValue(in paint : SkPaint, in text : jchar, in start : jint, in count : jint, in contextCount : jint, in dirFlags : jint) : sp<TextLayoutValue>
+    AutoMutex _l(mLock);
+    nsecs_t startTime = 0;
+    if (mDebugEnabled) {
+        startTime = systemTime(SYSTEM_TIME_MONOTONIC);
+    }
+
+    // Create the key
+    TextLayoutCacheKey key(paint, text, start, count, contextCount, dirFlags);
+
+    // Get value from cache if possible
+    sp<TextLayoutValue> value = mCache.get(key);
+
+    // Value not found for the key, we need to add a new value in the cache
+    if (value == NULL) {
+        if (mDebugEnabled) {
+            startTime = systemTime(SYSTEM_TIME_MONOTONIC);
+        }
+
+        value = new TextLayoutValue(contextCount);
+
+        // Compute advances and store them
+        mShaper->computeValues(value.get(), paint,
+                reinterpret_cast<const UChar*>(key.getText()), start, count,
+                size_t(contextCount), int(dirFlags));
+
+        if (mDebugEnabled) {
+            value->setElapsedTime(systemTime(SYSTEM_TIME_MONOTONIC) - startTime);
+        }
+
+        // Don't bother to add in the cache if the entry is too big
+        size_t size = key.getSize() + value->getSize();
+        if (size <= mMaxSize) {
+            // Cleanup to make some room if needed
+            if (mSize + size > mMaxSize) {
+                if (mDebugEnabled) {
+                    ALOGD("Need to clean some entries for making some room for a new entry");
+                }
+                while (mSize + size > mMaxSize) {
+                    // This will call the callback
+                    bool removedOne = mCache.removeOldest();
+                    LOG_ALWAYS_FATAL_IF(!removedOne, "The cache is non-empty but we "
+                            "failed to remove the oldest entry.  "
+                            "mSize = %u, size = %u, mMaxSize = %u, mCache.size() = %u",
+                            mSize, size, mMaxSize, mCache.size());
+                }
+            }
+
+            // Update current cache size
+            mSize += size;
+
+            bool putOne = mCache.put(key, value);
+            LOG_ALWAYS_FATAL_IF(!putOne, "Failed to put an entry into the cache.  "
+                    "This indicates that the cache already has an entry with the "
+                    "same key but it should not since we checked earlier!"
+                    " - start = %d, count = %d, contextCount = %d - Text = '%s'",
+                    start, count, contextCount, String8(key.getText() + start, count).string());
+
+            if (mDebugEnabled) {
+                nsecs_t totalTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
+                ALOGD("CACHE MISS: Added entry %p "
+                        "with start = %d, count = %d, contextCount = %d, "
+                        "entry size %d bytes, remaining space %d bytes"
+                        " - Compute time %0.6f ms - Put time %0.6f ms - Text = '%s'",
+                        value.get(), start, count, contextCount, size, mMaxSize - mSize,
+                        value->getElapsedTime() * 0.000001f,
+                        (totalTime - value->getElapsedTime()) * 0.000001f,
+                        String8(key.getText() + start, count).string());
+            }
+        } else {
+            if (mDebugEnabled) {
+                ALOGD("CACHE MISS: Calculated but not storing entry because it is too big "
+                        "with start = %d, count = %d, contextCount = %d, "
+                        "entry size %d bytes, remaining space %d bytes"
+                        " - Compute time %0.6f ms - Text = '%s'",
+                        start, count, contextCount, size, mMaxSize - mSize,
+                        value->getElapsedTime() * 0.000001f,
+                        String8(key.getText() + start, count).string());
+            }
+        }
+    } else {
+        // This is a cache hit, just log timestamp and user infos
+        if (mDebugEnabled) {
+            nsecs_t elapsedTimeThruCacheGet = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
+            mNanosecondsSaved += (value->getElapsedTime() - elapsedTimeThruCacheGet);
+            ++mCacheHitCount;
+
+            if (value->getElapsedTime() > 0) {
+                float deltaPercent = 100 * ((value->getElapsedTime() - elapsedTimeThruCacheGet)
+                        / ((float)value->getElapsedTime()));
+                ALOGD("CACHE HIT #%d with start = %d, count = %d, contextCount = %d"
+                        "- Compute time %0.6f ms - "
+                        "Cache get time %0.6f ms - Gain in percent: %2.2f - Text = '%s'",
+                        mCacheHitCount, start, count, contextCount,
+                        value->getElapsedTime() * 0.000001f,
+                        elapsedTimeThruCacheGet * 0.000001f,
+                        deltaPercent,
+                        String8(key.getText() + start, count).string());
+            }
+            if (mCacheHitCount % DEFAULT_DUMP_STATS_CACHE_HIT_INTERVAL == 0) {
+                dumpCacheStats();
+            }
+        }
+    }
+    return value;
+!!!954380.cpp!!!	purgeCaches() : void
+    AutoMutex _l(mLock);
+    mCache.clear();
+    mShaper->purgeCaches();
+!!!954508.cpp!!!	init() : void
+    mCache.setOnEntryRemovedListener(this);
+
+    mDebugLevel = readRtlDebugLevel();
+    mDebugEnabled = mDebugLevel & kRtlDebugCaches;
+    ALOGD("Using debug level = %d - Debug Enabled = %d", mDebugLevel, mDebugEnabled);
+
+    mCacheStartTime = systemTime(SYSTEM_TIME_MONOTONIC);
+
+    if (mDebugEnabled) {
+        ALOGD("Initialization is done - Start time = %lld", mCacheStartTime);
+    }
+
+    mInitialized = true;
+!!!954636.cpp!!!	dumpCacheStats() : void
+    float remainingPercent = 100 * ((mMaxSize - mSize) / ((float)mMaxSize));
+    float timeRunningInSec = (systemTime(SYSTEM_TIME_MONOTONIC) - mCacheStartTime) / 1000000000;
+
+    size_t bytes = 0;
+    size_t cacheSize = mCache.size();
+    for (size_t i = 0; i < cacheSize; i++) {
+        bytes += mCache.getKeyAt(i).getSize() + mCache.getValueAt(i)->getSize();
+    }
+
+    ALOGD("------------------------------------------------");
+    ALOGD("Cache stats");
+    ALOGD("------------------------------------------------");
+    ALOGD("pid       : %d", getpid());
+    ALOGD("running   : %.0f seconds", timeRunningInSec);
+    ALOGD("entries   : %d", cacheSize);
+    ALOGD("max size  : %d bytes", mMaxSize);
+    ALOGD("used      : %d bytes according to mSize, %d bytes actual", mSize, bytes);
+    ALOGD("remaining : %d bytes or %2.2f percent", mMaxSize - mSize, remainingPercent);
+    ALOGD("hits      : %d", mCacheHitCount);
+    ALOGD("saved     : %0.6f ms", mNanosecondsSaved * 0.000001f);
+    ALOGD("------------------------------------------------");

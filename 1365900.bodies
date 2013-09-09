@@ -1,0 +1,307 @@
+class NsdService
+!!!8239116.java!!!	cmdToString(in cmd : int) : String
+        cmd -= BASE;
+        if ((cmd >= 0) && (cmd < sCmdToString.length)) {
+            return sCmdToString[cmd];
+        } else {
+            return null;
+        }
+!!!8240780.java!!!	NsdService(inout context : Context)
+        mContext = context;
+        mContentResolver = context.getContentResolver();
+
+        mNativeConnector = new NativeDaemonConnector(new NativeCallbackReceiver(), "mdns", 10,
+                MDNS_TAG, 25);
+
+        mNsdStateMachine = new NsdStateMachine(TAG);
+        mNsdStateMachine.start();
+
+        Thread th = new Thread(mNativeConnector, MDNS_TAG);
+        th.start();
+!!!8240908.java!!!	create(inout context : Context) : NsdService
+        NsdService service = new NsdService(context);
+        service.mNativeDaemonConnected.await();
+        return service;
+!!!8241036.java!!!	getMessenger() : Messenger
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.INTERNET,
+            "NsdService");
+        return new Messenger(mNsdStateMachine.getHandler());
+!!!8241164.java!!!	setEnabled(inout enable : boolean) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.CONNECTIVITY_INTERNAL,
+                "NsdService");
+        Settings.Global.putInt(mContentResolver, Settings.Global.NSD_ON, enable ? 1 : 0);
+        if (enable) {
+            mNsdStateMachine.sendMessage(NsdManager.ENABLE);
+        } else {
+            mNsdStateMachine.sendMessage(NsdManager.DISABLE);
+        }
+!!!8241292.java!!!	sendNsdStateChangeBroadcast(inout enabled : boolean) : void
+        final Intent intent = new Intent(NsdManager.ACTION_NSD_STATE_CHANGED);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+        if (enabled) {
+            intent.putExtra(NsdManager.EXTRA_NSD_STATE, NsdManager.NSD_STATE_ENABLED);
+        } else {
+            intent.putExtra(NsdManager.EXTRA_NSD_STATE, NsdManager.NSD_STATE_DISABLED);
+        }
+        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+!!!8241420.java!!!	isNsdEnabled() : boolean
+        boolean ret = Settings.Global.getInt(mContentResolver, Settings.Global.NSD_ON, 1) == 1;
+        if (DBG) Slog.d(TAG, "Network service discovery enabled " + ret);
+        return ret;
+!!!8241548.java!!!	getUniqueId() : int
+        if (++mUniqueId == INVALID_ID) return ++mUniqueId;
+        return mUniqueId;
+!!!8242060.java!!!	handleNativeEvent(in code : int, in raw : String, inout cooked : String) : void
+        NsdServiceInfo servInfo;
+        int id = Integer.parseInt(cooked[1]);
+        ClientInfo clientInfo = mIdToClientInfoMap.get(id);
+        if (clientInfo == null) {
+            Slog.e(TAG, "Unique id with no client mapping: " + id);
+            return;
+        }
+
+        /* This goes in response as msg.arg2 */
+        int clientId = -1;
+        int keyId = clientInfo.mClientIds.indexOfValue(id);
+        if (keyId != -1) {
+            clientId = clientInfo.mClientIds.keyAt(keyId);
+        }
+        switch (code) {
+            case NativeResponseCode.SERVICE_FOUND:
+                /* NNN uniqueId serviceName regType domain */
+                if (DBG) Slog.d(TAG, "SERVICE_FOUND Raw: " + raw);
+                servInfo = new NsdServiceInfo(cooked[2], cooked[3], null);
+                clientInfo.mChannel.sendMessage(NsdManager.SERVICE_FOUND, 0,
+                        clientId, servInfo);
+                break;
+            case NativeResponseCode.SERVICE_LOST:
+                /* NNN uniqueId serviceName regType domain */
+                if (DBG) Slog.d(TAG, "SERVICE_LOST Raw: " + raw);
+                servInfo = new NsdServiceInfo(cooked[2], cooked[3], null);
+                clientInfo.mChannel.sendMessage(NsdManager.SERVICE_LOST, 0,
+                        clientId, servInfo);
+                break;
+            case NativeResponseCode.SERVICE_DISCOVERY_FAILED:
+                /* NNN uniqueId errorCode */
+                if (DBG) Slog.d(TAG, "SERVICE_DISC_FAILED Raw: " + raw);
+                clientInfo.mChannel.sendMessage(NsdManager.DISCOVER_SERVICES_FAILED,
+                        NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                break;
+            case NativeResponseCode.SERVICE_REGISTERED:
+                /* NNN regId serviceName regType */
+                if (DBG) Slog.d(TAG, "SERVICE_REGISTERED Raw: " + raw);
+                servInfo = new NsdServiceInfo(cooked[2], null, null);
+                clientInfo.mChannel.sendMessage(NsdManager.REGISTER_SERVICE_SUCCEEDED,
+                        id, clientId, servInfo);
+                break;
+            case NativeResponseCode.SERVICE_REGISTRATION_FAILED:
+                /* NNN regId errorCode */
+                if (DBG) Slog.d(TAG, "SERVICE_REGISTER_FAILED Raw: " + raw);
+                clientInfo.mChannel.sendMessage(NsdManager.REGISTER_SERVICE_FAILED,
+                        NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                break;
+            case NativeResponseCode.SERVICE_UPDATED:
+                /* NNN regId */
+                break;
+            case NativeResponseCode.SERVICE_UPDATE_FAILED:
+                /* NNN regId errorCode */
+                break;
+            case NativeResponseCode.SERVICE_RESOLVED:
+                /* NNN resolveId fullName hostName port txtlen txtdata */
+                if (DBG) Slog.d(TAG, "SERVICE_RESOLVED Raw: " + raw);
+                int index = cooked[2].indexOf(".");
+                if (index == -1) {
+                    Slog.e(TAG, "Invalid service found " + raw);
+                    break;
+                }
+                String name = cooked[2].substring(0, index);
+                String rest = cooked[2].substring(index);
+                String type = rest.replace(".local.", "");
+
+                clientInfo.mResolvedService.setServiceName(name);
+                clientInfo.mResolvedService.setServiceType(type);
+                clientInfo.mResolvedService.setPort(Integer.parseInt(cooked[4]));
+
+                stopResolveService(id);
+                if (!getAddrInfo(id, cooked[3])) {
+                    clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                            NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                    mIdToClientInfoMap.remove(id);
+                    clientInfo.mResolvedService = null;
+                }
+                break;
+            case NativeResponseCode.SERVICE_RESOLUTION_FAILED:
+                /* NNN resolveId errorCode */
+                if (DBG) Slog.d(TAG, "SERVICE_RESOLVE_FAILED Raw: " + raw);
+                stopResolveService(id);
+                mIdToClientInfoMap.remove(id);
+                clientInfo.mResolvedService = null;
+                clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                        NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                break;
+            case NativeResponseCode.SERVICE_GET_ADDR_FAILED:
+                /* NNN resolveId errorCode */
+                stopGetAddrInfo(id);
+                mIdToClientInfoMap.remove(id);
+                clientInfo.mResolvedService = null;
+                if (DBG) Slog.d(TAG, "SERVICE_RESOLVE_FAILED Raw: " + raw);
+                clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                        NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                break;
+            case NativeResponseCode.SERVICE_GET_ADDR_SUCCESS:
+                /* NNN resolveId hostname ttl addr */
+                if (DBG) Slog.d(TAG, "SERVICE_GET_ADDR_SUCCESS Raw: " + raw);
+                try {
+                    clientInfo.mResolvedService.setHost(InetAddress.getByName(cooked[4]));
+                    clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_SUCCEEDED,
+                            0, clientId, clientInfo.mResolvedService);
+                } catch (java.net.UnknownHostException e) {
+                    clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                            NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                }
+                stopGetAddrInfo(id);
+                mIdToClientInfoMap.remove(id);
+                clientInfo.mResolvedService = null;
+                break;
+            default:
+                break;
+        }
+!!!8242188.java!!!	startMDnsDaemon() : boolean
+        if (DBG) Slog.d(TAG, "startMDnsDaemon");
+        try {
+            mNativeConnector.execute("mdnssd", "start-service");
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to start daemon" + e);
+            return false;
+        }
+        return true;
+!!!8242316.java!!!	stopMDnsDaemon() : boolean
+        if (DBG) Slog.d(TAG, "stopMDnsDaemon");
+        try {
+            mNativeConnector.execute("mdnssd", "stop-service");
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to start daemon" + e);
+            return false;
+        }
+        return true;
+!!!8242444.java!!!	registerService(in regId : int, inout service : NsdServiceInfo) : boolean
+        if (DBG) Slog.d(TAG, "registerService: " + regId + " " + service);
+        try {
+            //Add txtlen and txtdata
+            mNativeConnector.execute("mdnssd", "register", regId, service.getServiceName(),
+                    service.getServiceType(), service.getPort());
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to execute registerService " + e);
+            return false;
+        }
+        return true;
+!!!8242572.java!!!	unregisterService(in regId : int) : boolean
+        if (DBG) Slog.d(TAG, "unregisterService: " + regId);
+        try {
+            mNativeConnector.execute("mdnssd", "stop-register", regId);
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to execute unregisterService " + e);
+            return false;
+        }
+        return true;
+!!!8242700.java!!!	updateService(in regId : int, inout t : DnsSdTxtRecord) : boolean
+        if (DBG) Slog.d(TAG, "updateService: " + regId + " " + t);
+        try {
+            if (t == null) return false;
+            mNativeConnector.execute("mdnssd", "update", regId, t.size(), t.getRawData());
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to updateServices " + e);
+            return false;
+        }
+        return true;
+!!!8242828.java!!!	discoverServices(in discoveryId : int, in serviceType : String) : boolean
+        if (DBG) Slog.d(TAG, "discoverServices: " + discoveryId + " " + serviceType);
+        try {
+            mNativeConnector.execute("mdnssd", "discover", discoveryId, serviceType);
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to discoverServices " + e);
+            return false;
+        }
+        return true;
+!!!8242956.java!!!	stopServiceDiscovery(in discoveryId : int) : boolean
+        if (DBG) Slog.d(TAG, "stopServiceDiscovery: " + discoveryId);
+        try {
+            mNativeConnector.execute("mdnssd", "stop-discover", discoveryId);
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to stopServiceDiscovery " + e);
+            return false;
+        }
+        return true;
+!!!8243084.java!!!	resolveService(in resolveId : int, inout service : NsdServiceInfo) : boolean
+        if (DBG) Slog.d(TAG, "resolveService: " + resolveId + " " + service);
+        try {
+            mNativeConnector.execute("mdnssd", "resolve", resolveId, service.getServiceName(),
+                    service.getServiceType(), "local.");
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to resolveService " + e);
+            return false;
+        }
+        return true;
+!!!8243212.java!!!	stopResolveService(in resolveId : int) : boolean
+        if (DBG) Slog.d(TAG, "stopResolveService: " + resolveId);
+        try {
+            mNativeConnector.execute("mdnssd", "stop-resolve", resolveId);
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to stop resolve " + e);
+            return false;
+        }
+        return true;
+!!!8243340.java!!!	getAddrInfo(in resolveId : int, in hostname : String) : boolean
+        if (DBG) Slog.d(TAG, "getAdddrInfo: " + resolveId);
+        try {
+            mNativeConnector.execute("mdnssd", "getaddrinfo", resolveId, hostname);
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to getAddrInfo " + e);
+            return false;
+        }
+        return true;
+!!!8243468.java!!!	stopGetAddrInfo(in resolveId : int) : boolean
+        if (DBG) Slog.d(TAG, "stopGetAdddrInfo: " + resolveId);
+        try {
+            mNativeConnector.execute("mdnssd", "stop-getaddrinfo", resolveId);
+        } catch(NativeDaemonConnectorException e) {
+            Slog.e(TAG, "Failed to stopGetAddrInfo " + e);
+            return false;
+        }
+        return true;
+!!!8243596.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump ServiceDiscoverService from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        for (ClientInfo client : mClients.values()) {
+            pw.println("Client Info");
+            pw.println(client);
+        }
+
+        mNsdStateMachine.dump(fd, pw, args);
+!!!8243724.java!!!	obtainMessage(inout srcMsg : Message) : Message
+        Message msg = Message.obtain();
+        msg.arg2 = srcMsg.arg2;
+        return msg;
+!!!8243852.java!!!	replyToMessage(inout msg : Message, in what : int) : void
+        if (msg.replyTo == null) return;
+        Message dstMsg = obtainMessage(msg);
+        dstMsg.what = what;
+        mReplyChannel.replyToMessage(msg, dstMsg);
+!!!8243980.java!!!	replyToMessage(inout msg : Message, in what : int, in arg1 : int) : void
+        if (msg.replyTo == null) return;
+        Message dstMsg = obtainMessage(msg);
+        dstMsg.what = what;
+        dstMsg.arg1 = arg1;
+        mReplyChannel.replyToMessage(msg, dstMsg);
+!!!8244108.java!!!	replyToMessage(inout msg : Message, in what : int, inout obj : Object) : void
+        if (msg.replyTo == null) return;
+        Message dstMsg = obtainMessage(msg);
+        dstMsg.what = what;
+        dstMsg.obj = obj;
+        mReplyChannel.replyToMessage(msg, dstMsg);

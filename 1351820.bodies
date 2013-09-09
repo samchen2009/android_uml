@@ -1,0 +1,1486 @@
+class PowerManagerService
+!!!8666764.java!!!	PowerManagerService()
+        synchronized (mLock) {
+            mWakeLockSuspendBlocker = createSuspendBlockerLocked("PowerManagerService");
+            mWakeLockSuspendBlocker.acquire();
+            mScreenOnBlocker = new ScreenOnBlockerImpl();
+            mDisplayBlanker = new DisplayBlankerImpl();
+            mHoldingWakeLockSuspendBlocker = true;
+            mWakefulness = WAKEFULNESS_AWAKE;
+        }
+
+        nativeInit();
+        nativeSetPowerState(true, true);
+!!!8666892.java!!!	init(inout context : Context, inout ls : LightsService, inout am : ActivityManagerService, inout bs : BatteryService, inout bss : IBatteryStats, inout dm : DisplayManagerService) : void
+        mContext = context;
+        mLightsService = ls;
+        mBatteryService = bs;
+        mBatteryStats = bss;
+        mDisplayManagerService = dm;
+        mHandlerThread = new HandlerThread(TAG);
+        mHandlerThread.start();
+        mHandler = new PowerManagerHandler(mHandlerThread.getLooper());
+
+        Watchdog.getInstance().addMonitor(this);
+
+        // Forcibly turn the screen on at boot so that it is in a known power state.
+        // We do this in init() rather than in the constructor because setting the
+        // screen state requires a call into surface flinger which then needs to call back
+        // into the activity manager to check permissions.  Unfortunately the
+        // activity manager is not running when the constructor is called, so we
+        // have to defer setting the screen state until this point.
+        mDisplayBlanker.unblankAllDisplays();
+!!!8667020.java!!!	setPolicy(inout policy : WindowManagerPolicy) : void
+        synchronized (mLock) {
+            mPolicy = policy;
+        }
+!!!8667148.java!!!	systemReady(inout twilight : TwilightService, inout dreamManager : DreamManagerService) : void
+        synchronized (mLock) {
+            mSystemReady = true;
+            mDreamManager = dreamManager;
+
+            PowerManager pm = (PowerManager)mContext.getSystemService(Context.POWER_SERVICE);
+            mScreenBrightnessSettingMinimum = pm.getMinimumScreenBrightnessSetting();
+            mScreenBrightnessSettingMaximum = pm.getMaximumScreenBrightnessSetting();
+            mScreenBrightnessSettingDefault = pm.getDefaultScreenBrightnessSetting();
+
+            SensorManager sensorManager = new SystemSensorManager(mHandler.getLooper());
+
+            // The notifier runs on the system server's main looper so as not to interfere
+            // with the animations and other critical functions of the power manager.
+            mNotifier = new Notifier(Looper.getMainLooper(), mContext, mBatteryStats,
+                    createSuspendBlockerLocked("PowerManagerService.Broadcasts"),
+                    mScreenOnBlocker, mPolicy);
+
+            // The display power controller runs on the power manager service's
+            // own handler thread to ensure timely operation.
+            mDisplayPowerController = new DisplayPowerController(mHandler.getLooper(),
+                    mContext, mNotifier, mLightsService, twilight, sensorManager,
+                    mDisplayManagerService, mDisplayBlanker,
+                    mDisplayPowerControllerCallbacks, mHandler);
+
+            mWirelessChargerDetector = new WirelessChargerDetector(sensorManager,
+                    createSuspendBlockerLocked("PowerManagerService.WirelessChargerDetector"));
+            mSettingsObserver = new SettingsObserver(mHandler);
+            mAttentionLight = mLightsService.getLight(LightsService.LIGHT_ID_ATTENTION);
+
+            // Register for broadcasts from other components of the system.
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_BATTERY_CHANGED);
+            mContext.registerReceiver(new BatteryReceiver(), filter, null, mHandler);
+
+            filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_BOOT_COMPLETED);
+            mContext.registerReceiver(new BootCompletedReceiver(), filter, null, mHandler);
+
+            filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_DREAMING_STARTED);
+            filter.addAction(Intent.ACTION_DREAMING_STOPPED);
+            mContext.registerReceiver(new DreamReceiver(), filter, null, mHandler);
+
+            filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_USER_SWITCHED);
+            mContext.registerReceiver(new UserSwitchedReceiver(), filter, null, mHandler);
+
+            filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_DOCK_EVENT);
+            mContext.registerReceiver(new DockReceiver(), filter, null, mHandler);
+
+            // Register for settings changes.
+            final ContentResolver resolver = mContext.getContentResolver();
+            resolver.registerContentObserver(Settings.Secure.getUriFor(
+                    Settings.Secure.SCREENSAVER_ENABLED),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.Secure.getUriFor(
+                    Settings.Secure.SCREENSAVER_ACTIVATE_ON_SLEEP),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.Secure.getUriFor(
+                    Settings.Secure.SCREENSAVER_ACTIVATE_ON_DOCK),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    Settings.System.SCREEN_OFF_TIMEOUT),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.Global.getUriFor(
+                    Settings.Global.STAY_ON_WHILE_PLUGGED_IN),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    Settings.System.SCREEN_BRIGHTNESS),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    Settings.System.SCREEN_BRIGHTNESS_MODE),
+                    false, mSettingsObserver, UserHandle.USER_ALL);
+
+            // Go.
+            readConfigurationLocked();
+            updateSettingsLocked();
+            mDirty |= DIRTY_BATTERY_STATE;
+            updatePowerStateLocked();
+        }
+!!!8667276.java!!!	readConfigurationLocked() : void
+        final Resources resources = mContext.getResources();
+
+        mWakeUpWhenPluggedOrUnpluggedConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_unplugTurnsOnScreen);
+        mDreamsSupportedConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_dreamsSupported);
+        mDreamsEnabledByDefaultConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_dreamsEnabledByDefault);
+        mDreamsActivatedOnSleepByDefaultConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_dreamsActivatedOnSleepByDefault);
+        mDreamsActivatedOnDockByDefaultConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_dreamsActivatedOnDockByDefault);
+!!!8667404.java!!!	updateSettingsLocked() : void
+        final ContentResolver resolver = mContext.getContentResolver();
+
+        mDreamsEnabledSetting = (Settings.Secure.getIntForUser(resolver,
+                Settings.Secure.SCREENSAVER_ENABLED,
+                mDreamsEnabledByDefaultConfig ? 1 : 0,
+                UserHandle.USER_CURRENT) != 0);
+        mDreamsActivateOnSleepSetting = (Settings.Secure.getIntForUser(resolver,
+                Settings.Secure.SCREENSAVER_ACTIVATE_ON_SLEEP,
+                mDreamsActivatedOnSleepByDefaultConfig ? 1 : 0,
+                UserHandle.USER_CURRENT) != 0);
+        mDreamsActivateOnDockSetting = (Settings.Secure.getIntForUser(resolver,
+                Settings.Secure.SCREENSAVER_ACTIVATE_ON_DOCK,
+                mDreamsActivatedOnDockByDefaultConfig ? 1 : 0,
+                UserHandle.USER_CURRENT) != 0);
+        mScreenOffTimeoutSetting = Settings.System.getIntForUser(resolver,
+                Settings.System.SCREEN_OFF_TIMEOUT, DEFAULT_SCREEN_OFF_TIMEOUT,
+                UserHandle.USER_CURRENT);
+        mStayOnWhilePluggedInSetting = Settings.Global.getInt(resolver,
+                Settings.Global.STAY_ON_WHILE_PLUGGED_IN, BatteryManager.BATTERY_PLUGGED_AC);
+
+        final int oldScreenBrightnessSetting = mScreenBrightnessSetting;
+        mScreenBrightnessSetting = Settings.System.getIntForUser(resolver,
+                Settings.System.SCREEN_BRIGHTNESS, mScreenBrightnessSettingDefault,
+                UserHandle.USER_CURRENT);
+        if (oldScreenBrightnessSetting != mScreenBrightnessSetting) {
+            mTemporaryScreenBrightnessSettingOverride = -1;
+        }
+
+        final float oldScreenAutoBrightnessAdjustmentSetting =
+                mScreenAutoBrightnessAdjustmentSetting;
+        mScreenAutoBrightnessAdjustmentSetting = Settings.System.getFloatForUser(resolver,
+                Settings.System.SCREEN_AUTO_BRIGHTNESS_ADJ, 0.0f,
+                UserHandle.USER_CURRENT);
+        if (oldScreenAutoBrightnessAdjustmentSetting != mScreenAutoBrightnessAdjustmentSetting) {
+            mTemporaryScreenAutoBrightnessAdjustmentSettingOverride = Float.NaN;
+        }
+
+        mScreenBrightnessModeSetting = Settings.System.getIntForUser(resolver,
+                Settings.System.SCREEN_BRIGHTNESS_MODE,
+                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL, UserHandle.USER_CURRENT);
+
+        mDirty |= DIRTY_SETTINGS;
+!!!8667532.java!!!	handleSettingsChangedLocked() : void
+        updateSettingsLocked();
+        updatePowerStateLocked();
+!!!8667660.java!!!	acquireWakeLock(inout lock : IBinder, in flags : int, in tag : String, inout ws : WorkSource) : void
+        if (lock == null) {
+            throw new IllegalArgumentException("lock must not be null");
+        }
+        PowerManager.validateWakeLockParameters(flags, tag);
+
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
+        if (ws != null && ws.size() != 0) {
+            mContext.enforceCallingOrSelfPermission(
+                    android.Manifest.permission.UPDATE_DEVICE_STATS, null);
+        } else {
+            ws = null;
+        }
+
+        final int uid = Binder.getCallingUid();
+        final int pid = Binder.getCallingPid();
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            acquireWakeLockInternal(lock, flags, tag, ws, uid, pid);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8667788.java!!!	acquireWakeLockInternal(inout lock : IBinder, in flags : int, in tag : String, inout ws : WorkSource, in uid : int, in pid : int) : void
+        synchronized (mLock) {
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "acquireWakeLockInternal: lock=" + Objects.hashCode(lock)
+                        + ", flags=0x" + Integer.toHexString(flags)
+                        + ", tag=\"" + tag + "\", ws=" + ws + ", uid=" + uid + ", pid=" + pid);
+            }
+
+            WakeLock wakeLock;
+            int index = findWakeLockIndexLocked(lock);
+            if (index >= 0) {
+                wakeLock = mWakeLocks.get(index);
+                if (!wakeLock.hasSameProperties(flags, tag, ws, uid, pid)) {
+                    // Update existing wake lock.  This shouldn't happen but is harmless.
+                    notifyWakeLockReleasedLocked(wakeLock);
+                    wakeLock.updateProperties(flags, tag, ws, uid, pid);
+                    notifyWakeLockAcquiredLocked(wakeLock);
+                }
+            } else {
+                wakeLock = new WakeLock(lock, flags, tag, ws, uid, pid);
+                try {
+                    lock.linkToDeath(wakeLock, 0);
+                } catch (RemoteException ex) {
+                    throw new IllegalArgumentException("Wake lock is already dead.");
+                }
+                notifyWakeLockAcquiredLocked(wakeLock);
+                mWakeLocks.add(wakeLock);
+            }
+
+            applyWakeLockFlagsOnAcquireLocked(wakeLock);
+            mDirty |= DIRTY_WAKE_LOCKS;
+            updatePowerStateLocked();
+        }
+!!!8667916.java!!!	isScreenLock(in wakeLock : WakeLock) : boolean
+        switch (wakeLock.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK) {
+            case PowerManager.FULL_WAKE_LOCK:
+            case PowerManager.SCREEN_BRIGHT_WAKE_LOCK:
+            case PowerManager.SCREEN_DIM_WAKE_LOCK:
+                return true;
+        }
+        return false;
+!!!8668044.java!!!	applyWakeLockFlagsOnAcquireLocked(inout wakeLock : WakeLock) : void
+        if ((wakeLock.mFlags & PowerManager.ACQUIRE_CAUSES_WAKEUP) != 0 &&
+                isScreenLock(wakeLock)) {
+            wakeUpNoUpdateLocked(SystemClock.uptimeMillis());
+        }
+!!!8668172.java!!!	releaseWakeLock(inout lock : IBinder, in flags : int) : void
+        if (lock == null) {
+            throw new IllegalArgumentException("lock must not be null");
+        }
+
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            releaseWakeLockInternal(lock, flags);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8668300.java!!!	releaseWakeLockInternal(inout lock : IBinder, in flags : int) : void
+        synchronized (mLock) {
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "releaseWakeLockInternal: lock=" + Objects.hashCode(lock)
+                        + ", flags=0x" + Integer.toHexString(flags));
+            }
+
+            int index = findWakeLockIndexLocked(lock);
+            if (index < 0) {
+                return;
+            }
+
+            WakeLock wakeLock = mWakeLocks.get(index);
+            mWakeLocks.remove(index);
+            notifyWakeLockReleasedLocked(wakeLock);
+            wakeLock.mLock.unlinkToDeath(wakeLock, 0);
+
+            if ((flags & PowerManager.WAIT_FOR_PROXIMITY_NEGATIVE) != 0) {
+                mRequestWaitForNegativeProximity = true;
+            }
+
+            applyWakeLockFlagsOnReleaseLocked(wakeLock);
+            mDirty |= DIRTY_WAKE_LOCKS;
+            updatePowerStateLocked();
+        }
+!!!8668428.java!!!	handleWakeLockDeath(inout wakeLock : WakeLock) : void
+        synchronized (mLock) {
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "handleWakeLockDeath: lock=" + Objects.hashCode(wakeLock.mLock));
+            }
+
+            int index = mWakeLocks.indexOf(wakeLock);
+            if (index < 0) {
+                return;
+            }
+
+            mWakeLocks.remove(index);
+            notifyWakeLockReleasedLocked(wakeLock);
+
+            applyWakeLockFlagsOnReleaseLocked(wakeLock);
+            mDirty |= DIRTY_WAKE_LOCKS;
+            updatePowerStateLocked();
+        }
+!!!8668556.java!!!	applyWakeLockFlagsOnReleaseLocked(inout wakeLock : WakeLock) : void
+        if ((wakeLock.mFlags & PowerManager.ON_AFTER_RELEASE) != 0) {
+            userActivityNoUpdateLocked(SystemClock.uptimeMillis(),
+                    PowerManager.USER_ACTIVITY_EVENT_OTHER,
+                    PowerManager.USER_ACTIVITY_FLAG_NO_CHANGE_LIGHTS,
+                    wakeLock.mOwnerUid);
+        }
+!!!8668684.java!!!	updateWakeLockWorkSource(inout lock : IBinder, inout ws : WorkSource) : void
+        if (lock == null) {
+            throw new IllegalArgumentException("lock must not be null");
+        }
+
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
+        if (ws != null && ws.size() != 0) {
+            mContext.enforceCallingOrSelfPermission(
+                    android.Manifest.permission.UPDATE_DEVICE_STATS, null);
+        } else {
+            ws = null;
+        }
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            updateWakeLockWorkSourceInternal(lock, ws);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8668812.java!!!	updateWakeLockWorkSourceInternal(inout lock : IBinder, inout ws : WorkSource) : void
+        synchronized (mLock) {
+            int index = findWakeLockIndexLocked(lock);
+            if (index < 0) {
+                throw new IllegalArgumentException("Wake lock not active");
+            }
+
+            WakeLock wakeLock = mWakeLocks.get(index);
+            if (!wakeLock.hasSameWorkSource(ws)) {
+                notifyWakeLockReleasedLocked(wakeLock);
+                wakeLock.updateWorkSource(ws);
+                notifyWakeLockAcquiredLocked(wakeLock);
+            }
+        }
+!!!8668940.java!!!	findWakeLockIndexLocked(inout lock : IBinder) : int
+        final int count = mWakeLocks.size();
+        for (int i = 0; i < count; i++) {
+            if (mWakeLocks.get(i).mLock == lock) {
+                return i;
+            }
+        }
+        return -1;
+!!!8669068.java!!!	notifyWakeLockAcquiredLocked(inout wakeLock : WakeLock) : void
+        if (mSystemReady) {
+            mNotifier.onWakeLockAcquired(wakeLock.mFlags, wakeLock.mTag,
+                    wakeLock.mOwnerUid, wakeLock.mOwnerPid, wakeLock.mWorkSource);
+        }
+!!!8669196.java!!!	notifyWakeLockReleasedLocked(inout wakeLock : WakeLock) : void
+        if (mSystemReady) {
+            mNotifier.onWakeLockReleased(wakeLock.mFlags, wakeLock.mTag,
+                    wakeLock.mOwnerUid, wakeLock.mOwnerPid, wakeLock.mWorkSource);
+        }
+!!!8669324.java!!!	isWakeLockLevelSupported(in level : int) : boolean
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            return isWakeLockLevelSupportedInternal(level);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8669452.java!!!	isWakeLockLevelSupportedInternal(in level : int) : boolean
+        synchronized (mLock) {
+            switch (level) {
+                case PowerManager.PARTIAL_WAKE_LOCK:
+                case PowerManager.SCREEN_DIM_WAKE_LOCK:
+                case PowerManager.SCREEN_BRIGHT_WAKE_LOCK:
+                case PowerManager.FULL_WAKE_LOCK:
+                    return true;
+
+                case PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK:
+                    return mSystemReady && mDisplayPowerController.isProximitySensorAvailable();
+
+                default:
+                    return false;
+            }
+        }
+!!!8669580.java!!!	userActivity(in eventTime : long, in event : int, in flags : int) : void
+        final long now = SystemClock.uptimeMillis();
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER)
+                != PackageManager.PERMISSION_GRANTED) {
+            // Once upon a time applications could call userActivity().
+            // Now we require the DEVICE_POWER permission.  Log a warning and ignore the
+            // request instead of throwing a SecurityException so we don't break old apps.
+            synchronized (mLock) {
+                if (now >= mLastWarningAboutUserActivityPermission + (5 * 60 * 1000)) {
+                    mLastWarningAboutUserActivityPermission = now;
+                    Slog.w(TAG, "Ignoring call to PowerManager.userActivity() because the "
+                            + "caller does not have DEVICE_POWER permission.  "
+                            + "Please fix your app!  "
+                            + " pid=" + Binder.getCallingPid()
+                            + " uid=" + Binder.getCallingUid());
+                }
+            }
+            return;
+        }
+
+        if (eventTime > SystemClock.uptimeMillis()) {
+            throw new IllegalArgumentException("event time must not be in the future");
+        }
+
+        final int uid = Binder.getCallingUid();
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            userActivityInternal(eventTime, event, flags, uid);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8669708.java!!!	userActivityFromNative(in eventTime : long, in event : int, in flags : int) : void
+        userActivityInternal(eventTime, event, flags, Process.SYSTEM_UID);
+!!!8669836.java!!!	userActivityInternal(in eventTime : long, in event : int, in flags : int, in uid : int) : void
+        synchronized (mLock) {
+            if (userActivityNoUpdateLocked(eventTime, event, flags, uid)) {
+                updatePowerStateLocked();
+            }
+        }
+!!!8669964.java!!!	userActivityNoUpdateLocked(in eventTime : long, in event : int, in flags : int, in uid : int) : boolean
+        if (DEBUG_SPEW) {
+            Slog.d(TAG, "userActivityNoUpdateLocked: eventTime=" + eventTime
+                    + ", event=" + event + ", flags=0x" + Integer.toHexString(flags)
+                    + ", uid=" + uid);
+        }
+
+        if (eventTime < mLastSleepTime || eventTime < mLastWakeTime
+                || mWakefulness == WAKEFULNESS_ASLEEP || !mBootCompleted || !mSystemReady) {
+            return false;
+        }
+
+        mNotifier.onUserActivity(event, uid);
+
+        if ((flags & PowerManager.USER_ACTIVITY_FLAG_NO_CHANGE_LIGHTS) != 0) {
+            if (eventTime > mLastUserActivityTimeNoChangeLights
+                    && eventTime > mLastUserActivityTime) {
+                mLastUserActivityTimeNoChangeLights = eventTime;
+                mDirty |= DIRTY_USER_ACTIVITY;
+                return true;
+            }
+        } else {
+            if (eventTime > mLastUserActivityTime) {
+                mLastUserActivityTime = eventTime;
+                mDirty |= DIRTY_USER_ACTIVITY;
+                return true;
+            }
+        }
+        return false;
+!!!8670092.java!!!	wakeUp(in eventTime : long) : void
+        if (eventTime > SystemClock.uptimeMillis()) {
+            throw new IllegalArgumentException("event time must not be in the future");
+        }
+
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            wakeUpInternal(eventTime);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8670220.java!!!	wakeUpFromNative(in eventTime : long) : void
+        wakeUpInternal(eventTime);
+!!!8670348.java!!!	wakeUpInternal(in eventTime : long) : void
+        synchronized (mLock) {
+            if (wakeUpNoUpdateLocked(eventTime)) {
+                updatePowerStateLocked();
+            }
+        }
+!!!8670476.java!!!	wakeUpNoUpdateLocked(in eventTime : long) : boolean
+        if (DEBUG_SPEW) {
+            Slog.d(TAG, "wakeUpNoUpdateLocked: eventTime=" + eventTime);
+        }
+
+        if (eventTime < mLastSleepTime || mWakefulness == WAKEFULNESS_AWAKE
+                || !mBootCompleted || !mSystemReady) {
+            return false;
+        }
+
+        switch (mWakefulness) {
+            case WAKEFULNESS_ASLEEP:
+                Slog.i(TAG, "Waking up from sleep...");
+                sendPendingNotificationsLocked();
+                mNotifier.onWakeUpStarted();
+                mSendWakeUpFinishedNotificationWhenReady = true;
+                break;
+            case WAKEFULNESS_DREAMING:
+                Slog.i(TAG, "Waking up from dream...");
+                break;
+            case WAKEFULNESS_NAPPING:
+                Slog.i(TAG, "Waking up from nap...");
+                break;
+        }
+
+        mLastWakeTime = eventTime;
+        mWakefulness = WAKEFULNESS_AWAKE;
+        mDirty |= DIRTY_WAKEFULNESS;
+
+        userActivityNoUpdateLocked(
+                eventTime, PowerManager.USER_ACTIVITY_EVENT_OTHER, 0, Process.SYSTEM_UID);
+        return true;
+!!!8670604.java!!!	goToSleep(in eventTime : long, in reason : int) : void
+        if (eventTime > SystemClock.uptimeMillis()) {
+            throw new IllegalArgumentException("event time must not be in the future");
+        }
+
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            goToSleepInternal(eventTime, reason);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8670732.java!!!	goToSleepFromNative(in eventTime : long, in reason : int) : void
+        goToSleepInternal(eventTime, reason);
+!!!8670860.java!!!	goToSleepInternal(in eventTime : long, in reason : int) : void
+        synchronized (mLock) {
+            if (goToSleepNoUpdateLocked(eventTime, reason)) {
+                updatePowerStateLocked();
+            }
+        }
+!!!8670988.java!!!	goToSleepNoUpdateLocked(in eventTime : long, in reason : int) : boolean
+        if (DEBUG_SPEW) {
+            Slog.d(TAG, "goToSleepNoUpdateLocked: eventTime=" + eventTime + ", reason=" + reason);
+        }
+
+        if (eventTime < mLastWakeTime || mWakefulness == WAKEFULNESS_ASLEEP
+                || !mBootCompleted || !mSystemReady) {
+            return false;
+        }
+
+        switch (reason) {
+            case PowerManager.GO_TO_SLEEP_REASON_DEVICE_ADMIN:
+                Slog.i(TAG, "Going to sleep due to device administration policy...");
+                break;
+            case PowerManager.GO_TO_SLEEP_REASON_TIMEOUT:
+                Slog.i(TAG, "Going to sleep due to screen timeout...");
+                break;
+            default:
+                Slog.i(TAG, "Going to sleep by user request...");
+                reason = PowerManager.GO_TO_SLEEP_REASON_USER;
+                break;
+        }
+
+        sendPendingNotificationsLocked();
+        mNotifier.onGoToSleepStarted(reason);
+        mSendGoToSleepFinishedNotificationWhenReady = true;
+
+        mLastSleepTime = eventTime;
+        mDirty |= DIRTY_WAKEFULNESS;
+        mWakefulness = WAKEFULNESS_ASLEEP;
+
+        // Report the number of wake locks that will be cleared by going to sleep.
+        int numWakeLocksCleared = 0;
+        final int numWakeLocks = mWakeLocks.size();
+        for (int i = 0; i < numWakeLocks; i++) {
+            final WakeLock wakeLock = mWakeLocks.get(i);
+            switch (wakeLock.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK) {
+                case PowerManager.FULL_WAKE_LOCK:
+                case PowerManager.SCREEN_BRIGHT_WAKE_LOCK:
+                case PowerManager.SCREEN_DIM_WAKE_LOCK:
+                    numWakeLocksCleared += 1;
+                    break;
+            }
+        }
+        EventLog.writeEvent(EventLogTags.POWER_SLEEP_REQUESTED, numWakeLocksCleared);
+        return true;
+!!!8671116.java!!!	nap(in eventTime : long) : void
+        if (eventTime > SystemClock.uptimeMillis()) {
+            throw new IllegalArgumentException("event time must not be in the future");
+        }
+
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            napInternal(eventTime);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8671244.java!!!	napInternal(in eventTime : long) : void
+        synchronized (mLock) {
+            if (napNoUpdateLocked(eventTime)) {
+                updatePowerStateLocked();
+            }
+        }
+!!!8671372.java!!!	napNoUpdateLocked(in eventTime : long) : boolean
+        if (DEBUG_SPEW) {
+            Slog.d(TAG, "napNoUpdateLocked: eventTime=" + eventTime);
+        }
+
+        if (eventTime < mLastWakeTime || mWakefulness != WAKEFULNESS_AWAKE
+                || !mBootCompleted || !mSystemReady) {
+            return false;
+        }
+
+        Slog.i(TAG, "Nap time...");
+
+        mDirty |= DIRTY_WAKEFULNESS;
+        mWakefulness = WAKEFULNESS_NAPPING;
+        return true;
+!!!8671500.java!!!	updatePowerStateLocked() : void
+        if (!mSystemReady || mDirty == 0) {
+            return;
+        }
+
+        // Phase 0: Basic state updates.
+        updateIsPoweredLocked(mDirty);
+        updateStayOnLocked(mDirty);
+
+        // Phase 1: Update wakefulness.
+        // Loop because the wake lock and user activity computations are influenced
+        // by changes in wakefulness.
+        final long now = SystemClock.uptimeMillis();
+        int dirtyPhase2 = 0;
+        for (;;) {
+            int dirtyPhase1 = mDirty;
+            dirtyPhase2 |= dirtyPhase1;
+            mDirty = 0;
+
+            updateWakeLockSummaryLocked(dirtyPhase1);
+            updateUserActivitySummaryLocked(now, dirtyPhase1);
+            if (!updateWakefulnessLocked(dirtyPhase1)) {
+                break;
+            }
+        }
+
+        // Phase 2: Update dreams and display power state.
+        updateDreamLocked(dirtyPhase2);
+        updateDisplayPowerStateLocked(dirtyPhase2);
+
+        // Phase 3: Send notifications, if needed.
+        if (mDisplayReady) {
+            sendPendingNotificationsLocked();
+        }
+
+        // Phase 4: Update suspend blocker.
+        // Because we might release the last suspend blocker here, we need to make sure
+        // we finished everything else first!
+        updateSuspendBlockerLocked();
+!!!8671628.java!!!	sendPendingNotificationsLocked() : void
+        if (mSendWakeUpFinishedNotificationWhenReady) {
+            mSendWakeUpFinishedNotificationWhenReady = false;
+            mNotifier.onWakeUpFinished();
+        }
+        if (mSendGoToSleepFinishedNotificationWhenReady) {
+            mSendGoToSleepFinishedNotificationWhenReady = false;
+            mNotifier.onGoToSleepFinished();
+        }
+!!!8671756.java!!!	updateIsPoweredLocked(in dirty : int) : void
+        if ((dirty & DIRTY_BATTERY_STATE) != 0) {
+            final boolean wasPowered = mIsPowered;
+            final int oldPlugType = mPlugType;
+            mIsPowered = mBatteryService.isPowered(BatteryManager.BATTERY_PLUGGED_ANY);
+            mPlugType = mBatteryService.getPlugType();
+            mBatteryLevel = mBatteryService.getBatteryLevel();
+
+            if (DEBUG) {
+                Slog.d(TAG, "updateIsPoweredLocked: wasPowered=" + wasPowered
+                        + ", mIsPowered=" + mIsPowered
+                        + ", oldPlugType=" + oldPlugType
+                        + ", mPlugType=" + mPlugType
+                        + ", mBatteryLevel=" + mBatteryLevel);
+            }
+
+            if (wasPowered != mIsPowered || oldPlugType != mPlugType) {
+                mDirty |= DIRTY_IS_POWERED;
+
+                // Update wireless dock detection state.
+                final boolean dockedOnWirelessCharger = mWirelessChargerDetector.update(
+                        mIsPowered, mPlugType, mBatteryLevel);
+
+                // Treat plugging and unplugging the devices as a user activity.
+                // Users find it disconcerting when they plug or unplug the device
+                // and it shuts off right away.
+                // Some devices also wake the device when plugged or unplugged because
+                // they don't have a charging LED.
+                final long now = SystemClock.uptimeMillis();
+                if (shouldWakeUpWhenPluggedOrUnpluggedLocked(wasPowered, oldPlugType,
+                        dockedOnWirelessCharger)) {
+                    wakeUpNoUpdateLocked(now);
+                }
+                userActivityNoUpdateLocked(
+                        now, PowerManager.USER_ACTIVITY_EVENT_OTHER, 0, Process.SYSTEM_UID);
+
+                // Tell the notifier whether wireless charging has started so that
+                // it can provide feedback to the user.
+                if (dockedOnWirelessCharger) {
+                    mNotifier.onWirelessChargingStarted();
+                }
+            }
+        }
+!!!8671884.java!!!	shouldWakeUpWhenPluggedOrUnpluggedLocked(inout wasPowered : boolean, in oldPlugType : int, inout dockedOnWirelessCharger : boolean) : boolean
+        // Don't wake when powered unless configured to do so.
+        if (!mWakeUpWhenPluggedOrUnpluggedConfig) {
+            return false;
+        }
+
+        // Don't wake when undocked from wireless charger.
+        // See WirelessChargerDetector for justification.
+        if (wasPowered && !mIsPowered
+                && oldPlugType == BatteryManager.BATTERY_PLUGGED_WIRELESS) {
+            return false;
+        }
+
+        // Don't wake when docked on wireless charger unless we are certain of it.
+        // See WirelessChargerDetector for justification.
+        if (!wasPowered && mIsPowered
+                && mPlugType == BatteryManager.BATTERY_PLUGGED_WIRELESS
+                && !dockedOnWirelessCharger) {
+            return false;
+        }
+
+        // If already dreaming and becoming powered, then don't wake.
+        if (mIsPowered && (mWakefulness == WAKEFULNESS_NAPPING
+                || mWakefulness == WAKEFULNESS_DREAMING)) {
+            return false;
+        }
+
+        // Otherwise wake up!
+        return true;
+!!!8672012.java!!!	updateStayOnLocked(in dirty : int) : void
+        if ((dirty & (DIRTY_BATTERY_STATE | DIRTY_SETTINGS)) != 0) {
+            final boolean wasStayOn = mStayOn;
+            if (mStayOnWhilePluggedInSetting != 0
+                    && !isMaximumScreenOffTimeoutFromDeviceAdminEnforcedLocked()) {
+                mStayOn = mBatteryService.isPowered(mStayOnWhilePluggedInSetting);
+            } else {
+                mStayOn = false;
+            }
+
+            if (mStayOn != wasStayOn) {
+                mDirty |= DIRTY_STAY_ON;
+            }
+        }
+!!!8672140.java!!!	updateWakeLockSummaryLocked(in dirty : int) : void
+        if ((dirty & (DIRTY_WAKE_LOCKS | DIRTY_WAKEFULNESS)) != 0) {
+            mWakeLockSummary = 0;
+
+            final int numWakeLocks = mWakeLocks.size();
+            for (int i = 0; i < numWakeLocks; i++) {
+                final WakeLock wakeLock = mWakeLocks.get(i);
+                switch (wakeLock.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK) {
+                    case PowerManager.PARTIAL_WAKE_LOCK:
+                        mWakeLockSummary |= WAKE_LOCK_CPU;
+                        break;
+                    case PowerManager.FULL_WAKE_LOCK:
+                        if (mWakefulness != WAKEFULNESS_ASLEEP) {
+                            mWakeLockSummary |= WAKE_LOCK_CPU
+                                    | WAKE_LOCK_SCREEN_BRIGHT | WAKE_LOCK_BUTTON_BRIGHT;
+                            if (mWakefulness == WAKEFULNESS_AWAKE) {
+                                mWakeLockSummary |= WAKE_LOCK_STAY_AWAKE;
+                            }
+                        }
+                        break;
+                    case PowerManager.SCREEN_BRIGHT_WAKE_LOCK:
+                        if (mWakefulness != WAKEFULNESS_ASLEEP) {
+                            mWakeLockSummary |= WAKE_LOCK_CPU | WAKE_LOCK_SCREEN_BRIGHT;
+                            if (mWakefulness == WAKEFULNESS_AWAKE) {
+                                mWakeLockSummary |= WAKE_LOCK_STAY_AWAKE;
+                            }
+                        }
+                        break;
+                    case PowerManager.SCREEN_DIM_WAKE_LOCK:
+                        if (mWakefulness != WAKEFULNESS_ASLEEP) {
+                            mWakeLockSummary |= WAKE_LOCK_CPU | WAKE_LOCK_SCREEN_DIM;
+                            if (mWakefulness == WAKEFULNESS_AWAKE) {
+                                mWakeLockSummary |= WAKE_LOCK_STAY_AWAKE;
+                            }
+                        }
+                        break;
+                    case PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK:
+                        if (mWakefulness != WAKEFULNESS_ASLEEP) {
+                            mWakeLockSummary |= WAKE_LOCK_CPU | WAKE_LOCK_PROXIMITY_SCREEN_OFF;
+                        }
+                        break;
+                }
+            }
+
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "updateWakeLockSummaryLocked: mWakefulness="
+                        + wakefulnessToString(mWakefulness)
+                        + ", mWakeLockSummary=0x" + Integer.toHexString(mWakeLockSummary));
+            }
+        }
+!!!8672268.java!!!	updateUserActivitySummaryLocked(in now : long, in dirty : int) : void
+        // Update the status of the user activity timeout timer.
+        if ((dirty & (DIRTY_USER_ACTIVITY | DIRTY_WAKEFULNESS | DIRTY_SETTINGS)) != 0) {
+            mHandler.removeMessages(MSG_USER_ACTIVITY_TIMEOUT);
+
+            long nextTimeout = 0;
+            if (mWakefulness != WAKEFULNESS_ASLEEP) {
+                final int screenOffTimeout = getScreenOffTimeoutLocked();
+                final int screenDimDuration = getScreenDimDurationLocked(screenOffTimeout);
+
+                mUserActivitySummary = 0;
+                if (mLastUserActivityTime >= mLastWakeTime) {
+                    nextTimeout = mLastUserActivityTime
+                            + screenOffTimeout - screenDimDuration;
+                    if (now < nextTimeout) {
+                        mUserActivitySummary |= USER_ACTIVITY_SCREEN_BRIGHT;
+                    } else {
+                        nextTimeout = mLastUserActivityTime + screenOffTimeout;
+                        if (now < nextTimeout) {
+                            mUserActivitySummary |= USER_ACTIVITY_SCREEN_DIM;
+                        }
+                    }
+                }
+                if (mUserActivitySummary == 0
+                        && mLastUserActivityTimeNoChangeLights >= mLastWakeTime) {
+                    nextTimeout = mLastUserActivityTimeNoChangeLights + screenOffTimeout;
+                    if (now < nextTimeout
+                            && mDisplayPowerRequest.screenState
+                                    != DisplayPowerRequest.SCREEN_STATE_OFF) {
+                        mUserActivitySummary = mDisplayPowerRequest.screenState
+                                == DisplayPowerRequest.SCREEN_STATE_BRIGHT ?
+                                USER_ACTIVITY_SCREEN_BRIGHT : USER_ACTIVITY_SCREEN_DIM;
+                    }
+                }
+                if (mUserActivitySummary != 0) {
+                    Message msg = mHandler.obtainMessage(MSG_USER_ACTIVITY_TIMEOUT);
+                    msg.setAsynchronous(true);
+                    mHandler.sendMessageAtTime(msg, nextTimeout);
+                }
+            } else {
+                mUserActivitySummary = 0;
+            }
+
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "updateUserActivitySummaryLocked: mWakefulness="
+                        + wakefulnessToString(mWakefulness)
+                        + ", mUserActivitySummary=0x" + Integer.toHexString(mUserActivitySummary)
+                        + ", nextTimeout=" + TimeUtils.formatUptime(nextTimeout));
+            }
+        }
+!!!8672396.java!!!	handleUserActivityTimeout() : void
+ // runs on handler thread
+        synchronized (mLock) {
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "handleUserActivityTimeout");
+            }
+
+            mDirty |= DIRTY_USER_ACTIVITY;
+            updatePowerStateLocked();
+        }
+!!!8672524.java!!!	getScreenOffTimeoutLocked() : int
+        int timeout = mScreenOffTimeoutSetting;
+        if (isMaximumScreenOffTimeoutFromDeviceAdminEnforcedLocked()) {
+            timeout = Math.min(timeout, mMaximumScreenOffTimeoutFromDeviceAdmin);
+        }
+        if (mUserActivityTimeoutOverrideFromWindowManager >= 0) {
+            timeout = (int)Math.min(timeout, mUserActivityTimeoutOverrideFromWindowManager);
+        }
+        return Math.max(timeout, MINIMUM_SCREEN_OFF_TIMEOUT);
+!!!8672652.java!!!	getScreenDimDurationLocked(in screenOffTimeout : int) : int
+        return Math.min(SCREEN_DIM_DURATION,
+                (int)(screenOffTimeout * MAXIMUM_SCREEN_DIM_RATIO));
+!!!8672780.java!!!	updateWakefulnessLocked(in dirty : int) : boolean
+        boolean changed = false;
+        if ((dirty & (DIRTY_WAKE_LOCKS | DIRTY_USER_ACTIVITY | DIRTY_BOOT_COMPLETED
+                | DIRTY_WAKEFULNESS | DIRTY_STAY_ON | DIRTY_PROXIMITY_POSITIVE
+                | DIRTY_DOCK_STATE)) != 0) {
+            if (mWakefulness == WAKEFULNESS_AWAKE && isItBedTimeYetLocked()) {
+                if (DEBUG_SPEW) {
+                    Slog.d(TAG, "updateWakefulnessLocked: Bed time...");
+                }
+                final long time = SystemClock.uptimeMillis();
+                if (shouldNapAtBedTimeLocked()) {
+                    changed = napNoUpdateLocked(time);
+                } else {
+                    changed = goToSleepNoUpdateLocked(time,
+                            PowerManager.GO_TO_SLEEP_REASON_TIMEOUT);
+                }
+            }
+        }
+        return changed;
+!!!8672908.java!!!	shouldNapAtBedTimeLocked() : boolean
+        return mDreamsActivateOnSleepSetting
+                || (mDreamsActivateOnDockSetting
+                        && mDockState != Intent.EXTRA_DOCK_STATE_UNDOCKED);
+!!!8673036.java!!!	isItBedTimeYetLocked() : boolean
+        return mBootCompleted && !isBeingKeptAwakeLocked();
+!!!8673164.java!!!	isBeingKeptAwakeLocked() : boolean
+        return mStayOn
+                || mProximityPositive
+                || (mWakeLockSummary & WAKE_LOCK_STAY_AWAKE) != 0
+                || (mUserActivitySummary & (USER_ACTIVITY_SCREEN_BRIGHT
+                        | USER_ACTIVITY_SCREEN_DIM)) != 0;
+!!!8673292.java!!!	updateDreamLocked(in dirty : int) : void
+        if ((dirty & (DIRTY_WAKEFULNESS
+                | DIRTY_USER_ACTIVITY
+                | DIRTY_WAKE_LOCKS
+                | DIRTY_BOOT_COMPLETED
+                | DIRTY_SETTINGS
+                | DIRTY_IS_POWERED
+                | DIRTY_STAY_ON
+                | DIRTY_PROXIMITY_POSITIVE
+                | DIRTY_BATTERY_STATE)) != 0) {
+            scheduleSandmanLocked();
+        }
+!!!8673420.java!!!	scheduleSandmanLocked() : void
+        if (!mSandmanScheduled) {
+            mSandmanScheduled = true;
+            Message msg = mHandler.obtainMessage(MSG_SANDMAN);
+            msg.setAsynchronous(true);
+            mHandler.sendMessage(msg);
+        }
+!!!8673548.java!!!	handleSandman() : void
+ // runs on handler thread
+        // Handle preconditions.
+        boolean startDreaming = false;
+        synchronized (mLock) {
+            mSandmanScheduled = false;
+            boolean canDream = canDreamLocked();
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "handleSandman: canDream=" + canDream
+                        + ", mWakefulness=" + wakefulnessToString(mWakefulness));
+            }
+
+            if (canDream && mWakefulness == WAKEFULNESS_NAPPING) {
+                startDreaming = true;
+            }
+        }
+
+        // Start dreaming if needed.
+        // We only control the dream on the handler thread, so we don't need to worry about
+        // concurrent attempts to start or stop the dream.
+        boolean isDreaming = false;
+        if (mDreamManager != null) {
+            if (startDreaming) {
+                mDreamManager.startDream();
+            }
+            isDreaming = mDreamManager.isDreaming();
+        }
+
+        // Update dream state.
+        // We might need to stop the dream again if the preconditions changed.
+        boolean continueDreaming = false;
+        synchronized (mLock) {
+            if (isDreaming && canDreamLocked()) {
+                if (mWakefulness == WAKEFULNESS_NAPPING) {
+                    mWakefulness = WAKEFULNESS_DREAMING;
+                    mDirty |= DIRTY_WAKEFULNESS;
+                    mBatteryLevelWhenDreamStarted = mBatteryLevel;
+                    updatePowerStateLocked();
+                    continueDreaming = true;
+                } else if (mWakefulness == WAKEFULNESS_DREAMING) {
+                    if (!isBeingKeptAwakeLocked()
+                            && mBatteryLevel < mBatteryLevelWhenDreamStarted
+                                    - DREAM_BATTERY_LEVEL_DRAIN_CUTOFF) {
+                        // If the user activity timeout expired and the battery appears
+                        // to be draining faster than it is charging then stop dreaming
+                        // and go to sleep.
+                        Slog.i(TAG, "Stopping dream because the battery appears to "
+                                + "be draining faster than it is charging.  "
+                                + "Battery level when dream started: "
+                                + mBatteryLevelWhenDreamStarted + "%.  "
+                                + "Battery level now: " + mBatteryLevel + "%.");
+                    } else {
+                        continueDreaming = true;
+                    }
+                }
+            }
+            if (!continueDreaming) {
+                handleDreamFinishedLocked();
+            }
+        }
+
+        // Stop dreaming if needed.
+        // It's possible that something else changed to make us need to start the dream again.
+        // If so, then the power manager will have posted another message to the handler
+        // to take care of it later.
+        if (mDreamManager != null) {
+            if (!continueDreaming) {
+                mDreamManager.stopDream();
+            }
+        }
+!!!8673676.java!!!	canDreamLocked() : boolean
+        return mDreamsSupportedConfig
+                && mDreamsEnabledSetting
+                && mDisplayPowerRequest.screenState != DisplayPowerRequest.SCREEN_STATE_OFF
+                && mBootCompleted
+                && (mIsPowered || isBeingKeptAwakeLocked());
+!!!8673804.java!!!	handleDreamFinishedLocked() : void
+        if (mWakefulness == WAKEFULNESS_NAPPING
+                || mWakefulness == WAKEFULNESS_DREAMING) {
+            if (isItBedTimeYetLocked()) {
+                goToSleepNoUpdateLocked(SystemClock.uptimeMillis(),
+                        PowerManager.GO_TO_SLEEP_REASON_TIMEOUT);
+                updatePowerStateLocked();
+            } else {
+                wakeUpNoUpdateLocked(SystemClock.uptimeMillis());
+                updatePowerStateLocked();
+            }
+        }
+!!!8673932.java!!!	handleScreenOnBlockerReleased() : void
+        synchronized (mLock) {
+            mDirty |= DIRTY_SCREEN_ON_BLOCKER_RELEASED;
+            updatePowerStateLocked();
+        }
+!!!8674060.java!!!	updateDisplayPowerStateLocked(in dirty : int) : void
+        if ((dirty & (DIRTY_WAKE_LOCKS | DIRTY_USER_ACTIVITY | DIRTY_WAKEFULNESS
+                | DIRTY_ACTUAL_DISPLAY_POWER_STATE_UPDATED | DIRTY_BOOT_COMPLETED
+                | DIRTY_SETTINGS | DIRTY_SCREEN_ON_BLOCKER_RELEASED)) != 0) {
+            int newScreenState = getDesiredScreenPowerStateLocked();
+            if (newScreenState != mDisplayPowerRequest.screenState) {
+                if (newScreenState == DisplayPowerRequest.SCREEN_STATE_OFF
+                        && mDisplayPowerRequest.screenState
+                                != DisplayPowerRequest.SCREEN_STATE_OFF) {
+                    mLastScreenOffEventElapsedRealTime = SystemClock.elapsedRealtime();
+                }
+
+                mDisplayPowerRequest.screenState = newScreenState;
+                nativeSetPowerState(
+                        newScreenState != DisplayPowerRequest.SCREEN_STATE_OFF,
+                        newScreenState == DisplayPowerRequest.SCREEN_STATE_BRIGHT);
+            }
+
+            int screenBrightness = mScreenBrightnessSettingDefault;
+            float screenAutoBrightnessAdjustment = 0.0f;
+            boolean autoBrightness = (mScreenBrightnessModeSetting ==
+                    Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC);
+            if (isValidBrightness(mScreenBrightnessOverrideFromWindowManager)) {
+                screenBrightness = mScreenBrightnessOverrideFromWindowManager;
+                autoBrightness = false;
+            } else if (isValidBrightness(mTemporaryScreenBrightnessSettingOverride)) {
+                screenBrightness = mTemporaryScreenBrightnessSettingOverride;
+            } else if (isValidBrightness(mScreenBrightnessSetting)) {
+                screenBrightness = mScreenBrightnessSetting;
+            }
+            if (autoBrightness) {
+                screenBrightness = mScreenBrightnessSettingDefault;
+                if (isValidAutoBrightnessAdjustment(
+                        mTemporaryScreenAutoBrightnessAdjustmentSettingOverride)) {
+                    screenAutoBrightnessAdjustment =
+                            mTemporaryScreenAutoBrightnessAdjustmentSettingOverride;
+                } else if (isValidAutoBrightnessAdjustment(
+                        mScreenAutoBrightnessAdjustmentSetting)) {
+                    screenAutoBrightnessAdjustment = mScreenAutoBrightnessAdjustmentSetting;
+                }
+            }
+            screenBrightness = Math.max(Math.min(screenBrightness,
+                    mScreenBrightnessSettingMaximum), mScreenBrightnessSettingMinimum);
+            screenAutoBrightnessAdjustment = Math.max(Math.min(
+                    screenAutoBrightnessAdjustment, 1.0f), -1.0f);
+            mDisplayPowerRequest.screenBrightness = screenBrightness;
+            mDisplayPowerRequest.screenAutoBrightnessAdjustment =
+                    screenAutoBrightnessAdjustment;
+            mDisplayPowerRequest.useAutoBrightness = autoBrightness;
+
+            mDisplayPowerRequest.useProximitySensor = shouldUseProximitySensorLocked();
+
+            mDisplayPowerRequest.blockScreenOn = mScreenOnBlocker.isHeld();
+
+            mDisplayReady = mDisplayPowerController.requestPowerState(mDisplayPowerRequest,
+                    mRequestWaitForNegativeProximity);
+            mRequestWaitForNegativeProximity = false;
+
+            if (DEBUG_SPEW) {
+                Slog.d(TAG, "updateScreenStateLocked: mDisplayReady=" + mDisplayReady
+                        + ", newScreenState=" + newScreenState
+                        + ", mWakefulness=" + mWakefulness
+                        + ", mWakeLockSummary=0x" + Integer.toHexString(mWakeLockSummary)
+                        + ", mUserActivitySummary=0x" + Integer.toHexString(mUserActivitySummary)
+                        + ", mBootCompleted=" + mBootCompleted);
+            }
+        }
+!!!8674188.java!!!	isValidBrightness(in value : int) : boolean
+        return value >= 0 && value <= 255;
+!!!8674316.java!!!	isValidAutoBrightnessAdjustment(in value : float) : boolean
+        // Handles NaN by always returning false.
+        return value >= -1.0f && value <= 1.0f;
+!!!8674444.java!!!	getDesiredScreenPowerStateLocked() : int
+        if (mWakefulness == WAKEFULNESS_ASLEEP) {
+            return DisplayPowerRequest.SCREEN_STATE_OFF;
+        }
+
+        if ((mWakeLockSummary & WAKE_LOCK_SCREEN_BRIGHT) != 0
+                || (mUserActivitySummary & USER_ACTIVITY_SCREEN_BRIGHT) != 0
+                || !mBootCompleted) {
+            return DisplayPowerRequest.SCREEN_STATE_BRIGHT;
+        }
+
+        return DisplayPowerRequest.SCREEN_STATE_DIM;
+!!!8674572.java!!!	shouldUseProximitySensorLocked() : boolean
+        return (mWakeLockSummary & WAKE_LOCK_PROXIMITY_SCREEN_OFF) != 0;
+!!!8674700.java!!!	updateSuspendBlockerLocked() : void
+        boolean wantCpu = isCpuNeededLocked();
+        if (wantCpu != mHoldingWakeLockSuspendBlocker) {
+            mHoldingWakeLockSuspendBlocker = wantCpu;
+            if (wantCpu) {
+                if (DEBUG) {
+                    Slog.d(TAG, "updateSuspendBlockerLocked: Acquiring suspend blocker.");
+                }
+                mWakeLockSuspendBlocker.acquire();
+            } else {
+                if (DEBUG) {
+                    Slog.d(TAG, "updateSuspendBlockerLocked: Releasing suspend blocker.");
+                }
+                mWakeLockSuspendBlocker.release();
+            }
+        }
+!!!8674828.java!!!	isCpuNeededLocked() : boolean
+        return !mBootCompleted
+                || mWakeLockSummary != 0
+                || mUserActivitySummary != 0
+                || mDisplayPowerRequest.screenState != DisplayPowerRequest.SCREEN_STATE_OFF
+                || !mDisplayReady;
+!!!8674956.java!!!	isScreenOn() : boolean
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            return isScreenOnInternal();
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8675084.java!!!	isScreenOnInternal() : boolean
+        synchronized (mLock) {
+            return !mSystemReady
+                    || mDisplayPowerRequest.screenState != DisplayPowerRequest.SCREEN_STATE_OFF;
+        }
+!!!8675212.java!!!	handleBatteryStateChangedLocked() : void
+        mDirty |= DIRTY_BATTERY_STATE;
+        updatePowerStateLocked();
+!!!8675340.java!!!	startWatchingForBootAnimationFinished() : void
+        mHandler.sendEmptyMessage(MSG_CHECK_IF_BOOT_ANIMATION_FINISHED);
+!!!8675468.java!!!	checkIfBootAnimationFinished() : void
+        if (DEBUG) {
+            Slog.d(TAG, "Check if boot animation finished...");
+        }
+
+        if (SystemService.isRunning(BOOT_ANIMATION_SERVICE)) {
+            mHandler.sendEmptyMessageDelayed(MSG_CHECK_IF_BOOT_ANIMATION_FINISHED,
+                    BOOT_ANIMATION_POLL_INTERVAL);
+            return;
+        }
+
+        synchronized (mLock) {
+            if (!mBootCompleted) {
+                Slog.i(TAG, "Boot animation finished.");
+                handleBootCompletedLocked();
+            }
+        }
+!!!8675596.java!!!	handleBootCompletedLocked() : void
+        final long now = SystemClock.uptimeMillis();
+        mBootCompleted = true;
+        mDirty |= DIRTY_BOOT_COMPLETED;
+        userActivityNoUpdateLocked(
+                now, PowerManager.USER_ACTIVITY_EVENT_OTHER, 0, Process.SYSTEM_UID);
+        updatePowerStateLocked();
+!!!8675724.java!!!	reboot(inout confirm : boolean, in reason : String, inout wait : boolean) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.REBOOT, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            shutdownOrRebootInternal(false, confirm, reason, wait);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8675852.java!!!	shutdown(inout confirm : boolean, inout wait : boolean) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.REBOOT, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            shutdownOrRebootInternal(true, confirm, null, wait);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8675980.java!!!	shutdownOrRebootInternal(in shutdown : boolean, in confirm : boolean, in reason : String, inout wait : boolean) : void
+        if (mHandler == null || !mSystemReady) {
+            throw new IllegalStateException("Too early to call shutdown() or reboot()");
+        }
+
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+                synchronized (this) {
+                    if (shutdown) {
+                        ShutdownThread.shutdown(mContext, confirm);
+                    } else {
+                        ShutdownThread.reboot(mContext, reason, confirm);
+                    }
+                }
+            }
+        };
+
+        // ShutdownThread must run on a looper capable of displaying the UI.
+        Message msg = Message.obtain(mHandler, runnable);
+        msg.setAsynchronous(true);
+        mHandler.sendMessage(msg);
+
+        // PowerManager.reboot() is documented not to return so just wait for the inevitable.
+        if (wait) {
+            synchronized (runnable) {
+                while (true) {
+                    try {
+                        runnable.wait();
+                    } catch (InterruptedException e) {
+                    }
+                }
+            }
+        }
+!!!8676108.java!!!	crash(in message : String) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.REBOOT, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            crashInternal(message);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8676236.java!!!	crashInternal(in message : String) : void
+        Thread t = new Thread("PowerManagerService.crash()") {
+            @Override
+            public void run() {
+                throw new RuntimeException(message);
+            }
+        };
+        try {
+            t.start();
+            t.join();
+        } catch (InterruptedException e) {
+            Log.wtf(TAG, e);
+        }
+!!!8676364.java!!!	setStayOnSetting(in val : int) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WRITE_SETTINGS, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setStayOnSettingInternal(val);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8676492.java!!!	setStayOnSettingInternal(in val : int) : void
+        Settings.Global.putInt(mContext.getContentResolver(),
+                Settings.Global.STAY_ON_WHILE_PLUGGED_IN, val);
+!!!8676620.java!!!	setMaximumScreenOffTimeoutFromDeviceAdmin(in timeMs : int) : void
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setMaximumScreenOffTimeoutFromDeviceAdminInternal(timeMs);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8676748.java!!!	setMaximumScreenOffTimeoutFromDeviceAdminInternal(in timeMs : int) : void
+        synchronized (mLock) {
+            mMaximumScreenOffTimeoutFromDeviceAdmin = timeMs;
+            mDirty |= DIRTY_SETTINGS;
+            updatePowerStateLocked();
+        }
+!!!8676876.java!!!	isMaximumScreenOffTimeoutFromDeviceAdminEnforcedLocked() : boolean
+        return mMaximumScreenOffTimeoutFromDeviceAdmin >= 0
+                && mMaximumScreenOffTimeoutFromDeviceAdmin < Integer.MAX_VALUE;
+!!!8677004.java!!!	setAttentionLight(inout on : boolean, in color : int) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setAttentionLightInternal(on, color);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8677132.java!!!	setAttentionLightInternal(inout on : boolean, in color : int) : void
+        LightsService.Light light;
+        synchronized (mLock) {
+            if (!mSystemReady) {
+                return;
+            }
+            light = mAttentionLight;
+        }
+
+        // Control light outside of lock.
+        light.setFlashing(color, LightsService.LIGHT_FLASH_HARDWARE, (on ? 3 : 0), 0);
+!!!8677260.java!!!	timeSinceScreenWasLastOn() : long
+        synchronized (mLock) {
+            if (mDisplayPowerRequest.screenState != DisplayPowerRequest.SCREEN_STATE_OFF) {
+                return 0;
+            }
+            return SystemClock.elapsedRealtime() - mLastScreenOffEventElapsedRealTime;
+        }
+!!!8677388.java!!!	setScreenBrightnessOverrideFromWindowManager(in brightness : int) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setScreenBrightnessOverrideFromWindowManagerInternal(brightness);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8677516.java!!!	setScreenBrightnessOverrideFromWindowManagerInternal(in brightness : int) : void
+        synchronized (mLock) {
+            if (mScreenBrightnessOverrideFromWindowManager != brightness) {
+                mScreenBrightnessOverrideFromWindowManager = brightness;
+                mDirty |= DIRTY_SETTINGS;
+                updatePowerStateLocked();
+            }
+        }
+!!!8677644.java!!!	setButtonBrightnessOverrideFromWindowManager(in brightness : int) : void
+        // Do nothing.
+        // Button lights are not currently supported in the new implementation.
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+!!!8677772.java!!!	setUserActivityTimeoutOverrideFromWindowManager(in timeoutMillis : long) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setUserActivityTimeoutOverrideFromWindowManagerInternal(timeoutMillis);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8677900.java!!!	setUserActivityTimeoutOverrideFromWindowManagerInternal(in timeoutMillis : long) : void
+        synchronized (mLock) {
+            if (mUserActivityTimeoutOverrideFromWindowManager != timeoutMillis) {
+                mUserActivityTimeoutOverrideFromWindowManager = timeoutMillis;
+                mDirty |= DIRTY_SETTINGS;
+                updatePowerStateLocked();
+            }
+        }
+!!!8678028.java!!!	setTemporaryScreenBrightnessSettingOverride(in brightness : int) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setTemporaryScreenBrightnessSettingOverrideInternal(brightness);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8678156.java!!!	setTemporaryScreenBrightnessSettingOverrideInternal(in brightness : int) : void
+        synchronized (mLock) {
+            if (mTemporaryScreenBrightnessSettingOverride != brightness) {
+                mTemporaryScreenBrightnessSettingOverride = brightness;
+                mDirty |= DIRTY_SETTINGS;
+                updatePowerStateLocked();
+            }
+        }
+!!!8678284.java!!!	setTemporaryScreenAutoBrightnessAdjustmentSettingOverride(in adj : float) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER, null);
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            setTemporaryScreenAutoBrightnessAdjustmentSettingOverrideInternal(adj);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!8678412.java!!!	setTemporaryScreenAutoBrightnessAdjustmentSettingOverrideInternal(in adj : float) : void
+        synchronized (mLock) {
+            // Note: This condition handles NaN because NaN is not equal to any other
+            // value, including itself.
+            if (mTemporaryScreenAutoBrightnessAdjustmentSettingOverride != adj) {
+                mTemporaryScreenAutoBrightnessAdjustmentSettingOverride = adj;
+                mDirty |= DIRTY_SETTINGS;
+                updatePowerStateLocked();
+            }
+        }
+!!!8678540.java!!!	lowLevelShutdown() : void
+        nativeShutdown();
+!!!8678668.java!!!	lowLevelReboot(in reason : String) : void
+        nativeReboot(reason);
+!!!8678796.java!!!	monitor() : void
+        // Grab and release lock for watchdog monitor to detect deadlocks.
+        synchronized (mLock) {
+        }
+!!!8678924.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump PowerManager from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        pw.println("POWER MANAGER (dumpsys power)\n");
+
+        final DisplayPowerController dpc;
+        final WirelessChargerDetector wcd;
+        synchronized (mLock) {
+            pw.println("Power Manager State:");
+            pw.println("  mDirty=0x" + Integer.toHexString(mDirty));
+            pw.println("  mWakefulness=" + wakefulnessToString(mWakefulness));
+            pw.println("  mIsPowered=" + mIsPowered);
+            pw.println("  mPlugType=" + mPlugType);
+            pw.println("  mBatteryLevel=" + mBatteryLevel);
+            pw.println("  mBatteryLevelWhenDreamStarted=" + mBatteryLevelWhenDreamStarted);
+            pw.println("  mDockState=" + mDockState);
+            pw.println("  mStayOn=" + mStayOn);
+            pw.println("  mProximityPositive=" + mProximityPositive);
+            pw.println("  mBootCompleted=" + mBootCompleted);
+            pw.println("  mSystemReady=" + mSystemReady);
+            pw.println("  mWakeLockSummary=0x" + Integer.toHexString(mWakeLockSummary));
+            pw.println("  mUserActivitySummary=0x" + Integer.toHexString(mUserActivitySummary));
+            pw.println("  mRequestWaitForNegativeProximity=" + mRequestWaitForNegativeProximity);
+            pw.println("  mSandmanScheduled=" + mSandmanScheduled);
+            pw.println("  mLastWakeTime=" + TimeUtils.formatUptime(mLastWakeTime));
+            pw.println("  mLastSleepTime=" + TimeUtils.formatUptime(mLastSleepTime));
+            pw.println("  mSendWakeUpFinishedNotificationWhenReady="
+                    + mSendWakeUpFinishedNotificationWhenReady);
+            pw.println("  mSendGoToSleepFinishedNotificationWhenReady="
+                    + mSendGoToSleepFinishedNotificationWhenReady);
+            pw.println("  mLastUserActivityTime=" + TimeUtils.formatUptime(mLastUserActivityTime));
+            pw.println("  mLastUserActivityTimeNoChangeLights="
+                    + TimeUtils.formatUptime(mLastUserActivityTimeNoChangeLights));
+            pw.println("  mDisplayReady=" + mDisplayReady);
+            pw.println("  mHoldingWakeLockSuspendBlocker=" + mHoldingWakeLockSuspendBlocker);
+
+            pw.println();
+            pw.println("Settings and Configuration:");
+            pw.println("  mDreamsSupportedConfig=" + mDreamsSupportedConfig);
+            pw.println("  mDreamsEnabledSetting=" + mDreamsEnabledSetting);
+            pw.println("  mDreamsActivateOnSleepSetting=" + mDreamsActivateOnSleepSetting);
+            pw.println("  mDreamsActivateOnDockSetting=" + mDreamsActivateOnDockSetting);
+            pw.println("  mScreenOffTimeoutSetting=" + mScreenOffTimeoutSetting);
+            pw.println("  mMaximumScreenOffTimeoutFromDeviceAdmin="
+                    + mMaximumScreenOffTimeoutFromDeviceAdmin + " (enforced="
+                    + isMaximumScreenOffTimeoutFromDeviceAdminEnforcedLocked() + ")");
+            pw.println("  mStayOnWhilePluggedInSetting=" + mStayOnWhilePluggedInSetting);
+            pw.println("  mScreenBrightnessSetting=" + mScreenBrightnessSetting);
+            pw.println("  mScreenAutoBrightnessAdjustmentSetting="
+                    + mScreenAutoBrightnessAdjustmentSetting);
+            pw.println("  mScreenBrightnessModeSetting=" + mScreenBrightnessModeSetting);
+            pw.println("  mScreenBrightnessOverrideFromWindowManager="
+                    + mScreenBrightnessOverrideFromWindowManager);
+            pw.println("  mUserActivityTimeoutOverrideFromWindowManager="
+                    + mUserActivityTimeoutOverrideFromWindowManager);
+            pw.println("  mTemporaryScreenBrightnessSettingOverride="
+                    + mTemporaryScreenBrightnessSettingOverride);
+            pw.println("  mTemporaryScreenAutoBrightnessAdjustmentSettingOverride="
+                    + mTemporaryScreenAutoBrightnessAdjustmentSettingOverride);
+            pw.println("  mScreenBrightnessSettingMinimum=" + mScreenBrightnessSettingMinimum);
+            pw.println("  mScreenBrightnessSettingMaximum=" + mScreenBrightnessSettingMaximum);
+            pw.println("  mScreenBrightnessSettingDefault=" + mScreenBrightnessSettingDefault);
+
+            final int screenOffTimeout = getScreenOffTimeoutLocked();
+            final int screenDimDuration = getScreenDimDurationLocked(screenOffTimeout);
+            pw.println();
+            pw.println("Screen off timeout: " + screenOffTimeout + " ms");
+            pw.println("Screen dim duration: " + screenDimDuration + " ms");
+
+            pw.println();
+            pw.println("Wake Locks: size=" + mWakeLocks.size());
+            for (WakeLock wl : mWakeLocks) {
+                pw.println("  " + wl);
+            }
+
+            pw.println();
+            pw.println("Suspend Blockers: size=" + mSuspendBlockers.size());
+            for (SuspendBlocker sb : mSuspendBlockers) {
+                pw.println("  " + sb);
+            }
+
+            pw.println();
+            pw.println("Screen On Blocker: " + mScreenOnBlocker);
+
+            pw.println();
+            pw.println("Display Blanker: " + mDisplayBlanker);
+
+            dpc = mDisplayPowerController;
+            wcd = mWirelessChargerDetector;
+        }
+
+        if (dpc != null) {
+            dpc.dump(pw);
+        }
+
+        if (wcd != null) {
+            wcd.dump(pw);
+        }
+!!!8679052.java!!!	createSuspendBlockerLocked(in name : String) : SuspendBlocker
+        SuspendBlocker suspendBlocker = new SuspendBlockerImpl(name);
+        mSuspendBlockers.add(suspendBlocker);
+        return suspendBlocker;
+!!!8679180.java!!!	wakefulnessToString(in wakefulness : int) : String
+        switch (wakefulness) {
+            case WAKEFULNESS_ASLEEP:
+                return "Asleep";
+            case WAKEFULNESS_AWAKE:
+                return "Awake";
+            case WAKEFULNESS_DREAMING:
+                return "Dreaming";
+            case WAKEFULNESS_NAPPING:
+                return "Napping";
+            default:
+                return Integer.toString(wakefulness);
+        }
+!!!8679308.java!!!	copyWorkSource(inout workSource : WorkSource) : WorkSource
+        return workSource != null ? new WorkSource(workSource) : null;

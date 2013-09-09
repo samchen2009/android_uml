@@ -1,0 +1,197 @@
+class Monitor
+!!!9982604.cpp!!!	Monitor()
+    mHead = NULL;
+    pthread_mutex_init(&mHeadMutex, NULL);
+    socketpair(AF_LOCAL, SOCK_STREAM, 0, mCtrlSocketPair);
+    pthread_create(&mThread, NULL, MDnsSdListener::Monitor::threadStart, this);
+!!!9982860.cpp!!!	allocateServiceRef(in id : int, inout context : Context) : DNSServiceRef
+    if (lookupServiceRef(id) != NULL) {
+        delete(context);
+        return NULL;
+    }
+    Element *e = new Element(id, context);
+    pthread_mutex_lock(&mHeadMutex);
+    e->mNext = mHead;
+    mHead = e;
+    pthread_mutex_unlock(&mHeadMutex);
+    return &(e->mRef);
+!!!9982988.cpp!!!	startMonitoring(in id : int) : void
+    if (VDBG) ALOGD("startMonitoring %d", id);
+    pthread_mutex_lock(&mHeadMutex);
+    Element *cur = mHead;
+    while (cur != NULL) {
+        if (cur->mId == id) {
+            if (DBG_RESCAN) ALOGD("marking %p as ready to be added", cur);
+            mLiveCount++;
+            cur->mReady = 1;
+            pthread_mutex_unlock(&mHeadMutex);
+            write(mCtrlSocketPair[1], RESCAN, 1);  // trigger a rescan for a fresh poll
+            if (VDBG) ALOGD("triggering rescan");
+            return;
+        }
+        cur = cur->mNext;
+    }
+    pthread_mutex_unlock(&mHeadMutex);
+!!!9983116.cpp!!!	lookupServiceRef(in id : int) : DNSServiceRef
+    pthread_mutex_lock(&mHeadMutex);
+    Element *cur = mHead;
+    while (cur != NULL) {
+        if (cur->mId == id) {
+            DNSServiceRef *result = &(cur->mRef);
+            pthread_mutex_unlock(&mHeadMutex);
+            return result;
+        }
+        cur = cur->mNext;
+    }
+    pthread_mutex_unlock(&mHeadMutex);
+    return NULL;
+!!!9983244.cpp!!!	freeServiceRef(in id : int) : void
+    if (VDBG) ALOGD("freeServiceRef %d", id);
+    pthread_mutex_lock(&mHeadMutex);
+    Element **prevPtr = &mHead;
+    Element *cur;
+    while (*prevPtr != NULL) {
+        cur = *prevPtr;
+        if (cur->mId == id) {
+            if (DBG_RESCAN) ALOGD("marking %p as ready to be removed", cur);
+            mLiveCount--;
+            if (cur->mReady == 1) {
+                cur->mReady = -1; // tell poll thread to delete
+                write(mCtrlSocketPair[1], RESCAN, 1); // trigger a rescan for a fresh poll
+                if (VDBG) ALOGD("triggering rescan");
+            } else {
+                *prevPtr = cur->mNext;
+                delete cur;
+            }
+            pthread_mutex_unlock(&mHeadMutex);
+            return;
+        }
+        prevPtr = &(cur->mNext);
+    }
+    pthread_mutex_unlock(&mHeadMutex);
+!!!9983372.cpp!!!	threadStart(inout obj : void) : void
+    Monitor *monitor = reinterpret_cast<Monitor *>(obj);
+
+    monitor->run();
+    delete monitor;
+    pthread_exit(NULL);
+    return NULL;
+!!!9983500.cpp!!!	startService() : int
+    int result = 0;
+    char property_value[PROPERTY_VALUE_MAX];
+    pthread_mutex_lock(&mHeadMutex);
+    property_get(MDNS_SERVICE_STATUS, property_value, "");
+    if (strcmp("running", property_value) != 0) {
+        ALOGD("Starting MDNSD");
+        property_set("ctl.start", MDNS_SERVICE_NAME);
+        wait_for_property(MDNS_SERVICE_STATUS, "running", 5);
+        result = -1;
+    } else {
+        result = 0;
+    }
+    pthread_mutex_unlock(&mHeadMutex);
+    return result;
+!!!9983628.cpp!!!	stopService() : int
+    int result = 0;
+    pthread_mutex_lock(&mHeadMutex);
+    if (mHead == NULL) {
+        ALOGD("Stopping MDNSD");
+        property_set("ctl.stop", MDNS_SERVICE_NAME);
+        wait_for_property(MDNS_SERVICE_STATUS, "stopped", 5);
+        result = -1;
+    } else {
+        result = 0;
+    }
+    pthread_mutex_unlock(&mHeadMutex);
+    return result;
+!!!9983756.cpp!!!	run() : void
+    int pollCount = 1;
+    mPollSize = 10;
+
+    mPollFds = (struct pollfd *)calloc(sizeof(struct pollfd), mPollSize);
+    mPollRefs = (DNSServiceRef **)calloc(sizeof(DNSServiceRef *), mPollSize);
+
+    mPollFds[0].fd = mCtrlSocketPair[0];
+    mPollFds[0].events = POLLIN;
+
+    if (VDBG) ALOGD("MDnsSdListener starting to monitor");
+    while (1) {
+        if (VDBG) ALOGD("Going to poll with pollCount %d", pollCount);
+        int pollResults = poll(mPollFds, pollCount, 10000000);
+        if (pollResults < 0) {
+            ALOGE("Error in poll - got %d", errno);
+        } else if (pollResults > 0) {
+            if (VDBG) ALOGD("Monitor poll got data pollCount = %d, %d", pollCount, pollResults);
+            for(int i = 1; i < pollCount; i++) {
+                if (mPollFds[i].revents != 0) {
+                    if (VDBG) {
+                        ALOGD("Monitor found [%d].revents = %d - calling ProcessResults",
+                                i, mPollFds[i].revents);
+                    }
+                    DNSServiceProcessResult(*(mPollRefs[i]));
+                    mPollFds[i].revents = 0;
+                }
+            }
+            if (VDBG) ALOGD("controlSocket shows revent= %d", mPollFds[0].revents);
+            switch (mPollFds[0].revents) {
+                case POLLIN: {
+                    char readBuf[2];
+                    read(mCtrlSocketPair[0], &readBuf, 1);
+                    if (DBG) ALOGD("MDnsSdListener::Monitor got %c", readBuf[0]);
+                    if (memcmp(RESCAN, readBuf, 1) == 0) {
+                        pollCount = rescan();
+                    }
+                }
+            }
+            mPollFds[0].revents = 0;
+        } else {
+            if (VDBG) ALOGD("MDnsSdListener::Monitor poll timed out");
+        }
+    }
+    free(mPollFds);
+    free(mPollRefs);
+!!!9983884.cpp!!!	rescan() : int
+// rescan the list from mHead and make new pollfds and serviceRefs
+    if (VDBG) {
+        ALOGD("MDnsSdListener::Monitor poll rescanning - size=%d, live=%d", mPollSize, mLiveCount);
+    }
+    int count = 0;
+    pthread_mutex_lock(&mHeadMutex);
+    Element **prevPtr = &mHead;
+    int i = 1;
+    if (mPollSize <= mLiveCount) {
+        mPollSize = mLiveCount + 5;
+        free(mPollFds);
+        free(mPollRefs);
+        mPollFds = (struct pollfd *)calloc(sizeof(struct pollfd), mPollSize);
+        mPollRefs = (DNSServiceRef **)calloc(sizeof(DNSServiceRef *), mPollSize);
+    } else {
+        memset(mPollFds, sizeof(struct pollfd) * mPollSize, 0);
+        memset(mPollRefs, sizeof(DNSServiceRef *) * mPollSize, 0);
+    }
+    mPollFds[0].fd = mCtrlSocketPair[0];
+    mPollFds[0].events = POLLIN;
+    if (DBG_RESCAN) ALOGD("mHead = %p", mHead);
+    while (*prevPtr != NULL) {
+        if (DBG_RESCAN) ALOGD("checking %p, mReady = %d", *prevPtr, (*prevPtr)->mReady);
+        if ((*prevPtr)->mReady == 1) {
+            int fd = DNSServiceRefSockFD((*prevPtr)->mRef);
+            if (fd != -1) {
+                if (DBG_RESCAN) ALOGD("  adding FD %d", fd);
+                mPollFds[i].fd = fd;
+                mPollFds[i].events = POLLIN;
+                mPollRefs[i] = &((*prevPtr)->mRef);
+                i++;
+            } else {
+                ALOGE("Error retreving socket FD for live ServiceRef");
+            }
+            prevPtr = &((*prevPtr)->mNext); // advance to the next element
+        } else if ((*prevPtr)->mReady == -1) {
+            if (DBG_RESCAN) ALOGD("  removing %p from  play", *prevPtr);
+            Element *cur = *prevPtr;
+            *prevPtr = (cur)->mNext; // change our notion of this element and don't advance
+            delete cur;
+        }
+    }
+    pthread_mutex_unlock(&mHeadMutex);
+    return i;

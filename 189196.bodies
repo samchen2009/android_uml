@@ -1,0 +1,145 @@
+class audio_track_cblk_t
+!!!445836.cpp!!!	stepUser(in frameCount : uint32_t) : uint32_t
+    ALOGV("stepuser %08x %08x %d", user, server, frameCount);
+
+    uint32_t u = user;
+    u += frameCount;
+    // Ensure that user is never ahead of server for AudioRecord
+    if (flags & CBLK_DIRECTION_MSK) {
+        // If stepServer() has been called once, switch to normal obtainBuffer() timeout period
+        if (bufferTimeoutMs == MAX_STARTUP_TIMEOUT_MS-1) {
+            bufferTimeoutMs = MAX_RUN_TIMEOUT_MS;
+        }
+    } else if (u > server) {
+        ALOGW("stepUser occurred after track reset");
+        u = server;
+    }
+
+    uint32_t fc = this->frameCount;
+    if (u >= fc) {
+        // common case, user didn't just wrap
+        if (u - fc >= userBase ) {
+            userBase += fc;
+        }
+    } else if (u >= userBase + fc) {
+        // user just wrapped
+        userBase += fc;
+    }
+
+    user = u;
+
+    // Clear flow control error condition as new data has been written/read to/from buffer.
+    if (flags & CBLK_UNDERRUN_MSK) {
+        android_atomic_and(~CBLK_UNDERRUN_MSK, &flags);
+    }
+
+    return u;
+!!!445964.cpp!!!	stepServer(in frameCount : uint32_t) : bool
+    ALOGV("stepserver %08x %08x %d", user, server, frameCount);
+
+    if (!tryLock()) {
+        ALOGW("stepServer() could not lock cblk");
+        return false;
+    }
+
+    uint32_t s = server;
+    bool flushed = (s == user);
+
+    s += frameCount;
+    if (flags & CBLK_DIRECTION_MSK) {
+        // Mark that we have read the first buffer so that next time stepUser() is called
+        // we switch to normal obtainBuffer() timeout period
+        if (bufferTimeoutMs == MAX_STARTUP_TIMEOUT_MS) {
+            bufferTimeoutMs = MAX_STARTUP_TIMEOUT_MS - 1;
+        }
+        // It is possible that we receive a flush()
+        // while the mixer is processing a block: in this case,
+        // stepServer() is called After the flush() has reset u & s and
+        // we have s > u
+        if (flushed) {
+            ALOGW("stepServer occurred after track reset");
+            s = user;
+        }
+    }
+
+    if (s >= loopEnd) {
+        ALOGW_IF(s > loopEnd, "stepServer: s %u > loopEnd %u", s, loopEnd);
+        s = loopStart;
+        if (--loopCount == 0) {
+            loopEnd = UINT_MAX;
+            loopStart = UINT_MAX;
+        }
+    }
+
+    uint32_t fc = this->frameCount;
+    if (s >= fc) {
+        // common case, server didn't just wrap
+        if (s - fc >= serverBase ) {
+            serverBase += fc;
+        }
+    } else if (s >= serverBase + fc) {
+        // server just wrapped
+        serverBase += fc;
+    }
+
+    server = s;
+
+    if (!(flags & CBLK_INVALID_MSK)) {
+        cv.signal();
+    }
+    lock.unlock();
+    return true;
+!!!446092.cpp!!!	buffer(in offset : uint32_t) : void
+    return (int8_t *)buffers + (offset - userBase) * frameSize;
+!!!446220.cpp!!!	framesAvailable() : uint32_t
+    Mutex::Autolock _l(lock);
+    return framesAvailable_l();
+!!!446348.cpp!!!	framesAvailable_l() : uint32_t
+    uint32_t u = user;
+    uint32_t s = server;
+
+    if (flags & CBLK_DIRECTION_MSK) {
+        uint32_t limit = (s < loopStart) ? s : loopStart;
+        return limit + frameCount - u;
+    } else {
+        return frameCount + u - s;
+    }
+!!!446476.cpp!!!	framesReady() : uint32_t
+    uint32_t u = user;
+    uint32_t s = server;
+
+    if (flags & CBLK_DIRECTION_MSK) {
+        if (u < loopEnd) {
+            return u - s;
+        } else {
+            // do not block on mutex shared with client on AudioFlinger side
+            if (!tryLock()) {
+                ALOGW("framesReady() could not lock cblk");
+                return 0;
+            }
+            uint32_t frames = UINT_MAX;
+            if (loopCount >= 0) {
+                frames = (loopEnd - loopStart)*loopCount + u - s;
+            }
+            lock.unlock();
+            return frames;
+        }
+    } else {
+        return s - u;
+    }
+!!!446604.cpp!!!	tryLock() : bool
+    // the code below simulates lock-with-timeout
+    // we MUST do this to protect the AudioFlinger server
+    // as this lock is shared with the client.
+    status_t err;
+
+    err = lock.tryLock();
+    if (err == -EBUSY) { // just wait a bit
+        usleep(1000);
+        err = lock.tryLock();
+    }
+    if (err != NO_ERROR) {
+        // probably, the client just died.
+        return false;
+    }
+    return true;

@@ -1,0 +1,164 @@
+class UserHistoryDictionary
+!!!12857868.java!!!	setDatabaseMax(in maxHistoryBigram : int) : void
+        sMaxHistoryBigrams = maxHistoryBigram;
+!!!12857996.java!!!	setDatabaseDelete(in deleteHistoryBigram : int) : void
+        sDeleteHistoryBigrams = deleteHistoryBigram;
+!!!12858124.java!!!	getInstance(in context : Context, in locale : String, in dictTypeId : int, in sp : SharedPreferences) : UserHistoryDictionary
+        if (sLangDictCache.containsKey(locale)) {
+            final SoftReference<UserHistoryDictionary> ref = sLangDictCache.get(locale);
+            final UserHistoryDictionary dict = ref == null ? null : ref.get();
+            if (dict != null) {
+                if (PROFILE_SAVE_RESTORE) {
+                    Log.w(TAG, "Use cached UserHistoryDictionary for " + locale);
+                }
+                return dict;
+            }
+        }
+        final UserHistoryDictionary dict =
+                new UserHistoryDictionary(context, locale, dictTypeId, sp);
+        sLangDictCache.put(locale, new SoftReference<UserHistoryDictionary>(dict));
+        return dict;
+!!!12858252.java!!!	UserHistoryDictionary(in context : Context, in locale : String, in dicTypeId : int, inout sp : SharedPreferences)
+        super(context, dicTypeId);
+        mLocale = locale;
+        mPrefs = sp;
+        if (sOpenHelper == null) {
+            sOpenHelper = new DatabaseHelper(getContext());
+        }
+        if (mLocale != null && mLocale.length() > 1) {
+            loadDictionary();
+        }
+!!!12858380.java!!!	close() : void
+        flushPendingWrites();
+        // Don't close the database as locale changes will require it to be reopened anyway
+        // Also, the database is written to somewhat frequently, so it needs to be kept alive
+        // throughout the life of the process.
+        // mOpenHelper.close();
+        // Ignore close because we cache UserHistoryDictionary for each language. See getInstance()
+        // above.
+        // super.close();
+!!!12858508.java!!!	isValidWord(in word : CharSequence) : boolean
+        // TODO: figure out what is the correct thing to do here.
+        return false;
+!!!12858636.java!!!	addToUserHistory(in word1 : String, in word2 : String, inout isValid : boolean) : int
+        if (mBigramListLock.tryLock()) {
+            try {
+                super.addWord(
+                        word2, null /* the "shortcut" parameter is null */, FREQUENCY_FOR_TYPED);
+                // Do not insert a word as a bigram of itself
+                if (word2.equals(word1)) {
+                    return 0;
+                }
+                final int freq;
+                if (null == word1) {
+                    freq = FREQUENCY_FOR_TYPED;
+                } else {
+                    freq = super.setBigramAndGetFrequency(
+                            word1, word2, new ForgettingCurveParams(isValid));
+                }
+                mBigramList.addBigram(word1, word2);
+                return freq;
+            } finally {
+                mBigramListLock.unlock();
+            }
+        }
+        return -1;
+!!!12858764.java!!!	cancelAddingUserHistory(in word1 : String, in word2 : String) : boolean
+        if (mBigramListLock.tryLock()) {
+            try {
+                if (mBigramList.removeBigram(word1, word2)) {
+                    return super.removeBigram(word1, word2);
+                }
+            } finally {
+                mBigramListLock.unlock();
+            }
+        }
+        return false;
+!!!12858892.java!!!	flushPendingWrites() : void
+        if (mBigramListLock.isLocked()) {
+            return;
+        }
+        // Create a background thread to write the pending entries
+        new UpdateDbTask(sOpenHelper, mBigramList, mLocale, this, mPrefs).execute();
+!!!12859020.java!!!	loadDictionaryAsync() : void
+        // This must be run on non-main thread
+        mBigramListLock.lock();
+        try {
+            loadDictionaryAsyncLocked();
+        } finally {
+            mBigramListLock.unlock();
+        }
+!!!12859148.java!!!	loadDictionaryAsyncLocked() : void
+        if (DBG_STRESS_TEST) {
+            try {
+                Log.w(TAG, "Start stress in loading: " + mLocale);
+                Thread.sleep(15000);
+                Log.w(TAG, "End stress in loading");
+            } catch (InterruptedException e) {
+            }
+        }
+        final long last = SettingsValues.getLastUserHistoryWriteTime(mPrefs, mLocale);
+        final boolean initializing = last == 0;
+        final long now = System.currentTimeMillis();
+        // Load the words that correspond to the current input locale
+        final Cursor cursor = query(MAIN_COLUMN_LOCALE + "=?", new String[] { mLocale });
+        if (null == cursor) return;
+        try {
+            // TODO: Call SQLiteDataBase.beginTransaction / SQLiteDataBase.endTransaction
+            if (cursor.moveToFirst()) {
+                final int word1Index = cursor.getColumnIndex(MAIN_COLUMN_WORD1);
+                final int word2Index = cursor.getColumnIndex(MAIN_COLUMN_WORD2);
+                final int fcIndex = cursor.getColumnIndex(COLUMN_FORGETTING_CURVE_VALUE);
+                while (!cursor.isAfterLast()) {
+                    final String word1 = cursor.getString(word1Index);
+                    final String word2 = cursor.getString(word2Index);
+                    final int fc = cursor.getInt(fcIndex);
+                    if (DBG_SAVE_RESTORE) {
+                        Log.d(TAG, "--- Load user history: " + word1 + ", " + word2 + ","
+                                + mLocale + "," + this);
+                    }
+                    // Safeguard against adding really long words. Stack may overflow due
+                    // to recursive lookup
+                    if (null == word1) {
+                        super.addWord(word2, null /* shortcut */, fc);
+                    } else if (word1.length() < BinaryDictionary.MAX_WORD_LENGTH
+                            && word2.length() < BinaryDictionary.MAX_WORD_LENGTH) {
+                        super.setBigramAndGetFrequency(
+                                word1, word2, initializing ? new ForgettingCurveParams(true)
+                                : new ForgettingCurveParams(fc, now, last));
+                    }
+                    mBigramList.addBigram(word1, word2, (byte)fc);
+                    cursor.moveToNext();
+                }
+            }
+        } finally {
+            cursor.close();
+            if (PROFILE_SAVE_RESTORE) {
+                final long diff = System.currentTimeMillis() - now;
+                Log.w(TAG, "PROF: Load User HistoryDictionary: "
+                        + mLocale + ", " + diff + "ms.");
+            }
+        }
+!!!12859276.java!!!	query(in selection : String, inout selectionArgs : String) : Cursor
+        SQLiteQueryBuilder qb = new SQLiteQueryBuilder();
+
+        // main INNER JOIN frequency ON (main._id=freq.pair_id)
+        qb.setTables(MAIN_TABLE_NAME + " INNER JOIN " + FREQ_TABLE_NAME + " ON ("
+                + MAIN_TABLE_NAME + "." + MAIN_COLUMN_ID + "=" + FREQ_TABLE_NAME + "."
+                + FREQ_COLUMN_PAIR_ID +")");
+
+        qb.setProjectionMap(sDictProjectionMap);
+
+        // Get the database and run the query
+        try {
+            SQLiteDatabase db = sOpenHelper.getReadableDatabase();
+            Cursor c = qb.query(db,
+                    new String[] {
+                            MAIN_COLUMN_WORD1, MAIN_COLUMN_WORD2, COLUMN_FORGETTING_CURVE_VALUE },
+                    selection, selectionArgs, null, null, null);
+            return c;
+        } catch (android.database.sqlite.SQLiteCantOpenDatabaseException e) {
+            // Can't open the database : presumably we can't access storage. That may happen
+            // when the device is wedged; do a best effort to still start the keyboard.
+            return null;
+        }

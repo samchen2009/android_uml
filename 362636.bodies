@@ -1,0 +1,182 @@
+class AMPEG4AudioAssembler
+!!!694796.cpp!!!	AMPEG4AudioAssembler(in notify : sp<AMessage>, in params : AString)
+    AString val;
+    if (!GetAttribute(params.c_str(), "cpresent", &val)) {
+        mMuxConfigPresent = true;
+    } else if (val == "0") {
+        mMuxConfigPresent = false;
+    } else {
+        CHECK(val == "1");
+        mMuxConfigPresent = true;
+    }
+
+    CHECK(GetAttribute(params.c_str(), "config", &val));
+
+    sp<ABuffer> config = decodeHex(val);
+    CHECK(config != NULL);
+
+    ABitReader bits(config->data(), config->size());
+    status_t err = parseStreamMuxConfig(
+            &bits, &mNumSubFrames, &mFrameLengthType,
+            &mFixedFrameLength,
+            &mOtherDataPresent, &mOtherDataLenBits);
+
+    CHECK_EQ(err, (status_t)NO_ERROR);
+!!!695052.cpp!!!	assembleMore(in source : sp<ARTPSource>) : AssemblyStatus
+    AssemblyStatus status = addPacket(source);
+    if (status == MALFORMED_PACKET) {
+        mAccessUnitDamaged = true;
+    }
+    return status;
+!!!695180.cpp!!!	onByeReceived() : void
+    sp<AMessage> msg = mNotifyMsg->dup();
+    msg->setInt32("eos", true);
+    msg->post();
+!!!695308.cpp!!!	packetLost() : void
+    CHECK(mNextExpectedSeqNoValid);
+    ++mNextExpectedSeqNo;
+
+    mAccessUnitDamaged = true;
+!!!695436.cpp!!!	addPacket(in source : sp<ARTPSource>) : AssemblyStatus
+    List<sp<ABuffer> > *queue = source->queue();
+
+    if (queue->empty()) {
+        return NOT_ENOUGH_DATA;
+    }
+
+    if (mNextExpectedSeqNoValid) {
+        List<sp<ABuffer> >::iterator it = queue->begin();
+        while (it != queue->end()) {
+            if ((uint32_t)(*it)->int32Data() >= mNextExpectedSeqNo) {
+                break;
+            }
+
+            it = queue->erase(it);
+        }
+
+        if (queue->empty()) {
+            return NOT_ENOUGH_DATA;
+        }
+    }
+
+    sp<ABuffer> buffer = *queue->begin();
+
+    if (!mNextExpectedSeqNoValid) {
+        mNextExpectedSeqNoValid = true;
+        mNextExpectedSeqNo = (uint32_t)buffer->int32Data();
+    } else if ((uint32_t)buffer->int32Data() != mNextExpectedSeqNo) {
+#if VERBOSE
+        LOG(VERBOSE) << "Not the sequence number I expected";
+#endif
+
+        return WRONG_SEQUENCE_NUMBER;
+    }
+
+    uint32_t rtpTime;
+    CHECK(buffer->meta()->findInt32("rtp-time", (int32_t *)&rtpTime));
+
+    if (mPackets.size() > 0 && rtpTime != mAccessUnitRTPTime) {
+        submitAccessUnit();
+    }
+    mAccessUnitRTPTime = rtpTime;
+
+    mPackets.push_back(buffer);
+
+    queue->erase(queue->begin());
+    ++mNextExpectedSeqNo;
+
+    return OK;
+!!!695564.cpp!!!	submitAccessUnit() : void
+    CHECK(!mPackets.empty());
+
+#if VERBOSE
+    LOG(VERBOSE) << "Access unit complete (" << mPackets.size() << " packets)";
+#endif
+
+    sp<ABuffer> accessUnit = MakeCompoundFromPackets(mPackets);
+    accessUnit = removeLATMFraming(accessUnit);
+    CopyTimes(accessUnit, *mPackets.begin());
+
+#if 0
+    printf(mAccessUnitDamaged ? "X" : ".");
+    fflush(stdout);
+#endif
+
+    if (mAccessUnitDamaged) {
+        accessUnit->meta()->setInt32("damaged", true);
+    }
+
+    mPackets.clear();
+    mAccessUnitDamaged = false;
+
+    sp<AMessage> msg = mNotifyMsg->dup();
+    msg->setBuffer("access-unit", accessUnit);
+    msg->post();
+!!!695692.cpp!!!	removeLATMFraming(in buffer : sp<ABuffer>) : sp<ABuffer>
+    CHECK(!mMuxConfigPresent);  // XXX to be implemented
+
+    sp<ABuffer> out = new ABuffer(buffer->size());
+    out->setRange(0, 0);
+
+    size_t offset = 0;
+    uint8_t *ptr = buffer->data();
+
+    for (size_t i = 0; i <= mNumSubFrames; ++i) {
+        // parse PayloadLengthInfo
+
+        unsigned payloadLength = 0;
+
+        switch (mFrameLengthType) {
+            case 0:
+            {
+                unsigned muxSlotLengthBytes = 0;
+                unsigned tmp;
+                do {
+                    CHECK_LT(offset, buffer->size());
+                    tmp = ptr[offset++];
+                    muxSlotLengthBytes += tmp;
+                } while (tmp == 0xff);
+
+                payloadLength = muxSlotLengthBytes;
+                break;
+            }
+
+            case 2:
+            {
+                // reserved
+
+                TRESPASS();
+                break;
+            }
+
+            default:
+            {
+                CHECK_GE(mFixedFrameLength, 0);
+
+                payloadLength = mFixedFrameLength;
+                break;
+            }
+        }
+
+        CHECK_LE(offset + payloadLength, buffer->size());
+
+        memcpy(out->data() + out->size(), &ptr[offset], payloadLength);
+        out->setRange(0, out->size() + payloadLength);
+
+        offset += payloadLength;
+
+        if (mOtherDataPresent) {
+            // We want to stay byte-aligned.
+
+            CHECK((mOtherDataLenBits % 8) == 0);
+            CHECK_LE(offset + (mOtherDataLenBits / 8), buffer->size());
+            offset += mOtherDataLenBits / 8;
+        }
+    }
+
+    if (offset < buffer->size()) {
+        ALOGI("ignoring %d bytes of trailing data", buffer->size() - offset);
+    }
+    CHECK_LE(offset, buffer->size());
+
+    return out;

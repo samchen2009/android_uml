@@ -1,0 +1,568 @@
+class DisplayManagerService
+!!!8115212.java!!!	DisplayManagerService(inout context : Context, inout mainHandler : Handler, inout uiHandler : Handler)
+        mContext = context;
+        mHeadless = SystemProperties.get(SYSTEM_HEADLESS).equals("1");
+
+        mHandler = new DisplayManagerHandler(mainHandler.getLooper());
+        mUiHandler = uiHandler;
+        mDisplayAdapterListener = new DisplayAdapterListener();
+        mSingleDisplayDemoMode = SystemProperties.getBoolean("persist.demo.singledisplay", false);
+
+        mHandler.sendEmptyMessage(MSG_REGISTER_DEFAULT_DISPLAY_ADAPTER);
+!!!8115340.java!!!	waitForDefaultDisplay() : boolean
+        synchronized (mSyncRoot) {
+            long timeout = SystemClock.uptimeMillis() + WAIT_FOR_DEFAULT_DISPLAY_TIMEOUT;
+            while (mLogicalDisplays.get(Display.DEFAULT_DISPLAY) == null) {
+                long delay = timeout - SystemClock.uptimeMillis();
+                if (delay <= 0) {
+                    return false;
+                }
+                if (DEBUG) {
+                    Slog.d(TAG, "waitForDefaultDisplay: waiting, timeout=" + delay);
+                }
+                try {
+                    mSyncRoot.wait(delay);
+                } catch (InterruptedException ex) {
+                }
+            }
+        }
+        return true;
+!!!8115468.java!!!	setWindowManager(inout windowManagerFuncs : WindowManagerFuncs) : void
+        synchronized (mSyncRoot) {
+            mWindowManagerFuncs = windowManagerFuncs;
+            scheduleTraversalLocked(false);
+        }
+!!!8115596.java!!!	setInputManager(inout inputManagerFuncs : InputManagerFuncs) : void
+        synchronized (mSyncRoot) {
+            mInputManagerFuncs = inputManagerFuncs;
+            scheduleTraversalLocked(false);
+        }
+!!!8115724.java!!!	systemReady(inout safeMode : boolean, inout onlyCore : boolean) : void
+        synchronized (mSyncRoot) {
+            mSafeMode = safeMode;
+            mOnlyCore = onlyCore;
+        }
+
+        mHandler.sendEmptyMessage(MSG_REGISTER_ADDITIONAL_DISPLAY_ADAPTERS);
+!!!8115852.java!!!	isHeadless() : boolean
+        return mHeadless;
+!!!8115980.java!!!	registerDisplayTransactionListener(inout listener : DisplayTransactionListener) : void
+        if (listener == null) {
+            throw new IllegalArgumentException("listener must not be null");
+        }
+
+        // List is self-synchronized copy-on-write.
+        mDisplayTransactionListeners.add(listener);
+!!!8116108.java!!!	unregisterDisplayTransactionListener(inout listener : DisplayTransactionListener) : void
+        if (listener == null) {
+            throw new IllegalArgumentException("listener must not be null");
+        }
+
+        // List is self-synchronized copy-on-write.
+        mDisplayTransactionListeners.remove(listener);
+!!!8116236.java!!!	setDisplayInfoOverrideFromWindowManager(in displayId : int, inout info : DisplayInfo) : void
+        synchronized (mSyncRoot) {
+            LogicalDisplay display = mLogicalDisplays.get(displayId);
+            if (display != null) {
+                mTempDisplayInfo.copyFrom(display.getDisplayInfoLocked());
+                display.setDisplayInfoOverrideFromWindowManagerLocked(info);
+                if (!mTempDisplayInfo.equals(display.getDisplayInfoLocked())) {
+                    sendDisplayEventLocked(displayId, DisplayManagerGlobal.EVENT_DISPLAY_CHANGED);
+                    scheduleTraversalLocked(false);
+                }
+            }
+        }
+!!!8116364.java!!!	performTraversalInTransactionFromWindowManager() : void
+        synchronized (mSyncRoot) {
+            if (!mPendingTraversal) {
+                return;
+            }
+            mPendingTraversal = false;
+
+            performTraversalInTransactionLocked();
+        }
+
+        // List is self-synchronized copy-on-write.
+        for (DisplayTransactionListener listener : mDisplayTransactionListeners) {
+            listener.onDisplayTransaction();
+        }
+!!!8116492.java!!!	blankAllDisplaysFromPowerManager() : void
+        synchronized (mSyncRoot) {
+            if (mAllDisplayBlankStateFromPowerManager != DISPLAY_BLANK_STATE_BLANKED) {
+                mAllDisplayBlankStateFromPowerManager = DISPLAY_BLANK_STATE_BLANKED;
+
+                final int count = mDisplayDevices.size();
+                for (int i = 0; i < count; i++) {
+                    DisplayDevice device = mDisplayDevices.get(i);
+                    device.blankLocked();
+                }
+
+                scheduleTraversalLocked(false);
+            }
+        }
+!!!8116620.java!!!	unblankAllDisplaysFromPowerManager() : void
+        synchronized (mSyncRoot) {
+            if (mAllDisplayBlankStateFromPowerManager != DISPLAY_BLANK_STATE_UNBLANKED) {
+                mAllDisplayBlankStateFromPowerManager = DISPLAY_BLANK_STATE_UNBLANKED;
+
+                final int count = mDisplayDevices.size();
+                for (int i = 0; i < count; i++) {
+                    DisplayDevice device = mDisplayDevices.get(i);
+                    device.unblankLocked();
+                }
+
+                scheduleTraversalLocked(false);
+            }
+        }
+!!!8116748.java!!!	getDisplayInfo(in displayId : int) : DisplayInfo
+        synchronized (mSyncRoot) {
+            LogicalDisplay display = mLogicalDisplays.get(displayId);
+            if (display != null) {
+                return display.getDisplayInfoLocked();
+            }
+            return null;
+        }
+!!!8116876.java!!!	getDisplayIds() : int
+        synchronized (mSyncRoot) {
+            final int count = mLogicalDisplays.size();
+            int[] displayIds = new int[count];
+            for (int i = 0; i < count; i++) {
+                displayIds[i] = mLogicalDisplays.keyAt(i);
+            }
+            return displayIds;
+        }
+!!!8117004.java!!!	registerCallback(inout callback : IDisplayManagerCallback) : void
+        if (callback == null) {
+            throw new IllegalArgumentException("listener must not be null");
+        }
+
+        synchronized (mSyncRoot) {
+            int callingPid = Binder.getCallingPid();
+            if (mCallbacks.get(callingPid) != null) {
+                throw new SecurityException("The calling process has already "
+                        + "registered an IDisplayManagerCallback.");
+            }
+
+            CallbackRecord record = new CallbackRecord(callingPid, callback);
+            try {
+                IBinder binder = callback.asBinder();
+                binder.linkToDeath(record, 0);
+            } catch (RemoteException ex) {
+                // give up
+                throw new RuntimeException(ex);
+            }
+
+            mCallbacks.put(callingPid, record);
+        }
+!!!8117132.java!!!	onCallbackDied(in pid : int) : void
+        synchronized (mSyncRoot) {
+            mCallbacks.remove(pid);
+        }
+!!!8117260.java!!!	scanWifiDisplays() : void
+        final long token = Binder.clearCallingIdentity();
+        try {
+            synchronized (mSyncRoot) {
+                if (mWifiDisplayAdapter != null) {
+                    mWifiDisplayAdapter.requestScanLocked();
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8117388.java!!!	connectWifiDisplay(in address : String) : void
+        if (address == null) {
+            throw new IllegalArgumentException("address must not be null");
+        }
+
+        final boolean trusted = canCallerConfigureWifiDisplay();
+        final long token = Binder.clearCallingIdentity();
+        try {
+            synchronized (mSyncRoot) {
+                if (mWifiDisplayAdapter != null) {
+                    mWifiDisplayAdapter.requestConnectLocked(address, trusted);
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8117516.java!!!	disconnectWifiDisplay() : void
+        final long token = Binder.clearCallingIdentity();
+        try {
+            synchronized (mSyncRoot) {
+                if (mWifiDisplayAdapter != null) {
+                    mWifiDisplayAdapter.requestDisconnectLocked();
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8117644.java!!!	renameWifiDisplay(in address : String, in alias : String) : void
+        if (address == null) {
+            throw new IllegalArgumentException("address must not be null");
+        }
+        if (!canCallerConfigureWifiDisplay()) {
+            throw new SecurityException("Requires CONFIGURE_WIFI_DISPLAY permission to "
+                    + "rename a wifi display.");
+        }
+
+        final long token = Binder.clearCallingIdentity();
+        try {
+            synchronized (mSyncRoot) {
+                if (mWifiDisplayAdapter != null) {
+                    mWifiDisplayAdapter.requestRenameLocked(address, alias);
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8117772.java!!!	forgetWifiDisplay(in address : String) : void
+        if (address == null) {
+            throw new IllegalArgumentException("address must not be null");
+        }
+        if (!canCallerConfigureWifiDisplay()) {
+            throw new SecurityException("Requires CONFIGURE_WIFI_DISPLAY permission to "
+                    + "forget a wifi display.");
+        }
+
+        final long token = Binder.clearCallingIdentity();
+        try {
+            synchronized (mSyncRoot) {
+                if (mWifiDisplayAdapter != null) {
+                    mWifiDisplayAdapter.requestForgetLocked(address);
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8117900.java!!!	getWifiDisplayStatus() : WifiDisplayStatus
+        final long token = Binder.clearCallingIdentity();
+        try {
+            synchronized (mSyncRoot) {
+                if (mWifiDisplayAdapter != null) {
+                    return mWifiDisplayAdapter.getWifiDisplayStatusLocked();
+                } else {
+                    return new WifiDisplayStatus();
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8118028.java!!!	canCallerConfigureWifiDisplay() : boolean
+        return mContext.checkCallingPermission(android.Manifest.permission.CONFIGURE_WIFI_DISPLAY)
+                == PackageManager.PERMISSION_GRANTED;
+!!!8118156.java!!!	registerDefaultDisplayAdapter() : void
+        // Register default display adapter.
+        synchronized (mSyncRoot) {
+            if (mHeadless) {
+                registerDisplayAdapterLocked(new HeadlessDisplayAdapter(
+                        mSyncRoot, mContext, mHandler, mDisplayAdapterListener));
+            } else {
+                registerDisplayAdapterLocked(new LocalDisplayAdapter(
+                        mSyncRoot, mContext, mHandler, mDisplayAdapterListener));
+            }
+        }
+!!!8118284.java!!!	registerAdditionalDisplayAdapters() : void
+        synchronized (mSyncRoot) {
+            if (shouldRegisterNonEssentialDisplayAdaptersLocked()) {
+                registerOverlayDisplayAdapterLocked();
+                registerWifiDisplayAdapterLocked();
+            }
+        }
+!!!8118412.java!!!	registerOverlayDisplayAdapterLocked() : void
+        registerDisplayAdapterLocked(new OverlayDisplayAdapter(
+                mSyncRoot, mContext, mHandler, mDisplayAdapterListener, mUiHandler));
+!!!8118540.java!!!	registerWifiDisplayAdapterLocked() : void
+        if (mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_enableWifiDisplay)
+                || SystemProperties.getInt(FORCE_WIFI_DISPLAY_ENABLE, -1) == 1) {
+            mWifiDisplayAdapter = new WifiDisplayAdapter(
+                    mSyncRoot, mContext, mHandler, mDisplayAdapterListener,
+                    mPersistentDataStore);
+            registerDisplayAdapterLocked(mWifiDisplayAdapter);
+        }
+!!!8118668.java!!!	shouldRegisterNonEssentialDisplayAdaptersLocked() : boolean
+        // In safe mode, we disable non-essential display adapters to give the user
+        // an opportunity to fix broken settings or other problems that might affect
+        // system stability.
+        // In only-core mode, we disable non-essential display adapters to minimize
+        // the number of dependencies that are started while in this mode and to
+        // prevent problems that might occur due to the device being encrypted.
+        return !mSafeMode && !mOnlyCore;
+!!!8118796.java!!!	registerDisplayAdapterLocked(inout adapter : DisplayAdapter) : void
+        mDisplayAdapters.add(adapter);
+        adapter.registerLocked();
+!!!8118924.java!!!	handleDisplayDeviceAdded(inout device : DisplayDevice) : void
+        synchronized (mSyncRoot) {
+            if (mDisplayDevices.contains(device)) {
+                Slog.w(TAG, "Attempted to add already added display device: "
+                        + device.getDisplayDeviceInfoLocked());
+                return;
+            }
+
+            Slog.i(TAG, "Display device added: " + device.getDisplayDeviceInfoLocked());
+
+            mDisplayDevices.add(device);
+            addLogicalDisplayLocked(device);
+            scheduleTraversalLocked(false);
+
+            // Blank or unblank the display immediately to match the state requested
+            // by the power manager (if known).
+            switch (mAllDisplayBlankStateFromPowerManager) {
+                case DISPLAY_BLANK_STATE_BLANKED:
+                    device.blankLocked();
+                    break;
+                case DISPLAY_BLANK_STATE_UNBLANKED:
+                    device.unblankLocked();
+                    break;
+            }
+        }
+!!!8119052.java!!!	handleDisplayDeviceChanged(inout device : DisplayDevice) : void
+        synchronized (mSyncRoot) {
+            if (!mDisplayDevices.contains(device)) {
+                Slog.w(TAG, "Attempted to change non-existent display device: "
+                        + device.getDisplayDeviceInfoLocked());
+                return;
+            }
+
+            Slog.i(TAG, "Display device changed: " + device.getDisplayDeviceInfoLocked());
+
+            device.applyPendingDisplayDeviceInfoChangesLocked();
+            if (updateLogicalDisplaysLocked()) {
+                scheduleTraversalLocked(false);
+            }
+        }
+!!!8119180.java!!!	handleDisplayDeviceRemoved(inout device : DisplayDevice) : void
+        synchronized (mSyncRoot) {
+            if (!mDisplayDevices.remove(device)) {
+                Slog.w(TAG, "Attempted to remove non-existent display device: "
+                        + device.getDisplayDeviceInfoLocked());
+                return;
+            }
+
+            Slog.i(TAG, "Display device removed: " + device.getDisplayDeviceInfoLocked());
+
+            mRemovedDisplayDevices.add(device);
+            updateLogicalDisplaysLocked();
+            scheduleTraversalLocked(false);
+        }
+!!!8119308.java!!!	addLogicalDisplayLocked(inout device : DisplayDevice) : void
+        DisplayDeviceInfo deviceInfo = device.getDisplayDeviceInfoLocked();
+        boolean isDefault = (deviceInfo.flags
+                & DisplayDeviceInfo.FLAG_DEFAULT_DISPLAY) != 0;
+        if (isDefault && mLogicalDisplays.get(Display.DEFAULT_DISPLAY) != null) {
+            Slog.w(TAG, "Ignoring attempt to add a second default display: " + deviceInfo);
+            isDefault = false;
+        }
+
+        if (!isDefault && mSingleDisplayDemoMode) {
+            Slog.i(TAG, "Not creating a logical display for a secondary display "
+                    + " because single display demo mode is enabled: " + deviceInfo);
+            return;
+        }
+
+        final int displayId = assignDisplayIdLocked(isDefault);
+        final int layerStack = assignLayerStackLocked(displayId);
+
+        LogicalDisplay display = new LogicalDisplay(displayId, layerStack, device);
+        display.updateLocked(mDisplayDevices);
+        if (!display.isValidLocked()) {
+            // This should never happen currently.
+            Slog.w(TAG, "Ignoring display device because the logical display "
+                    + "created from it was not considered valid: " + deviceInfo);
+            return;
+        }
+
+        mLogicalDisplays.put(displayId, display);
+
+        // Wake up waitForDefaultDisplay.
+        if (isDefault) {
+            mSyncRoot.notifyAll();
+        }
+
+        sendDisplayEventLocked(displayId, DisplayManagerGlobal.EVENT_DISPLAY_ADDED);
+!!!8119436.java!!!	assignDisplayIdLocked(inout isDefault : boolean) : int
+        return isDefault ? Display.DEFAULT_DISPLAY : mNextNonDefaultDisplayId++;
+!!!8119564.java!!!	assignLayerStackLocked(in displayId : int) : int
+        // Currently layer stacks and display ids are the same.
+        // This need not be the case.
+        return displayId;
+!!!8119692.java!!!	updateLogicalDisplaysLocked() : boolean
+        boolean changed = false;
+        for (int i = mLogicalDisplays.size(); i-- > 0; ) {
+            final int displayId = mLogicalDisplays.keyAt(i);
+            LogicalDisplay display = mLogicalDisplays.valueAt(i);
+
+            mTempDisplayInfo.copyFrom(display.getDisplayInfoLocked());
+            display.updateLocked(mDisplayDevices);
+            if (!display.isValidLocked()) {
+                mLogicalDisplays.removeAt(i);
+                sendDisplayEventLocked(displayId, DisplayManagerGlobal.EVENT_DISPLAY_REMOVED);
+                changed = true;
+            } else if (!mTempDisplayInfo.equals(display.getDisplayInfoLocked())) {
+                sendDisplayEventLocked(displayId, DisplayManagerGlobal.EVENT_DISPLAY_CHANGED);
+                changed = true;
+            }
+        }
+        return changed;
+!!!8119820.java!!!	performTraversalInTransactionLocked() : void
+        // Perform one last traversal for each removed display device.
+        final int removedCount = mRemovedDisplayDevices.size();
+        for (int i = 0; i < removedCount; i++) {
+            DisplayDevice device = mRemovedDisplayDevices.get(i);
+            device.performTraversalInTransactionLocked();
+        }
+        mRemovedDisplayDevices.clear();
+
+        // Clear all viewports before configuring displays so that we can keep
+        // track of which ones we have configured.
+        clearViewportsLocked();
+
+        // Configure each display device.
+        final int count = mDisplayDevices.size();
+        for (int i = 0; i < count; i++) {
+            DisplayDevice device = mDisplayDevices.get(i);
+            configureDisplayInTransactionLocked(device);
+            device.performTraversalInTransactionLocked();
+        }
+
+        // Tell the input system about these new viewports.
+        if (mInputManagerFuncs != null) {
+            mHandler.sendEmptyMessage(MSG_UPDATE_VIEWPORT);
+        }
+!!!8119948.java!!!	setDisplayHasContent(in displayId : int, inout hasContent : boolean, inout inTraversal : boolean) : void
+        synchronized (mSyncRoot) {
+            LogicalDisplay display = mLogicalDisplays.get(displayId);
+            if (display != null && display.hasContentLocked() != hasContent) {
+                display.setHasContentLocked(hasContent);
+                scheduleTraversalLocked(inTraversal);
+            }
+        }
+!!!8120076.java!!!	clearViewportsLocked() : void
+        mDefaultViewport.valid = false;
+        mExternalTouchViewport.valid = false;
+!!!8120204.java!!!	configureDisplayInTransactionLocked(inout device : DisplayDevice) : void
+        // Find the logical display that the display device is showing.
+        LogicalDisplay display = findLogicalDisplayForDeviceLocked(device);
+        if (display != null && !display.hasContentLocked()) {
+            display = null;
+        }
+        if (display == null) {
+            display = mLogicalDisplays.get(Display.DEFAULT_DISPLAY);
+        }
+
+        // Apply the logical display configuration to the display device.
+        if (display == null) {
+            // TODO: no logical display for the device, blank it
+            Slog.w(TAG, "Missing logical display to use for physical display device: "
+                    + device.getDisplayDeviceInfoLocked());
+            return;
+        } else {
+            boolean isBlanked = (mAllDisplayBlankStateFromPowerManager
+                    == DISPLAY_BLANK_STATE_BLANKED);
+            display.configureDisplayInTransactionLocked(device, isBlanked);
+        }
+
+        // Update the viewports if needed.
+        DisplayDeviceInfo info = device.getDisplayDeviceInfoLocked();
+        if (!mDefaultViewport.valid
+                && (info.flags & DisplayDeviceInfo.FLAG_DEFAULT_DISPLAY) != 0) {
+            setViewportLocked(mDefaultViewport, display, device);
+        }
+        if (!mExternalTouchViewport.valid
+                && info.touch == DisplayDeviceInfo.TOUCH_EXTERNAL) {
+            setViewportLocked(mExternalTouchViewport, display, device);
+        }
+!!!8120332.java!!!	setViewportLocked(inout viewport : DisplayViewport, inout display : LogicalDisplay, inout device : DisplayDevice) : void
+        viewport.valid = true;
+        viewport.displayId = display.getDisplayIdLocked();
+        device.populateViewportLocked(viewport);
+!!!8120460.java!!!	findLogicalDisplayForDeviceLocked(inout device : DisplayDevice) : LogicalDisplay
+        final int count = mLogicalDisplays.size();
+        for (int i = 0; i < count; i++) {
+            LogicalDisplay display = mLogicalDisplays.valueAt(i);
+            if (display.getPrimaryDisplayDeviceLocked() == device) {
+                return display;
+            }
+        }
+        return null;
+!!!8120588.java!!!	sendDisplayEventLocked(in displayId : int, in event : int) : void
+        Message msg = mHandler.obtainMessage(MSG_DELIVER_DISPLAY_EVENT, displayId, event);
+        mHandler.sendMessage(msg);
+!!!8120716.java!!!	scheduleTraversalLocked(inout inTraversal : boolean) : void
+        if (!mPendingTraversal && mWindowManagerFuncs != null) {
+            mPendingTraversal = true;
+            if (!inTraversal) {
+                mHandler.sendEmptyMessage(MSG_REQUEST_TRAVERSAL);
+            }
+        }
+!!!8120844.java!!!	deliverDisplayEvent(in displayId : int, in event : int) : void
+        if (DEBUG) {
+            Slog.d(TAG, "Delivering display event: displayId="
+                    + displayId + ", event=" + event);
+        }
+
+        // Grab the lock and copy the callbacks.
+        final int count;
+        synchronized (mSyncRoot) {
+            count = mCallbacks.size();
+            mTempCallbacks.clear();
+            for (int i = 0; i < count; i++) {
+                mTempCallbacks.add(mCallbacks.valueAt(i));
+            }
+        }
+
+        // After releasing the lock, send the notifications out.
+        for (int i = 0; i < count; i++) {
+            mTempCallbacks.get(i).notifyDisplayEventAsync(displayId, event);
+        }
+        mTempCallbacks.clear();
+!!!8120972.java!!!	dump(inout fd : FileDescriptor, in pw : PrintWriter, inout args : String) : void
+        if (mContext == null
+                || mContext.checkCallingOrSelfPermission(Manifest.permission.DUMP)
+                        != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump DisplayManager from from pid="
+                    + Binder.getCallingPid() + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        pw.println("DISPLAY MANAGER (dumpsys display)");
+
+        synchronized (mSyncRoot) {
+            pw.println("  mHeadless=" + mHeadless);
+            pw.println("  mOnlyCode=" + mOnlyCore);
+            pw.println("  mSafeMode=" + mSafeMode);
+            pw.println("  mPendingTraversal=" + mPendingTraversal);
+            pw.println("  mAllDisplayBlankStateFromPowerManager="
+                    + mAllDisplayBlankStateFromPowerManager);
+            pw.println("  mNextNonDefaultDisplayId=" + mNextNonDefaultDisplayId);
+            pw.println("  mDefaultViewport=" + mDefaultViewport);
+            pw.println("  mExternalTouchViewport=" + mExternalTouchViewport);
+            pw.println("  mSingleDisplayDemoMode=" + mSingleDisplayDemoMode);
+
+            IndentingPrintWriter ipw = new IndentingPrintWriter(pw, "    ");
+            ipw.increaseIndent();
+
+            pw.println();
+            pw.println("Display Adapters: size=" + mDisplayAdapters.size());
+            for (DisplayAdapter adapter : mDisplayAdapters) {
+                pw.println("  " + adapter.getName());
+                adapter.dumpLocked(ipw);
+            }
+
+            pw.println();
+            pw.println("Display Devices: size=" + mDisplayDevices.size());
+            for (DisplayDevice device : mDisplayDevices) {
+                pw.println("  " + device.getDisplayDeviceInfoLocked());
+                device.dumpLocked(ipw);
+            }
+
+            final int logicalDisplayCount = mLogicalDisplays.size();
+            pw.println();
+            pw.println("Logical Displays: size=" + logicalDisplayCount);
+            for (int i = 0; i < logicalDisplayCount; i++) {
+                int displayId = mLogicalDisplays.keyAt(i);
+                LogicalDisplay display = mLogicalDisplays.valueAt(i);
+                pw.println("  Display " + displayId + ":");
+                display.dumpLocked(ipw);
+            }
+        }

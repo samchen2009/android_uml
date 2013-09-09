@@ -1,0 +1,171 @@
+class FtpService
+!!!13395340.java!!!	clearFtpStartNotification() : void
+        mNotificationManager.cancel(sFtpStartNotificationId);
+!!!13396748.java!!!	stopByManyLoginFailure() : void
+        serverStop();
+        sendMessage(FtpServiceProxy.MSG_FTP_STATE_CHANGE);
+        showNotification(sFtpStateStopped, getString(R.string.ftp_many_login_failures));
+!!!13396876.java!!!	sendMessage(in message : int) : void
+        // Broadcast to all clients the new value.
+        final int N = mCallbacks.beginBroadcast();
+        for (int i = N - 1; i >= 0; --i) {
+            try {
+                mCallbacks.getBroadcastItem(i).stateChanged(message);
+            } catch (RemoteException e) {
+                Log.e(TAG, "sendMessage exception: " + e.toString());
+            }
+        }
+        mCallbacks.finishBroadcast();
+!!!13397004.java!!!	showNotification(in type : int, in str : String) : void
+        CharSequence text = "";
+        int notificationId = sFtpOtherNotificationId;
+        boolean onGoing = false;
+
+        switch (type) {
+            case sFtpStateStarted:
+                text = getString(R.string.ftp_notification_start);
+                notificationId = sFtpStartNotificationId;
+                onGoing = true;
+                break;
+            case sFtpStateStopped:
+                text = getString(R.string.ftp_notification_stop) + " " + str;
+                break;
+            case sFtpActionAbortedExceededStorage:
+                text = getString(R.string.ftp_acation_aborted_exceeded_storage);
+        }
+
+        Intent intent = new Intent();
+        intent.setClassName(sStorageSettingsPackageName, sStorageSettingsClassName);
+        Notification.Builder builder = new Notification.Builder(this)
+                .setSmallIcon(R.drawable.icon)
+                .setContentTitle(getString(R.string.ftp_service_name))
+                .setContentText(text)
+                .setOngoing(onGoing)
+                .setContentIntent(PendingIntent.getActivity(this, 0, intent, 0));
+        mNotificationManager.notify(notificationId, builder.getNotification());
+!!!13397132.java!!!	onCreate() : void
+        super.onCreate();
+        mNotificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
+        if (DEBUG) Toast.makeText(this, "FTP Service started", Toast.LENGTH_SHORT).show();
+!!!13397260.java!!!	onDestroy() : void
+        super.onDestroy();
+
+        // Unregister all callbacks.
+        mCallbacks.kill();
+        if (DEBUG) Toast.makeText(this, "FTP Service stopped", Toast.LENGTH_SHORT).show();
+!!!13397388.java!!!	onBind(inout intent : Intent) : IBinder
+        return mBinder;
+!!!13397516.java!!!	getLocalIpAddressFromSystem() : String
+        ConnectivityManager connectivityManager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        LinkProperties linkProperties = connectivityManager.getActiveLinkProperties();
+
+        // TODO: The Collection will only contain one entry on GTV.
+        // If we activate ipv6 at some point, the interface may contain an ipv4 and
+        // an ipv6 address (depending upon ipv8/ipv4 options).
+        if (linkProperties != null) {
+            Collection<LinkAddress> addrs = linkProperties.getLinkAddresses();
+
+            for (LinkAddress linkAddress : addrs) {
+                if (DEBUG) Log.d(TAG, "getLocalIp " + linkAddress.getAddress().getHostAddress());
+                return linkAddress.getAddress().getHostAddress();
+            }
+        }
+        return null;
+!!!13397644.java!!!	isServerRunning() : boolean
+        return mFtpServer != null && !mFtpServer.isStopped();
+!!!13397772.java!!!	serverStart(in id : String, in password : String, in port : int, in homeDir : String, in maxLoginUser : int) : boolean
+        if (isServerRunning()) {
+            serverStop();
+        }
+
+        FtpServerFactory serverFactory = new FtpServerFactory();
+        PropertiesUserManagerFactory userManagerFactory = new PropertiesUserManagerFactory();
+        File userFileDir;
+        try {
+            FileOutputStream fos = openFileOutput(sUserFile, Context.MODE_PRIVATE);
+            fos.close();
+            userFileDir = getFilesDir();
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        }
+        userManagerFactory.setFile(new File(userFileDir, sUserFile));
+        userManagerFactory.setPasswordEncryptor(new SaltedPasswordEncryptor());
+        UserManager userManager = userManagerFactory.createUserManager();
+
+        // FTP user setting
+        UserFactory userFact = new UserFactory();
+        userFact.setName(id);
+        userFact.setPassword(password);
+        userFact.setHomeDirectory(homeDir);
+        List<Authority> authorities = new ArrayList<Authority>();
+        authorities.add(new WritePermission());
+        userFact.setAuthorities(authorities);
+        User user = userFact.createUser();
+        if (DEBUG) {
+            Log.d(TAG, "Set a user id/pass " + id + " " + password + " home " +
+                    homeDir + " port " + port);
+        }
+        try {
+            userManager.save(user);
+        } catch (FtpException e1) {
+            e1.printStackTrace();
+            return false;
+        }
+        serverFactory.setUserManager(userManager);
+
+        String localIp = getLocalIpAddressFromSystem();
+        if (localIp == null) return false;
+        ListenerFactory factory = new ListenerFactory();
+        port = AvailablePortFinder.getNextAvailable(port);
+        // Sets the port of the listener.
+        factory.setPort(port);
+        factory.setServerAddress(localIp);
+
+        // Replaces the default listener.
+        Listener listener = factory.createListener();
+        serverFactory.addListener("default", listener);
+        if (DEBUG) Log.d(TAG, "Get local ip address " + localIp);
+
+        // Sets connection configuration.
+        ConnectionConfigFactory connectionConfigFactory = new ConnectionConfigFactory();
+        connectionConfigFactory.setMaxLogins(maxLoginUser);
+        serverFactory.setConnectionConfig(connectionConfigFactory.createConnectionConfig());
+
+        // Overrides the commands "STOR" and "STOU"
+        CommandFactoryFactory commandFactoryFactory = new CommandFactoryFactory();
+        commandFactoryFactory.addCommand("STOR", new STOR());
+        commandFactoryFactory.addCommand("STOU", new STOU());
+        CommandFactory commandFactory = commandFactoryFactory.createCommandFactory();
+        serverFactory.setCommandFactory(commandFactory);
+        // Sets listener for FTP events such as login.
+        Map<String, Ftplet> ftplets = new HashMap<String, Ftplet>();
+        ftplets.put(sFtpletName, new GtvFtplet(this));
+        serverFactory.setFtplets(ftplets);
+
+        if (DEBUG) Log.d(TAG, "Start the ftp server");
+        mFtpServer = serverFactory.createServer();
+        try {
+            mFtpServer.start();
+        } catch (FtpException e) {
+            Log.e(TAG, "Fail to start the ftp server" + e.toString());
+            return false;
+        }
+        if (DEBUG) Log.d(TAG, "Succeed to start the ftp server");
+
+        mLocalIpAddress = localIp;
+        mId = id;
+        mPassword = password;
+        mPort = port;
+        mHomeDir = homeDir;
+        mLoginUserNumber = 0;
+        mLoginFailureNumber = 0;
+        showNotification(sFtpStateStarted, null);
+        return true;
+!!!13397900.java!!!	serverStop() : void
+        if (isServerRunning()) {
+            mFtpServer.stop();
+        }
+        clearFtpStartNotification();

@@ -1,0 +1,722 @@
+class FmService
+!!!11003148.cpp!!!	instantiate() : void
+    defaultServiceManager()->addService(
+            String16("com.marvell.fm.FmService"), new FmService());
+!!!11003788.cpp!!!	FmService()
+    ALOGI("init enter\n");
+
+    loadLayoutFiles();
+
+    mMountCount = 0;
+    //mAutoDetectUSBThreadRunning = true;
+    //pthread_create(&mAutoDetectUSBThread, NULL, staticAutoDetectUSBThreadEntry, this);
+
+    ALOGI("init leave\n");
+!!!11003916.cpp!!!	~FmService()
+    ALOGI("destroy enter\n");
+
+    mAutoDetectUSBThreadRunning = false;
+    // Wait thread exit done
+    while (false == mAutoDetectUSBThreadRunning) {
+        usleep(100000);
+    }
+
+    for (size_t i = 0; i < mTestcaseList.size(); i++) {
+       Testcase *testcase = mTestcaseList.editValueAt(i);
+       delete testcase;
+    }
+
+    ALOGI("destroy leave\n");
+!!!11004044.cpp!!!	staticAutoDetectUSBThreadEntry(inout thiz : void) : void
+    ALOGI("staticAutoDetectUSBThreadEntry enter");
+    FmService *fmService = reinterpret_cast<FmService*>(thiz);
+
+    // Init inotify
+    struct pollfd fds[1];
+    int res, fd;
+    fd = inotify_init();
+    res = inotify_add_watch(fd, DEVICE_PATH, IN_DELETE | IN_CREATE);
+    if (res < 0) {
+        ALOGE("staticAutoDetectUSBThreadEntry could not add watch for %s, %s\n",
+                DEVICE_PATH, strerror(errno));
+        printf("Auto detect USB thread add inotify wathc fail!!!");
+        close(fd);
+        return NULL;
+    }
+    fds[0].fd = fd;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+
+    // scan the dir first
+    fmService->scanDevices();
+
+    int count = 0;
+    while (fmService->mAutoDetectUSBThreadRunning) {
+        ALOGI("staticAutoDetectUSBThreadEntry loop count %d", count++);
+
+        int pollResult = poll(fds, (unsigned long)1, POLL_TIMEOUT_MS);
+
+        if ( 0 < pollResult) {
+            if (fds[0].revents & POLLIN) {
+                fmService->readNotify(fds[0].fd);
+                fds[0].revents = 0;
+            } else {
+                ALOGW("poll event is not POLLIN");
+            }
+        } else if (0 == pollResult) {
+            // Should not reach here
+            ALOGW("poll timeout. Try again");
+            continue;
+        } else if (pollResult < 0) {
+            if (EINTR != errno) {
+                ALOGW("poll failed (errno=%d)\n", errno);
+                usleep(100000);
+            }
+            continue;
+        }
+    }
+
+    // Close inotify
+    inotify_rm_watch(fd, res);
+    close(fd);
+
+    // Let the other know this thread is exit
+    fmService->mAutoDetectUSBThreadRunning = true;
+
+    ALOGI("staticAutoDetectUSBThreadEntry leave");
+
+    return NULL;
+!!!11004172.cpp!!!	scanDevices() : int
+    ALOGI("scanDevices enter");
+    char devname[PATH_MAX];
+    char *filename;
+    DIR *dir;
+    struct dirent *de;
+    dir = opendir(DEVICE_PATH);
+    if(NULL == dir)
+        return -1;
+    strcpy(devname, DEVICE_PATH);
+    filename = devname + strlen(devname);
+    *filename++ = '/';
+    while((de = readdir(dir))) {
+        if(de->d_name[0] == '.' &&
+           (de->d_name[1] == '\0' ||
+            (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+            continue;
+        ALOGI("scanDevices de->d_name = %s", de->d_name);
+        if ((0 == strncmp(de->d_name, "sd", 2)) &&
+                ((3 == strlen(de->d_name)) || (4 == strlen(de->d_name)))) {
+            ALOGI("scanDevices go to openDevice");
+            strcpy(filename, de->d_name);
+            openDevice(devname);
+        }
+    }
+    closedir(dir);
+
+    ALOGI("scanDevices leave");
+
+    return 0;
+!!!11004300.cpp!!!	readNotify(in nfd : int) : int
+    ALOGI("readNotify enter");
+    int res;
+    char devname[PATH_MAX];
+    char *filename;
+    char event_buf[512];
+    int event_size;
+    int event_pos = 0;
+    struct inotify_event *event;
+    res = read(nfd, event_buf, sizeof(event_buf));
+    if (res < (int)sizeof(*event)) {
+        if(EINTR == errno) {
+            ALOGI("readNotify leave 1");
+            return 0;
+        }
+
+        ALOGW("could not get event, %s\n", strerror(errno));
+        ALOGI("readNotify leave 2");
+        return 1;
+    }
+
+    strcpy(devname, DEVICE_PATH);
+    filename = devname + strlen(devname);
+    *filename++ = '/';
+
+    while((int)sizeof(*event) <= res) {
+        event = (struct inotify_event *)(event_buf + event_pos);
+        //printf("%d: %08x \"%s\"\n", event->wd, event->mask, event->len ? event->name : "");
+        if(event->len) {
+            ALOGI("readNotify event->name = %s", event->name);
+            if ((0 == strncmp(event->name, "sd", 2)) &&
+                ((3 == strlen(event->name)) || (4 == strlen(event->name)))) {
+                strcpy(filename, event->name);
+                if(event->mask & IN_CREATE) {
+                    // Go to mount this USB disk
+                    printf("open dev %s\n", devname);
+                    ALOGI("open dev %s\n", devname);
+                    openDevice(devname);
+
+                    // Go to check if there are some auto run package in this disk
+                }
+                else {
+                    // Go to umount this USB disk
+                    printf("close dev %s\n", devname);
+                    ALOGI("close dev %s\n", devname);
+                    closeDevice(devname);
+                }
+            }
+        }
+        event_size = sizeof(*event) + event->len;
+        res -= event_size;
+        event_pos += event_size;
+    }
+
+
+    ALOGI("readNotify leave 3");
+    return 0;
+!!!11004428.cpp!!!	openDevice(in devicePath : char) : int
+    ALOGI("openDevice enter, devicePath = %s", devicePath);
+    int ret = 0;
+    char finalMountPath[FM_MAX_PATH_LEN] = {0};
+    strcpy(finalMountPath, MOUNT_PATH);
+    char *pLast = finalMountPath + strlen(finalMountPath);
+    int tempCount = mMountCount;
+    int num = 1;
+    while (tempCount / 10) {
+        num++;
+        tempCount = tempCount / 10;
+    }
+
+    while (num) {
+        int tempNum = num - 1;
+        tempCount = mMountCount;
+        while (tempNum--) {
+            tempCount /= 10;
+        }
+        *pLast = '0' + tempCount % 10;
+        pLast++;
+        num--;
+    }
+    *pLast = '\0';
+    ALOGD("openDevice finalMountPath = %s", finalMountPath);
+
+    // Run command to mount
+    char pCommand[FM_MAX_COMMAND_LEN] = {0};
+    sprintf(pCommand, "/system/bin/mkdir -p %s && /system/xbin/busybox mount %s %s",
+            finalMountPath, devicePath, finalMountPath);
+    int systemRet = system(pCommand);
+    int cmdRet = systemRet >> 8;
+    if (0 == cmdRet) {
+        printf("Device %s has mounted to %s\n", devicePath, finalMountPath);
+        MountInfo *info = new MountInfo(devicePath, finalMountPath);
+        mMountInfos.push(info);
+        mMountCount++;
+
+        // Go to check if there is auto run package in the disk
+        pid_t pid;
+        pid = fork();
+        if (0 == pid) {
+            ALOGI("openDevice child process");
+            detectAutoRun(finalMountPath);
+            exit(0);
+        }
+        else if (pid < 0) {
+            ALOGE("openDevice fork fail");
+        }
+        ALOGI("openDevice parent process");
+    } else {
+        printf("Run command %s fail\n", pCommand);
+        ALOGE("openDevice run command %s fail\n", pCommand);
+
+        char pRmCommand[FM_MAX_COMMAND_LEN] = {0};
+        sprintf(pRmCommand, "/system/bin/rm -rf %s", finalMountPath);
+        system(pRmCommand);
+
+        ret = 1;
+    }
+
+    ALOGI("openDevice leave");
+
+    return ret;
+!!!11004556.cpp!!!	closeDevice(in devicePath : char) : int
+    ALOGD("closeDevice enter, devicePath = %s", devicePath);
+    int ret = 0;
+    for (size_t i = 0; i < mMountInfos.size(); i++) {
+        MountInfo *info = mMountInfos[i];
+        if (0 == strcmp(devicePath, info->mDevPath)) {
+            ALOGI("closeDevice found mount point, go to umount it");
+            // Run command to umount
+            char pCommand[FM_MAX_COMMAND_LEN] = {0};
+            sprintf(pCommand, "/system/bin/umount %s && /system/bin/rm -rf %s",
+                    info->mMountPath, info->mMountPath);
+            int systemRet = system(pCommand);
+            int cmdRet = systemRet >> 8;
+            if (0 == cmdRet) {
+                ALOGI("closeDevice run %s success", pCommand);
+            } else {
+                ALOGW("closeDevice run %s fail", pCommand);
+            }
+
+            printf("Device %s has been removed. Mount path %s has been umount and deleted\n",
+                    info->mDevPath, info->mMountPath);
+            mMountInfos.removeAt(i);
+            break;
+        }
+    }
+    ALOGI("closeDevice leave");
+
+    return ret;
+!!!11004684.cpp!!!	checkFileExist(in pDir : char, in pFileName : char) : bool
+    ALOGI("detectAutoRun enter, pDir = %s, pFileName = %s",
+            pDir, pFileName);
+
+    bool bRet = false;
+    char devname[PATH_MAX];
+    char *filename;
+    DIR *dir;
+    struct dirent *de;
+    dir = opendir(pDir);
+    if(NULL == dir)
+        return bRet;
+    strcpy(devname, pDir);
+    filename = devname + strlen(devname);
+    *filename++ = '/';
+    while((de = readdir(dir))) {
+        if(de->d_name[0] == '.' &&
+           (de->d_name[1] == '\0' ||
+            (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+            continue;
+        ALOGI("checkFileExist de->d_name = %s", de->d_name);
+
+        // check the sign key sign package
+        if (0 == strcmp(de->d_name, pFileName)) {
+            bRet = true;
+            break;
+        }
+    }
+    closedir(dir);
+
+    ALOGI("checkFileExist leave, bRet = %s", ((true == bRet) ? "true" : "false"));
+
+    return bRet;
+!!!11004812.cpp!!!	detectAutoRun(in mountPath : char) : void
+    ALOGI("detectAutoRun enter, mountPath = %s", mountPath);
+
+    int size = sizeof(SIGN_PACKAGE) / sizeof(char*);
+    for (int i = 0; i < size; i++) {
+        bool ret = checkFileExist(mountPath, SIGN_PACKAGE[i]);
+        if (ret) {
+            // Go to un-sign the package
+            bool execRet = false;
+            char pCommand[FM_MAX_COMMAND_LEN] = {0};
+            sprintf(pCommand, "/system/vendor/bin/Verify_Sign_Image %s/%s %s",
+                    mountPath, SIGN_PACKAGE[i], UNSIGN_PACKAGE);
+            int systemRet = system(pCommand);
+            int cmdRet = systemRet >> 8;
+            if (0 == cmdRet) {
+                ALOGI("detectAutoRun %s is a valid sign package",
+                        SIGN_PACKAGE[i]);
+
+                // Go to un-compress the package
+                memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+                sprintf(pCommand, "cd /tmp && tar -zxvf %s", UNSIGN_PACKAGE);
+                systemRet = system(pCommand);
+                cmdRet = systemRet >> 8;
+                if (0 == cmdRet) {
+                    // The un-compress dir is "/tmp/factoryMode"
+                    // In this dir, it should meet the following condition:
+                    // 1. fmAutoRun.sh: This must be included. Copy it to "/tmp/factoryModeAutoRun"
+                    // 2. customer.testcase.layout: This may be existed.
+                    //    If it is existed, we will go to load this layout.
+                    //    And the bins or scripts in this layout should be existed
+                    //    in this dir.
+
+                    // Check if fmAutoRun.sh is existed
+                    bool fmAutoRunExist = checkFileExist(UNSIGN_PACKAGE_DECOMPRESS,
+                            AUTO_RUN_SCRIPT);
+                    if (fmAutoRunExist) {
+                        // Copy fmAutoRun.sh to "/tmp/factoryModeAutoRun"
+                        memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+                        sprintf(pCommand, "/system/bin/mkdir -p %s && cp -rf %s/%s %s",
+                                AUTO_RUN, UNSIGN_PACKAGE_DECOMPRESS, AUTO_RUN_SCRIPT, AUTO_RUN);
+                        systemRet = system(pCommand);
+                        cmdRet = systemRet >> 8;
+                        if (0 == cmdRet) {
+                            // Delete "/tmp/factoryMode"
+                            memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+                            sprintf(pCommand, "/system/bin/rm -rf %s",
+                                    UNSIGN_PACKAGE_DECOMPRESS);
+                            systemRet = system(pCommand);
+                            cmdRet = systemRet >> 8;
+                            if (0 == cmdRet) {
+                                // Load customers test case
+                                memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+                                sprintf(pCommand,
+                    "/system/vendor/bin/factory_mode/bin/fm_client LoadCustomersTestCase %s %s",
+                                        mountPath, SIGN_PACKAGE[i]);
+                                system(pCommand);
+
+                                // Run fmAutoRun.sh
+                                memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+                                sprintf(pCommand, "chmod 777 %s/%s && %s/%s",
+                                        AUTO_RUN, AUTO_RUN_SCRIPT, AUTO_RUN, AUTO_RUN_SCRIPT);
+                                systemRet = system(pCommand);
+                                cmdRet = systemRet >> 8;
+                                if (0 == cmdRet) {
+                                } else {
+                                    ALOGE("detectAutoRun run command %s fail", pCommand);
+                                }
+                            } else {
+                                ALOGE("detectAutoRun run command %s fail", pCommand);
+                            }
+                        } else {
+                            ALOGE("detectAutoRun run command %s fail", pCommand);
+                        }
+                    } else {
+                        ALOGE("detectAutoRun %s is not existed in the %s",
+                                AUTO_RUN_SCRIPT, UNSIGN_PACKAGE_DECOMPRESS);
+                    }
+                } else {
+                    ALOGE("detectAutoRun run command %s fail", pCommand);
+                }
+
+                // No need to check the other image
+                break;
+            } else {
+                ALOGW("detectAutoRun %s is a invalid sign package",
+                        SIGN_PACKAGE[i]);
+            }
+        }
+    }
+
+    ALOGI("detectAutoRun leave");
+!!!11004940.cpp!!!	loadCustomersTestCase(in pMountPoint : char, in pPackageFile : char) : void
+    ALOGI("loadCustomersTestCase enter, pMountPoint = %s, pPackageFile = %s",
+            pMountPoint, pPackageFile);
+    bool ret = checkFileExist(pMountPoint, pPackageFile);
+    if (ret) {
+        // Go to un-sign the package
+        char pCommand[FM_MAX_COMMAND_LEN] = {0};
+        sprintf(pCommand, "/system/vendor/bin/Verify_Sign_Image %s/%s %s",
+                pMountPoint, pPackageFile, UNSIGN_PACKAGE);
+        int systemRet = system(pCommand);
+        int cmdRet = systemRet >> 8;
+        if (0 == cmdRet) {
+            ALOGI("loadCustomersTestCase %s is a valid sign package",
+                    pPackageFile);
+
+            // Go to un-compress the package
+            memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+            sprintf(pCommand, "cd /tmp && tar -zxvf %s", UNSIGN_PACKAGE);
+            systemRet = system(pCommand);
+            cmdRet = systemRet >> 8;
+
+            // Delete the unsign package for save space
+            memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+            sprintf(pCommand, "cd /tmp && /system/bin/rm -rf %s", UNSIGN_PACKAGE);
+            system(pCommand);
+
+            if (0 == cmdRet) {
+                char pLayoutFilePath[FM_MAX_PATH_LEN] = {0};
+                sprintf(pLayoutFilePath, "%s/%s", UNSIGN_PACKAGE_DECOMPRESS,
+                        CUSTOMER_LAYOUT_FILE);
+                bool bLayoutFileExist = checkFileExist(UNSIGN_PACKAGE_DECOMPRESS,
+                        CUSTOMER_LAYOUT_FILE);
+                if (true == bLayoutFileExist) {
+                    loadLayoutFile(pLayoutFilePath, false, UNSIGN_PACKAGE_DECOMPRESS);
+
+                    // INC global ID of mount devices
+                    g_mount_dev_id++;
+                } else {
+                    ALOGW("loadCustomersTestCase %s is not existed",
+                            pLayoutFilePath);
+                }
+
+                // Delete the decompress dir
+                memset(pCommand, 0, FM_MAX_COMMAND_LEN);
+                sprintf(pCommand, "cd /tmp && /system/bin/rm -rf %s", UNSIGN_PACKAGE_DECOMPRESS);
+                system(pCommand);
+            } else {
+                ALOGE("loadCustomersTestCase run command %s fail",
+                        pCommand);
+            }
+        } else {
+            printf("Error!%s is a invalid sign package",
+                    pPackageFile);
+            ALOGE("loadCustomersTestCase %s is a invalid sign package",
+                    pPackageFile);
+        }
+     } else {
+        printf("Error! %s is not existed in the %s\n",
+                pPackageFile, pMountPoint);
+        ALOGE("loadCustomersTestCase %s is not existed", pPackageFile);
+     }
+    ALOGI("loadCustomersTestCase leave");
+!!!11005068.cpp!!!	loadLayoutFiles() : void
+    ALOGI("loadLayoutFiles enter\n");
+    mTestcaseCount = 0;
+    const char *pDirOfLayoutFiles = "/system/vendor/bin/factory_mode/etc";
+    DIR *pDir = opendir(pDirOfLayoutFiles);
+    if (NULL != pDir) {
+        struct dirent *de;
+        const char *pFileName;
+        for (;;) {
+            de = readdir(pDir);
+            if (NULL == de) {
+                ALOGI("loadLayoutFiles reach the end");
+                break;
+            }
+
+            pFileName = de->d_name;
+            ALOGI("loadLayoutFiles file name is %s\n",
+                    pFileName);
+            if (pFileName[0] == '.') continue;
+            char filePath[FM_MAX_PATH_LEN] = {0};
+            sprintf(filePath, "%s/%s", pDirOfLayoutFiles, pFileName);
+            struct stat mstat;
+            memset(&mstat, 0, sizeof(mstat));
+            if (-1 == lstat(filePath, &mstat)) {
+                ALOGE("loadLayoutFiles lstat %s error\n",
+                        filePath);
+                continue;
+            }
+
+            if (S_ISREG(mstat.st_mode)) {
+                const char *pExtension = ".testcase.layout";
+                const char *pLastExt = filePath + strlen(filePath) -
+                    strlen(pExtension);
+                ALOGI("loadLayoutFiles pLastExt is %s\n",
+                        pLastExt);
+                if (!strcmp(pExtension, pLastExt)) {
+                    loadLayoutFile(filePath);
+                }
+            }
+        }
+
+        closedir(pDir);
+    } else {
+        ALOGE("loadLayoutFiles opendir %s fail. errno is %d\n",
+                pDirOfLayoutFiles, errno);
+    }
+    ALOGI("loadLayoutFiles leave\n");
+!!!11005196.cpp!!!	loadLayoutFile(in pLayoutFilePath : char, in internal : bool = true, in pDir : char = NULL) : void
+    ALOGI("loadLayoutFile %s enter\n", pLayoutFilePath);
+
+    FILE *fp = NULL;
+    char line[2048] = {0};
+    int maxLineSize = 2048;
+    size_t len = 0;
+    size_t read;
+
+    fp = fopen(pLayoutFilePath, "r");
+    if (NULL != fp) {
+        //while (-1 != (read = getline(&line, &len, fp))) {
+        while (NULL != getline(line, maxLineSize, fp)) {
+            ALOGI("loadLayoutFile line is %s\n", line);
+            const char *pRemoveSpace = line;
+            // Remove the space at the beginninig
+            while (' ' == *pRemoveSpace) pRemoveSpace++;
+            // Check if this line is a comment
+            if ('#' == *pRemoveSpace) {
+                ALOGI("loadLayoutFile this line is a comment\n");
+                continue;
+            }
+            const char *pFirstSpacePos = strstr(pRemoveSpace, " ");
+            if (NULL == pFirstSpacePos) {
+                ALOGE("loadLayoutFile this line does not follow the format");
+                continue;
+            }
+
+            char pTestcaseName[FM_MAX_TESTCASE_NAME_LEN] = {0};
+            strncpy(pTestcaseName, pRemoveSpace, (pFirstSpacePos - pRemoveSpace));
+            if (isTestCaseExisted(pTestcaseName)) {
+                printf("Testcase %s has existed in list.\n", pTestcaseName);
+                ALOGE("loadLayoutFile testcase %s has existed in list.", pTestcaseName);
+                continue;
+            }
+
+            Testcase *testcase = new Testcase();
+            memset(testcase->testcaseName, 0, sizeof(char) * FM_MAX_TESTCASE_NAME_LEN);
+            memset(testcase->cmdPath, 0, sizeof(char) * FM_MAX_PATH_LEN);
+            strncpy(testcase->testcaseName, pRemoveSpace, (pFirstSpacePos - pRemoveSpace));
+            const char *pEnd = NULL;
+            if (NULL == (pEnd = strstr(pFirstSpacePos, "\r\n")) &&
+                NULL == (pEnd = strstr(pFirstSpacePos, "\n"))) {
+                pEnd = pFirstSpacePos + strlen(pFirstSpacePos);
+            }
+            if (NULL != pEnd) {
+                if (false == internal) {
+                    char cmdPath[FM_MAX_PATH_LEN] = {0};
+                    // skip space
+                    while(pFirstSpacePos != NULL && *pFirstSpacePos == ' ')++pFirstSpacePos;
+                    // skip '/'
+                    if (*pFirstSpacePos  == '/') ++pFirstSpacePos;
+                    strncpy(cmdPath, pFirstSpacePos, pEnd - pFirstSpacePos);
+                    // define destination dir
+                    char pCommand[FM_MAX_COMMAND_LEN] = {0};
+                    char pDesti[FM_MAX_PATH_LEN] = {0};
+                    sprintf(pDesti, "/tmp/factory_mode/%d/%s", g_mount_dev_id, cmdPath);
+                    // create destination dir
+                    memset(pCommand, 0, sizeof(char) * FM_MAX_COMMAND_LEN);
+                    sprintf(pCommand, "/system/bin/mkdir -p %s && /system/bin/rm -r %s",
+                                      pDesti, pDesti);
+                    system(pCommand);
+                    ALOGI("loadLayoutFile, Execute: %s", pCommand);
+                    // copy to destination dir
+                    memset(pCommand, 0, sizeof(char) * FM_MAX_COMMAND_LEN);
+                    sprintf(pCommand, "cp %s/%s %s", pDir, cmdPath, pDesti);
+                    system(pCommand);
+                    ALOGI("loadLayoutFile, Execute: %s", pCommand);
+                    // change mode to 777
+                    memset(pCommand, 0, sizeof(char) * FM_MAX_COMMAND_LEN);
+                    sprintf(pCommand, "chmod 777 %s", pDesti);
+                    system(pCommand);
+                    ALOGI("loadLayoutFile, Execute: %s", pCommand);
+
+                    strcpy(testcase->cmdPath, pDesti);
+                } else {
+                    strncpy(testcase->cmdPath, pFirstSpacePos + 1, pEnd - (pFirstSpacePos + 1));
+                }
+                ALOGI("loadLayoutFile Testcase (%s, %s)\n", testcase->testcaseName,
+                        testcase->cmdPath);
+                mTestcaseList.add(mTestcaseCount++, testcase);
+            }
+        }
+
+        fclose(fp);
+    } else {
+        ALOGE("loadLayoutFile fopen %s fail\n",
+                pLayoutFilePath);
+    }
+
+    ALOGI("loadLayoutFile leave\n");
+!!!11005324.cpp!!!	isTestCaseExisted(in testcasename : char) : bool
+    ALOGI("isTestCaseExisted enter\n");
+    bool ret = false;
+    for (size_t i = 0; i < mTestcaseList.size(); i++) {
+        const Testcase *testcase = mTestcaseList.valueAt(i);
+        if (!strcmp(testcase->testcaseName, testcasename)) {
+            ret = true;
+            break;
+        }
+    }
+    ALOGI("isTestCaseExisted leave, ret = %s\n", (ret == true ? "true":"false"));
+    return ret;
+!!!11005452.cpp!!!	showHelp() : void
+    ALOGI("showHelp enter\n");
+
+    printf("***********************************************\n"
+            " Enter Factory Mode\n"
+            " Usage: testcasename [parameters]\n"
+            " Input '%s' to exit this factory mode client\n"
+            " Input '%s' to exit factory mode and power off system\n"
+            " Input '%s' to exit factory mode and reboot system\n"
+            " Input '%s' to get help\n"
+            " NOTE: do not user 'ctrl-c' 'ctrl-z' here\n"
+            " Testcase support list\n", FM_COMMAND_EXIT_TESTMODE_CLIENT,
+            FM_COMMAND_EXIT_TESTMODE, FM_COMMAND_REBOOT, FM_COMMAND_HELP);
+
+    const char *pCmdPath = NULL;
+    for (size_t i = 0; i < mTestcaseList.size(); i++) {
+        const Testcase *testcase = mTestcaseList.valueAt(i);
+        printf(" Testcase %d: %s\n", i, testcase->testcaseName);
+    }
+
+    printf("***********************************************\n");
+
+    ALOGI("showHelp leave\n");
+!!!11005580.cpp!!!	processCommand(in pCommand : char) : int32_t
+    int32_t ret = FM_COMMAND_RESULT_SUCCESS;
+
+    ALOGI("processCommand enter, command is %s\n", pCommand);
+
+    if (!strcmp(pCommand, FM_COMMAND_EXIT_TESTMODE)) {
+        printf("Exit the factory mode, system will power off ...\n");
+        android_reboot(ANDROID_RB_POWEROFF, 0, 0);
+    } else if (!strcmp(pCommand, FM_COMMAND_REBOOT)){
+        printf("Exit the factory mode, system will reboot ...\n");
+        android_reboot(ANDROID_RB_RESTART, 0, 0);
+    } else if (!strcmp(pCommand, FM_COMMAND_HELP)) {
+        showHelp();
+    } else {
+        char pTestcaseName[FM_MAX_COMMAND_LEN] = {0};
+        char pParams[FM_MAX_COMMAND_LEN] = {0};
+        const char *pBegin = pCommand;
+        const char *pFirstSpace = NULL;
+        // 1. Get test case name from the command
+        // a. remove the first beginning space
+        while (*pBegin == ' ') pBegin++;
+        // b. get the second ' ' location
+        pFirstSpace = strstr(pBegin, " ");
+        if (NULL == pFirstSpace) {
+            strcpy(pTestcaseName, pBegin);
+        } else {
+            strncpy(pTestcaseName, pBegin, (pFirstSpace - pBegin));
+            strcpy(pParams, pFirstSpace);
+        }
+        ALOGI("processCommand tesecase name is %s.\n", pTestcaseName);
+        ALOGI("processCommand params is %s.\n", pParams);
+
+        // 2. Get the command location for test case.
+        // If test case is invalid, the command location is NULL
+        const char *pCmdPath = NULL;
+        for (size_t i = 0; i < mTestcaseList.size(); i++) {
+            const Testcase *testcase = mTestcaseList.valueAt(i);
+            if (!strcmp(testcase->testcaseName, pTestcaseName)) {
+                pCmdPath = testcase->cmdPath;
+            }
+        }
+
+        // 3. Run the cmd path with params
+        if (NULL != pCmdPath) {
+            ALOGI("processCommand pCmdPath is %s\n", pCmdPath);
+            char pFinalCommand[FM_MAX_COMMAND_LEN] = {0};
+            strcpy(pFinalCommand, pCmdPath);
+            strcat(pFinalCommand, pParams);
+            ALOGI("processCommand pFinalCommand is %s\n", pFinalCommand);
+
+            int systemRet = system(pFinalCommand);
+            int cmdRet = systemRet >> 8;
+            if (0 != cmdRet) {
+                ALOGI("processCommand system cmd fail, ret is %d\n", cmdRet);
+                ret = FM_COMMAND_RESULT_FAIL;
+            } else if (!strcmp(pTestcaseName, FM_COMMAND_LOADCUSTOMERSTESTCASE)) {
+                char pMountPoint[FM_MAX_PATH_LEN] = {0};
+                char pPackageFile[FM_MAX_PATH_LEN] = {0};
+                char *pPath = pParams;
+                // skip space
+                while (pPath != NULL && *pPath == ' ') ++pPath;
+                char *pNextSpace = strstr(pPath, " ");
+                strncpy(pMountPoint, pPath, pNextSpace - pPath);
+                pPath = pNextSpace;
+                // skip space
+                while (pPath != NULL && *pPath == ' ') ++pPath;
+                strcpy(pPackageFile, pPath);
+
+                loadCustomersTestCase(pMountPoint, pPackageFile);
+            }
+        } else {
+            ALOGW("processCommand could not find cmd path for %s\n", pTestcaseName);
+            ret = FM_COMMAND_RESULT_INVALID_TEST_CASE;
+        }
+    }
+
+
+    printf("---------------------------------------\n");
+    switch (ret) {
+        case FM_COMMAND_RESULT_SUCCESS:
+        case FM_COMMAND_RESULT_FAIL:
+            printf("Run '%s' end\n", pCommand);
+            break;
+        case FM_COMMAND_RESULT_INVALID_TEST_CASE:
+            printf("'%s' is a invalid test case\n", pCommand);
+            break;
+        case FM_COMMAND_RESULT_UNKNOW_ERROR:
+        default:
+            printf("Some unknown error happen when run test case '%s'\n",
+                    pCommand);
+            break;
+    }
+    printf("---------------------------------------\n");
+
+    ALOGI("processCommand leave, ret = %d\n", ret);
+    return ret;

@@ -1,0 +1,223 @@
+class A2dpAudioStreamOut
+!!!10043020.cpp!!!	A2dpAudioStreamOut()
+    // use any address by default
+    strcpy(mA2dpAddress, "00:00:00:00:00:00");
+    init();
+!!!10043148.cpp!!!	~A2dpAudioStreamOut()
+    ALOGV("A2dpAudioStreamOut destructor");
+    close();
+    ALOGV("A2dpAudioStreamOut destructor returning from close()");
+!!!10043276.cpp!!!	set(in device : uint32_t, inout pFormat : int, inout pChannels : uint32_t, inout pRate : uint32_t) : status_t
+    int lFormat = pFormat ? *pFormat : 0;
+    uint32_t lChannels = pChannels ? *pChannels : 0;
+    uint32_t lRate = pRate ? *pRate : 0;
+
+    ALOGD("A2dpAudioStreamOut::set %x, %d, %d, %d\n", device, lFormat, lChannels, lRate);
+
+    // fix up defaults
+    if (lFormat == 0) lFormat = format();
+    if (lChannels == 0) lChannels = channels();
+    if (lRate == 0) lRate = sampleRate();
+
+    // check values
+    if ((lFormat != format()) ||
+            (lChannels != channels()) ||
+            (lRate != sampleRate())){
+        if (pFormat) *pFormat = format();
+        if (pChannels) *pChannels = channels();
+        if (pRate) *pRate = sampleRate();
+        return BAD_VALUE;
+    }
+
+    if (pFormat) *pFormat = lFormat;
+    if (pChannels) *pChannels = lChannels;
+    if (pRate) *pRate = lRate;
+
+    mDevice = device;
+    mBufferDurationUs = ((bufferSize() * 1000 )/ frameSize() / sampleRate()) * 1000;
+    return NO_ERROR;
+!!!10044172.cpp!!!	write(in buffer : void, in bytes : size_t) : ssize_t
+    status_t status = -1;
+    {
+        Mutex::Autolock lock(mLock);
+
+        size_t remaining = bytes;
+
+        if (!mBluetoothEnabled || mClosing || mSuspended) {
+            ALOGV("A2dpAudioStreamOut::write(), but bluetooth disabled \
+                   mBluetoothEnabled %d, mClosing %d, mSuspended %d",
+                    mBluetoothEnabled, mClosing, mSuspended);
+            goto Error;
+        }
+
+        if (mStandby) {
+            acquire_wake_lock (PARTIAL_WAKE_LOCK, sA2dpWakeLock);
+            mStandby = false;
+            mLastWriteTime = systemTime();
+        }
+
+        status = init();
+        if (status < 0)
+            goto Error;
+
+        int retries = MAX_WRITE_RETRIES;
+        while (remaining > 0 && retries) {
+            status = a2dp_write(mData, buffer, remaining);
+            if (status < 0) {
+                ALOGE("a2dp_write failed err: %d\n", status);
+                goto Error;
+            }
+            if (status == 0) {
+                retries--;
+            }
+            remaining -= status;
+            buffer = (char *)buffer + status;
+        }
+
+        // if A2DP sink runs abnormally fast, sleep a little so that audioflinger mixer thread
+        // does no spin and starve other threads.
+        // NOTE: It is likely that the A2DP headset is being disconnected
+        nsecs_t now = systemTime();
+        if ((uint32_t)ns2us(now - mLastWriteTime) < (mBufferDurationUs >> 2)) {
+            ALOGV("A2DP sink runs too fast");
+            usleep(mBufferDurationUs - (uint32_t)ns2us(now - mLastWriteTime));
+        }
+        mLastWriteTime = now;
+        return bytes;
+
+    }
+Error:
+
+    standby();
+
+    // Simulate audio output timing in case of error
+    usleep(mBufferDurationUs);
+
+    return status;
+!!!10044300.cpp!!!	standby() : status_t
+    Mutex::Autolock lock(mLock);
+    return standby_l();
+!!!10044428.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    return NO_ERROR;
+!!!10044556.cpp!!!	setParameters(in keyValuePairs : String8) : status_t
+    AudioParameter param = AudioParameter(keyValuePairs);
+    String8 value;
+    String8 key = String8("a2dp_sink_address");
+    status_t status = NO_ERROR;
+    int device;
+    ALOGV("A2dpAudioStreamOut::setParameters() %s", keyValuePairs.string());
+
+    if (param.get(key, value) == NO_ERROR) {
+        if (value.length() != strlen("00:00:00:00:00:00")) {
+            status = BAD_VALUE;
+        } else {
+            setAddress(value.string());
+        }
+        param.remove(key);
+    }
+    key = String8("closing");
+    if (param.get(key, value) == NO_ERROR) {
+        mClosing = (value == "true");
+        if (mClosing) {
+            standby();
+        }
+        param.remove(key);
+    }
+    key = AudioParameter::keyRouting;
+    if (param.getInt(key, device) == NO_ERROR) {
+        if (audio_is_a2dp_device(device)) {
+            mDevice = device;
+            status = NO_ERROR;
+        } else {
+            status = BAD_VALUE;
+        }
+        param.remove(key);
+    }
+
+    if (param.size()) {
+        status = BAD_VALUE;
+    }
+    return status;
+!!!10044684.cpp!!!	getParameters(in keys : String8) : String8
+    AudioParameter param = AudioParameter(keys);
+    String8 value;
+    String8 key = String8("a2dp_sink_address");
+
+    if (param.get(key, value) == NO_ERROR) {
+        value = mA2dpAddress;
+        param.add(key, value);
+    }
+    key = AudioParameter::keyRouting;
+    if (param.get(key, value) == NO_ERROR) {
+        param.addInt(key, (int)mDevice);
+    }
+
+    ALOGV("A2dpAudioStreamOut::getParameters() %s", param.toString().string());
+    return param.toString();
+!!!10044812.cpp!!!	getRenderPosition(inout driverFrames : uint32_t) : status_t
+    //TODO: enable when supported by driver
+    return INVALID_OPERATION;
+!!!10044940.cpp!!!	init() : status_t
+    if (!mData) {
+        status_t status = a2dp_init(44100, 2, &mData);
+        if (status < 0) {
+            ALOGE("a2dp_init failed err: %d\n", status);
+            mData = NULL;
+            return status;
+        }
+        a2dp_set_sink(mData, mA2dpAddress);
+    }
+
+    return 0;
+!!!10045068.cpp!!!	close() : status_t
+    Mutex::Autolock lock(mLock);
+    ALOGV("A2dpAudioStreamOut::close() calling close_l()");
+    return close_l();
+!!!10045196.cpp!!!	close_l() : status_t
+    standby_l();
+    if (mData) {
+        ALOGV("A2dpAudioStreamOut::close_l() calling a2dp_cleanup(mData)");
+        a2dp_cleanup(mData);
+        mData = NULL;
+    }
+    return NO_ERROR;
+!!!10045324.cpp!!!	setAddress(in address : char) : status_t
+    Mutex::Autolock lock(mLock);
+
+    if (strlen(address) != strlen("00:00:00:00:00:00"))
+        return -EINVAL;
+
+    strcpy(mA2dpAddress, address);
+    if (mData)
+        a2dp_set_sink(mData, mA2dpAddress);
+
+    return NO_ERROR;
+!!!10045452.cpp!!!	setBluetoothEnabled(in enabled : bool) : status_t
+    ALOGD("setBluetoothEnabled %d", enabled);
+
+    Mutex::Autolock lock(mLock);
+
+    mBluetoothEnabled = enabled;
+    if (!enabled) {
+        return close_l();
+    }
+    return NO_ERROR;
+!!!10045580.cpp!!!	setSuspended(in onOff : bool) : status_t
+    ALOGV("setSuspended %d", onOff);
+    mSuspended = onOff;
+    standby();
+    return NO_ERROR;
+!!!10045708.cpp!!!	standby_l() : status_t
+    int result = NO_ERROR;
+
+    if (!mStandby) {
+        ALOGV_IF(mClosing || !mBluetoothEnabled, "Standby skip stop: closing %d enabled %d",
+                mClosing, mBluetoothEnabled);
+        if (!mClosing && mBluetoothEnabled) {
+            result = a2dp_stop(mData);
+        }
+        release_wake_lock(sA2dpWakeLock);
+        mStandby = true;
+    }
+
+    return result;

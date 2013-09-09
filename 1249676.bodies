@@ -1,0 +1,247 @@
+class MediaEncoderFilter
+!!!7115020.java!!!	MediaEncoderFilter(in name : String)
+        super(name);
+        Point bl = new Point(0, 0);
+        Point br = new Point(1, 0);
+        Point tl = new Point(0, 1);
+        Point tr = new Point(1, 1);
+        mSourceRegion = new Quad(bl, br, tl, tr);
+        mLogVerbose = Log.isLoggable(TAG, Log.VERBOSE);
+!!!7115148.java!!!	setupPorts() : void
+        // Add input port- will accept RGBA GLFrames
+        addMaskedInputPort("videoframe", ImageFormat.create(ImageFormat.COLORSPACE_RGBA,
+                                                      FrameFormat.TARGET_GPU));
+!!!7115276.java!!!	fieldPortValueUpdated(in name : String, inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Port " + name + " has been updated");
+        if (name.equals("recording")) return;
+        if (name.equals("inputRegion")) {
+            if (isOpen()) updateSourceRegion();
+            return;
+        }
+        // TODO: Not sure if it is possible to update the maxFileSize
+        // when the recording is going on. For now, not doing that.
+        if (isOpen() && mRecordingActive) {
+            throw new RuntimeException("Cannot change recording parameters"
+                                       + " when the filter is recording!");
+        }
+!!!7115404.java!!!	updateSourceRegion() : void
+        // Flip source quad to map to OpenGL origin
+        Quad flippedRegion = new Quad();
+        flippedRegion.p0 = mSourceRegion.p2;
+        flippedRegion.p1 = mSourceRegion.p3;
+        flippedRegion.p2 = mSourceRegion.p0;
+        flippedRegion.p3 = mSourceRegion.p1;
+        mProgram.setSourceRegion(flippedRegion);
+!!!7115532.java!!!	updateMediaRecorderParams() : void
+        mCaptureTimeLapse = mTimeBetweenTimeLapseFrameCaptureUs > 0;
+        final int GRALLOC_BUFFER = 2;
+        mMediaRecorder.setVideoSource(GRALLOC_BUFFER);
+        if (!mCaptureTimeLapse && (mAudioSource != NO_AUDIO_SOURCE)) {
+            mMediaRecorder.setAudioSource(mAudioSource);
+        }
+        if (mProfile != null) {
+            mMediaRecorder.setProfile(mProfile);
+            mFps = mProfile.videoFrameRate;
+            // If width and height are set larger than 0, then those
+            // overwrite the ones in the profile.
+            if (mWidth > 0 && mHeight > 0) {
+                mMediaRecorder.setVideoSize(mWidth, mHeight);
+            }
+        } else {
+            mMediaRecorder.setOutputFormat(mOutputFormat);
+            mMediaRecorder.setVideoEncoder(mVideoEncoder);
+            mMediaRecorder.setVideoSize(mWidth, mHeight);
+            mMediaRecorder.setVideoFrameRate(mFps);
+        }
+        mMediaRecorder.setOrientationHint(mOrientationHint);
+        mMediaRecorder.setOnInfoListener(mInfoListener);
+        mMediaRecorder.setOnErrorListener(mErrorListener);
+        if (mFd != null) {
+            mMediaRecorder.setOutputFile(mFd);
+        } else {
+            mMediaRecorder.setOutputFile(mOutputFile);
+        }
+        try {
+            mMediaRecorder.setMaxFileSize(mMaxFileSize);
+        } catch (Exception e) {
+            // Following the logic in  VideoCamera.java (in Camera app)
+            // We are going to ignore failure of setMaxFileSize here, as
+            // a) The composer selected may simply not support it, or
+            // b) The underlying media framework may not handle 64-bit range
+            // on the size restriction.
+            Log.w(TAG, "Setting maxFileSize on MediaRecorder unsuccessful! "
+                    + e.getMessage());
+        }
+        mMediaRecorder.setMaxDuration(mMaxDurationMs);
+!!!7115660.java!!!	prepare(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Preparing");
+
+        mProgram = ShaderProgram.createIdentity(context);
+
+        mRecordingActive = false;
+!!!7115788.java!!!	open(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Opening");
+        updateSourceRegion();
+        if (mRecording) startRecording(context);
+!!!7115916.java!!!	startRecording(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Starting recording");
+
+        // Create a frame representing the screen
+        MutableFrameFormat screenFormat = new MutableFrameFormat(
+                              FrameFormat.TYPE_BYTE, FrameFormat.TARGET_GPU);
+        screenFormat.setBytesPerSample(4);
+
+        int width, height;
+        boolean widthHeightSpecified = mWidth > 0 && mHeight > 0;
+        // If width and height are specified, then use those instead
+        // of that in the profile.
+        if (mProfile != null && !widthHeightSpecified) {
+            width = mProfile.videoFrameWidth;
+            height = mProfile.videoFrameHeight;
+        } else {
+            width = mWidth;
+            height = mHeight;
+        }
+        screenFormat.setDimensions(width, height);
+        mScreen = (GLFrame)context.getFrameManager().newBoundFrame(
+                           screenFormat, GLFrame.EXISTING_FBO_BINDING, 0);
+
+        // Initialize the media recorder
+
+        mMediaRecorder = new MediaRecorder();
+        updateMediaRecorderParams();
+
+        try {
+            mMediaRecorder.prepare();
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new RuntimeException("IOException in"
+                    + "MediaRecorder.prepare()!", e);
+        } catch (Exception e) {
+            throw new RuntimeException("Unknown Exception in"
+                    + "MediaRecorder.prepare()!", e);
+        }
+        // Make sure start() is called before trying to
+        // register the surface. The native window handle needed to create
+        // the surface is initiated in start()
+        mMediaRecorder.start();
+        if (mLogVerbose) Log.v(TAG, "Open: registering surface from Mediarecorder");
+        mSurfaceId = context.getGLEnvironment().
+                registerSurfaceFromMediaRecorder(mMediaRecorder);
+        mNumFramesEncoded = 0;
+        mRecordingActive = true;
+!!!7116044.java!!!	skipFrameAndModifyTimestamp(in timestampNs : long) : boolean
+        // first frame- encode. Don't skip
+        if (mNumFramesEncoded == 0) {
+            mLastTimeLapseFrameRealTimestampNs = timestampNs;
+            mTimestampNs = timestampNs;
+            if (mLogVerbose) Log.v(TAG, "timelapse: FIRST frame, last real t= "
+                    + mLastTimeLapseFrameRealTimestampNs +
+                    ", setting t = " + mTimestampNs );
+            return false;
+        }
+
+        // Workaround to bypass the first 2 input frames for skipping.
+        // The first 2 output frames from the encoder are: decoder specific info and
+        // the compressed video frame data for the first input video frame.
+        if (mNumFramesEncoded >= 2 && timestampNs <
+            (mLastTimeLapseFrameRealTimestampNs +  1000L * mTimeBetweenTimeLapseFrameCaptureUs)) {
+            // If 2 frames have been already encoded,
+            // Skip all frames from last encoded frame until
+            // sufficient time (mTimeBetweenTimeLapseFrameCaptureUs) has passed.
+            if (mLogVerbose) Log.v(TAG, "timelapse: skipping intermediate frame");
+            return true;
+        } else {
+            // Desired frame has arrived after mTimeBetweenTimeLapseFrameCaptureUs time:
+            // - Reset mLastTimeLapseFrameRealTimestampNs to current time.
+            // - Artificially modify timestampNs to be one frame time (1/framerate) ahead
+            // of the last encoded frame's time stamp.
+            if (mLogVerbose) Log.v(TAG, "timelapse: encoding frame, Timestamp t = " + timestampNs +
+                    ", last real t= " + mLastTimeLapseFrameRealTimestampNs +
+                    ", interval = " + mTimeBetweenTimeLapseFrameCaptureUs);
+            mLastTimeLapseFrameRealTimestampNs = timestampNs;
+            mTimestampNs = mTimestampNs + (1000000000L / (long)mFps);
+            if (mLogVerbose) Log.v(TAG, "timelapse: encoding frame, setting t = "
+                    + mTimestampNs + ", delta t = " + (1000000000L / (long)mFps) +
+                    ", fps = " + mFps );
+            return false;
+        }
+!!!7116172.java!!!	process(inout context : FilterContext) : void
+        GLEnvironment glEnv = context.getGLEnvironment();
+        // Get input frame
+        Frame input = pullInput("videoframe");
+
+        // Check if recording needs to start
+        if (!mRecordingActive && mRecording) {
+            startRecording(context);
+        }
+        // Check if recording needs to stop
+        if (mRecordingActive && !mRecording) {
+            stopRecording(context);
+        }
+
+        if (!mRecordingActive) return;
+
+        if (mCaptureTimeLapse) {
+            if (skipFrameAndModifyTimestamp(input.getTimestamp())) {
+                return;
+            }
+        } else {
+            mTimestampNs = input.getTimestamp();
+        }
+
+        // Activate our surface
+        glEnv.activateSurfaceWithId(mSurfaceId);
+
+        // Process
+        mProgram.process(input, mScreen);
+
+        // Set timestamp from input
+        glEnv.setSurfaceTimestamp(mTimestampNs);
+        // And swap buffers
+        glEnv.swapBuffers();
+        mNumFramesEncoded++;
+!!!7116300.java!!!	stopRecording(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Stopping recording");
+
+        mRecordingActive = false;
+        mNumFramesEncoded = 0;
+        GLEnvironment glEnv = context.getGLEnvironment();
+        // The following call will switch the surface_id to 0
+        // (thus, calling eglMakeCurrent on surface with id 0) and
+        // then call eglDestroy on the surface. Hence, this will
+        // call disconnect the SurfaceMediaSource, which is needed to
+        // be called before calling Stop on the mediarecorder
+        if (mLogVerbose) Log.v(TAG, String.format("Unregistering surface %d", mSurfaceId));
+        glEnv.unregisterSurfaceId(mSurfaceId);
+        try {
+            mMediaRecorder.stop();
+        } catch (RuntimeException e) {
+            throw new MediaRecorderStopException("MediaRecorder.stop() failed!", e);
+        }
+        mMediaRecorder.release();
+        mMediaRecorder = null;
+
+        mScreen.release();
+        mScreen = null;
+
+        // Use an EffectsRecorder callback to forward a media finalization
+        // call so that it creates the video thumbnail, and whatever else needs
+        // to be done to finalize media.
+        if (mRecordingDoneListener != null) {
+            mRecordingDoneListener.onRecordingDone();
+        }
+!!!7116428.java!!!	close(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Closing");
+        if (mRecordingActive) stopRecording(context);
+!!!7116556.java!!!	tearDown(inout context : FilterContext) : void
+        // Release all the resources associated with the MediaRecorder
+        // and GLFrame members
+        if (mMediaRecorder != null) {
+            mMediaRecorder.release();
+        }
+        if (mScreen != null) {
+            mScreen.release();
+        }
+

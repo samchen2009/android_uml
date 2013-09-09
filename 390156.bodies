@@ -1,0 +1,390 @@
+class AudioResamplerSinc
+!!!872204.cpp!!!	AudioResamplerSinc(in bitDepth : int, in inChannelCount : int, in sampleRate : int32_t, in quality : src_quality = HIGH_QUALITY)
+    /*
+     * Layout of the state buffer for 32 tap:
+     *
+     * "present" sample            beginning of 2nd buffer
+     *                 v                v
+     *  0              01               2              23              3
+     *  0              F0               0              F0              F
+     * [pppppppppppppppInnnnnnnnnnnnnnnnpppppppppppppppInnnnnnnnnnnnnnnn]
+     *                 ^               ^ head
+     *
+     * p = past samples, convoluted with the (p)ositive side of sinc()
+     * n = future samples, convoluted with the (n)egative side of sinc()
+     * r = extra space for implementing the ring buffer
+     *
+     */
+
+    mVolumeSIMD[0] = 0;
+    mVolumeSIMD[1] = 0;
+
+    // Load the constants for coefficients
+    int ok = pthread_once(&once_control, init_routine);
+    if (ok != 0) {
+        ALOGE("%s pthread_once failed: %d", __func__, ok);
+    }
+    mConstants = (quality == VERY_HIGH_QUALITY) ?
+            &veryHighQualityConstants : &highQualityConstants;
+!!!872332.cpp!!!	~AudioResamplerSinc()
+    free(mState);
+!!!872460.cpp!!!	resample(inout out : int32_t, in outFrameCount : size_t, inout provider : AudioBufferProvider) : void
+    // FIXME store current state (up or down sample) and only load the coefs when the state
+    // changes. Or load two pointers one for up and one for down in the init function.
+    // Not critical now since the read functions are fast, but would be important if read was slow.
+    if (mConstants == &veryHighQualityConstants && readResampleCoefficients) {
+        mFirCoefs = readResampleCoefficients( mInSampleRate <= mSampleRate );
+    } else {
+        mFirCoefs = (mInSampleRate <= mSampleRate) ? mFirCoefsUp : mFirCoefsDown;
+    }
+
+    // select the appropriate resampler
+    switch (mChannelCount) {
+    case 1:
+        resample<1>(out, outFrameCount, provider);
+        break;
+    case 2:
+        resample<2>(out, outFrameCount, provider);
+        break;
+    }
+!!!872588.cpp!!!	init() : void
+    const Constants& c(*mConstants);
+    const size_t numCoefs = 2 * c.halfNumCoefs;
+    const size_t stateSize = numCoefs * mChannelCount * 2;
+    mState = (int16_t*)memalign(32, stateSize*sizeof(int16_t));
+    memset(mState, 0, sizeof(int16_t)*stateSize);
+    mImpulse  = mState   + (c.halfNumCoefs-1)*mChannelCount;
+    mRingFull = mImpulse + (numCoefs+1)*mChannelCount;
+!!!872716.cpp!!!	setVolume(in left : int16_t, in right : int16_t) : void
+    AudioResampler::setVolume(left, right);
+    mVolumeSIMD[0] = int32_t(left)<<16;
+    mVolumeSIMD[1] = int32_t(right)<<16;
+!!!872844.cpp!!!	resample(inout out : int32_t, in outFrameCount : size_t, inout provider : AudioBufferProvider) : void
+    const Constants& c(*mConstants);
+    const size_t headOffset = c.halfNumCoefs*CHANNELS;
+    int16_t* impulse = mImpulse;
+    uint32_t vRL = mVolumeRL;
+    size_t inputIndex = mInputIndex;
+    uint32_t phaseFraction = mPhaseFraction;
+    uint32_t phaseIncrement = mPhaseIncrement;
+    size_t outputIndex = 0;
+    size_t outputSampleCount = outFrameCount * 2;
+    size_t inFrameCount = (outFrameCount*mInSampleRate)/mSampleRate;
+
+    while (outputIndex < outputSampleCount) {
+        // buffer is empty, fetch a new one
+        while (mBuffer.frameCount == 0) {
+            mBuffer.frameCount = inFrameCount;
+            provider->getNextBuffer(&mBuffer,
+                                    calculateOutputPTS(outputIndex / 2));
+            if (mBuffer.raw == NULL) {
+                goto resample_exit;
+            }
+            const uint32_t phaseIndex = phaseFraction >> kNumPhaseBits;
+            if (phaseIndex == 1) {
+                // read one frame
+                read<CHANNELS>(impulse, phaseFraction, mBuffer.i16, inputIndex);
+            } else if (phaseIndex == 2) {
+                // read 2 frames
+                read<CHANNELS>(impulse, phaseFraction, mBuffer.i16, inputIndex);
+                inputIndex++;
+                if (inputIndex >= mBuffer.frameCount) {
+                    inputIndex -= mBuffer.frameCount;
+                    provider->releaseBuffer(&mBuffer);
+                } else {
+                    read<CHANNELS>(impulse, phaseFraction, mBuffer.i16, inputIndex);
+                }
+            }
+        }
+        int16_t const * const in = mBuffer.i16;
+        const size_t frameCount = mBuffer.frameCount;
+
+        // Always read-in the first samples from the input buffer
+        int16_t* head = impulse + headOffset;
+        for (size_t i=0 ; i<CHANNELS ; i++) {
+            head[i] = in[inputIndex*CHANNELS + i];
+        }
+
+        // handle boundary case
+        while (CC_LIKELY(outputIndex < outputSampleCount)) {
+            filterCoefficient<CHANNELS>(&out[outputIndex], phaseFraction, impulse, vRL);
+            outputIndex += 2;
+
+            phaseFraction += phaseIncrement;
+            const size_t phaseIndex = phaseFraction >> kNumPhaseBits;
+            for (size_t i=0 ; i<phaseIndex ; i++) {
+                inputIndex++;
+                if (inputIndex >= frameCount) {
+                    goto done;  // need a new buffer
+                }
+                read<CHANNELS>(impulse, phaseFraction, in, inputIndex);
+            }
+        }
+done:
+        // if done with buffer, save samples
+        if (inputIndex >= frameCount) {
+            inputIndex -= frameCount;
+            provider->releaseBuffer(&mBuffer);
+        }
+    }
+
+resample_exit:
+    mImpulse = impulse;
+    mInputIndex = inputIndex;
+    mPhaseFraction = phaseFraction;
+!!!872972.cpp!!!	filterCoefficient(inout out : int32_t, in phase : uint32_t, in samples : int16_t, in vRL : uint32_t) : void
+    // NOTE: be very careful when modifying the code here. register
+    // pressure is very high and a small change might cause the compiler
+    // to generate far less efficient code.
+    // Always sanity check the result with objdump or test-resample.
+
+    // compute the index of the coefficient on the positive side and
+    // negative side
+    const Constants& c(*mConstants);
+    const int32_t ONE = c.cMask | c.pMask;
+    uint32_t indexP = ( phase & c.cMask) >> c.cShift;
+    uint32_t lerpP  = ( phase & c.pMask) >> c.pShift;
+    uint32_t indexN = ((ONE-phase) & c.cMask) >> c.cShift;
+    uint32_t lerpN  = ((ONE-phase) & c.pMask) >> c.pShift;
+
+    const size_t offset = c.halfNumCoefs;
+    indexP *= offset;
+    indexN *= offset;
+
+    int32_t const* coefsP = mFirCoefs + indexP;
+    int32_t const* coefsN = mFirCoefs + indexN;
+    int16_t const* sP = samples;
+    int16_t const* sN = samples + CHANNELS;
+
+    size_t count = offset;
+
+    if (!USE_NEON) {
+        int32_t l = 0;
+        int32_t r = 0;
+        for (size_t i=0 ; i<count ; i++) {
+            interpolate<CHANNELS>(l, r, coefsP++, offset, lerpP, sP);
+            sP -= CHANNELS;
+            interpolate<CHANNELS>(l, r, coefsN++, offset, lerpN, sN);
+            sN += CHANNELS;
+        }
+        out[0] += 2 * mulRL(1, l, vRL);
+        out[1] += 2 * mulRL(0, r, vRL);
+    } else if (CHANNELS == 1) {
+        int32_t const* coefsP1 = coefsP + offset;
+        int32_t const* coefsN1 = coefsN + offset;
+        sP -= CHANNELS*3;
+        asm (
+            "vmov.32        d2[0], %[lerpP]          \n"    // load the positive phase
+            "vmov.32        d2[1], %[lerpN]          \n"    // load the negative phase
+            "veor           q0, q0, q0               \n"    // result, initialize to 0
+            "vshl.s32       d2, d2, #16              \n"    // convert to 32 bits
+
+            "1:                                      \n"
+            "vld1.16        { d4}, [%[sP]]           \n"    // load 4 16-bits stereo samples
+            "vld1.32        { q8}, [%[coefsP0]:128]! \n"    // load 4 32-bits coefs
+            "vld1.32        { q9}, [%[coefsP1]:128]! \n"    // load 4 32-bits coefs for interpolation
+            "vld1.16        { d6}, [%[sN]]!          \n"    // load 4 16-bits stereo samples
+            "vld1.32        {q10}, [%[coefsN0]:128]! \n"    // load 4 32-bits coefs
+            "vld1.32        {q11}, [%[coefsN1]:128]! \n"    // load 4 32-bits coefs for interpolation
+
+            "vrev64.16      d4, d4                   \n"    // reverse 2 frames of the positive side
+
+            "vsub.s32        q9,  q9,  q8            \n"    // interpolate (step1) 1st set of coefs
+            "vsub.s32       q11, q11, q10            \n"    // interpolate (step1) 2nd set of coets
+            "vshll.s16      q12,  d4, #15            \n"    // extend samples to 31 bits
+
+            "vqrdmulh.s32    q9,  q9, d2[0]          \n"    // interpolate (step2) 1st set of coefs
+            "vqrdmulh.s32   q11, q11, d2[1]          \n"    // interpolate (step3) 2nd set of coefs
+            "vshll.s16      q14,  d6, #15            \n"    // extend samples to 31 bits
+
+            "vadd.s32        q8,  q8,  q9            \n"    // interpolate (step3) 1st set
+            "vadd.s32       q10, q10, q11            \n"    // interpolate (step4) 2nd set
+            "subs           %[count], %[count], #4   \n"    // update loop counter
+
+            "vqrdmulh.s32   q12, q12, q8             \n"    // multiply samples by interpolated coef
+            "vqrdmulh.s32   q14, q14, q10            \n"    // multiply samples by interpolated coef
+            "sub            %[sP], %[sP], #8         \n"    // move pointer to next set of samples
+
+            "vadd.s32       q0, q0, q12              \n"    // accumulate result
+            "vadd.s32       q0, q0, q14              \n"    // accumulate result
+
+            "bne            1b                       \n"    // loop
+
+            "vld1.s32       {d2}, [%[vLR]]           \n"    // load volumes
+            "vld1.s32       {d3}, %[out]             \n"    // load the output
+            "vpadd.s32      d0, d0, d1               \n"    // add all 4 partial sums
+            "vpadd.s32      d0, d0, d0               \n"    // together
+            "vdup.i32       d0, d0[0]                \n"    // interleave L,R channels
+            "vqrdmulh.s32   d0, d0, d2               \n"    // apply volume
+            "vadd.s32       d3, d3, d0               \n"    // accumulate result
+            "vst1.s32       {d3}, %[out]             \n"    // store result
+
+            : [out]     "=Uv" (out[0]),
+              [count]   "+r" (count),
+              [coefsP0] "+r" (coefsP),
+              [coefsP1] "+r" (coefsP1),
+              [coefsN0] "+r" (coefsN),
+              [coefsN1] "+r" (coefsN1),
+              [sP]      "+r" (sP),
+              [sN]      "+r" (sN)
+            : [lerpP]   "r" (lerpP),
+              [lerpN]   "r" (lerpN),
+              [vLR]     "r" (mVolumeSIMD)
+            : "cc", "memory",
+              "q0", "q1", "q2", "q3",
+              "q8", "q9", "q10", "q11",
+              "q12", "q14"
+        );
+    } else if (CHANNELS == 2) {
+        int32_t const* coefsP1 = coefsP + offset;
+        int32_t const* coefsN1 = coefsN + offset;
+        sP -= CHANNELS*3;
+        asm (
+            "vmov.32        d2[0], %[lerpP]          \n"    // load the positive phase
+            "vmov.32        d2[1], %[lerpN]          \n"    // load the negative phase
+            "veor           q0, q0, q0               \n"    // result, initialize to 0
+            "veor           q4, q4, q4               \n"    // result, initialize to 0
+            "vshl.s32       d2, d2, #16              \n"    // convert to 32 bits
+
+            "1:                                      \n"
+            "vld2.16        {d4,d5}, [%[sP]]         \n"    // load 4 16-bits stereo samples
+            "vld1.32        { q8}, [%[coefsP0]:128]! \n"    // load 4 32-bits coefs
+            "vld1.32        { q9}, [%[coefsP1]:128]! \n"    // load 4 32-bits coefs for interpolation
+            "vld2.16        {d6,d7}, [%[sN]]!        \n"    // load 4 16-bits stereo samples
+            "vld1.32        {q10}, [%[coefsN0]:128]! \n"    // load 4 32-bits coefs
+            "vld1.32        {q11}, [%[coefsN1]:128]! \n"    // load 4 32-bits coefs for interpolation
+
+            "vrev64.16      d4, d4                   \n"    // reverse 2 frames of the positive side
+            "vrev64.16      d5, d5                   \n"    // reverse 2 frames of the positive side
+
+            "vsub.s32        q9,  q9,  q8            \n"    // interpolate (step1) 1st set of coefs
+            "vsub.s32       q11, q11, q10            \n"    // interpolate (step1) 2nd set of coets
+            "vshll.s16      q12,  d4, #15            \n"    // extend samples to 31 bits
+            "vshll.s16      q13,  d5, #15            \n"    // extend samples to 31 bits
+
+            "vqrdmulh.s32    q9,  q9, d2[0]          \n"    // interpolate (step2) 1st set of coefs
+            "vqrdmulh.s32   q11, q11, d2[1]          \n"    // interpolate (step3) 2nd set of coefs
+            "vshll.s16      q14,  d6, #15            \n"    // extend samples to 31 bits
+            "vshll.s16      q15,  d7, #15            \n"    // extend samples to 31 bits
+
+            "vadd.s32        q8,  q8,  q9            \n"    // interpolate (step3) 1st set
+            "vadd.s32       q10, q10, q11            \n"    // interpolate (step4) 2nd set
+            "subs           %[count], %[count], #4   \n"    // update loop counter
+
+            "vqrdmulh.s32   q12, q12, q8             \n"    // multiply samples by interpolated coef
+            "vqrdmulh.s32   q13, q13, q8             \n"    // multiply samples by interpolated coef
+            "vqrdmulh.s32   q14, q14, q10            \n"    // multiply samples by interpolated coef
+            "vqrdmulh.s32   q15, q15, q10            \n"    // multiply samples by interpolated coef
+            "sub            %[sP], %[sP], #16        \n"    // move pointer to next set of samples
+
+            "vadd.s32       q0, q0, q12              \n"    // accumulate result
+            "vadd.s32       q4, q4, q13              \n"    // accumulate result
+            "vadd.s32       q0, q0, q14              \n"    // accumulate result
+            "vadd.s32       q4, q4, q15              \n"    // accumulate result
+
+            "bne            1b                       \n"    // loop
+
+            "vld1.s32       {d2}, [%[vLR]]           \n"    // load volumes
+            "vld1.s32       {d3}, %[out]             \n"    // load the output
+            "vpadd.s32      d0, d0, d1               \n"    // add all 4 partial sums from q0
+            "vpadd.s32      d8, d8, d9               \n"    // add all 4 partial sums from q4
+            "vpadd.s32      d0, d0, d0               \n"    // together
+            "vpadd.s32      d8, d8, d8               \n"    // together
+            "vtrn.s32       d0, d8                   \n"    // interlace L,R channels
+            "vqrdmulh.s32   d0, d0, d2               \n"    // apply volume
+            "vadd.s32       d3, d3, d0               \n"    // accumulate result
+            "vst1.s32       {d3}, %[out]             \n"    // store result
+
+            : [out]     "=Uv" (out[0]),
+              [count]   "+r" (count),
+              [coefsP0] "+r" (coefsP),
+              [coefsP1] "+r" (coefsP1),
+              [coefsN0] "+r" (coefsN),
+              [coefsN1] "+r" (coefsN1),
+              [sP]      "+r" (sP),
+              [sN]      "+r" (sN)
+            : [lerpP]   "r" (lerpP),
+              [lerpN]   "r" (lerpN),
+              [vLR]     "r" (mVolumeSIMD)
+            : "cc", "memory",
+              "q0", "q1", "q2", "q3", "q4",
+              "q8", "q9", "q10", "q11",
+              "q12", "q13", "q14", "q15"
+        );
+    }
+!!!873100.cpp!!!	interpolate(inout l : int32_t, inout r : int32_t, in coefs : int32_t, in offset : size_t, in lerp : int32_t, in samples : int16_t) : void
+    int32_t c0 = coefs[0];
+    int32_t c1 = coefs[offset];
+    int32_t sinc = mulAdd(lerp, (c1-c0)<<1, c0);
+    if (CHANNELS == 2) {
+        uint32_t rl = *reinterpret_cast<const uint32_t*>(samples);
+        l = mulAddRL(1, rl, sinc, l);
+        r = mulAddRL(0, rl, sinc, r);
+    } else {
+        r = l = mulAdd(samples[0], sinc, l);
+    }
+!!!873228.cpp!!!	read(inout impulse : int16_t, inout phaseFraction : uint32_t, in in : int16_t, in inputIndex : size_t) : void
+    impulse += CHANNELS;
+    phaseFraction -= 1LU<<kNumPhaseBits;
+
+    const Constants& c(*mConstants);
+    if (CC_UNLIKELY(impulse >= mRingFull)) {
+        const size_t stateSize = (c.halfNumCoefs*2)*CHANNELS;
+        memcpy(mState, mState+stateSize, sizeof(int16_t)*stateSize);
+        impulse -= stateSize;
+    }
+
+    int16_t* head = impulse + c.halfNumCoefs*CHANNELS;
+    for (size_t i=0 ; i<CHANNELS ; i++) {
+        head[i] = in[inputIndex*CHANNELS + i];
+    }
+!!!873356.cpp!!!	init_routine() : void
+    // for high quality resampler, the parameters for coefficients are compile-time constants
+    Constants *c = &highQualityConstants;
+    c->coefsBits = RESAMPLE_FIR_LERP_INT_BITS;
+    c->cShift = kNumPhaseBits - c->coefsBits;
+    c->cMask = ((1<< c->coefsBits)-1) << c->cShift;
+    c->pShift = kNumPhaseBits - c->coefsBits - pLerpBits;
+    c->pMask = ((1<< pLerpBits)-1) << c->pShift;
+    c->halfNumCoefs = RESAMPLE_FIR_NUM_COEF;
+
+    // for very high quality resampler, the parameters are load-time constants
+    veryHighQualityConstants = highQualityConstants;
+
+    // Open the dll to get the coefficients for VERY_HIGH_QUALITY
+    void *resampleCoeffLib = dlopen("libaudio-resampler.so", RTLD_NOW);
+    ALOGV("Open libaudio-resampler library = %p", resampleCoeffLib);
+    if (resampleCoeffLib == NULL) {
+        ALOGE("Could not open audio-resampler library: %s", dlerror());
+        return;
+    }
+
+    readResampleFirNumCoeffFn readResampleFirNumCoeff;
+    readResampleFirLerpIntBitsFn readResampleFirLerpIntBits;
+
+    readResampleCoefficients = (readCoefficientsFn)
+            dlsym(resampleCoeffLib, "readResamplerCoefficients");
+    readResampleFirNumCoeff = (readResampleFirNumCoeffFn)
+            dlsym(resampleCoeffLib, "readResampleFirNumCoeff");
+    readResampleFirLerpIntBits = (readResampleFirLerpIntBitsFn)
+            dlsym(resampleCoeffLib, "readResampleFirLerpIntBits");
+
+    if (!readResampleCoefficients || !readResampleFirNumCoeff || !readResampleFirLerpIntBits) {
+        readResampleCoefficients = NULL;
+        dlclose(resampleCoeffLib);
+        resampleCoeffLib = NULL;
+        ALOGE("Could not find symbol: %s", dlerror());
+        return;
+    }
+
+    c = &veryHighQualityConstants;
+    c->coefsBits = readResampleFirLerpIntBits();
+    c->cShift = kNumPhaseBits - c->coefsBits;
+    c->cMask = ((1<<c->coefsBits)-1) << c->cShift;
+    c->pShift = kNumPhaseBits - c->coefsBits - pLerpBits;
+    c->pMask = ((1<<pLerpBits)-1) << c->pShift;
+    // number of zero-crossing on each side
+    c->halfNumCoefs = readResampleFirNumCoeff();
+    ALOGV("coefsBits = %d", c->coefsBits);
+    ALOGV("halfNumCoefs = %d", c->halfNumCoefs);
+    // note that we "leak" resampleCoeffLib until the process exits

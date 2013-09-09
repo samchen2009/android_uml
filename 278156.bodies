@@ -1,0 +1,538 @@
+class SoftAAC2
+!!!566668.cpp!!!	SoftAAC2(in name : char, in callbacks : OMX_CALLBACKTYPE, in appData : OMX_PTR, inout component : OMX_COMPONENTTYPE)
+    initPorts();
+    CHECK_EQ(initDecoder(), (status_t)OK);
+!!!566796.cpp!!!	~SoftAAC2()
+    aacDecoder_Close(mAACDecoder);
+!!!566924.cpp!!!	internalGetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamAudioAac:
+        {
+            OMX_AUDIO_PARAM_AACPROFILETYPE *aacParams =
+                (OMX_AUDIO_PARAM_AACPROFILETYPE *)params;
+
+            if (aacParams->nPortIndex != 0) {
+                return OMX_ErrorUndefined;
+            }
+
+            aacParams->nBitRate = 0;
+            aacParams->nAudioBandWidth = 0;
+            aacParams->nAACtools = 0;
+            aacParams->nAACERtools = 0;
+            aacParams->eAACProfile = OMX_AUDIO_AACObjectMain;
+
+            aacParams->eAACStreamFormat =
+                mIsADTS
+                    ? OMX_AUDIO_AACStreamFormatMP4ADTS
+                    : OMX_AUDIO_AACStreamFormatMP4FF;
+
+            aacParams->eChannelMode = OMX_AUDIO_ChannelModeStereo;
+
+            if (!isConfigured()) {
+                aacParams->nChannels = 1;
+                aacParams->nSampleRate = 44100;
+                aacParams->nFrameLength = 0;
+            } else {
+                aacParams->nChannels = mStreamInfo->numChannels;
+                aacParams->nSampleRate = mStreamInfo->sampleRate;
+                aacParams->nFrameLength = mStreamInfo->frameSize;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (pcmParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            pcmParams->eNumData = OMX_NumericalDataSigned;
+            pcmParams->eEndian = OMX_EndianBig;
+            pcmParams->bInterleaved = OMX_TRUE;
+            pcmParams->nBitPerSample = 16;
+            pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
+            pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
+            pcmParams->eChannelMapping[2] = OMX_AUDIO_ChannelCF;
+            pcmParams->eChannelMapping[3] = OMX_AUDIO_ChannelLFE;
+            pcmParams->eChannelMapping[4] = OMX_AUDIO_ChannelLS;
+            pcmParams->eChannelMapping[5] = OMX_AUDIO_ChannelRS;
+
+            if (!isConfigured()) {
+                pcmParams->nChannels = 1;
+                pcmParams->nSamplingRate = 44100;
+            } else {
+                pcmParams->nChannels = mStreamInfo->numChannels;
+                pcmParams->nSamplingRate = mStreamInfo->sampleRate;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalGetParameter(index, params);
+    }
+!!!567052.cpp!!!	internalSetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamStandardComponentRole:
+        {
+            const OMX_PARAM_COMPONENTROLETYPE *roleParams =
+                (const OMX_PARAM_COMPONENTROLETYPE *)params;
+
+            if (strncmp((const char *)roleParams->cRole,
+                        "audio_decoder.aac",
+                        OMX_MAX_STRINGNAME_SIZE - 1)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioAac:
+        {
+            const OMX_AUDIO_PARAM_AACPROFILETYPE *aacParams =
+                (const OMX_AUDIO_PARAM_AACPROFILETYPE *)params;
+
+            if (aacParams->nPortIndex != 0) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (aacParams->eAACStreamFormat == OMX_AUDIO_AACStreamFormatMP4FF) {
+                mIsADTS = false;
+            } else if (aacParams->eAACStreamFormat
+                        == OMX_AUDIO_AACStreamFormatMP4ADTS) {
+                mIsADTS = true;
+            } else {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioPcm:
+        {
+            const OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (pcmParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalSetParameter(index, params);
+    }
+!!!567180.cpp!!!	onQueueFilled(in portIndex : OMX_U32) : void
+    if (mSignalledError || mOutputPortSettingsChange != NONE) {
+        return;
+    }
+
+    UCHAR* inBuffer[FILEREAD_MAX_LAYERS];
+    UINT inBufferLength[FILEREAD_MAX_LAYERS] = {0};
+    UINT bytesValid[FILEREAD_MAX_LAYERS] = {0};
+
+    List<BufferInfo *> &inQueue = getPortQueue(0);
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+
+    if (portIndex == 0 && mInputBufferCount == 0) {
+        ++mInputBufferCount;
+        BufferInfo *info = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *header = info->mHeader;
+
+        inBuffer[0] = header->pBuffer + header->nOffset;
+        inBufferLength[0] = header->nFilledLen;
+
+        AAC_DECODER_ERROR decoderErr =
+            aacDecoder_ConfigRaw(mAACDecoder,
+                                 inBuffer,
+                                 inBufferLength);
+
+        if (decoderErr != AAC_DEC_OK) {
+            mSignalledError = true;
+            notify(OMX_EventError, OMX_ErrorUndefined, decoderErr, NULL);
+            return;
+        }
+        inQueue.erase(inQueue.begin());
+        info->mOwnedByUs = false;
+        notifyEmptyBufferDone(header);
+
+        // Only send out port settings changed event if both sample rate
+        // and numChannels are valid.
+        if (mStreamInfo->sampleRate && mStreamInfo->numChannels) {
+            maybeConfigureDownmix();
+            ALOGI("Initially configuring decoder: %d Hz, %d channels",
+                mStreamInfo->sampleRate,
+                mStreamInfo->numChannels);
+
+            notify(OMX_EventPortSettingsChanged, 1, 0, NULL);
+            mOutputPortSettingsChange = AWAITING_DISABLED;
+        }
+
+        return;
+    }
+
+    while (!inQueue.empty() && !outQueue.empty()) {
+        BufferInfo *inInfo = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+
+        BufferInfo *outInfo = *outQueue.begin();
+        OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            inQueue.erase(inQueue.begin());
+            inInfo->mOwnedByUs = false;
+            notifyEmptyBufferDone(inHeader);
+
+            if (!mIsFirst) {
+                // flush out the decoder's delayed data by calling DecodeFrame
+                // one more time, with the AACDEC_FLUSH flag set
+                INT_PCM *outBuffer =
+                        reinterpret_cast<INT_PCM *>(
+                                outHeader->pBuffer + outHeader->nOffset);
+
+                AAC_DECODER_ERROR decoderErr =
+                    aacDecoder_DecodeFrame(mAACDecoder,
+                                           outBuffer,
+                                           outHeader->nAllocLen,
+                                           AACDEC_FLUSH);
+
+                if (decoderErr != AAC_DEC_OK) {
+                    mSignalledError = true;
+
+                    notify(OMX_EventError, OMX_ErrorUndefined, decoderErr,
+                           NULL);
+
+                    return;
+                }
+
+                outHeader->nFilledLen =
+                        mStreamInfo->frameSize
+                            * sizeof(int16_t)
+                            * mStreamInfo->numChannels;
+            } else {
+                // Since we never discarded frames from the start, we won't have
+                // to add any padding at the end either.
+
+                outHeader->nFilledLen = 0;
+            }
+
+            outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+
+            outQueue.erase(outQueue.begin());
+            outInfo->mOwnedByUs = false;
+            notifyFillBufferDone(outHeader);
+            return;
+        }
+
+        if (inHeader->nOffset == 0) {
+            mAnchorTimeUs = inHeader->nTimeStamp;
+            mNumSamplesOutput = 0;
+        }
+
+        size_t adtsHeaderSize = 0;
+        if (mIsADTS) {
+            // skip 30 bits, aac_frame_length follows.
+            // ssssssss ssssiiip ppffffPc ccohCCll llllllll lll?????
+
+            const uint8_t *adtsHeader = inHeader->pBuffer + inHeader->nOffset;
+
+            bool signalError = false;
+            if (inHeader->nFilledLen < 7) {
+                ALOGE("Audio data too short to contain even the ADTS header. "
+                      "Got %ld bytes.", inHeader->nFilledLen);
+                hexdump(adtsHeader, inHeader->nFilledLen);
+                signalError = true;
+            } else {
+                bool protectionAbsent = (adtsHeader[1] & 1);
+
+                unsigned aac_frame_length =
+                    ((adtsHeader[3] & 3) << 11)
+                    | (adtsHeader[4] << 3)
+                    | (adtsHeader[5] >> 5);
+
+                if (inHeader->nFilledLen < aac_frame_length) {
+                    ALOGE("Not enough audio data for the complete frame. "
+                          "Got %ld bytes, frame size according to the ADTS "
+                          "header is %u bytes.",
+                          inHeader->nFilledLen, aac_frame_length);
+                    hexdump(adtsHeader, inHeader->nFilledLen);
+                    signalError = true;
+                } else {
+                    adtsHeaderSize = (protectionAbsent ? 7 : 9);
+
+                    inBuffer[0] = (UCHAR *)adtsHeader + adtsHeaderSize;
+                    inBufferLength[0] = aac_frame_length - adtsHeaderSize;
+
+                    inHeader->nOffset += adtsHeaderSize;
+                    inHeader->nFilledLen -= adtsHeaderSize;
+                }
+            }
+
+            if (signalError) {
+                mSignalledError = true;
+
+                notify(OMX_EventError,
+                       OMX_ErrorStreamCorrupt,
+                       ERROR_MALFORMED,
+                       NULL);
+
+                return;
+            }
+        } else {
+            inBuffer[0] = inHeader->pBuffer + inHeader->nOffset;
+            inBufferLength[0] = inHeader->nFilledLen;
+        }
+
+        // Fill and decode
+        INT_PCM *outBuffer = reinterpret_cast<INT_PCM *>(
+                outHeader->pBuffer + outHeader->nOffset);
+
+        bytesValid[0] = inBufferLength[0];
+
+        int prevSampleRate = mStreamInfo->sampleRate;
+        int prevNumChannels = mStreamInfo->numChannels;
+
+        AAC_DECODER_ERROR decoderErr = AAC_DEC_NOT_ENOUGH_BITS;
+        while (bytesValid[0] > 0 && decoderErr == AAC_DEC_NOT_ENOUGH_BITS) {
+            aacDecoder_Fill(mAACDecoder,
+                            inBuffer,
+                            inBufferLength,
+                            bytesValid);
+
+            decoderErr = aacDecoder_DecodeFrame(mAACDecoder,
+                                                outBuffer,
+                                                outHeader->nAllocLen,
+                                                0 /* flags */);
+
+            if (decoderErr == AAC_DEC_NOT_ENOUGH_BITS) {
+                ALOGW("Not enough bits, bytesValid %d", bytesValid[0]);
+            }
+        }
+
+        /*
+         * AAC+/eAAC+ streams can be signalled in two ways: either explicitly
+         * or implicitly, according to MPEG4 spec. AAC+/eAAC+ is a dual
+         * rate system and the sampling rate in the final output is actually
+         * doubled compared with the core AAC decoder sampling rate.
+         *
+         * Explicit signalling is done by explicitly defining SBR audio object
+         * type in the bitstream. Implicit signalling is done by embedding
+         * SBR content in AAC extension payload specific to SBR, and hence
+         * requires an AAC decoder to perform pre-checks on actual audio frames.
+         *
+         * Thus, we could not say for sure whether a stream is
+         * AAC+/eAAC+ until the first data frame is decoded.
+         */
+        if (mInputBufferCount <= 2) {
+            if (mStreamInfo->sampleRate != prevSampleRate ||
+                mStreamInfo->numChannels != prevNumChannels) {
+                maybeConfigureDownmix();
+                ALOGI("Reconfiguring decoder: %d Hz, %d channels",
+                      mStreamInfo->sampleRate,
+                      mStreamInfo->numChannels);
+
+                // We're going to want to revisit this input buffer, but
+                // may have already advanced the offset. Undo that if
+                // necessary.
+                inHeader->nOffset -= adtsHeaderSize;
+                inHeader->nFilledLen += adtsHeaderSize;
+
+                notify(OMX_EventPortSettingsChanged, 1, 0, NULL);
+                mOutputPortSettingsChange = AWAITING_DISABLED;
+                return;
+            }
+        } else if (!mStreamInfo->sampleRate || !mStreamInfo->numChannels) {
+            ALOGW("Invalid AAC stream");
+            mSignalledError = true;
+            notify(OMX_EventError, OMX_ErrorUndefined, decoderErr, NULL);
+            return;
+        }
+
+        size_t numOutBytes =
+            mStreamInfo->frameSize * sizeof(int16_t) * mStreamInfo->numChannels;
+
+        if (decoderErr == AAC_DEC_OK) {
+            UINT inBufferUsedLength = inBufferLength[0] - bytesValid[0];
+            inHeader->nFilledLen -= inBufferUsedLength;
+            inHeader->nOffset += inBufferUsedLength;
+        } else {
+            ALOGW("AAC decoder returned error %d, substituting silence",
+                  decoderErr);
+
+            memset(outHeader->pBuffer + outHeader->nOffset, 0, numOutBytes);
+
+            // Discard input buffer.
+            inHeader->nFilledLen = 0;
+
+            aacDecoder_SetParam(mAACDecoder, AAC_TPDEC_CLEAR_BUFFER, 1);
+
+            // fall through
+        }
+
+        if (decoderErr == AAC_DEC_OK || mNumSamplesOutput > 0) {
+            // We'll only output data if we successfully decoded it or
+            // we've previously decoded valid data, in the latter case
+            // (decode failed) we'll output a silent frame.
+            if (mIsFirst) {
+                mIsFirst = false;
+                // the first decoded frame should be discarded to account
+                // for decoder delay
+                numOutBytes = 0;
+            }
+
+            outHeader->nFilledLen = numOutBytes;
+            outHeader->nFlags = 0;
+
+            outHeader->nTimeStamp =
+                mAnchorTimeUs
+                    + (mNumSamplesOutput * 1000000ll) / mStreamInfo->sampleRate;
+
+            mNumSamplesOutput += mStreamInfo->frameSize;
+
+            outInfo->mOwnedByUs = false;
+            outQueue.erase(outQueue.begin());
+            outInfo = NULL;
+            notifyFillBufferDone(outHeader);
+            outHeader = NULL;
+        }
+
+        if (inHeader->nFilledLen == 0) {
+            inInfo->mOwnedByUs = false;
+            inQueue.erase(inQueue.begin());
+            inInfo = NULL;
+            notifyEmptyBufferDone(inHeader);
+            inHeader = NULL;
+        }
+
+        if (decoderErr == AAC_DEC_OK) {
+            ++mInputBufferCount;
+        }
+    }
+!!!567308.cpp!!!	onPortFlushCompleted(in portIndex : OMX_U32) : void
+    if (portIndex == 0) {
+        // Make sure that the next buffer output does not still
+        // depend on fragments from the last one decoded.
+        aacDecoder_SetParam(mAACDecoder, AAC_TPDEC_CLEAR_BUFFER, 1);
+        mIsFirst = true;
+    }
+!!!567436.cpp!!!	onPortEnableCompleted(in portIndex : OMX_U32, in enabled : bool) : void
+    if (portIndex != 1) {
+        return;
+    }
+
+    switch (mOutputPortSettingsChange) {
+        case NONE:
+            break;
+
+        case AWAITING_DISABLED:
+        {
+            CHECK(!enabled);
+            mOutputPortSettingsChange = AWAITING_ENABLED;
+            break;
+        }
+
+        default:
+        {
+            CHECK_EQ((int)mOutputPortSettingsChange, (int)AWAITING_ENABLED);
+            CHECK(enabled);
+            mOutputPortSettingsChange = NONE;
+            break;
+        }
+    }
+!!!567564.cpp!!!	initPorts() : void
+    OMX_PARAM_PORTDEFINITIONTYPE def;
+    InitOMXParams(&def);
+
+    def.nPortIndex = 0;
+    def.eDir = OMX_DirInput;
+    def.nBufferCountMin = kNumInputBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = 8192;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 1;
+
+    def.format.audio.cMIMEType = const_cast<char *>("audio/aac");
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingAAC;
+
+    addPort(def);
+
+    def.nPortIndex = 1;
+    def.eDir = OMX_DirOutput;
+    def.nBufferCountMin = kNumOutputBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = 4096 * MAX_CHANNEL_COUNT;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 2;
+
+    def.format.audio.cMIMEType = const_cast<char *>("audio/raw");
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingPCM;
+
+    addPort(def);
+!!!567692.cpp!!!	initDecoder() : status_t
+    status_t status = UNKNOWN_ERROR;
+    mAACDecoder = aacDecoder_Open(TT_MP4_ADIF, /* num layers */ 1);
+    if (mAACDecoder != NULL) {
+        mStreamInfo = aacDecoder_GetStreamInfo(mAACDecoder);
+        if (mStreamInfo != NULL) {
+            status = OK;
+        }
+    }
+    mIsFirst = true;
+
+    // for streams that contain metadata, use the mobile profile DRC settings unless overridden
+    // by platform properties:
+    char value[PROPERTY_VALUE_MAX];
+    //  * AAC_DRC_REFERENCE_LEVEL
+    if (property_get(PROP_DRC_OVERRIDE_REF_LEVEL, value, NULL)) {
+        unsigned refLevel = atoi(value);
+        ALOGV("AAC decoder using AAC_DRC_REFERENCE_LEVEL of %d instead of %d",
+                refLevel, DRC_DEFAULT_MOBILE_REF_LEVEL);
+        aacDecoder_SetParam(mAACDecoder, AAC_DRC_REFERENCE_LEVEL, refLevel);
+    } else {
+        aacDecoder_SetParam(mAACDecoder, AAC_DRC_REFERENCE_LEVEL, DRC_DEFAULT_MOBILE_REF_LEVEL);
+    }
+    //  * AAC_DRC_ATTENUATION_FACTOR
+    if (property_get(PROP_DRC_OVERRIDE_CUT, value, NULL)) {
+        unsigned cut = atoi(value);
+        ALOGV("AAC decoder using AAC_DRC_ATTENUATION_FACTOR of %d instead of %d",
+                        cut, DRC_DEFAULT_MOBILE_DRC_CUT);
+        aacDecoder_SetParam(mAACDecoder, AAC_DRC_ATTENUATION_FACTOR, cut);
+    } else {
+        aacDecoder_SetParam(mAACDecoder, AAC_DRC_ATTENUATION_FACTOR, DRC_DEFAULT_MOBILE_DRC_CUT);
+    }
+    //  * AAC_DRC_BOOST_FACTOR (note: no default, using cut)
+    if (property_get(PROP_DRC_OVERRIDE_BOOST, value, NULL)) {
+        unsigned boost = atoi(value);
+        ALOGV("AAC decoder using AAC_DRC_BOOST_FACTOR of %d", boost);
+        aacDecoder_SetParam(mAACDecoder, AAC_DRC_BOOST_FACTOR, boost);
+    }
+
+    return status;
+!!!567820.cpp!!!	isConfigured() : bool
+    return mInputBufferCount > 0;
+!!!567948.cpp!!!	maybeConfigureDownmix() : void
+    if (mStreamInfo->numChannels > 2) {
+        char value[PROPERTY_VALUE_MAX];
+        if (!(property_get("media.aac_51_output_enabled", value, NULL) &&
+                (!strcmp(value, "1") || !strcasecmp(value, "true")))) {
+            ALOGI("Downmixing multichannel AAC to stereo");
+            aacDecoder_SetParam(mAACDecoder, AAC_PCM_OUTPUT_CHANNELS, 2);
+            mStreamInfo->numChannels = 2;
+        }
+    }

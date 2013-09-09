@@ -1,0 +1,298 @@
+class AudioStream
+!!!2033676.cpp!!!	AudioStream()
+    mSocket = -1;
+    mCodec = NULL;
+    mBuffer = NULL;
+    mNext = NULL;
+!!!2033804.cpp!!!	~AudioStream()
+    close(mSocket);
+    delete mCodec;
+    delete [] mBuffer;
+    ALOGD("stream[%d] is dead", mSocket);
+!!!2033932.cpp!!!	set(in mode : int, in socket : int, inout remote : sockaddr_storage, inout codec : AudioCodec, in sampleRate : int, in sampleCount : int, in codecType : int, in dtmfType : int) : bool
+    if (mode < 0 || mode > LAST_MODE) {
+        return false;
+    }
+    mMode = mode;
+
+    mCodecMagic = (0x8000 | codecType) << 16;
+    mDtmfMagic = (dtmfType == -1) ? 0 : (0x8000 | dtmfType) << 16;
+
+    mTick = elapsedRealtime();
+    mSampleRate = sampleRate / 1000;
+    mSampleCount = sampleCount;
+    mInterval = mSampleCount / mSampleRate;
+
+    // Allocate jitter buffer.
+    for (mBufferMask = 8; mBufferMask < mSampleRate; mBufferMask <<= 1);
+    mBufferMask *= BUFFER_SIZE;
+    mBuffer = new int16_t[mBufferMask];
+    --mBufferMask;
+    mBufferHead = 0;
+    mBufferTail = 0;
+    mLatencyTimer = 0;
+    mLatencyScore = 0;
+
+    // Initialize random bits.
+    read(gRandom, &mSequence, sizeof(mSequence));
+    read(gRandom, &mTimestamp, sizeof(mTimestamp));
+    read(gRandom, &mSsrc, sizeof(mSsrc));
+
+    mDtmfEvent = -1;
+    mDtmfStart = 0;
+
+    // Only take over these things when succeeded.
+    mSocket = socket;
+    if (codec) {
+        mRemote = *remote;
+        mCodec = codec;
+
+        // Here we should never get an private address, but some buggy proxy
+        // servers do give us one. To solve this, we replace the address when
+        // the first time we successfully decode an incoming packet.
+        mFixRemote = false;
+        if (remote->ss_family == AF_INET) {
+            unsigned char *address =
+                (unsigned char *)&((sockaddr_in *)remote)->sin_addr;
+            if (address[0] == 10 ||
+                (address[0] == 172 && (address[1] >> 4) == 1) ||
+                (address[0] == 192 && address[1] == 168)) {
+                mFixRemote = true;
+            }
+        }
+    }
+
+    ALOGD("stream[%d] is configured as %s %dkHz %dms mode %d", mSocket,
+        (codec ? codec->name : "RAW"), mSampleRate, mInterval, mMode);
+    return true;
+!!!2034060.cpp!!!	sendDtmf(in event : int) : void
+    if (mDtmfMagic != 0) {
+        mDtmfEvent = event << 24;
+        mDtmfStart = mTimestamp + mSampleCount;
+    }
+!!!2034188.cpp!!!	mix(inout output : int32_t, in head : int, in tail : int, in sampleRate : int) : bool
+    if (mMode == SEND_ONLY) {
+        return false;
+    }
+
+    if (head - mBufferHead < 0) {
+        head = mBufferHead;
+    }
+    if (tail - mBufferTail > 0) {
+        tail = mBufferTail;
+    }
+    if (tail - head <= 0) {
+        return false;
+    }
+
+    head *= mSampleRate;
+    tail *= mSampleRate;
+
+    if (sampleRate == mSampleRate) {
+        for (int i = head; i - tail < 0; ++i) {
+            output[i - head] += mBuffer[i & mBufferMask];
+        }
+    } else {
+        // TODO: implement resampling.
+        return false;
+    }
+    return true;
+!!!2034316.cpp!!!	encode(in tick : int, inout chain : AudioStream) : void
+    if (tick - mTick >= mInterval) {
+        // We just missed the train. Pretend that packets in between are lost.
+        int skipped = (tick - mTick) / mInterval;
+        mTick += skipped * mInterval;
+        mSequence += skipped;
+        mTimestamp += skipped * mSampleCount;
+        ALOGV("stream[%d] skips %d packets", mSocket, skipped);
+    }
+
+    tick = mTick;
+    mTick += mInterval;
+    ++mSequence;
+    mTimestamp += mSampleCount;
+
+    // If there is an ongoing DTMF event, send it now.
+    if (mMode != RECEIVE_ONLY && mDtmfEvent != -1) {
+        int duration = mTimestamp - mDtmfStart;
+        // Make sure duration is reasonable.
+        if (duration >= 0 && duration < mSampleRate * DTMF_PERIOD) {
+            duration += mSampleCount;
+            int32_t buffer[4] = {
+                htonl(mDtmfMagic | mSequence),
+                htonl(mDtmfStart),
+                mSsrc,
+                htonl(mDtmfEvent | duration),
+            };
+            if (duration >= mSampleRate * DTMF_PERIOD) {
+                buffer[3] |= htonl(1 << 23);
+                mDtmfEvent = -1;
+            }
+            sendto(mSocket, buffer, sizeof(buffer), MSG_DONTWAIT,
+                (sockaddr *)&mRemote, sizeof(mRemote));
+            return;
+        }
+        mDtmfEvent = -1;
+    }
+
+    int32_t buffer[mSampleCount + 3];
+    bool data = false;
+    if (mMode != RECEIVE_ONLY) {
+        // Mix all other streams.
+        memset(buffer, 0, sizeof(buffer));
+        while (chain) {
+            if (chain != this) {
+                data |= chain->mix(buffer, tick - mInterval, tick, mSampleRate);
+            }
+            chain = chain->mNext;
+        }
+    }
+
+    int16_t samples[mSampleCount];
+    if (data) {
+        // Saturate into 16 bits.
+        for (int i = 0; i < mSampleCount; ++i) {
+            int32_t sample = buffer[i];
+            if (sample < -32768) {
+                sample = -32768;
+            }
+            if (sample > 32767) {
+                sample = 32767;
+            }
+            samples[i] = sample;
+        }
+    } else {
+        if ((mTick ^ mKeepAlive) >> 10 == 0) {
+            return;
+        }
+        mKeepAlive = mTick;
+        memset(samples, 0, sizeof(samples));
+
+        if (mMode != RECEIVE_ONLY) {
+            ALOGV("stream[%d] no data", mSocket);
+        }
+    }
+
+    if (!mCodec) {
+        // Special case for device stream.
+        send(mSocket, samples, sizeof(samples), MSG_DONTWAIT);
+        return;
+    }
+
+    // Cook the packet and send it out.
+    buffer[0] = htonl(mCodecMagic | mSequence);
+    buffer[1] = htonl(mTimestamp);
+    buffer[2] = mSsrc;
+    int length = mCodec->encode(&buffer[3], samples);
+    if (length <= 0) {
+        ALOGV("stream[%d] encoder error", mSocket);
+        return;
+    }
+    sendto(mSocket, buffer, length + 12, MSG_DONTWAIT, (sockaddr *)&mRemote,
+        sizeof(mRemote));
+!!!2034444.cpp!!!	decode(in tick : int) : void
+    char c;
+    if (mMode == SEND_ONLY) {
+        recv(mSocket, &c, 1, MSG_DONTWAIT);
+        return;
+    }
+
+    // Make sure mBufferHead and mBufferTail are reasonable.
+    if ((unsigned int)(tick + BUFFER_SIZE - mBufferHead) > BUFFER_SIZE * 2) {
+        mBufferHead = tick - HISTORY_SIZE;
+        mBufferTail = mBufferHead;
+    }
+
+    if (tick - mBufferHead > HISTORY_SIZE) {
+        // Throw away outdated samples.
+        mBufferHead = tick - HISTORY_SIZE;
+        if (mBufferTail - mBufferHead < 0) {
+            mBufferTail = mBufferHead;
+        }
+    }
+
+    // Adjust the jitter buffer if the latency keeps larger than the threshold
+    // in the measurement period.
+    int score = mBufferTail - tick - MEASURE_BASE;
+    if (mLatencyScore > score || mLatencyScore <= 0) {
+        mLatencyScore = score;
+        mLatencyTimer = tick;
+    } else if (tick - mLatencyTimer >= MEASURE_PERIOD) {
+        ALOGV("stream[%d] reduces latency of %dms", mSocket, mLatencyScore);
+        mBufferTail -= mLatencyScore;
+        mLatencyScore = -1;
+    }
+
+    int count = (BUFFER_SIZE - (mBufferTail - mBufferHead)) * mSampleRate;
+    if (count < mSampleCount) {
+        // Buffer overflow. Drop the packet.
+        ALOGV("stream[%d] buffer overflow", mSocket);
+        recv(mSocket, &c, 1, MSG_DONTWAIT);
+        return;
+    }
+
+    // Receive the packet and decode it.
+    int16_t samples[count];
+    if (!mCodec) {
+        // Special case for device stream.
+        count = recv(mSocket, samples, sizeof(samples),
+            MSG_TRUNC | MSG_DONTWAIT) >> 1;
+    } else {
+        __attribute__((aligned(4))) uint8_t buffer[2048];
+        sockaddr_storage remote;
+        socklen_t addrlen = sizeof(remote);
+
+        int length = recvfrom(mSocket, buffer, sizeof(buffer),
+            MSG_TRUNC | MSG_DONTWAIT, (sockaddr *)&remote, &addrlen);
+
+        // Do we need to check SSRC, sequence, and timestamp? They are not
+        // reliable but at least they can be used to identify duplicates?
+        if (length < 12 || length > (int)sizeof(buffer) ||
+            (ntohl(*(uint32_t *)buffer) & 0xC07F0000) != mCodecMagic) {
+            ALOGV("stream[%d] malformed packet", mSocket);
+            return;
+        }
+        int offset = 12 + ((buffer[0] & 0x0F) << 2);
+        if ((buffer[0] & 0x10) != 0) {
+            offset += 4 + (ntohs(*(uint16_t *)&buffer[offset + 2]) << 2);
+        }
+        if ((buffer[0] & 0x20) != 0) {
+            length -= buffer[length - 1];
+        }
+        length -= offset;
+        if (length >= 0) {
+            length = mCodec->decode(samples, count, &buffer[offset], length);
+        }
+        if (length > 0 && mFixRemote) {
+            mRemote = remote;
+            mFixRemote = false;
+        }
+        count = length;
+    }
+    if (count <= 0) {
+        ALOGV("stream[%d] decoder error", mSocket);
+        return;
+    }
+
+    if (tick - mBufferTail > 0) {
+        // Buffer underrun. Reset the jitter buffer.
+        ALOGV("stream[%d] buffer underrun", mSocket);
+        if (mBufferTail - mBufferHead <= 0) {
+            mBufferHead = tick + mInterval;
+            mBufferTail = mBufferHead;
+        } else {
+            int tail = (tick + mInterval) * mSampleRate;
+            for (int i = mBufferTail * mSampleRate; i - tail < 0; ++i) {
+                mBuffer[i & mBufferMask] = 0;
+            }
+            mBufferTail = tick + mInterval;
+        }
+    }
+
+    // Append to the jitter buffer.
+    int tail = mBufferTail * mSampleRate;
+    for (int i = 0; i < count; ++i) {
+        mBuffer[tail & mBufferMask] = samples[i];
+        ++tail;
+    }
+    mBufferTail += mInterval;

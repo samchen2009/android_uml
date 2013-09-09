@@ -1,0 +1,536 @@
+class ZygoteConnection
+!!!5526156.java!!!	ZygoteConnection(inout socket : LocalSocket)
+        mSocket = socket;
+
+        mSocketOutStream
+                = new DataOutputStream(socket.getOutputStream());
+
+        mSocketReader = new BufferedReader(
+                new InputStreamReader(socket.getInputStream()), 256);
+
+        mSocket.setSoTimeout(CONNECTION_TIMEOUT_MILLIS);
+                
+        try {
+            peer = mSocket.getPeerCredentials();
+        } catch (IOException ex) {
+            Log.e(TAG, "Cannot read peer credentials", ex);
+            throw ex;
+        }
+
+        peerSecurityContext = SELinux.getPeerContext(mSocket.getFileDescriptor());
+!!!5526284.java!!!	getFileDesciptor() : FileDescriptor
+        return mSocket.getFileDescriptor();
+!!!5526412.java!!!	run() : void
+
+        int loopCount = ZygoteInit.GC_LOOP_COUNT;
+
+        while (true) {
+            /*
+             * Call gc() before we block in readArgumentList().
+             * It's work that has to be done anyway, and it's better
+             * to avoid making every child do it.  It will also
+             * madvise() any free memory as a side-effect.
+             *
+             * Don't call it every time, because walking the entire
+             * heap is a lot of overhead to free a few hundred bytes.
+             */
+            if (loopCount <= 0) {
+                ZygoteInit.gc();
+                loopCount = ZygoteInit.GC_LOOP_COUNT;
+            } else {
+                loopCount--;
+            }
+
+            if (runOnce()) {
+                break;
+            }
+        }
+!!!5526540.java!!!	runOnce() : boolean
+
+        String args[];
+        Arguments parsedArgs = null;
+        FileDescriptor[] descriptors;
+
+        try {
+            args = readArgumentList();
+            descriptors = mSocket.getAncillaryFileDescriptors();
+        } catch (IOException ex) {
+            Log.w(TAG, "IOException on command socket " + ex.getMessage());
+            closeSocket();
+            return true;
+        }
+
+        if (args == null) {
+            // EOF reached.
+            closeSocket();
+            return true;
+        }
+
+        /** the stderr of the most recent request, if avail */
+        PrintStream newStderr = null;
+
+        if (descriptors != null && descriptors.length >= 3) {
+            newStderr = new PrintStream(
+                    new FileOutputStream(descriptors[2]));
+        }
+
+        int pid = -1;
+        FileDescriptor childPipeFd = null;
+        FileDescriptor serverPipeFd = null;
+
+        try {
+            parsedArgs = new Arguments(args);
+
+            applyUidSecurityPolicy(parsedArgs, peer, peerSecurityContext);
+            applyRlimitSecurityPolicy(parsedArgs, peer, peerSecurityContext);
+            applyCapabilitiesSecurityPolicy(parsedArgs, peer, peerSecurityContext);
+            applyInvokeWithSecurityPolicy(parsedArgs, peer, peerSecurityContext);
+            applyseInfoSecurityPolicy(parsedArgs, peer, peerSecurityContext);
+
+            applyDebuggerSystemProperty(parsedArgs);
+            applyInvokeWithSystemProperty(parsedArgs);
+
+            int[][] rlimits = null;
+
+            if (parsedArgs.rlimits != null) {
+                rlimits = parsedArgs.rlimits.toArray(intArray2d);
+            }
+
+            if (parsedArgs.runtimeInit && parsedArgs.invokeWith != null) {
+                FileDescriptor[] pipeFds = Libcore.os.pipe();
+                childPipeFd = pipeFds[1];
+                serverPipeFd = pipeFds[0];
+                ZygoteInit.setCloseOnExec(serverPipeFd, true);
+            }
+
+            pid = Zygote.forkAndSpecialize(parsedArgs.uid, parsedArgs.gid, parsedArgs.gids,
+                    parsedArgs.debugFlags, rlimits, parsedArgs.mountExternal, parsedArgs.seInfo,
+                    parsedArgs.niceName);
+        } catch (IOException ex) {
+            logAndPrintError(newStderr, "Exception creating pipe", ex);
+        } catch (ErrnoException ex) {
+            logAndPrintError(newStderr, "Exception creating pipe", ex);
+        } catch (IllegalArgumentException ex) {
+            logAndPrintError(newStderr, "Invalid zygote arguments", ex);
+        } catch (ZygoteSecurityException ex) {
+            logAndPrintError(newStderr,
+                    "Zygote security policy prevents request: ", ex);
+        }
+
+        try {
+            if (pid == 0) {
+                // in child
+                IoUtils.closeQuietly(serverPipeFd);
+                serverPipeFd = null;
+                handleChildProc(parsedArgs, descriptors, childPipeFd, newStderr);
+
+                // should never get here, the child is expected to either
+                // throw ZygoteInit.MethodAndArgsCaller or exec().
+                return true;
+            } else {
+                // in parent...pid of < 0 means failure
+                IoUtils.closeQuietly(childPipeFd);
+                childPipeFd = null;
+                return handleParentProc(pid, descriptors, serverPipeFd, parsedArgs);
+            }
+        } finally {
+            IoUtils.closeQuietly(childPipeFd);
+            IoUtils.closeQuietly(serverPipeFd);
+        }
+!!!5526668.java!!!	closeSocket() : void
+        try {
+            mSocket.close();
+        } catch (IOException ex) {
+            Log.e(TAG, "Exception while closing command "
+                    + "socket in parent", ex);
+        }
+!!!5527052.java!!!	readArgumentList() : String
+
+        /**
+         * See android.os.Process.zygoteSendArgsAndGetPid()
+         * Presently the wire format to the zygote process is:
+         * a) a count of arguments (argc, in essence)
+         * b) a number of newline-separated argument strings equal to count
+         *
+         * After the zygote process reads these it will write the pid of
+         * the child or -1 on failure.
+         */
+
+        int argc;
+
+        try {
+            String s = mSocketReader.readLine();
+
+            if (s == null) {
+                // EOF reached.
+                return null;
+            }
+            argc = Integer.parseInt(s);
+        } catch (NumberFormatException ex) {
+            Log.e(TAG, "invalid Zygote wire format: non-int at argc");
+            throw new IOException("invalid wire format");
+        }
+
+        // See bug 1092107: large argc can be used for a DOS attack
+        if (argc > MAX_ZYGOTE_ARGC) {   
+            throw new IOException("max arg count exceeded");
+        }
+
+        String[] result = new String[argc];
+        for (int i = 0; i < argc; i++) {
+            result[i] = mSocketReader.readLine();
+            if (result[i] == null) {
+                // We got an unexpected EOF.
+                throw new IOException("truncated request");
+            }
+        }
+
+        return result;
+!!!5527180.java!!!	applyUidSecurityPolicy(inout args : Arguments, inout peer : Credentials, in peerSecurityContext : String) : void
+
+        int peerUid = peer.getUid();
+
+        if (peerUid == 0) {
+            // Root can do what it wants
+        } else if (peerUid == Process.SYSTEM_UID ) {
+            // System UID is restricted, except in factory test mode
+            String factoryTest = SystemProperties.get("ro.factorytest");
+            boolean uidRestricted;
+
+            /* In normal operation, SYSTEM_UID can only specify a restricted
+             * set of UIDs. In factory test mode, SYSTEM_UID may specify any uid.
+             */
+            uidRestricted  
+                 = !(factoryTest.equals("1") || factoryTest.equals("2"));
+
+            if (uidRestricted
+                    && args.uidSpecified && (args.uid < Process.SYSTEM_UID)) {
+                throw new ZygoteSecurityException(
+                        "System UID may not launch process with UID < "
+                                + Process.SYSTEM_UID);
+            }
+        } else {
+            // Everything else
+            if (args.uidSpecified || args.gidSpecified
+                || args.gids != null) {
+                throw new ZygoteSecurityException(
+                        "App UIDs may not specify uid's or gid's");
+            }
+        }
+
+        if (args.uidSpecified || args.gidSpecified || args.gids != null) {
+            boolean allowed = SELinux.checkSELinuxAccess(peerSecurityContext,
+                                                         peerSecurityContext,
+                                                         "zygote",
+                                                         "specifyids");
+            if (!allowed) {
+                throw new ZygoteSecurityException(
+                        "Peer may not specify uid's or gid's");
+            }
+        }
+
+        // If not otherwise specified, uid and gid are inherited from peer
+        if (!args.uidSpecified) {
+            args.uid = peer.getUid();
+            args.uidSpecified = true;
+        }
+        if (!args.gidSpecified) {
+            args.gid = peer.getGid();
+            args.gidSpecified = true;
+        }
+!!!5527308.java!!!	applyDebuggerSystemProperty(inout args : Arguments) : void
+        if ("1".equals(SystemProperties.get("ro.debuggable"))) {
+            args.debugFlags |= Zygote.DEBUG_ENABLE_DEBUGGER;
+        }
+!!!5527436.java!!!	applyRlimitSecurityPolicy(inout args : Arguments, inout peer : Credentials, in peerSecurityContext : String) : void
+
+        int peerUid = peer.getUid();
+
+        if (!(peerUid == 0 || peerUid == Process.SYSTEM_UID)) {
+            // All peers with UID other than root or SYSTEM_UID
+            if (args.rlimits != null) {
+                throw new ZygoteSecurityException(
+                        "This UID may not specify rlimits.");
+            }
+        }
+
+        if (args.rlimits != null) {
+            boolean allowed = SELinux.checkSELinuxAccess(peerSecurityContext,
+                                                         peerSecurityContext,
+                                                         "zygote",
+                                                         "specifyrlimits");
+            if (!allowed) {
+                throw new ZygoteSecurityException(
+                        "Peer may not specify rlimits");
+            }
+         }
+!!!5527564.java!!!	applyCapabilitiesSecurityPolicy(inout args : Arguments, inout peer : Credentials, in peerSecurityContext : String) : void
+
+        if (args.permittedCapabilities == 0
+                && args.effectiveCapabilities == 0) {
+            // nothing to check
+            return;
+        }
+
+        boolean allowed = SELinux.checkSELinuxAccess(peerSecurityContext,
+                                                     peerSecurityContext,
+                                                     "zygote",
+                                                     "specifycapabilities");
+        if (!allowed) {
+            throw new ZygoteSecurityException(
+                    "Peer may not specify capabilities");
+        }
+
+        if (peer.getUid() == 0) {
+            // root may specify anything
+            return;
+        }
+
+        long permittedCaps;
+
+        try {
+            permittedCaps = ZygoteInit.capgetPermitted(peer.getPid());
+        } catch (IOException ex) {
+            throw new ZygoteSecurityException(
+                    "Error retrieving peer's capabilities.");
+        }
+
+        /*
+         * Ensure that the client did not specify an effective set larger
+         * than the permitted set. The kernel will enforce this too, but we
+         * do it here to make the following check easier.
+         */
+        if (((~args.permittedCapabilities) & args.effectiveCapabilities) != 0) {
+            throw new ZygoteSecurityException(
+                    "Effective capabilities cannot be superset of "
+                            + " permitted capabilities" );
+        }
+
+        /*
+         * Ensure that the new permitted (and thus the new effective) set is
+         * a subset of the peer process's permitted set
+         */
+
+        if (((~permittedCaps) & args.permittedCapabilities) != 0) {
+            throw new ZygoteSecurityException(
+                    "Peer specified unpermitted capabilities" );
+        }
+!!!5527692.java!!!	applyInvokeWithSecurityPolicy(inout args : Arguments, inout peer : Credentials, in peerSecurityContext : String) : void
+        int peerUid = peer.getUid();
+
+        if (args.invokeWith != null && peerUid != 0) {
+            throw new ZygoteSecurityException("Peer is not permitted to specify "
+                    + "an explicit invoke-with wrapper command");
+        }
+
+        if (args.invokeWith != null) {
+            boolean allowed = SELinux.checkSELinuxAccess(peerSecurityContext,
+                                                         peerSecurityContext,
+                                                         "zygote",
+                                                         "specifyinvokewith");
+            if (!allowed) {
+                throw new ZygoteSecurityException("Peer is not permitted to specify "
+                    + "an explicit invoke-with wrapper command");
+            }
+        }
+!!!5527820.java!!!	applyseInfoSecurityPolicy(inout args : Arguments, inout peer : Credentials, in peerSecurityContext : String) : void
+        int peerUid = peer.getUid();
+
+        if (args.seInfo == null) {
+            // nothing to check
+            return;
+        }
+
+        if (!(peerUid == 0 || peerUid == Process.SYSTEM_UID)) {
+            // All peers with UID other than root or SYSTEM_UID
+            throw new ZygoteSecurityException(
+                    "This UID may not specify SEAndroid info.");
+        }
+
+        boolean allowed = SELinux.checkSELinuxAccess(peerSecurityContext,
+                                                     peerSecurityContext,
+                                                     "zygote",
+                                                     "specifyseinfo");
+        if (!allowed) {
+            throw new ZygoteSecurityException(
+                    "Peer may not specify SEAndroid info");
+        }
+
+        return;
+!!!5527948.java!!!	applyInvokeWithSystemProperty(inout args : Arguments) : void
+        if (args.invokeWith == null && args.niceName != null) {
+            if (args.niceName != null) {
+                String property = "wrap." + args.niceName;
+                if (property.length() > 31) {
+                    property = property.substring(0, 31);
+                }
+                args.invokeWith = SystemProperties.get(property);
+                if (args.invokeWith != null && args.invokeWith.length() == 0) {
+                    args.invokeWith = null;
+                }
+            }
+        }
+!!!5528076.java!!!	handleChildProc(inout parsedArgs : Arguments, inout descriptors : FileDescriptor, inout pipeFd : FileDescriptor, inout newStderr : PrintStream) : void
+
+        /*
+         * Close the socket, unless we're in "peer wait" mode, in which
+         * case it's used to track the liveness of this process.
+         */
+
+        if (parsedArgs.peerWait) {
+            try {
+                ZygoteInit.setCloseOnExec(mSocket.getFileDescriptor(), true);
+                sPeerWaitSocket = mSocket;
+            } catch (IOException ex) {
+                Log.e(TAG, "Zygote Child: error setting peer wait "
+                        + "socket to be close-on-exec", ex);
+            }
+        } else {
+            closeSocket();
+            ZygoteInit.closeServerSocket();
+        }
+
+        if (descriptors != null) {
+            try {
+                ZygoteInit.reopenStdio(descriptors[0],
+                        descriptors[1], descriptors[2]);
+
+                for (FileDescriptor fd: descriptors) {
+                    IoUtils.closeQuietly(fd);
+                }
+                newStderr = System.err;
+            } catch (IOException ex) {
+                Log.e(TAG, "Error reopening stdio", ex);
+            }
+        }
+
+        if (parsedArgs.niceName != null) {
+            Process.setArgV0(parsedArgs.niceName);
+        }
+
+        if (parsedArgs.runtimeInit) {
+            if (parsedArgs.invokeWith != null) {
+                WrapperInit.execApplication(parsedArgs.invokeWith,
+                        parsedArgs.niceName, parsedArgs.targetSdkVersion,
+                        pipeFd, parsedArgs.remainingArgs);
+            } else {
+                RuntimeInit.zygoteInit(parsedArgs.targetSdkVersion,
+                        parsedArgs.remainingArgs);
+            }
+        } else {
+            String className;
+            try {
+                className = parsedArgs.remainingArgs[0];
+            } catch (ArrayIndexOutOfBoundsException ex) {
+                logAndPrintError(newStderr,
+                        "Missing required class name argument", null);
+                return;
+            }
+
+            String[] mainArgs = new String[parsedArgs.remainingArgs.length - 1];
+            System.arraycopy(parsedArgs.remainingArgs, 1,
+                    mainArgs, 0, mainArgs.length);
+
+            if (parsedArgs.invokeWith != null) {
+                WrapperInit.execStandalone(parsedArgs.invokeWith,
+                        parsedArgs.classpath, className, mainArgs);
+            } else {
+                ClassLoader cloader;
+                if (parsedArgs.classpath != null) {
+                    cloader = new PathClassLoader(parsedArgs.classpath,
+                            ClassLoader.getSystemClassLoader());
+                } else {
+                    cloader = ClassLoader.getSystemClassLoader();
+                }
+
+                try {
+                    ZygoteInit.invokeStaticMain(cloader, className, mainArgs);
+                } catch (RuntimeException ex) {
+                    logAndPrintError(newStderr, "Error starting.", ex);
+                }
+            }
+        }
+!!!5528204.java!!!	handleParentProc(in pid : int, inout descriptors : FileDescriptor, inout pipeFd : FileDescriptor, inout parsedArgs : Arguments) : boolean
+
+        if (pid > 0) {
+            setChildPgid(pid);
+        }
+
+        if (descriptors != null) {
+            for (FileDescriptor fd: descriptors) {
+                IoUtils.closeQuietly(fd);
+            }
+        }
+
+        boolean usingWrapper = false;
+        if (pipeFd != null && pid > 0) {
+            DataInputStream is = new DataInputStream(new FileInputStream(pipeFd));
+            int innerPid = -1;
+            try {
+                innerPid = is.readInt();
+            } catch (IOException ex) {
+                Log.w(TAG, "Error reading pid from wrapped process, child may have died", ex);
+            } finally {
+                try {
+                    is.close();
+                } catch (IOException ex) {
+                }
+            }
+
+            // Ensure that the pid reported by the wrapped process is either the
+            // child process that we forked, or a descendant of it.
+            if (innerPid > 0) {
+                int parentPid = innerPid;
+                while (parentPid > 0 && parentPid != pid) {
+                    parentPid = Process.getParentPid(parentPid);
+                }
+                if (parentPid > 0) {
+                    Log.i(TAG, "Wrapped process has pid " + innerPid);
+                    pid = innerPid;
+                    usingWrapper = true;
+                } else {
+                    Log.w(TAG, "Wrapped process reported a pid that is not a child of "
+                            + "the process that we forked: childPid=" + pid
+                            + " innerPid=" + innerPid);
+                }
+            }
+        }
+
+        try {
+            mSocketOutStream.writeInt(pid);
+            mSocketOutStream.writeBoolean(usingWrapper);
+        } catch (IOException ex) {
+            Log.e(TAG, "Error reading from command socket", ex);
+            return true;
+        }
+
+        /*
+         * If the peer wants to use the socket to wait on the
+         * newly spawned process, then we're all done.
+         */
+        if (parsedArgs.peerWait) {
+            try {
+                mSocket.close();
+            } catch (IOException ex) {
+                Log.e(TAG, "Zygote: error closing sockets", ex);
+            }
+            return true;
+        }
+        return false;
+!!!5528332.java!!!	setChildPgid(in pid : int) : void
+        // Try to move the new child into the peer's process group.
+        try {
+            ZygoteInit.setpgid(pid, ZygoteInit.getpgid(peer.getPid()));
+        } catch (IOException ex) {
+            // This exception is expected in the case where
+            // the peer is not in our session
+            // TODO get rid of this log message in the case where
+            // getsid(0) != getsid(peer.getPid())
+            Log.i(TAG, "Zygote: setpgid failed. This is "
+                + "normal if peer is not in our session");
+        }
+!!!5528460.java!!!	logAndPrintError(inout newStderr : PrintStream, in message : String, inout ex : Throwable) : void
+        Log.e(TAG, message, ex);
+        if (newStderr != null) {
+            newStderr.println(message + (ex == null ? "" : ex));
+        }

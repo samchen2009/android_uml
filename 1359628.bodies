@@ -1,0 +1,248 @@
+class GeofenceManager
+!!!8528908.java!!!	GeofenceManager(inout context : Context, inout blacklist : LocationBlacklist)
+        mContext = context;
+        mLocationManager = (LocationManager) mContext.getSystemService(Context.LOCATION_SERVICE);
+        PowerManager powerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+        mHandler = new GeofenceHandler();
+        mBlacklist = blacklist;
+!!!8529036.java!!!	addFence(inout request : LocationRequest, inout geofence : Geofence, inout intent : PendingIntent, in uid : int, in packageName : String) : void
+        if (D) {
+            Slog.d(TAG, "addFence: request=" + request + ", geofence=" + geofence
+                    + ", intent=" + intent + ", uid=" + uid + ", packageName=" + packageName);
+        }
+
+        GeofenceState state = new GeofenceState(geofence,
+                request.getExpireAt(), packageName, intent);
+        synchronized (mLock) {
+            // first make sure it doesn't already exist
+            for (int i = mFences.size() - 1; i >= 0; i--) {
+                GeofenceState w = mFences.get(i);
+                if (geofence.equals(w.mFence) && intent.equals(w.mIntent)) {
+                    // already exists, remove the old one
+                    mFences.remove(i);
+                    break;
+                }
+            }
+            mFences.add(state);
+            scheduleUpdateFencesLocked();
+        }
+!!!8529164.java!!!	removeFence(inout fence : Geofence, inout intent : PendingIntent) : void
+        if (D) {
+            Slog.d(TAG, "removeFence: fence=" + fence + ", intent=" + intent);
+        }
+
+        synchronized (mLock) {
+            Iterator<GeofenceState> iter = mFences.iterator();
+            while (iter.hasNext()) {
+                GeofenceState state = iter.next();
+                if (state.mIntent.equals(intent)) {
+
+                    if (fence == null) {
+                        // always remove
+                        iter.remove();
+                    } else {
+                        // just remove matching fences
+                        if (fence.equals(state.mFence)) {
+                            iter.remove();
+                        }
+                    }
+                }
+            }
+            scheduleUpdateFencesLocked();
+        }
+!!!8529292.java!!!	removeFence(in packageName : String) : void
+        if (D) {
+            Slog.d(TAG, "removeFence: packageName=" + packageName);
+        }
+
+        synchronized (mLock) {
+            Iterator<GeofenceState> iter = mFences.iterator();
+            while (iter.hasNext()) {
+                GeofenceState state = iter.next();
+                if (state.mPackageName.equals(packageName)) {
+                    iter.remove();
+                }
+            }
+            scheduleUpdateFencesLocked();
+        }
+!!!8529420.java!!!	removeExpiredFencesLocked() : void
+        long time = SystemClock.elapsedRealtime();
+        Iterator<GeofenceState> iter = mFences.iterator();
+        while (iter.hasNext()) {
+            GeofenceState state = iter.next();
+            if (state.mExpireAt < time) {
+                iter.remove();
+            }
+        }
+!!!8529548.java!!!	scheduleUpdateFencesLocked() : void
+        if (!mPendingUpdate) {
+            mPendingUpdate = true;
+            mHandler.sendEmptyMessage(MSG_UPDATE_FENCES);
+        }
+!!!8529676.java!!!	getFreshLocationLocked() : Location
+        // Prefer mLastLocationUpdate to LocationManager.getLastLocation().
+        Location location = mReceivingLocationUpdates ? mLastLocationUpdate : null;
+        if (location == null && !mFences.isEmpty()) {
+            location = mLocationManager.getLastLocation();
+        }
+
+        // Early out for null location.
+        if (location == null) {
+            return null;
+        }
+
+        // Early out for stale location.
+        long now = SystemClock.elapsedRealtimeNanos();
+        if (now - location.getElapsedRealtimeNanos() > MAX_AGE_NANOS) {
+            return null;
+        }
+
+        // Made it this far? Return our fresh, valid location.
+        return location;
+!!!8529804.java!!!	updateFences() : void
+        List<PendingIntent> enterIntents = new LinkedList<PendingIntent>();
+        List<PendingIntent> exitIntents = new LinkedList<PendingIntent>();
+
+        synchronized (mLock) {
+            mPendingUpdate = false;
+
+            // Remove expired fences.
+            removeExpiredFencesLocked();
+
+            // Get a location to work with, either received via onLocationChanged() or
+            // via LocationManager.getLastLocation().
+            Location location = getFreshLocationLocked();
+
+            // Update all fences.
+            // Keep track of the distance to the nearest fence.
+            double minFenceDistance = Double.MAX_VALUE;
+            boolean needUpdates = false;
+            for (GeofenceState state : mFences) {
+                if (mBlacklist.isBlacklisted(state.mPackageName)) {
+                    if (D) {
+                        Slog.d(TAG, "skipping geofence processing for blacklisted app: "
+                                + state.mPackageName);
+                    }
+                    continue;
+                }
+
+                needUpdates = true;
+                if (location != null) {
+                    int event = state.processLocation(location);
+                    if ((event & GeofenceState.FLAG_ENTER) != 0) {
+                        enterIntents.add(state.mIntent);
+                    }
+                    if ((event & GeofenceState.FLAG_EXIT) != 0) {
+                        exitIntents.add(state.mIntent);
+                    }
+
+                    // FIXME: Ideally this code should take into account the accuracy of the
+                    // location fix that was used to calculate the distance in the first place.
+                    double fenceDistance = state.getDistanceToBoundary(); // MAX_VALUE if unknown
+                    if (fenceDistance < minFenceDistance) {
+                        minFenceDistance = fenceDistance;
+                    }
+                }
+            }
+
+            // Request or cancel location updates if needed.
+            if (needUpdates) {
+                // Request location updates.
+                // Compute a location update interval based on the distance to the nearest fence.
+                long intervalMs;
+                if (location != null && Double.compare(minFenceDistance, Double.MAX_VALUE) != 0) {
+                    intervalMs = (long)Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS,
+                            minFenceDistance * 1000 / MAX_SPEED_M_S));
+                } else {
+                    intervalMs = MIN_INTERVAL_MS;
+                }
+                if (!mReceivingLocationUpdates || mLocationUpdateInterval != intervalMs) {
+                    mReceivingLocationUpdates = true;
+                    mLocationUpdateInterval = intervalMs;
+                    mLastLocationUpdate = location;
+
+                    LocationRequest request = new LocationRequest();
+                    request.setInterval(intervalMs).setFastestInterval(0);
+                    mLocationManager.requestLocationUpdates(request, this, mHandler.getLooper());
+                }
+            } else {
+                // Cancel location updates.
+                if (mReceivingLocationUpdates) {
+                    mReceivingLocationUpdates = false;
+                    mLocationUpdateInterval = 0;
+                    mLastLocationUpdate = null;
+
+                    mLocationManager.removeUpdates(this);
+                }
+            }
+
+            if (D) {
+                Slog.d(TAG, "updateFences: location=" + location
+                        + ", mFences.size()=" + mFences.size()
+                        + ", mReceivingLocationUpdates=" + mReceivingLocationUpdates
+                        + ", mLocationUpdateInterval=" + mLocationUpdateInterval
+                        + ", mLastLocationUpdate=" + mLastLocationUpdate);
+            }
+        }
+
+        // release lock before sending intents
+        for (PendingIntent intent : exitIntents) {
+            sendIntentExit(intent);
+        }
+        for (PendingIntent intent : enterIntents) {
+            sendIntentEnter(intent);
+        }
+!!!8529932.java!!!	sendIntentEnter(inout pendingIntent : PendingIntent) : void
+        if (D) {
+            Slog.d(TAG, "sendIntentEnter: pendingIntent=" + pendingIntent);
+        }
+
+        Intent intent = new Intent();
+        intent.putExtra(LocationManager.KEY_PROXIMITY_ENTERING, true);
+        sendIntent(pendingIntent, intent);
+!!!8530060.java!!!	sendIntentExit(inout pendingIntent : PendingIntent) : void
+        if (D) {
+            Slog.d(TAG, "sendIntentExit: pendingIntent=" + pendingIntent);
+        }
+
+        Intent intent = new Intent();
+        intent.putExtra(LocationManager.KEY_PROXIMITY_ENTERING, false);
+        sendIntent(pendingIntent, intent);
+!!!8530188.java!!!	sendIntent(inout pendingIntent : PendingIntent, inout intent : Intent) : void
+        mWakeLock.acquire();
+        try {
+            pendingIntent.send(mContext, 0, intent, this, null,
+                    android.Manifest.permission.ACCESS_FINE_LOCATION);
+        } catch (PendingIntent.CanceledException e) {
+            removeFence(null, pendingIntent);
+            mWakeLock.release();
+        }
+        // ...otherwise, mWakeLock.release() gets called by onSendFinished()
+!!!8530316.java!!!	onLocationChanged(inout location : Location) : void
+        synchronized (mLock) {
+            if (mReceivingLocationUpdates) {
+                mLastLocationUpdate = location;
+            }
+
+            // Update the fences immediately before returning in
+            // case the caller is holding a wakelock.
+            if (mPendingUpdate) {
+                mHandler.removeMessages(MSG_UPDATE_FENCES);
+            } else {
+                mPendingUpdate = true;
+            }
+        }
+        updateFences();
+!!!8530828.java!!!	onSendFinished(inout pendingIntent : PendingIntent, inout intent : Intent, in resultCode : int, in resultData : String, inout resultExtras : Bundle) : void
+        mWakeLock.release();
+!!!8530956.java!!!	dump(inout pw : PrintWriter) : void
+        pw.println("  Geofences:");
+
+        for (GeofenceState state : mFences) {
+            pw.append("    ");
+            pw.append(state.mPackageName);
+            pw.append(" ");
+            pw.append(state.mFence.toString());
+            pw.append("\n");
+        }

@@ -1,0 +1,153 @@
+class WirelessChargerDetector
+!!!8685836.java!!!	WirelessChargerDetector(inout sensorManager : SensorManager, inout suspendBlocker : SuspendBlocker)
+        mSensorManager = sensorManager;
+        mSuspendBlocker = suspendBlocker;
+
+        mGravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY);
+!!!8685964.java!!!	dump(inout pw : PrintWriter) : void
+        synchronized (mLock) {
+            pw.println();
+            pw.println("Wireless Charger Detector State:");
+            pw.println("  mGravitySensor=" + mGravitySensor);
+            pw.println("  mPoweredWirelessly=" + mPoweredWirelessly);
+            pw.println("  mAtRest=" + mAtRest);
+            pw.println("  mRestX=" + mRestX + ", mRestY=" + mRestY + ", mRestZ=" + mRestZ);
+            pw.println("  mDetectionInProgress=" + mDetectionInProgress);
+            pw.println("  mMustUpdateRestPosition=" + mMustUpdateRestPosition);
+            pw.println("  mTotalSamples=" + mTotalSamples);
+            pw.println("  mMovingSamples=" + mMovingSamples);
+            pw.println("  mFirstSampleTime=" + mFirstSampleTime);
+            pw.println("  mFirstSampleX=" + mFirstSampleX
+                    + ", mFirstSampleY=" + mFirstSampleY + ", mFirstSampleZ=" + mFirstSampleZ);
+        }
+!!!8686092.java!!!	update(inout isPowered : boolean, in plugType : int, in batteryLevel : int) : boolean
+        synchronized (mLock) {
+            final boolean wasPoweredWirelessly = mPoweredWirelessly;
+
+            if (isPowered && plugType == BatteryManager.BATTERY_PLUGGED_WIRELESS) {
+                // The device is receiving power from the wireless charger.
+                // Update the rest position asynchronously.
+                mPoweredWirelessly = true;
+                mMustUpdateRestPosition = true;
+                startDetectionLocked();
+            } else {
+                // The device may or may not be on the wireless charger depending on whether
+                // the unplug signal that we received was spurious.
+                mPoweredWirelessly = false;
+                if (mAtRest) {
+                    if (plugType != 0 && plugType != BatteryManager.BATTERY_PLUGGED_WIRELESS) {
+                        // The device was plugged into a new non-wireless power source.
+                        // It's safe to assume that it is no longer on the wireless charger.
+                        mMustUpdateRestPosition = false;
+                        clearAtRestLocked();
+                    } else {
+                        // The device may still be on the wireless charger but we don't know.
+                        // Check whether the device has remained at rest on the charger
+                        // so that we will know to ignore the next wireless plug event
+                        // if needed.
+                        startDetectionLocked();
+                    }
+                }
+            }
+
+            // Report that the device has been docked only if the device just started
+            // receiving power wirelessly, has a high enough battery level that we
+            // can be assured that charging was not delayed due to the battery previously
+            // having been full, and the device is not known to already be at rest
+            // on the wireless charger from earlier.
+            return mPoweredWirelessly && !wasPoweredWirelessly
+                    && batteryLevel < WIRELESS_CHARGER_TURN_ON_BATTERY_LEVEL_LIMIT
+                    && !mAtRest;
+        }
+!!!8686220.java!!!	startDetectionLocked() : void
+        if (!mDetectionInProgress && mGravitySensor != null) {
+            if (mSensorManager.registerListener(mListener, mGravitySensor,
+                    SensorManager.SENSOR_DELAY_UI)) {
+                mSuspendBlocker.acquire();
+                mDetectionInProgress = true;
+                mTotalSamples = 0;
+                mMovingSamples = 0;
+            }
+        }
+!!!8686348.java!!!	processSample(in timeNanos : long, in x : float, in y : float, in z : float) : void
+        synchronized (mLock) {
+            if (!mDetectionInProgress) {
+                return;
+            }
+
+            mTotalSamples += 1;
+            if (mTotalSamples == 1) {
+                // Save information about the first sample collected.
+                mFirstSampleTime = timeNanos;
+                mFirstSampleX = x;
+                mFirstSampleY = y;
+                mFirstSampleZ = z;
+            } else {
+                // Determine whether movement has occurred relative to the first sample.
+                if (hasMoved(mFirstSampleX, mFirstSampleY, mFirstSampleZ, x, y, z)) {
+                    mMovingSamples += 1;
+                }
+            }
+
+            // Clear the at rest flag if movement has occurred relative to the rest sample.
+            if (mAtRest && hasMoved(mRestX, mRestY, mRestZ, x, y, z)) {
+                if (DEBUG) {
+                    Slog.d(TAG, "No longer at rest: "
+                            + "mRestX=" + mRestX + ", mRestY=" + mRestY + ", mRestZ=" + mRestZ
+                            + ", x=" + x + ", y=" + y + ", z=" + z);
+                }
+                clearAtRestLocked();
+            }
+
+            // Save the result when done.
+            if (timeNanos - mFirstSampleTime >= SETTLE_TIME_NANOS
+                    && mTotalSamples >= MIN_SAMPLES) {
+                mSensorManager.unregisterListener(mListener);
+                if (mMustUpdateRestPosition) {
+                    if (mMovingSamples == 0) {
+                        mAtRest = true;
+                        mRestX = x;
+                        mRestY = y;
+                        mRestZ = z;
+                    } else {
+                        clearAtRestLocked();
+                    }
+                    mMustUpdateRestPosition = false;
+                }
+                mDetectionInProgress = false;
+                mSuspendBlocker.release();
+
+                if (DEBUG) {
+                    Slog.d(TAG, "New state: mAtRest=" + mAtRest
+                            + ", mRestX=" + mRestX + ", mRestY=" + mRestY + ", mRestZ=" + mRestZ
+                            + ", mTotalSamples=" + mTotalSamples
+                            + ", mMovingSamples=" + mMovingSamples);
+                }
+            }
+        }
+!!!8686476.java!!!	clearAtRestLocked() : void
+        mAtRest = false;
+        mRestX = 0;
+        mRestY = 0;
+        mRestZ = 0;
+!!!8686604.java!!!	hasMoved(in x1 : float, in y1 : float, in z1 : float, in x2 : float, in y2 : float, in z2 : float) : boolean
+        final double dotProduct = (x1 * x2) + (y1 * y2) + (z1 * z2);
+        final double mag1 = Math.sqrt((x1 * x1) + (y1 * y1) + (z1 * z1));
+        final double mag2 = Math.sqrt((x2 * x2) + (y2 * y2) + (z2 * z2));
+        if (mag1 < MIN_GRAVITY || mag1 > MAX_GRAVITY
+                || mag2 < MIN_GRAVITY || mag2 > MAX_GRAVITY) {
+            if (DEBUG) {
+                Slog.d(TAG, "Weird gravity vector: mag1=" + mag1 + ", mag2=" + mag2);
+            }
+            return true;
+        }
+        final boolean moved = (dotProduct < mag1 * mag2 * MOVEMENT_ANGLE_COS_THRESHOLD);
+        if (DEBUG) {
+            Slog.d(TAG, "Check: moved=" + moved
+                    + ", x1=" + x1 + ", y1=" + y1 + ", z1=" + z1
+                    + ", x2=" + x2 + ", y2=" + y2 + ", z2=" + z2
+                    + ", angle=" + (Math.acos(dotProduct / mag1 / mag2) * 180 / Math.PI)
+                    + ", dotProduct=" + dotProduct
+                    + ", mag1=" + mag1 + ", mag2=" + mag2);
+        }
+        return moved;

@@ -1,0 +1,367 @@
+class InstallParams
+!!!8606988.java!!!	InstallParams(inout packageURI : Uri, inout observer : IPackageInstallObserver, in flags : int, in installerPackageName : String, inout verificationParams : VerificationParams, inout encryptionParams : ContainerEncryptionParams, inout user : UserHandle)
+            super(user);
+            this.mPackageURI = packageURI;
+            this.flags = flags;
+            this.observer = observer;
+            this.installerPackageName = installerPackageName;
+            this.verificationParams = verificationParams;
+            this.encryptionParams = encryptionParams;
+!!!8607116.java!!!	getManifestDigest() : ManifestDigest
+            if (verificationParams == null) {
+                return null;
+            }
+            return verificationParams.getManifestDigest();
+!!!8607244.java!!!	installLocationPolicy(inout pkgLite : PackageInfoLite, in flags : int) : int
+            String packageName = pkgLite.packageName;
+            int installLocation = pkgLite.installLocation;
+            boolean onSd = (flags & PackageManager.INSTALL_EXTERNAL) != 0;
+            // reader
+            synchronized (mPackages) {
+                PackageParser.Package pkg = mPackages.get(packageName);
+                if (pkg != null) {
+                    if ((flags & PackageManager.INSTALL_REPLACE_EXISTING) != 0) {
+                        // Check for downgrading.
+                        if ((flags & PackageManager.INSTALL_ALLOW_DOWNGRADE) == 0) {
+                            if (pkgLite.versionCode < pkg.mVersionCode) {
+                                Slog.w(TAG, "Can't install update of " + packageName
+                                        + " update version " + pkgLite.versionCode
+                                        + " is older than installed version "
+                                        + pkg.mVersionCode);
+                                return PackageHelper.RECOMMEND_FAILED_VERSION_DOWNGRADE;
+                            }
+                        }
+                        // Check for updated system application.
+                        if ((pkg.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
+                            if (onSd) {
+                                Slog.w(TAG, "Cannot install update to system app on sdcard");
+                                return PackageHelper.RECOMMEND_FAILED_INVALID_LOCATION;
+                            }
+                            return PackageHelper.RECOMMEND_INSTALL_INTERNAL;
+                        } else {
+                            if (onSd) {
+                                // Install flag overrides everything.
+                                return PackageHelper.RECOMMEND_INSTALL_EXTERNAL;
+                            }
+                            // If current upgrade specifies particular preference
+                            if (installLocation == PackageInfo.INSTALL_LOCATION_INTERNAL_ONLY) {
+                                // Application explicitly specified internal.
+                                return PackageHelper.RECOMMEND_INSTALL_INTERNAL;
+                            } else if (installLocation == PackageInfo.INSTALL_LOCATION_PREFER_EXTERNAL) {
+                                // App explictly prefers external. Let policy decide
+                            } else {
+                                // Prefer previous location
+                                if (isExternal(pkg)) {
+                                    return PackageHelper.RECOMMEND_INSTALL_EXTERNAL;
+                                }
+                                return PackageHelper.RECOMMEND_INSTALL_INTERNAL;
+                            }
+                        }
+                    } else {
+                        // Invalid install. Return error code
+                        return PackageHelper.RECOMMEND_FAILED_ALREADY_EXISTS;
+                    }
+                }
+            }
+            // All the special cases have been taken care of.
+            // Return result based on recommended install location.
+            if (onSd) {
+                return PackageHelper.RECOMMEND_INSTALL_EXTERNAL;
+            }
+            return pkgLite.recommendedInstallLocation;
+!!!8607372.java!!!	handleStartCopy() : void
+            int ret = PackageManager.INSTALL_SUCCEEDED;
+            final boolean onSd = (flags & PackageManager.INSTALL_EXTERNAL) != 0;
+            final boolean onInt = (flags & PackageManager.INSTALL_INTERNAL) != 0;
+            PackageInfoLite pkgLite = null;
+
+            if (onInt && onSd) {
+                // Check if both bits are set.
+                Slog.w(TAG, "Conflicting flags specified for installing on both internal and external");
+                ret = PackageManager.INSTALL_FAILED_INVALID_INSTALL_LOCATION;
+            } else {
+                final long lowThreshold;
+
+                final DeviceStorageMonitorService dsm = (DeviceStorageMonitorService) ServiceManager
+                        .getService(DeviceStorageMonitorService.SERVICE);
+                if (dsm == null) {
+                    Log.w(TAG, "Couldn't get low memory threshold; no free limit imposed");
+                    lowThreshold = 0L;
+                } else {
+                    lowThreshold = dsm.getMemoryLowThreshold();
+                }
+
+                try {
+                    mContext.grantUriPermission(DEFAULT_CONTAINER_PACKAGE, mPackageURI,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+                    final File packageFile;
+                    if (encryptionParams != null || !"file".equals(mPackageURI.getScheme())) {
+                        mTempPackage = createTempPackageFile(mDrmAppPrivateInstallDir);
+                        if (mTempPackage != null) {
+                            ParcelFileDescriptor out;
+                            try {
+                                out = ParcelFileDescriptor.open(mTempPackage,
+                                        ParcelFileDescriptor.MODE_READ_WRITE);
+                            } catch (FileNotFoundException e) {
+                                out = null;
+                                Slog.e(TAG, "Failed to create temporary file for : " + mPackageURI);
+                            }
+
+                            // Make a temporary file for decryption.
+                            ret = mContainerService
+                                    .copyResource(mPackageURI, encryptionParams, out);
+                            IoUtils.closeQuietly(out);
+
+                            packageFile = mTempPackage;
+
+                            FileUtils.setPermissions(packageFile.getAbsolutePath(),
+                                    FileUtils.S_IRUSR | FileUtils.S_IWUSR | FileUtils.S_IRGRP
+                                            | FileUtils.S_IROTH,
+                                    -1, -1);
+                        } else {
+                            packageFile = null;
+                        }
+                    } else {
+                        packageFile = new File(mPackageURI.getPath());
+                    }
+
+                    if (packageFile != null) {
+                        // Remote call to find out default install location
+                        final String packageFilePath = packageFile.getAbsolutePath();
+                        pkgLite = mContainerService.getMinimalPackageInfo(packageFilePath, flags,
+                                lowThreshold);
+
+                        /*
+                         * If we have too little free space, try to free cache
+                         * before giving up.
+                         */
+                        if (pkgLite.recommendedInstallLocation
+                                == PackageHelper.RECOMMEND_FAILED_INSUFFICIENT_STORAGE) {
+                            final long size = mContainerService.calculateInstalledSize(
+                                    packageFilePath, isForwardLocked());
+                            if (mInstaller.freeCache(size + lowThreshold) >= 0) {
+                                pkgLite = mContainerService.getMinimalPackageInfo(packageFilePath,
+                                        flags, lowThreshold);
+                            }
+                            /*
+                             * The cache free must have deleted the file we
+                             * downloaded to install.
+                             *
+                             * TODO: fix the "freeCache" call to not delete
+                             *       the file we care about.
+                             */
+                            if (pkgLite.recommendedInstallLocation
+                                    == PackageHelper.RECOMMEND_FAILED_INVALID_URI) {
+                                pkgLite.recommendedInstallLocation
+                                    = PackageHelper.RECOMMEND_FAILED_INSUFFICIENT_STORAGE;
+                            }
+                        }
+                    }
+                } finally {
+                    mContext.revokeUriPermission(mPackageURI,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                }
+            }
+
+            if (ret == PackageManager.INSTALL_SUCCEEDED) {
+                int loc = pkgLite.recommendedInstallLocation;
+                if (loc == PackageHelper.RECOMMEND_FAILED_INVALID_LOCATION) {
+                    ret = PackageManager.INSTALL_FAILED_INVALID_INSTALL_LOCATION;
+                } else if (loc == PackageHelper.RECOMMEND_FAILED_ALREADY_EXISTS) {
+                    ret = PackageManager.INSTALL_FAILED_ALREADY_EXISTS;
+                } else if (loc == PackageHelper.RECOMMEND_FAILED_INSUFFICIENT_STORAGE) {
+                    ret = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
+                } else if (loc == PackageHelper.RECOMMEND_FAILED_INVALID_APK) {
+                    ret = PackageManager.INSTALL_FAILED_INVALID_APK;
+                } else if (loc == PackageHelper.RECOMMEND_FAILED_INVALID_URI) {
+                    ret = PackageManager.INSTALL_FAILED_INVALID_URI;
+                } else if (loc == PackageHelper.RECOMMEND_MEDIA_UNAVAILABLE) {
+                    ret = PackageManager.INSTALL_FAILED_MEDIA_UNAVAILABLE;
+                } else {
+                    // Override with defaults if needed.
+                    loc = installLocationPolicy(pkgLite, flags);
+                    if (loc == PackageHelper.RECOMMEND_FAILED_VERSION_DOWNGRADE) {
+                        ret = PackageManager.INSTALL_FAILED_VERSION_DOWNGRADE;
+                    } else if (!onSd && !onInt) {
+                        // Override install location with flags
+                        if (loc == PackageHelper.RECOMMEND_INSTALL_EXTERNAL) {
+                            // Set the flag to install on external media.
+                            flags |= PackageManager.INSTALL_EXTERNAL;
+                            flags &= ~PackageManager.INSTALL_INTERNAL;
+                        } else {
+                            // Make sure the flag for installing on external
+                            // media is unset
+                            flags |= PackageManager.INSTALL_INTERNAL;
+                            flags &= ~PackageManager.INSTALL_EXTERNAL;
+                        }
+                    }
+                }
+            }
+
+            final InstallArgs args = createInstallArgs(this);
+            mArgs = args;
+
+            if (ret == PackageManager.INSTALL_SUCCEEDED) {
+                 /*
+                 * ADB installs appear as UserHandle.USER_ALL, and can only be performed by
+                 * UserHandle.USER_OWNER, so use the package verifier for UserHandle.USER_OWNER.
+                 */
+                int userIdentifier = getUser().getIdentifier();
+                if (userIdentifier == UserHandle.USER_ALL
+                        && ((flags & PackageManager.INSTALL_FROM_ADB) != 0)) {
+                    userIdentifier = UserHandle.USER_OWNER;
+                }
+
+                /*
+                 * Determine if we have any installed package verifiers. If we
+                 * do, then we'll defer to them to verify the packages.
+                 */
+                final int requiredUid = mRequiredVerifierPackage == null ? -1
+                        : getPackageUid(mRequiredVerifierPackage, userIdentifier);
+                if (requiredUid != -1 && isVerificationEnabled(flags)) {
+                    final Intent verification = new Intent(
+                            Intent.ACTION_PACKAGE_NEEDS_VERIFICATION);
+                    verification.setDataAndType(getPackageUri(), PACKAGE_MIME_TYPE);
+                    verification.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+                    final List<ResolveInfo> receivers = queryIntentReceivers(verification,
+                            PACKAGE_MIME_TYPE, PackageManager.GET_DISABLED_COMPONENTS,
+                            0 /* TODO: Which userId? */);
+
+                    if (DEBUG_VERIFY) {
+                        Slog.d(TAG, "Found " + receivers.size() + " verifiers for intent "
+                                + verification.toString() + " with " + pkgLite.verifiers.length
+                                + " optional verifiers");
+                    }
+
+                    final int verificationId = mPendingVerificationToken++;
+
+                    verification.putExtra(PackageManager.EXTRA_VERIFICATION_ID, verificationId);
+
+                    verification.putExtra(PackageManager.EXTRA_VERIFICATION_INSTALLER_PACKAGE,
+                            installerPackageName);
+
+                    verification.putExtra(PackageManager.EXTRA_VERIFICATION_INSTALL_FLAGS, flags);
+
+                    verification.putExtra(PackageManager.EXTRA_VERIFICATION_PACKAGE_NAME,
+                            pkgLite.packageName);
+
+                    verification.putExtra(PackageManager.EXTRA_VERIFICATION_VERSION_CODE,
+                            pkgLite.versionCode);
+
+                    if (verificationParams != null) {
+                        if (verificationParams.getVerificationURI() != null) {
+                           verification.putExtra(PackageManager.EXTRA_VERIFICATION_URI,
+                                 verificationParams.getVerificationURI());
+                        }
+                        if (verificationParams.getOriginatingURI() != null) {
+                            verification.putExtra(Intent.EXTRA_ORIGINATING_URI,
+                                  verificationParams.getOriginatingURI());
+                        }
+                        if (verificationParams.getReferrer() != null) {
+                            verification.putExtra(Intent.EXTRA_REFERRER,
+                                  verificationParams.getReferrer());
+                        }
+                        if (verificationParams.getOriginatingUid() >= 0) {
+                            verification.putExtra(Intent.EXTRA_ORIGINATING_UID,
+                                  verificationParams.getOriginatingUid());
+                        }
+                        if (verificationParams.getInstallerUid() >= 0) {
+                            verification.putExtra(PackageManager.EXTRA_VERIFICATION_INSTALLER_UID,
+                                  verificationParams.getInstallerUid());
+                        }
+                    }
+
+                    final PackageVerificationState verificationState = new PackageVerificationState(
+                            requiredUid, args);
+
+                    mPendingVerification.append(verificationId, verificationState);
+
+                    final List<ComponentName> sufficientVerifiers = matchVerifiers(pkgLite,
+                            receivers, verificationState);
+
+                    /*
+                     * If any sufficient verifiers were listed in the package
+                     * manifest, attempt to ask them.
+                     */
+                    if (sufficientVerifiers != null) {
+                        final int N = sufficientVerifiers.size();
+                        if (N == 0) {
+                            Slog.i(TAG, "Additional verifiers required, but none installed.");
+                            ret = PackageManager.INSTALL_FAILED_VERIFICATION_FAILURE;
+                        } else {
+                            for (int i = 0; i < N; i++) {
+                                final ComponentName verifierComponent = sufficientVerifiers.get(i);
+
+                                final Intent sufficientIntent = new Intent(verification);
+                                sufficientIntent.setComponent(verifierComponent);
+
+                                mContext.sendBroadcastAsUser(sufficientIntent, getUser());
+                            }
+                        }
+                    }
+
+                    final ComponentName requiredVerifierComponent = matchComponentForVerifier(
+                            mRequiredVerifierPackage, receivers);
+                    if (ret == PackageManager.INSTALL_SUCCEEDED
+                            && mRequiredVerifierPackage != null) {
+                        /*
+                         * Send the intent to the required verification agent,
+                         * but only start the verification timeout after the
+                         * target BroadcastReceivers have run.
+                         */
+                        verification.setComponent(requiredVerifierComponent);
+                        mContext.sendOrderedBroadcastAsUser(verification, getUser(),
+                                android.Manifest.permission.PACKAGE_VERIFICATION_AGENT,
+                                new BroadcastReceiver() {
+                                    @Override
+                                    public void onReceive(Context context, Intent intent) {
+                                        final Message msg = mHandler
+                                                .obtainMessage(CHECK_PENDING_VERIFICATION);
+                                        msg.arg1 = verificationId;
+                                        mHandler.sendMessageDelayed(msg, getVerificationTimeout());
+                                    }
+                                }, null, 0, null, null);
+
+                        /*
+                         * We don't want the copy to proceed until verification
+                         * succeeds, so null out this field.
+                         */
+                        mArgs = null;
+                    }
+                } else {
+                    /*
+                     * No package verification is enabled, so immediately start
+                     * the remote call to initiate copy using temporary file.
+                     */
+                    ret = args.copyApk(mContainerService, true);
+                }
+            }
+
+            mRet = ret;
+!!!8607500.java!!!	handleReturnCode() : void
+            // If mArgs is null, then MCS couldn't be reached. When it
+            // reconnects, it will try again to install. At that point, this
+            // will succeed.
+            if (mArgs != null) {
+                processPendingInstall(mArgs, mRet);
+
+                if (mTempPackage != null) {
+                    if (!mTempPackage.delete()) {
+                        Slog.w(TAG, "Couldn't delete temporary file: " +
+                                mTempPackage.getAbsolutePath());
+                    }
+                }
+            }
+!!!8607628.java!!!	handleServiceError() : void
+            mArgs = createInstallArgs(this);
+            mRet = PackageManager.INSTALL_FAILED_INTERNAL_ERROR;
+!!!8607756.java!!!	isForwardLocked() : boolean
+            return (flags & PackageManager.INSTALL_FORWARD_LOCK) != 0;
+!!!8607884.java!!!	getPackageUri() : Uri
+            if (mTempPackage != null) {
+                return Uri.fromFile(mTempPackage);
+            } else {
+                return mPackageURI;
+            }

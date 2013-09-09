@@ -1,0 +1,1626 @@
+class BackupManagerService
+!!!8038924.java!!!	generateToken() : int
+        int token;
+        do {
+            synchronized (mTokenGenerator) {
+                token = mTokenGenerator.nextInt();
+            }
+        } while (token < 0);
+        return token;
+!!!8039308.java!!!	addBackupTrace(in s : String) : void
+        if (DEBUG_BACKUP_TRACE) {
+            synchronized (mBackupTrace) {
+                mBackupTrace.add(s);
+            }
+        }
+!!!8039436.java!!!	clearBackupTrace() : void
+        if (DEBUG_BACKUP_TRACE) {
+            synchronized (mBackupTrace) {
+                mBackupTrace.clear();
+            }
+        }
+!!!8039564.java!!!	BackupManagerService(inout context : Context)
+        mContext = context;
+        mPackageManager = context.getPackageManager();
+        mPackageManagerBinder = AppGlobals.getPackageManager();
+        mActivityManager = ActivityManagerNative.getDefault();
+
+        mAlarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        mPowerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mMountService = IMountService.Stub.asInterface(ServiceManager.getService("mount"));
+
+        mBackupManagerBinder = asInterface(asBinder());
+
+        // spin up the backup/restore handler thread
+        mHandlerThread = new HandlerThread("backup", Process.THREAD_PRIORITY_BACKGROUND);
+        mHandlerThread.start();
+        mBackupHandler = new BackupHandler(mHandlerThread.getLooper());
+
+        // Set up our bookkeeping
+        final ContentResolver resolver = context.getContentResolver();
+        boolean areEnabled = Settings.Secure.getInt(resolver,
+                Settings.Secure.BACKUP_ENABLED, 0) != 0;
+        mProvisioned = Settings.Global.getInt(resolver,
+                Settings.Global.DEVICE_PROVISIONED, 0) != 0;
+        mAutoRestore = Settings.Secure.getInt(resolver,
+                Settings.Secure.BACKUP_AUTO_RESTORE, 1) != 0;
+
+        mProvisionedObserver = new ProvisionedObserver(mBackupHandler);
+        resolver.registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.DEVICE_PROVISIONED),
+                false, mProvisionedObserver);
+
+        // If Encrypted file systems is enabled or disabled, this call will return the
+        // correct directory.
+        mBaseStateDir = new File(Environment.getSecureDataDirectory(), "backup");
+        mBaseStateDir.mkdirs();
+        mDataDir = Environment.getDownloadCacheDirectory();
+
+        mPasswordHashFile = new File(mBaseStateDir, "pwhash");
+        if (mPasswordHashFile.exists()) {
+            FileInputStream fin = null;
+            DataInputStream in = null;
+            try {
+                fin = new FileInputStream(mPasswordHashFile);
+                in = new DataInputStream(new BufferedInputStream(fin));
+                // integer length of the salt array, followed by the salt,
+                // then the hex pw hash string
+                int saltLen = in.readInt();
+                byte[] salt = new byte[saltLen];
+                in.readFully(salt);
+                mPasswordHash = in.readUTF();
+                mPasswordSalt = salt;
+            } catch (IOException e) {
+                Slog.e(TAG, "Unable to read saved backup pw hash");
+            } finally {
+                try {
+                    if (in != null) in.close();
+                    if (fin != null) fin.close();
+                } catch (IOException e) {
+                    Slog.w(TAG, "Unable to close streams");
+                }
+            }
+        }
+
+        // Alarm receivers for scheduled backups & initialization operations
+        mRunBackupReceiver = new RunBackupReceiver();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(RUN_BACKUP_ACTION);
+        context.registerReceiver(mRunBackupReceiver, filter,
+                android.Manifest.permission.BACKUP, null);
+
+        mRunInitReceiver = new RunInitializeReceiver();
+        filter = new IntentFilter();
+        filter.addAction(RUN_INITIALIZE_ACTION);
+        context.registerReceiver(mRunInitReceiver, filter,
+                android.Manifest.permission.BACKUP, null);
+
+        Intent backupIntent = new Intent(RUN_BACKUP_ACTION);
+        backupIntent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
+        mRunBackupIntent = PendingIntent.getBroadcast(context, MSG_RUN_BACKUP, backupIntent, 0);
+
+        Intent initIntent = new Intent(RUN_INITIALIZE_ACTION);
+        backupIntent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
+        mRunInitIntent = PendingIntent.getBroadcast(context, MSG_RUN_INITIALIZE, initIntent, 0);
+
+        // Set up the backup-request journaling
+        mJournalDir = new File(mBaseStateDir, "pending");
+        mJournalDir.mkdirs();   // creates mBaseStateDir along the way
+        mJournal = null;        // will be created on first use
+
+        // Set up the various sorts of package tracking we do
+        initPackageTracking();
+
+        // Build our mapping of uid to backup client services.  This implicitly
+        // schedules a backup pass on the Package Manager metadata the first
+        // time anything needs to be backed up.
+        synchronized (mBackupParticipants) {
+            addPackageParticipantsLocked(null);
+        }
+
+        // Set up our transport options and initialize the default transport
+        // TODO: Have transports register themselves somehow?
+        // TODO: Don't create transports that we don't need to?
+        mLocalTransport = new LocalTransport(context);  // This is actually pretty cheap
+        ComponentName localName = new ComponentName(context, LocalTransport.class);
+        registerTransport(localName.flattenToShortString(), mLocalTransport);
+
+        mGoogleTransport = null;
+        mCurrentTransport = Settings.Secure.getString(context.getContentResolver(),
+                Settings.Secure.BACKUP_TRANSPORT);
+        if ("".equals(mCurrentTransport)) {
+            mCurrentTransport = null;
+        }
+        if (DEBUG) Slog.v(TAG, "Starting with transport " + mCurrentTransport);
+
+        // Attach to the Google backup transport.  When this comes up, it will set
+        // itself as the current transport because we explicitly reset mCurrentTransport
+        // to null.
+        ComponentName transportComponent = new ComponentName("com.google.android.backup",
+                "com.google.android.backup.BackupTransportService");
+        try {
+            // If there's something out there that is supposed to be the Google
+            // backup transport, make sure it's legitimately part of the OS build
+            // and not an app lying about its package name.
+            ApplicationInfo info = mPackageManager.getApplicationInfo(
+                    transportComponent.getPackageName(), 0);
+            if ((info.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
+                if (DEBUG) Slog.v(TAG, "Binding to Google transport");
+                Intent intent = new Intent().setComponent(transportComponent);
+                context.bindService(intent, mGoogleConnection, Context.BIND_AUTO_CREATE,
+                        UserHandle.USER_OWNER);
+            } else {
+                Slog.w(TAG, "Possible Google transport spoof: ignoring " + info);
+            }
+        } catch (PackageManager.NameNotFoundException nnf) {
+            // No such package?  No binding.
+            if (DEBUG) Slog.v(TAG, "Google transport not present");
+        }
+
+        // Now that we know about valid backup participants, parse any
+        // leftover journal files into the pending backup set
+        parseLeftoverJournals();
+
+        // Power management
+        mWakelock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "*backup*");
+
+        // Start the backup passes going
+        setBackupEnabled(areEnabled);
+!!!8039948.java!!!	initPackageTracking() : void
+        if (DEBUG) Slog.v(TAG, "Initializing package tracking");
+
+        // Remember our ancestral dataset
+        mTokenFile = new File(mBaseStateDir, "ancestral");
+        try {
+            RandomAccessFile tf = new RandomAccessFile(mTokenFile, "r");
+            int version = tf.readInt();
+            if (version == CURRENT_ANCESTRAL_RECORD_VERSION) {
+                mAncestralToken = tf.readLong();
+                mCurrentToken = tf.readLong();
+
+                int numPackages = tf.readInt();
+                if (numPackages >= 0) {
+                    mAncestralPackages = new HashSet<String>();
+                    for (int i = 0; i < numPackages; i++) {
+                        String pkgName = tf.readUTF();
+                        mAncestralPackages.add(pkgName);
+                    }
+                }
+            }
+            tf.close();
+        } catch (FileNotFoundException fnf) {
+            // Probably innocuous
+            Slog.v(TAG, "No ancestral data");
+        } catch (IOException e) {
+            Slog.w(TAG, "Unable to read token file", e);
+        }
+
+        // Keep a log of what apps we've ever backed up.  Because we might have
+        // rebooted in the middle of an operation that was removing something from
+        // this log, we sanity-check its contents here and reconstruct it.
+        mEverStored = new File(mBaseStateDir, "processed");
+        File tempProcessedFile = new File(mBaseStateDir, "processed.new");
+
+        // If we were in the middle of removing something from the ever-backed-up
+        // file, there might be a transient "processed.new" file still present.
+        // Ignore it -- we'll validate "processed" against the current package set.
+        if (tempProcessedFile.exists()) {
+            tempProcessedFile.delete();
+        }
+
+        // If there are previous contents, parse them out then start a new
+        // file to continue the recordkeeping.
+        if (mEverStored.exists()) {
+            RandomAccessFile temp = null;
+            RandomAccessFile in = null;
+
+            try {
+                temp = new RandomAccessFile(tempProcessedFile, "rws");
+                in = new RandomAccessFile(mEverStored, "r");
+
+                while (true) {
+                    PackageInfo info;
+                    String pkg = in.readUTF();
+                    try {
+                        info = mPackageManager.getPackageInfo(pkg, 0);
+                        mEverStoredApps.add(pkg);
+                        temp.writeUTF(pkg);
+                        if (MORE_DEBUG) Slog.v(TAG, "   + " + pkg);
+                    } catch (NameNotFoundException e) {
+                        // nope, this package was uninstalled; don't include it
+                        if (MORE_DEBUG) Slog.v(TAG, "   - " + pkg);
+                    }
+                }
+            } catch (EOFException e) {
+                // Once we've rewritten the backup history log, atomically replace the
+                // old one with the new one then reopen the file for continuing use.
+                if (!tempProcessedFile.renameTo(mEverStored)) {
+                    Slog.e(TAG, "Error renaming " + tempProcessedFile + " to " + mEverStored);
+                }
+            } catch (IOException e) {
+                Slog.e(TAG, "Error in processed file", e);
+            } finally {
+                try { if (temp != null) temp.close(); } catch (IOException e) {}
+                try { if (in != null) in.close(); } catch (IOException e) {}
+            }
+        }
+
+        // Register for broadcasts about package install, etc., so we can
+        // update the provider list.
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        filter.addDataScheme("package");
+        mContext.registerReceiver(mBroadcastReceiver, filter);
+        // Register for events related to sdcard installation.
+        IntentFilter sdFilter = new IntentFilter();
+        sdFilter.addAction(Intent.ACTION_EXTERNAL_APPLICATIONS_AVAILABLE);
+        sdFilter.addAction(Intent.ACTION_EXTERNAL_APPLICATIONS_UNAVAILABLE);
+        mContext.registerReceiver(mBroadcastReceiver, sdFilter);
+!!!8040076.java!!!	parseLeftoverJournals() : void
+        for (File f : mJournalDir.listFiles()) {
+            if (mJournal == null || f.compareTo(mJournal) != 0) {
+                // This isn't the current journal, so it must be a leftover.  Read
+                // out the package names mentioned there and schedule them for
+                // backup.
+                RandomAccessFile in = null;
+                try {
+                    Slog.i(TAG, "Found stale backup journal, scheduling");
+                    in = new RandomAccessFile(f, "r");
+                    while (true) {
+                        String packageName = in.readUTF();
+                        Slog.i(TAG, "  " + packageName);
+                        dataChangedImpl(packageName);
+                    }
+                } catch (EOFException e) {
+                    // no more data; we're done
+                } catch (Exception e) {
+                    Slog.e(TAG, "Can't read " + f, e);
+                } finally {
+                    // close/delete the file
+                    try { if (in != null) in.close(); } catch (IOException e) {}
+                    f.delete();
+                }
+            }
+        }
+!!!8040204.java!!!	buildPasswordKey(in pw : String, inout salt : byte, in rounds : int) : SecretKey
+        return buildCharArrayKey(pw.toCharArray(), salt, rounds);
+!!!8040332.java!!!	buildCharArrayKey(inout pwArray : char, inout salt : byte, in rounds : int) : SecretKey
+        try {
+            SecretKeyFactory keyFactory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1");
+            KeySpec ks = new PBEKeySpec(pwArray, salt, rounds, PBKDF2_KEY_SIZE);
+            return keyFactory.generateSecret(ks);
+        } catch (InvalidKeySpecException e) {
+            Slog.e(TAG, "Invalid key spec for PBKDF2!");
+        } catch (NoSuchAlgorithmException e) {
+            Slog.e(TAG, "PBKDF2 unavailable!");
+        }
+        return null;
+!!!8040460.java!!!	buildPasswordHash(in pw : String, inout salt : byte, in rounds : int) : String
+        SecretKey key = buildPasswordKey(pw, salt, rounds);
+        if (key != null) {
+            return byteArrayToHex(key.getEncoded());
+        }
+        return null;
+!!!8040588.java!!!	byteArrayToHex(inout data : byte) : String
+        StringBuilder buf = new StringBuilder(data.length * 2);
+        for (int i = 0; i < data.length; i++) {
+            buf.append(Byte.toHexString(data[i], true));
+        }
+        return buf.toString();
+!!!8040716.java!!!	hexToByteArray(in digits : String) : byte
+        final int bytes = digits.length() / 2;
+        if (2*bytes != digits.length()) {
+            throw new IllegalArgumentException("Hex string must have an even number of digits");
+        }
+
+        byte[] result = new byte[bytes];
+        for (int i = 0; i < digits.length(); i += 2) {
+            result[i/2] = (byte) Integer.parseInt(digits.substring(i, i+2), 16);
+        }
+        return result;
+!!!8040844.java!!!	makeKeyChecksum(inout pwBytes : byte, inout salt : byte, in rounds : int) : byte
+        char[] mkAsChar = new char[pwBytes.length];
+        for (int i = 0; i < pwBytes.length; i++) {
+            mkAsChar[i] = (char) pwBytes[i];
+        }
+
+        Key checksum = buildCharArrayKey(mkAsChar, salt, rounds);
+        return checksum.getEncoded();
+!!!8040972.java!!!	randomBytes(in bits : int) : byte
+        byte[] array = new byte[bits / 8];
+        mRng.nextBytes(array);
+        return array;
+!!!8041100.java!!!	passwordMatchesSaved(in candidatePw : String, in rounds : int) : boolean
+        // First, on an encrypted device we require matching the device pw
+        final boolean isEncrypted;
+        try {
+            isEncrypted = (mMountService.getEncryptionState() != MountService.ENCRYPTION_STATE_NONE);
+            if (isEncrypted) {
+                if (DEBUG) {
+                    Slog.i(TAG, "Device encrypted; verifying against device data pw");
+                }
+                // 0 means the password validated
+                // -2 means device not encrypted
+                // Any other result is either password failure or an error condition,
+                // so we refuse the match
+                final int result = mMountService.verifyEncryptionPassword(candidatePw);
+                if (result == 0) {
+                    if (MORE_DEBUG) Slog.d(TAG, "Pw verifies");
+                    return true;
+                } else if (result != -2) {
+                    if (MORE_DEBUG) Slog.d(TAG, "Pw mismatch");
+                    return false;
+                } else {
+                    // ...else the device is supposedly not encrypted.  HOWEVER, the
+                    // query about the encryption state said that the device *is*
+                    // encrypted, so ... we may have a problem.  Log it and refuse
+                    // the backup.
+                    Slog.e(TAG, "verified encryption state mismatch against query; no match allowed");
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            // Something went wrong talking to the mount service.  This is very bad;
+            // assume that we fail password validation.
+            return false;
+        }
+
+        if (mPasswordHash == null) {
+            // no current password case -- require that 'currentPw' be null or empty
+            if (candidatePw == null || "".equals(candidatePw)) {
+                return true;
+            } // else the non-empty candidate does not match the empty stored pw
+        } else {
+            // hash the stated current pw and compare to the stored one
+            if (candidatePw != null && candidatePw.length() > 0) {
+                String currentPwHash = buildPasswordHash(candidatePw, mPasswordSalt, rounds);
+                if (mPasswordHash.equalsIgnoreCase(currentPwHash)) {
+                    // candidate hash matches the stored hash -- the password matches
+                    return true;
+                }
+            } // else the stored pw is nonempty but the candidate is empty; no match
+        }
+        return false;
+!!!8041228.java!!!	setBackupPassword(in currentPw : String, in newPw : String) : boolean
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "setBackupPassword");
+
+        // If the supplied pw doesn't hash to the the saved one, fail
+        if (!passwordMatchesSaved(currentPw, PBKDF2_HASH_ROUNDS)) {
+            return false;
+        }
+
+        // Clearing the password is okay
+        if (newPw == null || newPw.isEmpty()) {
+            if (mPasswordHashFile.exists()) {
+                if (!mPasswordHashFile.delete()) {
+                    // Unable to delete the old pw file, so fail
+                    Slog.e(TAG, "Unable to clear backup password");
+                    return false;
+                }
+            }
+            mPasswordHash = null;
+            mPasswordSalt = null;
+            return true;
+        }
+
+        try {
+            // Okay, build the hash of the new backup password
+            byte[] salt = randomBytes(PBKDF2_SALT_SIZE);
+            String newPwHash = buildPasswordHash(newPw, salt, PBKDF2_HASH_ROUNDS);
+
+            OutputStream pwf = null, buffer = null;
+            DataOutputStream out = null;
+            try {
+                pwf = new FileOutputStream(mPasswordHashFile);
+                buffer = new BufferedOutputStream(pwf);
+                out = new DataOutputStream(buffer);
+                // integer length of the salt array, followed by the salt,
+                // then the hex pw hash string
+                out.writeInt(salt.length);
+                out.write(salt);
+                out.writeUTF(newPwHash);
+                out.flush();
+                mPasswordHash = newPwHash;
+                mPasswordSalt = salt;
+                return true;
+            } finally {
+                if (out != null) out.close();
+                if (buffer != null) buffer.close();
+                if (pwf != null) pwf.close();
+            }
+        } catch (IOException e) {
+            Slog.e(TAG, "Unable to set backup password");
+        }
+        return false;
+!!!8041356.java!!!	hasBackupPassword() : boolean
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "hasBackupPassword");
+
+        try {
+            return (mMountService.getEncryptionState() != IMountService.ENCRYPTION_STATE_NONE)
+                || (mPasswordHash != null && mPasswordHash.length() > 0);
+        } catch (Exception e) {
+            // If we can't talk to the mount service we have a serious problem; fail
+            // "secure" i.e. assuming that we require a password
+            return true;
+        }
+!!!8041484.java!!!	recordInitPendingLocked(inout isPending : boolean, in transportName : String) : void
+        if (DEBUG) Slog.i(TAG, "recordInitPendingLocked: " + isPending
+                + " on transport " + transportName);
+        try {
+            IBackupTransport transport = getTransport(transportName);
+            String transportDirName = transport.transportDirName();
+            File stateDir = new File(mBaseStateDir, transportDirName);
+            File initPendingFile = new File(stateDir, INIT_SENTINEL_FILE_NAME);
+
+            if (isPending) {
+                // We need an init before we can proceed with sending backup data.
+                // Record that with an entry in our set of pending inits, as well as
+                // journaling it via creation of a sentinel file.
+                mPendingInits.add(transportName);
+                try {
+                    (new FileOutputStream(initPendingFile)).close();
+                } catch (IOException ioe) {
+                    // Something is badly wrong with our permissions; just try to move on
+                }
+            } else {
+                // No more initialization needed; wipe the journal and reset our state.
+                initPendingFile.delete();
+                mPendingInits.remove(transportName);
+            }
+        } catch (RemoteException e) {
+            // can't happen; the transport is local
+        }
+!!!8041612.java!!!	resetBackupState(inout stateFileDir : File) : void
+        synchronized (mQueueLock) {
+            // Wipe the "what we've ever backed up" tracking
+            mEverStoredApps.clear();
+            mEverStored.delete();
+
+            mCurrentToken = 0;
+            writeRestoreTokens();
+
+            // Remove all the state files
+            for (File sf : stateFileDir.listFiles()) {
+                // ... but don't touch the needs-init sentinel
+                if (!sf.getName().equals(INIT_SENTINEL_FILE_NAME)) {
+                    sf.delete();
+                }
+            }
+        }
+
+        // Enqueue a new backup of every participant
+        synchronized (mBackupParticipants) {
+            final int N = mBackupParticipants.size();
+            for (int i=0; i<N; i++) {
+                HashSet<String> participants = mBackupParticipants.valueAt(i);
+                if (participants != null) {
+                    for (String packageName : participants) {
+                        dataChangedImpl(packageName);
+                    }
+                }
+            }
+        }
+!!!8041740.java!!!	registerTransport(in name : String, inout transport : IBackupTransport) : void
+        synchronized (mTransports) {
+            if (DEBUG) Slog.v(TAG, "Registering transport " + name + " = " + transport);
+            if (transport != null) {
+                mTransports.put(name, transport);
+            } else {
+                mTransports.remove(name);
+                if ((mCurrentTransport != null) && mCurrentTransport.equals(name)) {
+                    mCurrentTransport = null;
+                }
+                // Nothing further to do in the unregistration case
+                return;
+            }
+        }
+
+        // If the init sentinel file exists, we need to be sure to perform the init
+        // as soon as practical.  We also create the state directory at registration
+        // time to ensure it's present from the outset.
+        try {
+            String transportName = transport.transportDirName();
+            File stateDir = new File(mBaseStateDir, transportName);
+            stateDir.mkdirs();
+
+            File initSentinel = new File(stateDir, INIT_SENTINEL_FILE_NAME);
+            if (initSentinel.exists()) {
+                synchronized (mQueueLock) {
+                    mPendingInits.add(transportName);
+
+                    // TODO: pick a better starting time than now + 1 minute
+                    long delay = 1000 * 60; // one minute, in milliseconds
+                    mAlarmManager.set(AlarmManager.RTC_WAKEUP,
+                            System.currentTimeMillis() + delay, mRunInitIntent);
+                }
+            }
+        } catch (RemoteException e) {
+            // can't happen, the transport is local
+        }
+!!!8041868.java!!!	addPackageParticipantsLocked(inout packageNames : String) : void
+        // Look for apps that define the android:backupAgent attribute
+        List<PackageInfo> targetApps = allAgentPackages();
+        if (packageNames != null) {
+            if (DEBUG) Slog.v(TAG, "addPackageParticipantsLocked: #" + packageNames.length);
+            for (String packageName : packageNames) {
+                addPackageParticipantsLockedInner(packageName, targetApps);
+            }
+        } else {
+            if (DEBUG) Slog.v(TAG, "addPackageParticipantsLocked: all");
+            addPackageParticipantsLockedInner(null, targetApps);
+        }
+!!!8041996.java!!!	addPackageParticipantsLockedInner(in packageName : String, inout targetPkgs : List<PackageInfo>) : void
+        if (MORE_DEBUG) {
+            Slog.v(TAG, "Examining " + packageName + " for backup agent");
+        }
+
+        for (PackageInfo pkg : targetPkgs) {
+            if (packageName == null || pkg.packageName.equals(packageName)) {
+                int uid = pkg.applicationInfo.uid;
+                HashSet<String> set = mBackupParticipants.get(uid);
+                if (set == null) {
+                    set = new HashSet<String>();
+                    mBackupParticipants.put(uid, set);
+                }
+                set.add(pkg.packageName);
+                if (MORE_DEBUG) Slog.v(TAG, "Agent found; added");
+
+                // Schedule a backup for it on general principles
+                if (DEBUG) Slog.i(TAG, "Scheduling backup for new app " + pkg.packageName);
+                dataChangedImpl(pkg.packageName);
+            }
+        }
+!!!8042124.java!!!	removePackageParticipantsLocked(inout packageNames : String, in oldUid : int) : void
+        if (packageNames == null) {
+            Slog.w(TAG, "removePackageParticipants with null list");
+            return;
+        }
+
+        if (DEBUG) Slog.v(TAG, "removePackageParticipantsLocked: uid=" + oldUid
+                + " #" + packageNames.length);
+        for (String pkg : packageNames) {
+            // Known previous UID, so we know which package set to check
+            HashSet<String> set = mBackupParticipants.get(oldUid);
+            if (set != null && set.contains(pkg)) {
+                removePackageFromSetLocked(set, pkg);
+                if (set.isEmpty()) {
+                    if (MORE_DEBUG) Slog.v(TAG, "  last one of this uid; purging set");
+                    mBackupParticipants.remove(oldUid);
+                }
+            }
+        }
+!!!8042252.java!!!	removePackageFromSetLocked(in set : HashSet<String>, in packageName : String) : void
+        if (set.contains(packageName)) {
+            // Found it.  Remove this one package from the bookkeeping, and
+            // if it's the last participating app under this uid we drop the
+            // (now-empty) set as well.
+            // Note that we deliberately leave it 'known' in the "ever backed up"
+            // bookkeeping so that its current-dataset data will be retrieved
+            // if the app is subsequently reinstalled
+            if (MORE_DEBUG) Slog.v(TAG, "  removing participant " + packageName);
+            set.remove(packageName);
+            mPendingBackups.remove(packageName);
+        }
+!!!8042380.java!!!	allAgentPackages() : PackageInfo
+        // !!! TODO: cache this and regenerate only when necessary
+        int flags = PackageManager.GET_SIGNATURES;
+        List<PackageInfo> packages = mPackageManager.getInstalledPackages(flags);
+        int N = packages.size();
+        for (int a = N-1; a >= 0; a--) {
+            PackageInfo pkg = packages.get(a);
+            try {
+                ApplicationInfo app = pkg.applicationInfo;
+                if (((app.flags&ApplicationInfo.FLAG_ALLOW_BACKUP) == 0)
+                        || app.backupAgentName == null) {
+                    packages.remove(a);
+                }
+                else {
+                    // we will need the shared library path, so look that up and store it here
+                    app = mPackageManager.getApplicationInfo(pkg.packageName,
+                            PackageManager.GET_SHARED_LIBRARY_FILES);
+                    pkg.applicationInfo.sharedLibraryFiles = app.sharedLibraryFiles;
+                }
+            } catch (NameNotFoundException e) {
+                packages.remove(a);
+            }
+        }
+        return packages;
+!!!8042508.java!!!	logBackupComplete(in packageName : String) : void
+        if (packageName.equals(PACKAGE_MANAGER_SENTINEL)) return;
+
+        synchronized (mEverStoredApps) {
+            if (!mEverStoredApps.add(packageName)) return;
+
+            RandomAccessFile out = null;
+            try {
+                out = new RandomAccessFile(mEverStored, "rws");
+                out.seek(out.length());
+                out.writeUTF(packageName);
+            } catch (IOException e) {
+                Slog.e(TAG, "Can't log backup of " + packageName + " to " + mEverStored);
+            } finally {
+                try { if (out != null) out.close(); } catch (IOException e) {}
+            }
+        }
+!!!8042636.java!!!	removeEverBackedUp(in packageName : String) : void
+        if (DEBUG) Slog.v(TAG, "Removing backed-up knowledge of " + packageName);
+        if (MORE_DEBUG) Slog.v(TAG, "New set:");
+
+        synchronized (mEverStoredApps) {
+            // Rewrite the file and rename to overwrite.  If we reboot in the middle,
+            // we'll recognize on initialization time that the package no longer
+            // exists and fix it up then.
+            File tempKnownFile = new File(mBaseStateDir, "processed.new");
+            RandomAccessFile known = null;
+            try {
+                known = new RandomAccessFile(tempKnownFile, "rws");
+                mEverStoredApps.remove(packageName);
+                for (String s : mEverStoredApps) {
+                    known.writeUTF(s);
+                    if (MORE_DEBUG) Slog.v(TAG, "    " + s);
+                }
+                known.close();
+                known = null;
+                if (!tempKnownFile.renameTo(mEverStored)) {
+                    throw new IOException("Can't rename " + tempKnownFile + " to " + mEverStored);
+                }
+            } catch (IOException e) {
+                // Bad: we couldn't create the new copy.  For safety's sake we
+                // abandon the whole process and remove all what's-backed-up
+                // state entirely, meaning we'll force a backup pass for every
+                // participant on the next boot or [re]install.
+                Slog.w(TAG, "Error rewriting " + mEverStored, e);
+                mEverStoredApps.clear();
+                tempKnownFile.delete();
+                mEverStored.delete();
+            } finally {
+                try { if (known != null) known.close(); } catch (IOException e) {}
+            }
+        }
+!!!8042764.java!!!	writeRestoreTokens() : void
+        try {
+            RandomAccessFile af = new RandomAccessFile(mTokenFile, "rwd");
+
+            // First, the version number of this record, for futureproofing
+            af.writeInt(CURRENT_ANCESTRAL_RECORD_VERSION);
+
+            // Write the ancestral and current tokens
+            af.writeLong(mAncestralToken);
+            af.writeLong(mCurrentToken);
+
+            // Now write the set of ancestral packages
+            if (mAncestralPackages == null) {
+                af.writeInt(-1);
+            } else {
+                af.writeInt(mAncestralPackages.size());
+                if (DEBUG) Slog.v(TAG, "Ancestral packages:  " + mAncestralPackages.size());
+                for (String pkgName : mAncestralPackages) {
+                    af.writeUTF(pkgName);
+                    if (MORE_DEBUG) Slog.v(TAG, "   " + pkgName);
+                }
+            }
+            af.close();
+        } catch (IOException e) {
+            Slog.w(TAG, "Unable to write token file:", e);
+        }
+!!!8042892.java!!!	getTransport(in transportName : String) : IBackupTransport
+        synchronized (mTransports) {
+            IBackupTransport transport = mTransports.get(transportName);
+            if (transport == null) {
+                Slog.w(TAG, "Requested unavailable transport: " + transportName);
+            }
+            return transport;
+        }
+!!!8043020.java!!!	bindToAgentSynchronous(inout app : ApplicationInfo, in mode : int) : IBackupAgent
+        IBackupAgent agent = null;
+        synchronized(mAgentConnectLock) {
+            mConnecting = true;
+            mConnectedAgent = null;
+            try {
+                if (mActivityManager.bindBackupAgent(app, mode)) {
+                    Slog.d(TAG, "awaiting agent for " + app);
+
+                    // success; wait for the agent to arrive
+                    // only wait 10 seconds for the bind to happen
+                    long timeoutMark = System.currentTimeMillis() + TIMEOUT_INTERVAL;
+                    while (mConnecting && mConnectedAgent == null
+                            && (System.currentTimeMillis() < timeoutMark)) {
+                        try {
+                            mAgentConnectLock.wait(5000);
+                        } catch (InterruptedException e) {
+                            // just bail
+                            if (DEBUG) Slog.w(TAG, "Interrupted: " + e);
+                            mActivityManager.clearPendingBackup();
+                            return null;
+                        }
+                    }
+
+                    // if we timed out with no connect, abort and move on
+                    if (mConnecting == true) {
+                        Slog.w(TAG, "Timeout waiting for agent " + app);
+                        mActivityManager.clearPendingBackup();
+                        return null;
+                    }
+                    if (DEBUG) Slog.i(TAG, "got agent " + mConnectedAgent);
+                    agent = mConnectedAgent;
+                }
+            } catch (RemoteException e) {
+                // can't happen
+            }
+        }
+        return agent;
+!!!8043148.java!!!	clearApplicationDataSynchronous(in packageName : String) : void
+        // Don't wipe packages marked allowClearUserData=false
+        try {
+            PackageInfo info = mPackageManager.getPackageInfo(packageName, 0);
+            if ((info.applicationInfo.flags & ApplicationInfo.FLAG_ALLOW_CLEAR_USER_DATA) == 0) {
+                if (MORE_DEBUG) Slog.i(TAG, "allowClearUserData=false so not wiping "
+                        + packageName);
+                return;
+            }
+        } catch (NameNotFoundException e) {
+            Slog.w(TAG, "Tried to clear data for " + packageName + " but not found");
+            return;
+        }
+
+        ClearDataObserver observer = new ClearDataObserver();
+
+        synchronized(mClearDataLock) {
+            mClearingData = true;
+            try {
+                mActivityManager.clearApplicationUserData(packageName, observer, 0);
+            } catch (RemoteException e) {
+                // can't happen because the activity manager is in this process
+            }
+
+            // only wait 10 seconds for the clear data to happen
+            long timeoutMark = System.currentTimeMillis() + TIMEOUT_INTERVAL;
+            while (mClearingData && (System.currentTimeMillis() < timeoutMark)) {
+                try {
+                    mClearDataLock.wait(5000);
+                } catch (InterruptedException e) {
+                    // won't happen, but still.
+                    mClearingData = false;
+                }
+            }
+        }
+!!!8043404.java!!!	getAvailableRestoreToken(in packageName : String) : long
+        long token = mAncestralToken;
+        synchronized (mQueueLock) {
+            if (mEverStoredApps.contains(packageName)) {
+                token = mCurrentToken;
+            }
+        }
+        return token;
+!!!8043916.java!!!	prepareOperationTimeout(in token : int, in interval : long, inout callback : BackupRestoreTask) : void
+        if (MORE_DEBUG) Slog.v(TAG, "starting timeout: token=" + Integer.toHexString(token)
+                + " interval=" + interval);
+        synchronized (mCurrentOpLock) {
+            mCurrentOperations.put(token, new Operation(OP_PENDING, callback));
+
+            Message msg = mBackupHandler.obtainMessage(MSG_TIMEOUT, token, 0, callback);
+            mBackupHandler.sendMessageDelayed(msg, interval);
+        }
+!!!8044044.java!!!	waitUntilOperationComplete(in token : int) : boolean
+        if (MORE_DEBUG) Slog.i(TAG, "Blocking until operation complete for "
+                + Integer.toHexString(token));
+        int finalState = OP_PENDING;
+        Operation op = null;
+        synchronized (mCurrentOpLock) {
+            while (true) {
+                op = mCurrentOperations.get(token);
+                if (op == null) {
+                    // mysterious disappearance: treat as success with no callback
+                    break;
+                } else {
+                    if (op.state == OP_PENDING) {
+                        try {
+                            mCurrentOpLock.wait();
+                        } catch (InterruptedException e) {}
+                        // When the wait is notified we loop around and recheck the current state
+                    } else {
+                        // No longer pending; we're done
+                        finalState = op.state;
+                        break;
+                    }
+                }
+            }
+        }
+
+        mBackupHandler.removeMessages(MSG_TIMEOUT);
+        if (MORE_DEBUG) Slog.v(TAG, "operation " + Integer.toHexString(token)
+                + " complete: finalState=" + finalState);
+        return finalState == OP_ACKNOWLEDGED;
+!!!8044172.java!!!	handleTimeout(in token : int, inout obj : Object) : void
+        // Notify any synchronous waiters
+        Operation op = null;
+        synchronized (mCurrentOpLock) {
+            op = mCurrentOperations.get(token);
+            if (MORE_DEBUG) {
+                if (op == null) Slog.w(TAG, "Timeout of token " + Integer.toHexString(token)
+                        + " but no op found");
+            }
+            int state = (op != null) ? op.state : OP_TIMEOUT;
+            if (state == OP_PENDING) {
+                if (DEBUG) Slog.v(TAG, "TIMEOUT: token=" + Integer.toHexString(token));
+                op.state = OP_TIMEOUT;
+                mCurrentOperations.put(token, op);
+            }
+            mCurrentOpLock.notifyAll();
+        }
+
+        // If there's a TimeoutHandler for this event, call it
+        if (op != null && op.callback != null) {
+            op.callback.handleTimeout();
+        }
+!!!8051980.java!!!	signaturesMatch(inout storedSigs : Signature, inout target : PackageInfo) : boolean
+        // If the target resides on the system partition, we allow it to restore
+        // data from the like-named package in a restore set even if the signatures
+        // do not match.  (Unlike general applications, those flashed to the system
+        // partition will be signed with the device's platform certificate, so on
+        // different phones the same system app will have different signatures.)
+        if ((target.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
+            if (DEBUG) Slog.v(TAG, "System app " + target.packageName + " - skipping sig check");
+            return true;
+        }
+
+        // Allow unsigned apps, but not signed on one device and unsigned on the other
+        // !!! TODO: is this the right policy?
+        Signature[] deviceSigs = target.signatures;
+        if (MORE_DEBUG) Slog.v(TAG, "signaturesMatch(): stored=" + storedSigs
+                + " device=" + deviceSigs);
+        if ((storedSigs == null || storedSigs.length == 0)
+                && (deviceSigs == null || deviceSigs.length == 0)) {
+            return true;
+        }
+        if (storedSigs == null || deviceSigs == null) {
+            return false;
+        }
+
+        // !!! TODO: this demands that every stored signature match one
+        // that is present on device, and does not demand the converse.
+        // Is this this right policy?
+        int nStored = storedSigs.length;
+        int nDevice = deviceSigs.length;
+
+        for (int i=0; i < nStored; i++) {
+            boolean match = false;
+            for (int j=0; j < nDevice; j++) {
+                if (storedSigs[i].equals(deviceSigs[j])) {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match) {
+                return false;
+            }
+        }
+        return true;
+!!!8054412.java!!!	dataChangedImpl(in packageName : String) : void
+        HashSet<String> targets = dataChangedTargets(packageName);
+        dataChangedImpl(packageName, targets);
+!!!8054540.java!!!	dataChangedImpl(in packageName : String, inout targets : HashSet<String>) : void
+        // Record that we need a backup pass for the caller.  Since multiple callers
+        // may share a uid, we need to note all candidates within that uid and schedule
+        // a backup pass for each of them.
+        EventLog.writeEvent(EventLogTags.BACKUP_DATA_CHANGED, packageName);
+
+        if (targets == null) {
+            Slog.w(TAG, "dataChanged but no participant pkg='" + packageName + "'"
+                   + " uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        synchronized (mQueueLock) {
+            // Note that this client has made data changes that need to be backed up
+            if (targets.contains(packageName)) {
+                // Add the caller to the set of pending backups.  If there is
+                // one already there, then overwrite it, but no harm done.
+                BackupRequest req = new BackupRequest(packageName);
+                if (mPendingBackups.put(packageName, req) == null) {
+                    if (DEBUG) Slog.d(TAG, "Now staging backup of " + packageName);
+
+                    // Journal this request in case of crash.  The put()
+                    // operation returned null when this package was not already
+                    // in the set; we want to avoid touching the disk redundantly.
+                    writeToJournalLocked(packageName);
+
+                    if (MORE_DEBUG) {
+                        int numKeys = mPendingBackups.size();
+                        Slog.d(TAG, "Now awaiting backup for " + numKeys + " participants:");
+                        for (BackupRequest b : mPendingBackups.values()) {
+                            Slog.d(TAG, "    + " + b);
+                        }
+                    }
+                }
+            }
+        }
+!!!8054668.java!!!	dataChangedTargets(in packageName : String) : HashSet<String>
+        // If the caller does not hold the BACKUP permission, it can only request a
+        // backup of its own data.
+        if ((mContext.checkPermission(android.Manifest.permission.BACKUP, Binder.getCallingPid(),
+                Binder.getCallingUid())) == PackageManager.PERMISSION_DENIED) {
+            synchronized (mBackupParticipants) {
+                return mBackupParticipants.get(Binder.getCallingUid());
+            }
+        }
+
+        // a caller with full permission can ask to back up any participating app
+        // !!! TODO: allow backup of ANY app?
+        HashSet<String> targets = new HashSet<String>();
+        synchronized (mBackupParticipants) {
+            int N = mBackupParticipants.size();
+            for (int i = 0; i < N; i++) {
+                HashSet<String> s = mBackupParticipants.valueAt(i);
+                if (s != null) {
+                    targets.addAll(s);
+                }
+            }
+        }
+        return targets;
+!!!8054796.java!!!	writeToJournalLocked(in str : String) : void
+        RandomAccessFile out = null;
+        try {
+            if (mJournal == null) mJournal = File.createTempFile("journal", null, mJournalDir);
+            out = new RandomAccessFile(mJournal, "rws");
+            out.seek(out.length());
+            out.writeUTF(str);
+        } catch (IOException e) {
+            Slog.e(TAG, "Can't write " + str + " to backup journal", e);
+            mJournal = null;
+        } finally {
+            try { if (out != null) out.close(); } catch (IOException e) {}
+        }
+!!!8054924.java!!!	dataChanged(in packageName : String) : void
+        final int callingUserHandle = UserHandle.getCallingUserId();
+        if (callingUserHandle != UserHandle.USER_OWNER) {
+            // App is running under a non-owner user profile.  For now, we do not back
+            // up data from secondary user profiles.
+            // TODO: backups for all user profiles.
+            if (MORE_DEBUG) {
+                Slog.v(TAG, "dataChanged(" + packageName + ") ignored because it's user "
+                        + callingUserHandle);
+            }
+            return;
+        }
+
+        final HashSet<String> targets = dataChangedTargets(packageName);
+        if (targets == null) {
+            Slog.w(TAG, "dataChanged but no participant pkg='" + packageName + "'"
+                   + " uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        mBackupHandler.post(new Runnable() {
+                public void run() {
+                    dataChangedImpl(packageName, targets);
+                }
+            });
+!!!8055052.java!!!	clearBackupData(in packageName : String) : void
+        if (DEBUG) Slog.v(TAG, "clearBackupData() of " + packageName);
+        PackageInfo info;
+        try {
+            info = mPackageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES);
+        } catch (NameNotFoundException e) {
+            Slog.d(TAG, "No such package '" + packageName + "' - not clearing backup data");
+            return;
+        }
+
+        // If the caller does not hold the BACKUP permission, it can only request a
+        // wipe of its own backed-up data.
+        HashSet<String> apps;
+        if ((mContext.checkPermission(android.Manifest.permission.BACKUP, Binder.getCallingPid(),
+                Binder.getCallingUid())) == PackageManager.PERMISSION_DENIED) {
+            apps = mBackupParticipants.get(Binder.getCallingUid());
+        } else {
+            // a caller with full permission can ask to back up any participating app
+            // !!! TODO: allow data-clear of ANY app?
+            if (DEBUG) Slog.v(TAG, "Privileged caller, allowing clear of other apps");
+            apps = new HashSet<String>();
+            int N = mBackupParticipants.size();
+            for (int i = 0; i < N; i++) {
+                HashSet<String> s = mBackupParticipants.valueAt(i);
+                if (s != null) {
+                    apps.addAll(s);
+                }
+            }
+        }
+
+        // Is the given app an available participant?
+        if (apps.contains(packageName)) {
+            if (DEBUG) Slog.v(TAG, "Found the app - running clear process");
+            // found it; fire off the clear request
+            synchronized (mQueueLock) {
+                long oldId = Binder.clearCallingIdentity();
+                mWakelock.acquire();
+                Message msg = mBackupHandler.obtainMessage(MSG_RUN_CLEAR,
+                        new ClearParams(getTransport(mCurrentTransport), info));
+                mBackupHandler.sendMessage(msg);
+                Binder.restoreCallingIdentity(oldId);
+            }
+        }
+!!!8055180.java!!!	backupNow() : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP, "backupNow");
+
+        if (DEBUG) Slog.v(TAG, "Scheduling immediate backup pass");
+        synchronized (mQueueLock) {
+            // Because the alarms we are using can jitter, and we want an *immediate*
+            // backup pass to happen, we restart the timer beginning with "next time,"
+            // then manually fire the backup trigger intent ourselves.
+            startBackupAlarmsLocked(BACKUP_INTERVAL);
+            try {
+                mRunBackupIntent.send();
+            } catch (PendingIntent.CanceledException e) {
+                // should never happen
+                Slog.e(TAG, "run-backup intent cancelled!");
+            }
+        }
+!!!8055308.java!!!	deviceIsProvisioned() : boolean
+        final ContentResolver resolver = mContext.getContentResolver();
+        return (Settings.Global.getInt(resolver, Settings.Global.DEVICE_PROVISIONED, 0) != 0);
+!!!8055436.java!!!	fullBackup(inout fd : ParcelFileDescriptor, inout includeApks : boolean, inout includeShared : boolean, inout doAllApps : boolean, inout includeSystem : boolean, inout pkgList : String) : void
+        mContext.enforceCallingPermission(android.Manifest.permission.BACKUP, "fullBackup");
+
+        final int callingUserHandle = UserHandle.getCallingUserId();
+        if (callingUserHandle != UserHandle.USER_OWNER) {
+            throw new IllegalStateException("Backup supported only for the device owner");
+        }
+
+        // Validate
+        if (!doAllApps) {
+            if (!includeShared) {
+                // If we're backing up shared data (sdcard or equivalent), then we can run
+                // without any supplied app names.  Otherwise, we'd be doing no work, so
+                // report the error.
+                if (pkgList == null || pkgList.length == 0) {
+                    throw new IllegalArgumentException(
+                            "Backup requested but neither shared nor any apps named");
+                }
+            }
+        }
+
+        long oldId = Binder.clearCallingIdentity();
+        try {
+            // Doesn't make sense to do a full backup prior to setup
+            if (!deviceIsProvisioned()) {
+                Slog.i(TAG, "Full backup not supported before setup");
+                return;
+            }
+
+            if (DEBUG) Slog.v(TAG, "Requesting full backup: apks=" + includeApks
+                    + " shared=" + includeShared + " all=" + doAllApps
+                    + " pkgs=" + pkgList);
+            Slog.i(TAG, "Beginning full backup...");
+
+            FullBackupParams params = new FullBackupParams(fd, includeApks, includeShared,
+                    doAllApps, includeSystem, pkgList);
+            final int token = generateToken();
+            synchronized (mFullConfirmations) {
+                mFullConfirmations.put(token, params);
+            }
+
+            // start up the confirmation UI
+            if (DEBUG) Slog.d(TAG, "Starting backup confirmation UI, token=" + token);
+            if (!startConfirmationUi(token, FullBackup.FULL_BACKUP_INTENT_ACTION)) {
+                Slog.e(TAG, "Unable to launch full backup confirmation");
+                mFullConfirmations.delete(token);
+                return;
+            }
+
+            // make sure the screen is lit for the user interaction
+            mPowerManager.userActivity(SystemClock.uptimeMillis(), false);
+
+            // start the confirmation countdown
+            startConfirmationTimeout(token, params);
+
+            // wait for the backup to be performed
+            if (DEBUG) Slog.d(TAG, "Waiting for full backup completion...");
+            waitForCompletion(params);
+        } finally {
+            try {
+                fd.close();
+            } catch (IOException e) {
+                // just eat it
+            }
+            Binder.restoreCallingIdentity(oldId);
+            Slog.d(TAG, "Full backup processing complete.");
+        }
+!!!8055564.java!!!	fullRestore(inout fd : ParcelFileDescriptor) : void
+        mContext.enforceCallingPermission(android.Manifest.permission.BACKUP, "fullRestore");
+
+        final int callingUserHandle = UserHandle.getCallingUserId();
+        if (callingUserHandle != UserHandle.USER_OWNER) {
+            throw new IllegalStateException("Restore supported only for the device owner");
+        }
+
+        long oldId = Binder.clearCallingIdentity();
+
+        try {
+            // Check whether the device has been provisioned -- we don't handle
+            // full restores prior to completing the setup process.
+            if (!deviceIsProvisioned()) {
+                Slog.i(TAG, "Full restore not permitted before setup");
+                return;
+            }
+
+            Slog.i(TAG, "Beginning full restore...");
+
+            FullRestoreParams params = new FullRestoreParams(fd);
+            final int token = generateToken();
+            synchronized (mFullConfirmations) {
+                mFullConfirmations.put(token, params);
+            }
+
+            // start up the confirmation UI
+            if (DEBUG) Slog.d(TAG, "Starting restore confirmation UI, token=" + token);
+            if (!startConfirmationUi(token, FullBackup.FULL_RESTORE_INTENT_ACTION)) {
+                Slog.e(TAG, "Unable to launch full restore confirmation");
+                mFullConfirmations.delete(token);
+                return;
+            }
+
+            // make sure the screen is lit for the user interaction
+            mPowerManager.userActivity(SystemClock.uptimeMillis(), false);
+
+            // start the confirmation countdown
+            startConfirmationTimeout(token, params);
+
+            // wait for the restore to be performed
+            if (DEBUG) Slog.d(TAG, "Waiting for full restore completion...");
+            waitForCompletion(params);
+        } finally {
+            try {
+                fd.close();
+            } catch (IOException e) {
+                Slog.w(TAG, "Error trying to close fd after full restore: " + e);
+            }
+            Binder.restoreCallingIdentity(oldId);
+            Slog.i(TAG, "Full restore processing complete.");
+        }
+!!!8055692.java!!!	startConfirmationUi(in token : int, in action : String) : boolean
+        try {
+            Intent confIntent = new Intent(action);
+            confIntent.setClassName("com.android.backupconfirm",
+                    "com.android.backupconfirm.BackupRestoreConfirmation");
+            confIntent.putExtra(FullBackup.CONF_TOKEN_INTENT_EXTRA, token);
+            confIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            mContext.startActivity(confIntent);
+        } catch (ActivityNotFoundException e) {
+            return false;
+        }
+        return true;
+!!!8055820.java!!!	startConfirmationTimeout(in token : int, inout params : FullParams) : void
+        if (MORE_DEBUG) Slog.d(TAG, "Posting conf timeout msg after "
+                + TIMEOUT_FULL_CONFIRMATION + " millis");
+        Message msg = mBackupHandler.obtainMessage(MSG_FULL_CONFIRMATION_TIMEOUT,
+                token, 0, params);
+        mBackupHandler.sendMessageDelayed(msg, TIMEOUT_FULL_CONFIRMATION);
+!!!8055948.java!!!	waitForCompletion(inout params : FullParams) : void
+        synchronized (params.latch) {
+            while (params.latch.get() == false) {
+                try {
+                    params.latch.wait();
+                } catch (InterruptedException e) { /* never interrupted */ }
+            }
+        }
+!!!8056076.java!!!	signalFullBackupRestoreCompletion(inout params : FullParams) : void
+        synchronized (params.latch) {
+            params.latch.set(true);
+            params.latch.notifyAll();
+        }
+!!!8056204.java!!!	acknowledgeFullBackupOrRestore(in token : int, inout allow : boolean, in curPassword : String, in encPpassword : String, inout observer : IFullBackupRestoreObserver) : void
+        if (DEBUG) Slog.d(TAG, "acknowledgeFullBackupOrRestore : token=" + token
+                + " allow=" + allow);
+
+        // TODO: possibly require not just this signature-only permission, but even
+        // require that the specific designated confirmation-UI app uid is the caller?
+        mContext.enforceCallingPermission(android.Manifest.permission.BACKUP, "acknowledgeFullBackupOrRestore");
+
+        long oldId = Binder.clearCallingIdentity();
+        try {
+
+            FullParams params;
+            synchronized (mFullConfirmations) {
+                params = mFullConfirmations.get(token);
+                if (params != null) {
+                    mBackupHandler.removeMessages(MSG_FULL_CONFIRMATION_TIMEOUT, params);
+                    mFullConfirmations.delete(token);
+
+                    if (allow) {
+                        final int verb = params instanceof FullBackupParams
+                                ? MSG_RUN_FULL_BACKUP
+                                : MSG_RUN_FULL_RESTORE;
+
+                        params.observer = observer;
+                        params.curPassword = curPassword;
+
+                        boolean isEncrypted;
+                        try {
+                            isEncrypted = (mMountService.getEncryptionState() != MountService.ENCRYPTION_STATE_NONE);
+                            if (isEncrypted) Slog.w(TAG, "Device is encrypted; forcing enc password");
+                        } catch (RemoteException e) {
+                            // couldn't contact the mount service; fail "safe" and assume encryption
+                            Slog.e(TAG, "Unable to contact mount service!");
+                            isEncrypted = true;
+                        }
+                        params.encryptPassword = (isEncrypted) ? curPassword : encPpassword;
+
+                        if (DEBUG) Slog.d(TAG, "Sending conf message with verb " + verb);
+                        mWakelock.acquire();
+                        Message msg = mBackupHandler.obtainMessage(verb, params);
+                        mBackupHandler.sendMessage(msg);
+                    } else {
+                        Slog.w(TAG, "User rejected full backup/restore operation");
+                        // indicate completion without having actually transferred any data
+                        signalFullBackupRestoreCompletion(params);
+                    }
+                } else {
+                    Slog.w(TAG, "Attempted to ack full backup/restore with invalid token");
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(oldId);
+        }
+!!!8056332.java!!!	setBackupEnabled(inout enable : boolean) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "setBackupEnabled");
+
+        Slog.i(TAG, "Backup enabled => " + enable);
+
+        boolean wasEnabled = mEnabled;
+        synchronized (this) {
+            Settings.Secure.putInt(mContext.getContentResolver(),
+                    Settings.Secure.BACKUP_ENABLED, enable ? 1 : 0);
+            mEnabled = enable;
+        }
+
+        synchronized (mQueueLock) {
+            if (enable && !wasEnabled && mProvisioned) {
+                // if we've just been enabled, start scheduling backup passes
+                startBackupAlarmsLocked(BACKUP_INTERVAL);
+            } else if (!enable) {
+                // No longer enabled, so stop running backups
+                if (DEBUG) Slog.i(TAG, "Opting out of backup");
+
+                mAlarmManager.cancel(mRunBackupIntent);
+
+                // This also constitutes an opt-out, so we wipe any data for
+                // this device from the backend.  We start that process with
+                // an alarm in order to guarantee wakelock states.
+                if (wasEnabled && mProvisioned) {
+                    // NOTE: we currently flush every registered transport, not just
+                    // the currently-active one.
+                    HashSet<String> allTransports;
+                    synchronized (mTransports) {
+                        allTransports = new HashSet<String>(mTransports.keySet());
+                    }
+                    // build the set of transports for which we are posting an init
+                    for (String transport : allTransports) {
+                        recordInitPendingLocked(true, transport);
+                    }
+                    mAlarmManager.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis(),
+                            mRunInitIntent);
+                }
+            }
+        }
+!!!8056460.java!!!	setAutoRestore(inout doAutoRestore : boolean) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "setAutoRestore");
+
+        Slog.i(TAG, "Auto restore => " + doAutoRestore);
+
+        synchronized (this) {
+            Settings.Secure.putInt(mContext.getContentResolver(),
+                    Settings.Secure.BACKUP_AUTO_RESTORE, doAutoRestore ? 1 : 0);
+            mAutoRestore = doAutoRestore;
+        }
+!!!8056588.java!!!	setBackupProvisioned(inout available : boolean) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "setBackupProvisioned");
+        /*
+         * This is now a no-op; provisioning is simply the device's own setup state.
+         */
+!!!8056716.java!!!	startBackupAlarmsLocked(in delayBeforeFirstBackup : long) : void
+        // We used to use setInexactRepeating(), but that may be linked to
+        // backups running at :00 more often than not, creating load spikes.
+        // Schedule at an exact time for now, and also add a bit of "fuzz".
+
+        Random random = new Random();
+        long when = System.currentTimeMillis() + delayBeforeFirstBackup +
+                random.nextInt(FUZZ_MILLIS);
+        mAlarmManager.setRepeating(AlarmManager.RTC_WAKEUP, when,
+                BACKUP_INTERVAL + random.nextInt(FUZZ_MILLIS), mRunBackupIntent);
+        mNextBackupPass = when;
+!!!8056844.java!!!	isBackupEnabled() : boolean
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP, "isBackupEnabled");
+        return mEnabled;    // no need to synchronize just to read it
+!!!8056972.java!!!	getCurrentTransport() : String
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "getCurrentTransport");
+        if (MORE_DEBUG) Slog.v(TAG, "... getCurrentTransport() returning " + mCurrentTransport);
+        return mCurrentTransport;
+!!!8057100.java!!!	listAllTransports() : String
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP, "listAllTransports");
+
+        String[] list = null;
+        ArrayList<String> known = new ArrayList<String>();
+        for (Map.Entry<String, IBackupTransport> entry : mTransports.entrySet()) {
+            if (entry.getValue() != null) {
+                known.add(entry.getKey());
+            }
+        }
+
+        if (known.size() > 0) {
+            list = new String[known.size()];
+            known.toArray(list);
+        }
+        return list;
+!!!8057228.java!!!	selectBackupTransport(in transport : String) : String
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP, "selectBackupTransport");
+
+        synchronized (mTransports) {
+            String prevTransport = null;
+            if (mTransports.get(transport) != null) {
+                prevTransport = mCurrentTransport;
+                mCurrentTransport = transport;
+                Settings.Secure.putString(mContext.getContentResolver(),
+                        Settings.Secure.BACKUP_TRANSPORT, transport);
+                Slog.v(TAG, "selectBackupTransport() set " + mCurrentTransport
+                        + " returning " + prevTransport);
+            } else {
+                Slog.w(TAG, "Attempt to select unavailable transport " + transport);
+            }
+            return prevTransport;
+        }
+!!!8057356.java!!!	getConfigurationIntent(in transportName : String) : Intent
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "getConfigurationIntent");
+
+        synchronized (mTransports) {
+            final IBackupTransport transport = mTransports.get(transportName);
+            if (transport != null) {
+                try {
+                    final Intent intent = transport.configurationIntent();
+                    if (MORE_DEBUG) Slog.d(TAG, "getConfigurationIntent() returning config intent "
+                            + intent);
+                    return intent;
+                } catch (RemoteException e) {
+                    /* fall through to return null */
+                }
+            }
+        }
+
+        return null;
+!!!8057484.java!!!	getDestinationString(in transportName : String) : String
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                "getDestinationString");
+
+        synchronized (mTransports) {
+            final IBackupTransport transport = mTransports.get(transportName);
+            if (transport != null) {
+                try {
+                    final String text = transport.currentDestinationString();
+                    if (MORE_DEBUG) Slog.d(TAG, "getDestinationString() returning " + text);
+                    return text;
+                } catch (RemoteException e) {
+                    /* fall through to return null */
+                }
+            }
+        }
+
+        return null;
+!!!8057612.java!!!	agentConnected(in packageName : String, inout agentBinder : IBinder) : void
+        synchronized(mAgentConnectLock) {
+            if (Binder.getCallingUid() == Process.SYSTEM_UID) {
+                Slog.d(TAG, "agentConnected pkg=" + packageName + " agent=" + agentBinder);
+                IBackupAgent agent = IBackupAgent.Stub.asInterface(agentBinder);
+                mConnectedAgent = agent;
+                mConnecting = false;
+            } else {
+                Slog.w(TAG, "Non-system process uid=" + Binder.getCallingUid()
+                        + " claiming agent connected");
+            }
+            mAgentConnectLock.notifyAll();
+        }
+!!!8057740.java!!!	agentDisconnected(in packageName : String) : void
+        // TODO: handle backup being interrupted
+        synchronized(mAgentConnectLock) {
+            if (Binder.getCallingUid() == Process.SYSTEM_UID) {
+                mConnectedAgent = null;
+                mConnecting = false;
+            } else {
+                Slog.w(TAG, "Non-system process uid=" + Binder.getCallingUid()
+                        + " claiming agent disconnected");
+            }
+            mAgentConnectLock.notifyAll();
+        }
+!!!8057868.java!!!	restoreAtInstall(in packageName : String, in token : int) : void
+        if (Binder.getCallingUid() != Process.SYSTEM_UID) {
+            Slog.w(TAG, "Non-system process uid=" + Binder.getCallingUid()
+                    + " attemping install-time restore");
+            return;
+        }
+
+        long restoreSet = getAvailableRestoreToken(packageName);
+        if (DEBUG) Slog.v(TAG, "restoreAtInstall pkg=" + packageName
+                + " token=" + Integer.toHexString(token)
+                + " restoreSet=" + Long.toHexString(restoreSet));
+
+        if (mAutoRestore && mProvisioned && restoreSet != 0) {
+            // okay, we're going to attempt a restore of this package from this restore set.
+            // The eventual message back into the Package Manager to run the post-install
+            // steps for 'token' will be issued from the restore handling code.
+
+            // We can use a synthetic PackageInfo here because:
+            //   1. We know it's valid, since the Package Manager supplied the name
+            //   2. Only the packageName field will be used by the restore code
+            PackageInfo pkg = new PackageInfo();
+            pkg.packageName = packageName;
+
+            mWakelock.acquire();
+            Message msg = mBackupHandler.obtainMessage(MSG_RUN_RESTORE);
+            msg.obj = new RestoreParams(getTransport(mCurrentTransport), null,
+                    restoreSet, pkg, token, true);
+            mBackupHandler.sendMessage(msg);
+        } else {
+            // Auto-restore disabled or no way to attempt a restore; just tell the Package
+            // Manager to proceed with the post-install handling for this package.
+            if (DEBUG) Slog.v(TAG, "No restore set -- skipping restore");
+            try {
+                mPackageManagerBinder.finishPackageInstall(token);
+            } catch (RemoteException e) { /* can't happen */ }
+        }
+!!!8057996.java!!!	beginRestoreSession(in packageName : String, in transport : String) : IRestoreSession
+        if (DEBUG) Slog.v(TAG, "beginRestoreSession: pkg=" + packageName
+                + " transport=" + transport);
+
+        boolean needPermission = true;
+        if (transport == null) {
+            transport = mCurrentTransport;
+
+            if (packageName != null) {
+                PackageInfo app = null;
+                try {
+                    app = mPackageManager.getPackageInfo(packageName, 0);
+                } catch (NameNotFoundException nnf) {
+                    Slog.w(TAG, "Asked to restore nonexistent pkg " + packageName);
+                    throw new IllegalArgumentException("Package " + packageName + " not found");
+                }
+
+                if (app.applicationInfo.uid == Binder.getCallingUid()) {
+                    // So: using the current active transport, and the caller has asked
+                    // that its own package will be restored.  In this narrow use case
+                    // we do not require the caller to hold the permission.
+                    needPermission = false;
+                }
+            }
+        }
+
+        if (needPermission) {
+            mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP,
+                    "beginRestoreSession");
+        } else {
+            if (DEBUG) Slog.d(TAG, "restoring self on current transport; no permission needed");
+        }
+
+        synchronized(this) {
+            if (mActiveRestoreSession != null) {
+                Slog.d(TAG, "Restore session requested but one already active");
+                return null;
+            }
+            mActiveRestoreSession = new ActiveRestoreSession(packageName, transport);
+            mBackupHandler.sendEmptyMessageDelayed(MSG_RESTORE_TIMEOUT, TIMEOUT_RESTORE_INTERVAL);
+        }
+        return mActiveRestoreSession;
+!!!8058124.java!!!	clearRestoreSession(inout currentSession : ActiveRestoreSession) : void
+        synchronized(this) {
+            if (currentSession != mActiveRestoreSession) {
+                Slog.e(TAG, "ending non-current restore session");
+            } else {
+                if (DEBUG) Slog.v(TAG, "Clearing restore session and halting timeout");
+                mActiveRestoreSession = null;
+                mBackupHandler.removeMessages(MSG_RESTORE_TIMEOUT);
+            }
+        }
+!!!8058252.java!!!	opComplete(in token : int) : void
+        if (MORE_DEBUG) Slog.v(TAG, "opComplete: " + Integer.toHexString(token));
+        Operation op = null;
+        synchronized (mCurrentOpLock) {
+            op = mCurrentOperations.get(token);
+            if (op != null) {
+                op.state = OP_ACKNOWLEDGED;
+            }
+            mCurrentOpLock.notifyAll();
+        }
+
+        // The completion callback, if any, is invoked on the handler
+        if (op != null && op.callback != null) {
+            Message msg = mBackupHandler.obtainMessage(MSG_OP_COMPLETE, op.callback);
+            mBackupHandler.sendMessage(msg);
+        }
+!!!8059404.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DUMP, TAG);
+
+        long identityToken = Binder.clearCallingIdentity();
+        try {
+            dumpInternal(pw);
+        } finally {
+            Binder.restoreCallingIdentity(identityToken);
+        }
+!!!8059532.java!!!	dumpInternal(inout pw : PrintWriter) : void
+        synchronized (mQueueLock) {
+            pw.println("Backup Manager is " + (mEnabled ? "enabled" : "disabled")
+                    + " / " + (!mProvisioned ? "not " : "") + "provisioned / "
+                    + (this.mPendingInits.size() == 0 ? "not " : "") + "pending init");
+            pw.println("Auto-restore is " + (mAutoRestore ? "enabled" : "disabled"));
+            if (mBackupRunning) pw.println("Backup currently running");
+            pw.println("Last backup pass started: " + mLastBackupPass
+                    + " (now = " + System.currentTimeMillis() + ')');
+            pw.println("  next scheduled: " + mNextBackupPass);
+
+            pw.println("Available transports:");
+            for (String t : listAllTransports()) {
+                pw.println((t.equals(mCurrentTransport) ? "  * " : "    ") + t);
+                try {
+                    IBackupTransport transport = getTransport(t);
+                    File dir = new File(mBaseStateDir, transport.transportDirName());
+                    pw.println("       destination: " + transport.currentDestinationString());
+                    pw.println("       intent: " + transport.configurationIntent());
+                    for (File f : dir.listFiles()) {
+                        pw.println("       " + f.getName() + " - " + f.length() + " state bytes");
+                    }
+                } catch (Exception e) {
+                    Slog.e(TAG, "Error in transport", e);
+                    pw.println("        Error: " + e);
+                }
+            }
+
+            pw.println("Pending init: " + mPendingInits.size());
+            for (String s : mPendingInits) {
+                pw.println("    " + s);
+            }
+
+            if (DEBUG_BACKUP_TRACE) {
+                synchronized (mBackupTrace) {
+                    if (!mBackupTrace.isEmpty()) {
+                        pw.println("Most recent backup trace:");
+                        for (String s : mBackupTrace) {
+                            pw.println("   " + s);
+                        }
+                    }
+                }
+            }
+
+            int N = mBackupParticipants.size();
+            pw.println("Participants:");
+            for (int i=0; i<N; i++) {
+                int uid = mBackupParticipants.keyAt(i);
+                pw.print("  uid: ");
+                pw.println(uid);
+                HashSet<String> participants = mBackupParticipants.valueAt(i);
+                for (String app: participants) {
+                    pw.println("    " + app);
+                }
+            }
+
+            pw.println("Ancestral packages: "
+                    + (mAncestralPackages == null ? "none" : mAncestralPackages.size()));
+            if (mAncestralPackages != null) {
+                for (String pkg : mAncestralPackages) {
+                    pw.println("    " + pkg);
+                }
+            }
+
+            pw.println("Ever backed up: " + mEverStoredApps.size());
+            for (String pkg : mEverStoredApps) {
+                pw.println("    " + pkg);
+            }
+
+            pw.println("Pending backup: " + mPendingBackups.size());
+            for (BackupRequest req : mPendingBackups.values()) {
+                pw.println("    " + req);
+            }
+        }

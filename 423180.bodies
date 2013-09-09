@@ -1,0 +1,363 @@
+class ResStringPool
+!!!1025036.cpp!!!	ResStringPool(in data : void, in size : size_t, in copyData : bool = false)
+    setTo(data, size, copyData);
+!!!1025164.cpp!!!	~ResStringPool()
+    uninit();
+!!!1025292.cpp!!!	setTo(in data : void, in size : size_t, in copyData : bool = false) : status_t
+    if (!data || !size) {
+        return (mError=BAD_TYPE);
+    }
+
+    uninit();
+
+    const bool notDeviceEndian = htods(0xf0) != 0xf0;
+
+    if (copyData || notDeviceEndian) {
+        mOwnedData = malloc(size);
+        if (mOwnedData == NULL) {
+            return (mError=NO_MEMORY);
+        }
+        memcpy(mOwnedData, data, size);
+        data = mOwnedData;
+    }
+
+    mHeader = (const ResStringPool_header*)data;
+
+    if (notDeviceEndian) {
+        ResStringPool_header* h = const_cast<ResStringPool_header*>(mHeader);
+        h->header.headerSize = dtohs(mHeader->header.headerSize);
+        h->header.type = dtohs(mHeader->header.type);
+        h->header.size = dtohl(mHeader->header.size);
+        h->stringCount = dtohl(mHeader->stringCount);
+        h->styleCount = dtohl(mHeader->styleCount);
+        h->flags = dtohl(mHeader->flags);
+        h->stringsStart = dtohl(mHeader->stringsStart);
+        h->stylesStart = dtohl(mHeader->stylesStart);
+    }
+
+    if (mHeader->header.headerSize > mHeader->header.size
+            || mHeader->header.size > size) {
+        ALOGW("Bad string block: header size %d or total size %d is larger than data size %d\n",
+                (int)mHeader->header.headerSize, (int)mHeader->header.size, (int)size);
+        return (mError=BAD_TYPE);
+    }
+    mSize = mHeader->header.size;
+    mEntries = (const uint32_t*)
+        (((const uint8_t*)data)+mHeader->header.headerSize);
+
+    if (mHeader->stringCount > 0) {
+        if ((mHeader->stringCount*sizeof(uint32_t) < mHeader->stringCount)  // uint32 overflow?
+            || (mHeader->header.headerSize+(mHeader->stringCount*sizeof(uint32_t)))
+                > size) {
+            ALOGW("Bad string block: entry of %d items extends past data size %d\n",
+                    (int)(mHeader->header.headerSize+(mHeader->stringCount*sizeof(uint32_t))),
+                    (int)size);
+            return (mError=BAD_TYPE);
+        }
+
+        size_t charSize;
+        if (mHeader->flags&ResStringPool_header::UTF8_FLAG) {
+            charSize = sizeof(uint8_t);
+            mCache = (char16_t**)calloc(mHeader->stringCount, sizeof(char16_t**));
+        } else {
+            charSize = sizeof(char16_t);
+        }
+
+        mStrings = (const void*)
+            (((const uint8_t*)data)+mHeader->stringsStart);
+        if (mHeader->stringsStart >= (mHeader->header.size-sizeof(uint16_t))) {
+            ALOGW("Bad string block: string pool starts at %d, after total size %d\n",
+                    (int)mHeader->stringsStart, (int)mHeader->header.size);
+            return (mError=BAD_TYPE);
+        }
+        if (mHeader->styleCount == 0) {
+            mStringPoolSize =
+                (mHeader->header.size-mHeader->stringsStart)/charSize;
+        } else {
+            // check invariant: styles starts before end of data
+            if (mHeader->stylesStart >= (mHeader->header.size-sizeof(uint16_t))) {
+                ALOGW("Bad style block: style block starts at %d past data size of %d\n",
+                    (int)mHeader->stylesStart, (int)mHeader->header.size);
+                return (mError=BAD_TYPE);
+            }
+            // check invariant: styles follow the strings
+            if (mHeader->stylesStart <= mHeader->stringsStart) {
+                ALOGW("Bad style block: style block starts at %d, before strings at %d\n",
+                    (int)mHeader->stylesStart, (int)mHeader->stringsStart);
+                return (mError=BAD_TYPE);
+            }
+            mStringPoolSize =
+                (mHeader->stylesStart-mHeader->stringsStart)/charSize;
+        }
+
+        // check invariant: stringCount > 0 requires a string pool to exist
+        if (mStringPoolSize == 0) {
+            ALOGW("Bad string block: stringCount is %d but pool size is 0\n", (int)mHeader->stringCount);
+            return (mError=BAD_TYPE);
+        }
+
+        if (notDeviceEndian) {
+            size_t i;
+            uint32_t* e = const_cast<uint32_t*>(mEntries);
+            for (i=0; i<mHeader->stringCount; i++) {
+                e[i] = dtohl(mEntries[i]);
+            }
+            if (!(mHeader->flags&ResStringPool_header::UTF8_FLAG)) {
+                const char16_t* strings = (const char16_t*)mStrings;
+                char16_t* s = const_cast<char16_t*>(strings);
+                for (i=0; i<mStringPoolSize; i++) {
+                    s[i] = dtohs(strings[i]);
+                }
+            }
+        }
+
+        if ((mHeader->flags&ResStringPool_header::UTF8_FLAG &&
+                ((uint8_t*)mStrings)[mStringPoolSize-1] != 0) ||
+                (!mHeader->flags&ResStringPool_header::UTF8_FLAG &&
+                ((char16_t*)mStrings)[mStringPoolSize-1] != 0)) {
+            ALOGW("Bad string block: last string is not 0-terminated\n");
+            return (mError=BAD_TYPE);
+        }
+    } else {
+        mStrings = NULL;
+        mStringPoolSize = 0;
+    }
+
+    if (mHeader->styleCount > 0) {
+        mEntryStyles = mEntries + mHeader->stringCount;
+        // invariant: integer overflow in calculating mEntryStyles
+        if (mEntryStyles < mEntries) {
+            ALOGW("Bad string block: integer overflow finding styles\n");
+            return (mError=BAD_TYPE);
+        }
+
+        if (((const uint8_t*)mEntryStyles-(const uint8_t*)mHeader) > (int)size) {
+            ALOGW("Bad string block: entry of %d styles extends past data size %d\n",
+                    (int)((const uint8_t*)mEntryStyles-(const uint8_t*)mHeader),
+                    (int)size);
+            return (mError=BAD_TYPE);
+        }
+        mStyles = (const uint32_t*)
+            (((const uint8_t*)data)+mHeader->stylesStart);
+        if (mHeader->stylesStart >= mHeader->header.size) {
+            ALOGW("Bad string block: style pool starts %d, after total size %d\n",
+                    (int)mHeader->stylesStart, (int)mHeader->header.size);
+            return (mError=BAD_TYPE);
+        }
+        mStylePoolSize =
+            (mHeader->header.size-mHeader->stylesStart)/sizeof(uint32_t);
+
+        if (notDeviceEndian) {
+            size_t i;
+            uint32_t* e = const_cast<uint32_t*>(mEntryStyles);
+            for (i=0; i<mHeader->styleCount; i++) {
+                e[i] = dtohl(mEntryStyles[i]);
+            }
+            uint32_t* s = const_cast<uint32_t*>(mStyles);
+            for (i=0; i<mStylePoolSize; i++) {
+                s[i] = dtohl(mStyles[i]);
+            }
+        }
+
+        const ResStringPool_span endSpan = {
+            { htodl(ResStringPool_span::END) },
+            htodl(ResStringPool_span::END), htodl(ResStringPool_span::END)
+        };
+        if (memcmp(&mStyles[mStylePoolSize-(sizeof(endSpan)/sizeof(uint32_t))],
+                   &endSpan, sizeof(endSpan)) != 0) {
+            ALOGW("Bad string block: last style is not 0xFFFFFFFF-terminated\n");
+            return (mError=BAD_TYPE);
+        }
+    } else {
+        mEntryStyles = NULL;
+        mStyles = NULL;
+        mStylePoolSize = 0;
+    }
+
+    return (mError=NO_ERROR);
+!!!1025420.cpp!!!	getError() : status_t
+    return mError;
+!!!1025548.cpp!!!	uninit() : void
+    mError = NO_INIT;
+    if (mOwnedData) {
+        free(mOwnedData);
+        mOwnedData = NULL;
+    }
+    if (mHeader != NULL && mCache != NULL) {
+        for (size_t x = 0; x < mHeader->stringCount; x++) {
+            if (mCache[x] != NULL) {
+                free(mCache[x]);
+                mCache[x] = NULL;
+            }
+        }
+        free(mCache);
+        mCache = NULL;
+    }
+!!!1025804.cpp!!!	stringAt(in idx : size_t, inout u16len : size_t) : char16_t
+    if (mError == NO_ERROR && idx < mHeader->stringCount) {
+        const bool isUTF8 = (mHeader->flags&ResStringPool_header::UTF8_FLAG) != 0;
+        const uint32_t off = mEntries[idx]/(isUTF8?sizeof(char):sizeof(char16_t));
+        if (off < (mStringPoolSize-1)) {
+            if (!isUTF8) {
+                const char16_t* strings = (char16_t*)mStrings;
+                const char16_t* str = strings+off;
+
+                *u16len = decodeLength(&str);
+                if ((uint32_t)(str+*u16len-strings) < mStringPoolSize) {
+                    return str;
+                } else {
+                    ALOGW("Bad string block: string #%d extends to %d, past end at %d\n",
+                            (int)idx, (int)(str+*u16len-strings), (int)mStringPoolSize);
+                }
+            } else {
+                const uint8_t* strings = (uint8_t*)mStrings;
+                const uint8_t* u8str = strings+off;
+
+                *u16len = decodeLength(&u8str);
+                size_t u8len = decodeLength(&u8str);
+
+                // encLen must be less than 0x7FFF due to encoding.
+                if ((uint32_t)(u8str+u8len-strings) < mStringPoolSize) {
+                    AutoMutex lock(mDecodeLock);
+
+                    if (mCache[idx] != NULL) {
+                        return mCache[idx];
+                    }
+
+                    ssize_t actualLen = utf8_to_utf16_length(u8str, u8len);
+                    if (actualLen < 0 || (size_t)actualLen != *u16len) {
+                        ALOGW("Bad string block: string #%lld decoded length is not correct "
+                                "%lld vs %llu\n",
+                                (long long)idx, (long long)actualLen, (long long)*u16len);
+                        return NULL;
+                    }
+
+                    char16_t *u16str = (char16_t *)calloc(*u16len+1, sizeof(char16_t));
+                    if (!u16str) {
+                        ALOGW("No memory when trying to allocate decode cache for string #%d\n",
+                                (int)idx);
+                        return NULL;
+                    }
+
+                    utf8_to_utf16(u8str, u8len, u16str);
+                    mCache[idx] = u16str;
+                    return u16str;
+                } else {
+                    ALOGW("Bad string block: string #%lld extends to %lld, past end at %lld\n",
+                            (long long)idx, (long long)(u8str+u8len-strings),
+                            (long long)mStringPoolSize);
+                }
+            }
+        } else {
+            ALOGW("Bad string block: string #%d entry is at %d, past end at %d\n",
+                    (int)idx, (int)(off*sizeof(uint16_t)),
+                    (int)(mStringPoolSize*sizeof(uint16_t)));
+        }
+    }
+    return NULL;
+!!!1025932.cpp!!!	string8At(in idx : size_t, inout outLen : size_t) : char
+    if (mError == NO_ERROR && idx < mHeader->stringCount) {
+        const bool isUTF8 = (mHeader->flags&ResStringPool_header::UTF8_FLAG) != 0;
+        const uint32_t off = mEntries[idx]/(isUTF8?sizeof(char):sizeof(char16_t));
+        if (off < (mStringPoolSize-1)) {
+            if (isUTF8) {
+                const uint8_t* strings = (uint8_t*)mStrings;
+                const uint8_t* str = strings+off;
+                *outLen = decodeLength(&str);
+                size_t encLen = decodeLength(&str);
+                if ((uint32_t)(str+encLen-strings) < mStringPoolSize) {
+                    return (const char*)str;
+                } else {
+                    ALOGW("Bad string block: string #%d extends to %d, past end at %d\n",
+                            (int)idx, (int)(str+encLen-strings), (int)mStringPoolSize);
+                }
+            }
+        } else {
+            ALOGW("Bad string block: string #%d entry is at %d, past end at %d\n",
+                    (int)idx, (int)(off*sizeof(uint16_t)),
+                    (int)(mStringPoolSize*sizeof(uint16_t)));
+        }
+    }
+    return NULL;
+!!!1026060.cpp!!!	string8ObjectAt(in idx : size_t) : String8
+    size_t len;
+    const char *str = (const char*)string8At(idx, &len);
+    if (str != NULL) {
+        return String8(str);
+    }
+    return String8(stringAt(idx, &len));
+!!!1026188.cpp!!!	styleAt(in ref : ResStringPool_ref) : ResStringPool_span
+    return styleAt(ref.index);
+!!!1026316.cpp!!!	styleAt(in idx : size_t) : ResStringPool_span
+    if (mError == NO_ERROR && idx < mHeader->styleCount) {
+        const uint32_t off = (mEntryStyles[idx]/sizeof(uint32_t));
+        if (off < mStylePoolSize) {
+            return (const ResStringPool_span*)(mStyles+off);
+        } else {
+            ALOGW("Bad string block: style #%d entry is at %d, past end at %d\n",
+                    (int)idx, (int)(off*sizeof(uint32_t)),
+                    (int)(mStylePoolSize*sizeof(uint32_t)));
+        }
+    }
+    return NULL;
+!!!1026444.cpp!!!	indexOfString(in str : char16_t, in strLen : size_t) : ssize_t
+    if (mError != NO_ERROR) {
+        return mError;
+    }
+
+    size_t len;
+
+    // TODO optimize searching for UTF-8 strings taking into account
+    // the cache fill to determine when to convert the searched-for
+    // string key to UTF-8.
+
+    if (mHeader->flags&ResStringPool_header::SORTED_FLAG) {
+        // Do a binary search for the string...
+        ssize_t l = 0;
+        ssize_t h = mHeader->stringCount-1;
+
+        ssize_t mid;
+        while (l <= h) {
+            mid = l + (h - l)/2;
+            const char16_t* s = stringAt(mid, &len);
+            int c = s ? strzcmp16(s, len, str, strLen) : -1;
+            POOL_NOISY(printf("Looking for %s, at %s, cmp=%d, l/mid/h=%d/%d/%d\n",
+                         String8(str).string(),
+                         String8(s).string(),
+                         c, (int)l, (int)mid, (int)h));
+            if (c == 0) {
+                return mid;
+            } else if (c < 0) {
+                l = mid + 1;
+            } else {
+                h = mid - 1;
+            }
+        }
+    } else {
+        // It is unusual to get the ID from an unsorted string block...
+        // most often this happens because we want to get IDs for style
+        // span tags; since those always appear at the end of the string
+        // block, start searching at the back.
+        for (int i=mHeader->stringCount-1; i>=0; i--) {
+            const char16_t* s = stringAt(i, &len);
+            POOL_NOISY(printf("Looking for %s, at %s, i=%d\n",
+                         String8(str, strLen).string(),
+                         String8(s).string(),
+                         i));
+            if (s && strzcmp16(s, len, str, strLen) == 0) {
+                return i;
+            }
+        }
+    }
+
+    return NAME_NOT_FOUND;
+!!!1026572.cpp!!!	size() : size_t
+    return (mError == NO_ERROR) ? mHeader->stringCount : 0;
+!!!1026700.cpp!!!	styleCount() : size_t
+    return (mError == NO_ERROR) ? mHeader->styleCount : 0;
+!!!1026828.cpp!!!	bytes() : size_t
+    return (mError == NO_ERROR) ? mHeader->header.size : 0;
+!!!1026956.cpp!!!	isSorted() : bool
+    return (mHeader->flags&ResStringPool_header::SORTED_FLAG)!=0;
+!!!1027084.cpp!!!	isUTF8() : bool
+    return (mHeader->flags&ResStringPool_header::UTF8_FLAG)!=0;

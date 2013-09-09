@@ -1,0 +1,668 @@
+class VolumePanel
+!!!4665356.java!!!	VolumePanel(in context : Context, inout volumeService : AudioService)
+        mContext = context;
+        mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        mAudioService = volumeService;
+
+        // For now, only show master volume if master volume is supported
+        boolean useMasterVolume = context.getResources().getBoolean(
+                com.android.internal.R.bool.config_useMasterVolume);
+        if (useMasterVolume) {
+            for (int i = 0; i < STREAMS.length; i++) {
+                StreamResources streamRes = STREAMS[i];
+                streamRes.show = (streamRes.streamType == STREAM_MASTER);
+            }
+        }
+
+        LayoutInflater inflater = (LayoutInflater) context
+                .getSystemService(Context.LAYOUT_INFLATER_SERVICE);
+        View view = mView = inflater.inflate(R.layout.volume_adjust, null);
+        mView.setOnTouchListener(new View.OnTouchListener() {
+            public boolean onTouch(View v, MotionEvent event) {
+                resetTimeout();
+                return false;
+            }
+        });
+        mPanel = (ViewGroup) mView.findViewById(R.id.visible_panel);
+        mSliderGroup = (ViewGroup) mView.findViewById(R.id.slider_group);
+        mMoreButton = (ImageView) mView.findViewById(R.id.expand_button);
+        mDivider = (ImageView) mView.findViewById(R.id.expand_button_divider);
+
+        mDialog = new Dialog(context, R.style.Theme_Panel_Volume) {
+            public boolean onTouchEvent(MotionEvent event) {
+                if (isShowing() && event.getAction() == MotionEvent.ACTION_OUTSIDE) {
+                    forceTimeout();
+                    return true;
+                }
+                return false;
+            }
+        };
+        mDialog.setTitle("Volume control"); // No need to localize
+        mDialog.setContentView(mView);
+        mDialog.setOnDismissListener(new OnDismissListener() {
+            public void onDismiss(DialogInterface dialog) {
+                mActiveStreamType = -1;
+                mAudioManager.forceVolumeControlStream(mActiveStreamType);
+            }
+        });
+        // Change some window properties
+        Window window = mDialog.getWindow();
+        window.setGravity(Gravity.TOP);
+        LayoutParams lp = window.getAttributes();
+        lp.token = null;
+        // Offset from the top
+        lp.y = mContext.getResources().getDimensionPixelOffset(
+                com.android.internal.R.dimen.volume_panel_top);
+        lp.type = LayoutParams.TYPE_VOLUME_OVERLAY;
+        lp.width = LayoutParams.WRAP_CONTENT;
+        lp.height = LayoutParams.WRAP_CONTENT;
+        lp.privateFlags |= LayoutParams.PRIVATE_FLAG_FORCE_SHOW_NAV_BAR;
+        window.setAttributes(lp);
+        window.addFlags(LayoutParams.FLAG_NOT_FOCUSABLE | LayoutParams.FLAG_NOT_TOUCH_MODAL
+                | LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH);
+
+        mToneGenerators = new ToneGenerator[AudioSystem.getNumStreamTypes()];
+        mVibrator = (Vibrator)context.getSystemService(Context.VIBRATOR_SERVICE);
+
+        mVoiceCapable = context.getResources().getBoolean(R.bool.config_voice_capable);
+        mShowCombinedVolumes = !mVoiceCapable && !useMasterVolume;
+        // If we don't want to show multiple volumes, hide the settings button and divider
+        if (!mShowCombinedVolumes) {
+            mMoreButton.setVisibility(View.GONE);
+            mDivider.setVisibility(View.GONE);
+        } else {
+            mMoreButton.setOnClickListener(this);
+        }
+
+        boolean masterVolumeOnly = context.getResources().getBoolean(
+                com.android.internal.R.bool.config_useMasterVolume);
+        boolean masterVolumeKeySounds = mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_useVolumeKeySounds);
+
+        mPlayMasterStreamTones = masterVolumeOnly && masterVolumeKeySounds;
+
+        listenToRingerMode();
+!!!4665484.java!!!	listenToRingerMode() : void
+        final IntentFilter filter = new IntentFilter();
+        filter.addAction(AudioManager.RINGER_MODE_CHANGED_ACTION);
+        mContext.registerReceiver(new BroadcastReceiver() {
+
+            public void onReceive(Context context, Intent intent) {
+                final String action = intent.getAction();
+
+                if (AudioManager.RINGER_MODE_CHANGED_ACTION.equals(action)) {
+                    removeMessages(MSG_RINGER_MODE_CHANGED);
+                    sendMessage(obtainMessage(MSG_RINGER_MODE_CHANGED));
+                }
+            }
+        }, filter);
+!!!4665612.java!!!	isMuted(in streamType : int) : boolean
+        if (streamType == STREAM_MASTER) {
+            return mAudioManager.isMasterMute();
+        } else if (streamType == AudioService.STREAM_REMOTE_MUSIC) {
+            return (mAudioService.getRemoteStreamVolume() <= 0);
+        } else {
+            return mAudioManager.isStreamMute(streamType);
+        }
+!!!4665740.java!!!	getStreamMaxVolume(in streamType : int) : int
+        if (streamType == STREAM_MASTER) {
+            return mAudioManager.getMasterMaxVolume();
+        } else if (streamType == AudioService.STREAM_REMOTE_MUSIC) {
+            return mAudioService.getRemoteStreamMaxVolume();
+        } else {
+            return mAudioManager.getStreamMaxVolume(streamType);
+        }
+!!!4665868.java!!!	getStreamVolume(in streamType : int) : int
+        if (streamType == STREAM_MASTER) {
+            return mAudioManager.getMasterVolume();
+        } else if (streamType == AudioService.STREAM_REMOTE_MUSIC) {
+            return mAudioService.getRemoteStreamVolume();
+        } else {
+            return mAudioManager.getStreamVolume(streamType);
+        }
+!!!4665996.java!!!	setStreamVolume(in streamType : int, in index : int, in flags : int) : void
+        if (streamType == STREAM_MASTER) {
+            mAudioManager.setMasterVolume(index, flags);
+        } else if (streamType == AudioService.STREAM_REMOTE_MUSIC) {
+            mAudioService.setRemoteStreamVolume(index);
+        } else {
+            mAudioManager.setStreamVolume(streamType, index, flags);
+        }
+!!!4666124.java!!!	createSliders() : void
+        LayoutInflater inflater = (LayoutInflater) mContext
+                .getSystemService(Context.LAYOUT_INFLATER_SERVICE);
+        mStreamControls = new HashMap<Integer, StreamControl>(STREAMS.length);
+        Resources res = mContext.getResources();
+        for (int i = 0; i < STREAMS.length; i++) {
+            StreamResources streamRes = STREAMS[i];
+            int streamType = streamRes.streamType;
+            if (mVoiceCapable && streamRes == StreamResources.NotificationStream) {
+                streamRes = StreamResources.RingerStream;
+            }
+            StreamControl sc = new StreamControl();
+            sc.streamType = streamType;
+            sc.group = (ViewGroup) inflater.inflate(R.layout.volume_adjust_item, null);
+            sc.group.setTag(sc);
+            sc.icon = (ImageView) sc.group.findViewById(R.id.stream_icon);
+            sc.icon.setTag(sc);
+            sc.icon.setContentDescription(res.getString(streamRes.descRes));
+            sc.iconRes = streamRes.iconRes;
+            sc.iconMuteRes = streamRes.iconMuteRes;
+            sc.icon.setImageResource(sc.iconRes);
+            sc.seekbarView = (SeekBar) sc.group.findViewById(R.id.seekbar);
+            int plusOne = (streamType == AudioSystem.STREAM_BLUETOOTH_SCO ||
+                    streamType == AudioSystem.STREAM_VOICE_CALL) ? 1 : 0;
+            sc.seekbarView.setMax(getStreamMaxVolume(streamType) + plusOne);
+            sc.seekbarView.setOnSeekBarChangeListener(this);
+            sc.seekbarView.setTag(sc);
+            mStreamControls.put(streamType, sc);
+        }
+!!!4666252.java!!!	reorderSliders(in activeStreamType : int) : void
+        mSliderGroup.removeAllViews();
+
+        StreamControl active = mStreamControls.get(activeStreamType);
+        if (active == null) {
+            Log.e("VolumePanel", "Missing stream type! - " + activeStreamType);
+            mActiveStreamType = -1;
+        } else {
+            mSliderGroup.addView(active.group);
+            mActiveStreamType = activeStreamType;
+            active.group.setVisibility(View.VISIBLE);
+            updateSlider(active);
+        }
+
+        addOtherVolumes();
+!!!4666380.java!!!	addOtherVolumes() : void
+        if (!mShowCombinedVolumes) return;
+
+        for (int i = 0; i < STREAMS.length; i++) {
+            // Skip the phone specific ones and the active one
+            final int streamType = STREAMS[i].streamType;
+            if (!STREAMS[i].show || streamType == mActiveStreamType) {
+                continue;
+            }
+            StreamControl sc = mStreamControls.get(streamType);
+            mSliderGroup.addView(sc.group);
+            updateSlider(sc);
+        }
+!!!4666508.java!!!	updateSlider(inout sc : StreamControl) : void
+        sc.seekbarView.setProgress(getStreamVolume(sc.streamType));
+        final boolean muted = isMuted(sc.streamType);
+        sc.icon.setImageResource(muted ? sc.iconMuteRes : sc.iconRes);
+        if (sc.streamType == AudioManager.STREAM_RING &&
+                mAudioManager.getRingerMode() == AudioManager.RINGER_MODE_VIBRATE) {
+            sc.icon.setImageResource(R.drawable.ic_audio_ring_notif_vibrate);
+        }
+        if (sc.streamType == AudioService.STREAM_REMOTE_MUSIC) {
+            // never disable touch interactions for remote playback, the muting is not tied to
+            // the state of the phone.
+            sc.seekbarView.setEnabled(true);
+        } else if (sc.streamType != mAudioManager.getMasterStreamType() && muted) {
+            sc.seekbarView.setEnabled(false);
+        } else {
+            sc.seekbarView.setEnabled(true);
+        }
+!!!4666636.java!!!	isExpanded() : boolean
+        return mMoreButton.getVisibility() != View.VISIBLE;
+!!!4666764.java!!!	expand() : void
+        final int count = mSliderGroup.getChildCount();
+        for (int i = 0; i < count; i++) {
+            mSliderGroup.getChildAt(i).setVisibility(View.VISIBLE);
+        }
+        mMoreButton.setVisibility(View.INVISIBLE);
+        mDivider.setVisibility(View.INVISIBLE);
+!!!4666892.java!!!	collapse() : void
+        mMoreButton.setVisibility(View.VISIBLE);
+        mDivider.setVisibility(View.VISIBLE);
+        final int count = mSliderGroup.getChildCount();
+        for (int i = 1; i < count; i++) {
+            mSliderGroup.getChildAt(i).setVisibility(View.GONE);
+        }
+!!!4667020.java!!!	updateStates() : void
+        final int count = mSliderGroup.getChildCount();
+        for (int i = 0; i < count; i++) {
+            StreamControl sc = (StreamControl) mSliderGroup.getChildAt(i).getTag();
+            updateSlider(sc);
+        }
+!!!4667148.java!!!	postVolumeChanged(in streamType : int, in flags : int) : void
+        if (hasMessages(MSG_VOLUME_CHANGED)) return;
+        synchronized (this) {
+            if (mStreamControls == null) {
+                createSliders();
+            }
+        }
+        removeMessages(MSG_FREE_RESOURCES);
+        obtainMessage(MSG_VOLUME_CHANGED, streamType, flags).sendToTarget();
+!!!4667276.java!!!	postRemoteVolumeChanged(in streamType : int, in flags : int) : void
+        if (hasMessages(MSG_REMOTE_VOLUME_CHANGED)) return;
+        synchronized (this) {
+            if (mStreamControls == null) {
+                createSliders();
+            }
+        }
+        removeMessages(MSG_FREE_RESOURCES);
+        obtainMessage(MSG_REMOTE_VOLUME_CHANGED, streamType, flags).sendToTarget();
+!!!4667404.java!!!	postRemoteSliderVisibility(inout visible : boolean) : void
+        obtainMessage(MSG_SLIDER_VISIBILITY_CHANGED,
+                AudioService.STREAM_REMOTE_MUSIC, visible ? 1 : 0).sendToTarget();
+!!!4667532.java!!!	postHasNewRemotePlaybackInfo() : void
+        if (hasMessages(MSG_REMOTE_VOLUME_UPDATE_IF_SHOWN)) return;
+        // don't create or prevent resources to be freed, if they disappear, this update came too
+        //   late and shouldn't warrant the panel to be displayed longer
+        obtainMessage(MSG_REMOTE_VOLUME_UPDATE_IF_SHOWN).sendToTarget();
+!!!4667660.java!!!	postMasterVolumeChanged(in flags : int) : void
+        postVolumeChanged(STREAM_MASTER, flags);
+!!!4667788.java!!!	postMuteChanged(in streamType : int, in flags : int) : void
+        if (hasMessages(MSG_VOLUME_CHANGED)) return;
+        synchronized (this) {
+            if (mStreamControls == null) {
+                createSliders();
+            }
+        }
+        removeMessages(MSG_FREE_RESOURCES);
+        obtainMessage(MSG_MUTE_CHANGED, streamType, flags).sendToTarget();
+!!!4667916.java!!!	postMasterMuteChanged(in flags : int) : void
+        postMuteChanged(STREAM_MASTER, flags);
+!!!4668044.java!!!	postDisplaySafeVolumeWarning() : void
+        if (hasMessages(MSG_DISPLAY_SAFE_VOLUME_WARNING)) return;
+        obtainMessage(MSG_DISPLAY_SAFE_VOLUME_WARNING, 0, 0).sendToTarget();
+!!!4668172.java!!!	onVolumeChanged(in streamType : int, in flags : int) : void
+
+        if (LOGD) Log.d(TAG, "onVolumeChanged(streamType: " + streamType + ", flags: " + flags + ")");
+
+        if ((flags & AudioManager.FLAG_SHOW_UI) != 0) {
+            synchronized (this) {
+                if (mActiveStreamType != streamType) {
+                    reorderSliders(streamType);
+                }
+                onShowVolumeChanged(streamType, flags);
+            }
+        }
+
+        if ((flags & AudioManager.FLAG_PLAY_SOUND) != 0 && ! mRingIsSilent) {
+            removeMessages(MSG_PLAY_SOUND);
+            sendMessageDelayed(obtainMessage(MSG_PLAY_SOUND, streamType, flags), PLAY_SOUND_DELAY);
+        }
+
+        if ((flags & AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE) != 0) {
+            removeMessages(MSG_PLAY_SOUND);
+            removeMessages(MSG_VIBRATE);
+            onStopSounds();
+        }
+
+        removeMessages(MSG_FREE_RESOURCES);
+        sendMessageDelayed(obtainMessage(MSG_FREE_RESOURCES), FREE_DELAY);
+
+        resetTimeout();
+!!!4668300.java!!!	onMuteChanged(in streamType : int, in flags : int) : void
+
+        if (LOGD) Log.d(TAG, "onMuteChanged(streamType: " + streamType + ", flags: " + flags + ")");
+
+        StreamControl sc = mStreamControls.get(streamType);
+        if (sc != null) {
+            sc.icon.setImageResource(isMuted(sc.streamType) ? sc.iconMuteRes : sc.iconRes);
+        }
+
+        onVolumeChanged(streamType, flags);
+!!!4668428.java!!!	onShowVolumeChanged(in streamType : int, in flags : int) : void
+        int index = getStreamVolume(streamType);
+
+        mRingIsSilent = false;
+
+        if (LOGD) {
+            Log.d(TAG, "onShowVolumeChanged(streamType: " + streamType
+                    + ", flags: " + flags + "), index: " + index);
+        }
+
+        // get max volume for progress bar
+
+        int max = getStreamMaxVolume(streamType);
+
+        switch (streamType) {
+
+            case AudioManager.STREAM_RING: {
+//                setRingerIcon();
+                Uri ringuri = RingtoneManager.getActualDefaultRingtoneUri(
+                        mContext, RingtoneManager.TYPE_RINGTONE);
+                if (ringuri == null) {
+                    mRingIsSilent = true;
+                }
+                break;
+            }
+
+            case AudioManager.STREAM_MUSIC: {
+                // Special case for when Bluetooth is active for music
+                if ((mAudioManager.getDevicesForStream(AudioManager.STREAM_MUSIC) &
+                        (AudioManager.DEVICE_OUT_BLUETOOTH_A2DP |
+                        AudioManager.DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES |
+                        AudioManager.DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER)) != 0) {
+                    setMusicIcon(R.drawable.ic_audio_bt, R.drawable.ic_audio_bt_mute);
+                } else {
+                    setMusicIcon(R.drawable.ic_audio_vol, R.drawable.ic_audio_vol_mute);
+                }
+                break;
+            }
+
+            case AudioManager.STREAM_VOICE_CALL: {
+                /*
+                 * For in-call voice call volume, there is no inaudible volume.
+                 * Rescale the UI control so the progress bar doesn't go all
+                 * the way to zero and don't show the mute icon.
+                 */
+                index++;
+                max++;
+                break;
+            }
+
+            case AudioManager.STREAM_ALARM: {
+                break;
+            }
+
+            case AudioManager.STREAM_NOTIFICATION: {
+                Uri ringuri = RingtoneManager.getActualDefaultRingtoneUri(
+                        mContext, RingtoneManager.TYPE_NOTIFICATION);
+                if (ringuri == null) {
+                    mRingIsSilent = true;
+                }
+                break;
+            }
+
+            case AudioManager.STREAM_BLUETOOTH_SCO: {
+                /*
+                 * For in-call voice call volume, there is no inaudible volume.
+                 * Rescale the UI control so the progress bar doesn't go all
+                 * the way to zero and don't show the mute icon.
+                 */
+                index++;
+                max++;
+                break;
+            }
+
+            case AudioService.STREAM_REMOTE_MUSIC: {
+                if (LOGD) { Log.d(TAG, "showing remote volume "+index+" over "+ max); }
+                break;
+            }
+        }
+
+        StreamControl sc = mStreamControls.get(streamType);
+        if (sc != null) {
+            if (sc.seekbarView.getMax() != max) {
+                sc.seekbarView.setMax(max);
+            }
+
+            sc.seekbarView.setProgress(index);
+            if (((flags & AudioManager.FLAG_FIXED_VOLUME) != 0) ||
+                    (streamType != mAudioManager.getMasterStreamType() &&
+                     streamType != AudioService.STREAM_REMOTE_MUSIC &&
+                     isMuted(streamType))) {
+                sc.seekbarView.setEnabled(false);
+            } else {
+                sc.seekbarView.setEnabled(true);
+            }
+        }
+
+        if (!mDialog.isShowing()) {
+            int stream = (streamType == AudioService.STREAM_REMOTE_MUSIC) ? -1 : streamType;
+            // when the stream is for remote playback, use -1 to reset the stream type evaluation
+            mAudioManager.forceVolumeControlStream(stream);
+            mDialog.setContentView(mView);
+            // Showing dialog - use collapsed state
+            if (mShowCombinedVolumes) {
+                collapse();
+            }
+            mDialog.show();
+        }
+
+        // Do a little vibrate if applicable (only when going into vibrate mode)
+        if ((streamType != AudioService.STREAM_REMOTE_MUSIC) &&
+                ((flags & AudioManager.FLAG_VIBRATE) != 0) &&
+                mAudioService.isStreamAffectedByRingerMode(streamType) &&
+                mAudioManager.getRingerMode() == AudioManager.RINGER_MODE_VIBRATE) {
+            sendMessageDelayed(obtainMessage(MSG_VIBRATE), VIBRATE_DELAY);
+        }
+!!!4668556.java!!!	onPlaySound(in streamType : int, in flags : int) : void
+
+        if (hasMessages(MSG_STOP_SOUNDS)) {
+            removeMessages(MSG_STOP_SOUNDS);
+            // Force stop right now
+            onStopSounds();
+        }
+
+        synchronized (this) {
+            ToneGenerator toneGen = getOrCreateToneGenerator(streamType);
+            if (toneGen != null) {
+                toneGen.startTone(ToneGenerator.TONE_PROP_BEEP);
+                sendMessageDelayed(obtainMessage(MSG_STOP_SOUNDS), BEEP_DURATION);
+            }
+        }
+!!!4668684.java!!!	onStopSounds() : void
+
+        synchronized (this) {
+            int numStreamTypes = AudioSystem.getNumStreamTypes();
+            for (int i = numStreamTypes - 1; i >= 0; i--) {
+                ToneGenerator toneGen = mToneGenerators[i];
+                if (toneGen != null) {
+                    toneGen.stopTone();
+                }
+            }
+        }
+!!!4668812.java!!!	onVibrate() : void
+
+        // Make sure we ended up in vibrate ringer mode
+        if (mAudioManager.getRingerMode() != AudioManager.RINGER_MODE_VIBRATE) {
+            return;
+        }
+
+        mVibrator.vibrate(VIBRATE_DURATION);
+!!!4668940.java!!!	onRemoteVolumeChanged(in streamType : int, in flags : int) : void
+        // streamType is the real stream type being affected, but for the UI sliders, we
+        // refer to AudioService.STREAM_REMOTE_MUSIC. We still play the beeps on the real
+        // stream type.
+        if (LOGD) Log.d(TAG, "onRemoteVolumeChanged(stream:"+streamType+", flags: " + flags + ")");
+
+        if (((flags & AudioManager.FLAG_SHOW_UI) != 0) || mDialog.isShowing()) {
+            synchronized (this) {
+                if (mActiveStreamType != AudioService.STREAM_REMOTE_MUSIC) {
+                    reorderSliders(AudioService.STREAM_REMOTE_MUSIC);
+                }
+                onShowVolumeChanged(AudioService.STREAM_REMOTE_MUSIC, flags);
+            }
+        } else {
+            if (LOGD) Log.d(TAG, "not calling onShowVolumeChanged(), no FLAG_SHOW_UI or no UI");
+        }
+
+        if ((flags & AudioManager.FLAG_PLAY_SOUND) != 0 && ! mRingIsSilent) {
+            removeMessages(MSG_PLAY_SOUND);
+            sendMessageDelayed(obtainMessage(MSG_PLAY_SOUND, streamType, flags), PLAY_SOUND_DELAY);
+        }
+
+        if ((flags & AudioManager.FLAG_REMOVE_SOUND_AND_VIBRATE) != 0) {
+            removeMessages(MSG_PLAY_SOUND);
+            removeMessages(MSG_VIBRATE);
+            onStopSounds();
+        }
+
+        removeMessages(MSG_FREE_RESOURCES);
+        sendMessageDelayed(obtainMessage(MSG_FREE_RESOURCES), FREE_DELAY);
+
+        resetTimeout();
+!!!4669068.java!!!	onRemoteVolumeUpdateIfShown() : void
+        if (LOGD) Log.d(TAG, "onRemoteVolumeUpdateIfShown()");
+        if (mDialog.isShowing()
+                && (mActiveStreamType == AudioService.STREAM_REMOTE_MUSIC)
+                && (mStreamControls != null)) {
+            onShowVolumeChanged(AudioService.STREAM_REMOTE_MUSIC, 0);
+        }
+!!!4669196.java!!!	onSliderVisibilityChanged(in streamType : int, in visible : int) : void
+        if (LOGD) Log.d(TAG, "onSliderVisibilityChanged(stream="+streamType+", visi="+visible+")");
+        boolean isVisible = (visible == 1);
+        for (int i = STREAMS.length - 1 ; i >= 0 ; i--) {
+            StreamResources streamRes = STREAMS[i];
+            if (streamRes.streamType == streamType) {
+                streamRes.show = isVisible;
+                if (!isVisible && (mActiveStreamType == streamType)) {
+                    mActiveStreamType = -1;
+                }
+                break;
+            }
+        }
+!!!4669324.java!!!	onDisplaySafeVolumeWarning() : void
+        synchronized (sConfirmSafeVolumeLock) {
+            if (sConfirmSafeVolumeDialog != null) {
+                return;
+            }
+            sConfirmSafeVolumeDialog = new AlertDialog.Builder(mContext)
+                    .setMessage(com.android.internal.R.string.safe_media_volume_warning)
+                    .setPositiveButton(com.android.internal.R.string.yes,
+                                        new DialogInterface.OnClickListener() {
+                        public void onClick(DialogInterface dialog, int which) {
+                            mAudioService.disableSafeMediaVolume();
+                        }
+                    })
+                    .setNegativeButton(com.android.internal.R.string.no, null)
+                    .setIconAttribute(android.R.attr.alertDialogIcon)
+                    .create();
+            final WarningDialogReceiver warning = new WarningDialogReceiver(mContext,
+                    sConfirmSafeVolumeDialog);
+
+            sConfirmSafeVolumeDialog.setOnDismissListener(warning);
+            sConfirmSafeVolumeDialog.getWindow().setType(
+                                                    WindowManager.LayoutParams.TYPE_KEYGUARD_DIALOG);
+            sConfirmSafeVolumeDialog.show();
+        }
+!!!4669452.java!!!	getOrCreateToneGenerator(in streamType : int) : ToneGenerator
+        if (streamType == STREAM_MASTER) {
+            // For devices that use the master volume setting only but still want to
+            // play a volume-changed tone, direct the master volume pseudostream to
+            // the system stream's tone generator.
+            if (mPlayMasterStreamTones) {
+                streamType = AudioManager.STREAM_SYSTEM;
+            } else {
+                return null;
+            }
+        }
+        synchronized (this) {
+            if (mToneGenerators[streamType] == null) {
+                try {
+                    mToneGenerators[streamType] = new ToneGenerator(streamType, MAX_VOLUME);
+                } catch (RuntimeException e) {
+                    if (LOGD) {
+                        Log.d(TAG, "ToneGenerator constructor failed with "
+                                + "RuntimeException: " + e);
+                    }
+                }
+            }
+            return mToneGenerators[streamType];
+        }
+!!!4669580.java!!!	setMusicIcon(in resId : int, in resMuteId : int) : void
+        StreamControl sc = mStreamControls.get(AudioManager.STREAM_MUSIC);
+        if (sc != null) {
+            sc.iconRes = resId;
+            sc.iconMuteRes = resMuteId;
+            sc.icon.setImageResource(isMuted(sc.streamType) ? sc.iconMuteRes : sc.iconRes);
+        }
+!!!4669708.java!!!	onFreeResources() : void
+        synchronized (this) {
+            for (int i = mToneGenerators.length - 1; i >= 0; i--) {
+                if (mToneGenerators[i] != null) {
+                    mToneGenerators[i].release();
+                }
+                mToneGenerators[i] = null;
+            }
+        }
+!!!4669836.java!!!	handleMessage(inout msg : Message) : void
+        switch (msg.what) {
+
+            case MSG_VOLUME_CHANGED: {
+                onVolumeChanged(msg.arg1, msg.arg2);
+                break;
+            }
+
+            case MSG_MUTE_CHANGED: {
+                onMuteChanged(msg.arg1, msg.arg2);
+                break;
+            }
+
+            case MSG_FREE_RESOURCES: {
+                onFreeResources();
+                break;
+            }
+
+            case MSG_STOP_SOUNDS: {
+                onStopSounds();
+                break;
+            }
+
+            case MSG_PLAY_SOUND: {
+                onPlaySound(msg.arg1, msg.arg2);
+                break;
+            }
+
+            case MSG_VIBRATE: {
+                onVibrate();
+                break;
+            }
+
+            case MSG_TIMEOUT: {
+                if (mDialog.isShowing()) {
+                    mDialog.dismiss();
+                    mActiveStreamType = -1;
+                }
+                break;
+            }
+            case MSG_RINGER_MODE_CHANGED: {
+                if (mDialog.isShowing()) {
+                    updateStates();
+                }
+                break;
+            }
+
+            case MSG_REMOTE_VOLUME_CHANGED: {
+                onRemoteVolumeChanged(msg.arg1, msg.arg2);
+                break;
+            }
+
+            case MSG_REMOTE_VOLUME_UPDATE_IF_SHOWN:
+                onRemoteVolumeUpdateIfShown();
+                break;
+
+            case MSG_SLIDER_VISIBILITY_CHANGED:
+                onSliderVisibilityChanged(msg.arg1, msg.arg2);
+                break;
+
+            case MSG_DISPLAY_SAFE_VOLUME_WARNING:
+                onDisplaySafeVolumeWarning();
+                break;
+        }
+!!!4669964.java!!!	resetTimeout() : void
+        removeMessages(MSG_TIMEOUT);
+        sendMessageDelayed(obtainMessage(MSG_TIMEOUT), TIMEOUT_DELAY);
+!!!4670092.java!!!	forceTimeout() : void
+        removeMessages(MSG_TIMEOUT);
+        sendMessage(obtainMessage(MSG_TIMEOUT));
+!!!4670220.java!!!	onProgressChanged(inout seekBar : SeekBar, in progress : int, inout fromUser : boolean) : void
+        final Object tag = seekBar.getTag();
+        if (fromUser && tag instanceof StreamControl) {
+            StreamControl sc = (StreamControl) tag;
+            if (getStreamVolume(sc.streamType) != progress) {
+                setStreamVolume(sc.streamType, progress, 0);
+            }
+        }
+        resetTimeout();
+!!!4670476.java!!!	onStopTrackingTouch(inout seekBar : SeekBar) : void
+        final Object tag = seekBar.getTag();
+        if (tag instanceof StreamControl) {
+            StreamControl sc = (StreamControl) tag;
+            // because remote volume updates are asynchronous, AudioService might have received
+            // a new remote volume value since the finger adjusted the slider. So when the
+            // progress of the slider isn't being tracked anymore, adjust the slider to the last
+            // "published" remote volume value, so the UI reflects the actual volume.
+            if (sc.streamType == AudioService.STREAM_REMOTE_MUSIC) {
+                seekBar.setProgress(getStreamVolume(AudioService.STREAM_REMOTE_MUSIC));
+            }
+        }
+!!!4670604.java!!!	onClick(inout v : View) : void
+        if (v == mMoreButton) {
+            expand();
+        }
+        resetTimeout();

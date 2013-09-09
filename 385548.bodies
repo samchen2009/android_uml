@@ -1,0 +1,646 @@
+class RecordThread
+!!!837004.cpp!!!	RecordThread(in audioFlinger : sp<AudioFlinger>, inout input : AudioStreamIn, in sampleRate : uint32_t, in channelMask : audio_channel_mask_t, in id : audio_io_handle_t, in device : audio_devices_t)
+    snprintf(mName, kNameLength, "AudioIn_%X", id);
+
+    readInputParameters();
+!!!837132.cpp!!!	~RecordThread()
+    delete[] mRsmpInBuffer;
+    delete mResampler;
+    delete[] mRsmpOutBuffer;
+!!!837260.cpp!!!	destroyTrack_l(in track : sp<RecordTrack>) : void
+    track->mState = TrackBase::TERMINATED;
+    // active tracks are removed by threadLoop()
+    if (mActiveTrack != track) {
+        removeTrack_l(track);
+    }
+!!!837388.cpp!!!	removeTrack_l(in track : sp<RecordTrack>) : void
+    mTracks.remove(track);
+    // need anything related to effects here?
+!!!837516.cpp!!!	dumpInternals(in fd : int, in args : Vector<String16>) : void
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    snprintf(buffer, SIZE, "\nInput thread %p internals\n", this);
+    result.append(buffer);
+
+    if (mActiveTrack != 0) {
+        snprintf(buffer, SIZE, "In index: %d\n", mRsmpInIndex);
+        result.append(buffer);
+        snprintf(buffer, SIZE, "In size: %d\n", mInputBytes);
+        result.append(buffer);
+        snprintf(buffer, SIZE, "Resampling: %d\n", (mResampler != NULL));
+        result.append(buffer);
+        snprintf(buffer, SIZE, "Out channel count: %d\n", mReqChannelCount);
+        result.append(buffer);
+        snprintf(buffer, SIZE, "Out sample rate: %d\n", mReqSampleRate);
+        result.append(buffer);
+    } else {
+        result.append("No active record client\n");
+    }
+
+    write(fd, result.string(), result.size());
+
+    dumpBase(fd, args);
+!!!837644.cpp!!!	dumpTracks(in fd : int, in args : Vector<String16>) : void
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    snprintf(buffer, SIZE, "Input thread %p tracks\n", this);
+    result.append(buffer);
+    RecordTrack::appendDumpHeader(result);
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        sp<RecordTrack> track = mTracks[i];
+        if (track != 0) {
+            track->dump(buffer, SIZE);
+            result.append(buffer);
+        }
+    }
+
+    if (mActiveTrack != 0) {
+        snprintf(buffer, SIZE, "\nInput thread %p active tracks\n", this);
+        result.append(buffer);
+        RecordTrack::appendDumpHeader(result);
+        mActiveTrack->dump(buffer, SIZE);
+        result.append(buffer);
+
+    }
+    write(fd, result.string(), result.size());
+!!!837772.cpp!!!	threadLoop() : bool
+    AudioBufferProvider::Buffer buffer;
+    sp<RecordTrack> activeTrack;
+    Vector< sp<EffectChain> > effectChains;
+
+    nsecs_t lastWarning = 0;
+
+    inputStandBy();
+    acquireWakeLock();
+
+    // used to verify we've read at least once before evaluating how many bytes were read
+    bool readOnce = false;
+
+    // start recording
+    while (!exitPending()) {
+
+        processConfigEvents();
+
+        { // scope for mLock
+            Mutex::Autolock _l(mLock);
+            checkForNewParameters_l();
+            if (mActiveTrack == 0 && mConfigEvents.isEmpty()) {
+                standby();
+
+                if (exitPending()) break;
+
+                releaseWakeLock_l();
+                ALOGV("RecordThread: loop stopping");
+                // go to sleep
+                mWaitWorkCV.wait(mLock);
+                ALOGV("RecordThread: loop starting");
+                acquireWakeLock_l();
+                continue;
+            }
+            if (mActiveTrack != 0) {
+                if (mActiveTrack->mState == TrackBase::PAUSING) {
+                    standby();
+                    mActiveTrack.clear();
+                    mStartStopCond.broadcast();
+                } else if (mActiveTrack->mState == TrackBase::RESUMING) {
+                    if (mReqChannelCount != mActiveTrack->channelCount()) {
+                        mActiveTrack.clear();
+                        mStartStopCond.broadcast();
+                    } else if (readOnce) {
+                        // record start succeeds only if first read from audio input
+                        // succeeds
+                        if (mBytesRead >= 0) {
+                            mActiveTrack->mState = TrackBase::ACTIVE;
+                        } else {
+                            mActiveTrack.clear();
+                        }
+                        mStartStopCond.broadcast();
+                    }
+                    mStandby = false;
+                } else if (mActiveTrack->mState == TrackBase::TERMINATED) {
+                    removeTrack_l(mActiveTrack);
+                    mActiveTrack.clear();
+                }
+            }
+            lockEffectChains_l(effectChains);
+        }
+
+        if (mActiveTrack != 0) {
+            if (mActiveTrack->mState != TrackBase::ACTIVE &&
+                mActiveTrack->mState != TrackBase::RESUMING) {
+                unlockEffectChains(effectChains);
+                usleep(kRecordThreadSleepUs);
+                continue;
+            }
+            for (size_t i = 0; i < effectChains.size(); i ++) {
+                effectChains[i]->process_l();
+            }
+
+            buffer.frameCount = mFrameCount;
+            if (CC_LIKELY(mActiveTrack->getNextBuffer(&buffer) == NO_ERROR)) {
+                readOnce = true;
+                size_t framesOut = buffer.frameCount;
+                if (mResampler == NULL) {
+                    // no resampling
+                    while (framesOut) {
+                        size_t framesIn = mFrameCount - mRsmpInIndex;
+                        if (framesIn) {
+                            int8_t *src = (int8_t *)mRsmpInBuffer + mRsmpInIndex * mFrameSize;
+                            int8_t *dst = buffer.i8 + (buffer.frameCount - framesOut) * mActiveTrack->mCblk->frameSize;
+                            if (framesIn > framesOut)
+                                framesIn = framesOut;
+                            mRsmpInIndex += framesIn;
+                            framesOut -= framesIn;
+                            if ((int)mChannelCount == mReqChannelCount ||
+                                mFormat != AUDIO_FORMAT_PCM_16_BIT) {
+                                memcpy(dst, src, framesIn * mFrameSize);
+                            } else {
+                                if (mChannelCount == 1) {
+                                    upmix_to_stereo_i16_from_mono_i16((int16_t *)dst,
+                                            (int16_t *)src, framesIn);
+                                } else {
+                                    downmix_to_mono_i16_from_stereo_i16((int16_t *)dst,
+                                            (int16_t *)src, framesIn);
+                                }
+                            }
+                        }
+                        if (framesOut && mFrameCount == mRsmpInIndex) {
+                            if (framesOut == mFrameCount &&
+                                ((int)mChannelCount == mReqChannelCount || mFormat != AUDIO_FORMAT_PCM_16_BIT)) {
+                                mBytesRead = mInput->stream->read(mInput->stream, buffer.raw, mInputBytes);
+                                framesOut = 0;
+                            } else {
+                                mBytesRead = mInput->stream->read(mInput->stream, mRsmpInBuffer, mInputBytes);
+                                mRsmpInIndex = 0;
+                            }
+                            if (mBytesRead <= 0) {
+                                if ((mBytesRead < 0) && (mActiveTrack->mState == TrackBase::ACTIVE))
+                                {
+                                    ALOGE("Error reading audio input");
+                                    // Force input into standby so that it tries to
+                                    // recover at next read attempt
+                                    inputStandBy();
+                                    usleep(kRecordThreadSleepUs);
+                                }
+                                mRsmpInIndex = mFrameCount;
+                                framesOut = 0;
+                                buffer.frameCount = 0;
+                            }
+                        }
+                    }
+                } else {
+                    // resampling
+
+                    memset(mRsmpOutBuffer, 0, framesOut * 2 * sizeof(int32_t));
+                    // alter output frame count as if we were expecting stereo samples
+                    if (mChannelCount == 1 && mReqChannelCount == 1) {
+                        framesOut >>= 1;
+                    }
+                    mResampler->resample(mRsmpOutBuffer, framesOut, this /* AudioBufferProvider* */);
+                    // ditherAndClamp() works as long as all buffers returned by mActiveTrack->getNextBuffer()
+                    // are 32 bit aligned which should be always true.
+                    if (mChannelCount == 2 && mReqChannelCount == 1) {
+                        ditherAndClamp(mRsmpOutBuffer, mRsmpOutBuffer, framesOut);
+                        // the resampler always outputs stereo samples: do post stereo to mono conversion
+                        downmix_to_mono_i16_from_stereo_i16(buffer.i16, (int16_t *)mRsmpOutBuffer,
+                                framesOut);
+                    } else {
+                        ditherAndClamp((int32_t *)buffer.raw, mRsmpOutBuffer, framesOut);
+                    }
+
+                }
+                if (mFramestoDrop == 0) {
+                    mActiveTrack->releaseBuffer(&buffer);
+                } else {
+                    if (mFramestoDrop > 0) {
+                        mFramestoDrop -= buffer.frameCount;
+                        if (mFramestoDrop <= 0) {
+                            clearSyncStartEvent();
+                        }
+                    } else {
+                        mFramestoDrop += buffer.frameCount;
+                        if (mFramestoDrop >= 0 || mSyncStartEvent == 0 ||
+                                mSyncStartEvent->isCancelled()) {
+                            ALOGW("Synced record %s, session %d, trigger session %d",
+                                  (mFramestoDrop >= 0) ? "timed out" : "cancelled",
+                                  mActiveTrack->sessionId(),
+                                  (mSyncStartEvent != 0) ? mSyncStartEvent->triggerSession() : 0);
+                            clearSyncStartEvent();
+                        }
+                    }
+                }
+                mActiveTrack->clearOverflow();
+            }
+            // client isn't retrieving buffers fast enough
+            else {
+                if (!mActiveTrack->setOverflow()) {
+                    nsecs_t now = systemTime();
+                    if ((now - lastWarning) > kWarningThrottleNs) {
+                        ALOGW("RecordThread: buffer overflow");
+                        lastWarning = now;
+                    }
+                }
+                // Release the processor for a while before asking for a new buffer.
+                // This will give the application more chance to read from the buffer and
+                // clear the overflow.
+                usleep(kRecordThreadSleepUs);
+            }
+        }
+        // enable changes in effect chain
+        unlockEffectChains(effectChains);
+        effectChains.clear();
+    }
+
+    standby();
+
+    {
+        Mutex::Autolock _l(mLock);
+        mActiveTrack.clear();
+        mStartStopCond.broadcast();
+    }
+
+    releaseWakeLock();
+
+    ALOGV("RecordThread %p exiting", this);
+    return false;
+!!!837900.cpp!!!	readyToRun() : status_t
+    status_t status = initCheck();
+    ALOGW_IF(status != NO_ERROR,"RecordThread %p could not initialize", this);
+    return status;
+!!!838028.cpp!!!	onFirstRef() : void
+    run(mName, PRIORITY_URGENT_AUDIO);
+!!!838284.cpp!!!	createRecordTrack_l(in client : sp<AudioFlinger::Client>, in sampleRate : uint32_t, in format : audio_format_t, in channelMask : audio_channel_mask_t, in frameCount : int, in sessionId : int, in flags : track_flags_t, in tid : pid_t, inout status : status_t) : sp<AudioFlinger::RecordThread::RecordTrack>
+    sp<RecordTrack> track;
+    status_t lStatus;
+
+    lStatus = initCheck();
+    if (lStatus != NO_ERROR) {
+        ALOGE("Audio driver not initialized.");
+        goto Exit;
+    }
+
+    // FIXME use flags and tid similar to createTrack_l()
+
+    { // scope for mLock
+        Mutex::Autolock _l(mLock);
+
+        track = new RecordTrack(this, client, sampleRate,
+                      format, channelMask, frameCount, sessionId);
+
+        if (track->getCblk() == 0) {
+            lStatus = NO_MEMORY;
+            goto Exit;
+        }
+        mTracks.add(track);
+
+        // disable AEC and NS if the device is a BT SCO headset supporting those pre processings
+        bool suspend = audio_is_bluetooth_sco_device(mInDevice) &&
+                        mAudioFlinger->btNrecIsOff();
+        setEffectSuspended_l(FX_IID_AEC, suspend, sessionId);
+        setEffectSuspended_l(FX_IID_NS, suspend, sessionId);
+    }
+    lStatus = NO_ERROR;
+
+Exit:
+    if (status) {
+        *status = lStatus;
+    }
+    return track;
+!!!838668.cpp!!!	dump(in fd : int, in args : Vector<String16>) : void
+    dumpInternals(fd, args);
+    dumpTracks(fd, args);
+    dumpEffectChains(fd, args);
+!!!838796.cpp!!!	clearInput() : AudioStreamIn
+    Mutex::Autolock _l(mLock);
+    AudioStreamIn *input = mInput;
+    mInput = NULL;
+    return input;
+!!!838924.cpp!!!	stream() : audio_stream_t
+    if (mInput == NULL) {
+        return NULL;
+    }
+    return &mInput->stream->common;
+!!!839052.cpp!!!	getNextBuffer(inout buffer : Buffer, in pts : int64_t) : status_t
+    size_t framesReq = buffer->frameCount;
+    size_t framesReady = mFrameCount - mRsmpInIndex;
+    int channelCount;
+
+    if (framesReady == 0) {
+        mBytesRead = mInput->stream->read(mInput->stream, mRsmpInBuffer, mInputBytes);
+        if (mBytesRead <= 0) {
+            if ((mBytesRead < 0) && (mActiveTrack->mState == TrackBase::ACTIVE)) {
+                ALOGE("RecordThread::getNextBuffer() Error reading audio input");
+                // Force input into standby so that it tries to
+                // recover at next read attempt
+                inputStandBy();
+                usleep(kRecordThreadSleepUs);
+            }
+            buffer->raw = NULL;
+            buffer->frameCount = 0;
+            return NOT_ENOUGH_DATA;
+        }
+        mRsmpInIndex = 0;
+        framesReady = mFrameCount;
+    }
+
+    if (framesReq > framesReady) {
+        framesReq = framesReady;
+    }
+
+    if (mChannelCount == 1 && mReqChannelCount == 2) {
+        channelCount = 1;
+    } else {
+        channelCount = 2;
+    }
+    buffer->raw = mRsmpInBuffer + mRsmpInIndex * channelCount;
+    buffer->frameCount = framesReq;
+    return NO_ERROR;
+!!!839180.cpp!!!	releaseBuffer(inout buffer : Buffer) : void
+    mRsmpInIndex += buffer->frameCount;
+    buffer->frameCount = 0;
+!!!839308.cpp!!!	checkForNewParameters_l() : bool
+    bool reconfig = false;
+
+    while (!mNewParameters.isEmpty()) {
+        status_t status = NO_ERROR;
+        String8 keyValuePair = mNewParameters[0];
+        AudioParameter param = AudioParameter(keyValuePair);
+        int value;
+        audio_format_t reqFormat = mFormat;
+        int reqSamplingRate = mReqSampleRate;
+        int reqChannelCount = mReqChannelCount;
+
+        if (param.getInt(String8(AudioParameter::keySamplingRate), value) == NO_ERROR) {
+            reqSamplingRate = value;
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyFormat), value) == NO_ERROR) {
+            reqFormat = (audio_format_t) value;
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyChannels), value) == NO_ERROR) {
+            reqChannelCount = popcount(value);
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyFrameCount), value) == NO_ERROR) {
+            // do not accept frame count changes if tracks are open as the track buffer
+            // size depends on frame count and correct behavior would not be guaranteed
+            // if frame count is changed after track creation
+            if (mActiveTrack != 0) {
+                status = INVALID_OPERATION;
+            } else {
+                reconfig = true;
+            }
+        }
+        if (param.getInt(String8(AudioParameter::keyRouting), value) == NO_ERROR) {
+            // forward device change to effects that have requested to be
+            // aware of attached audio device.
+            for (size_t i = 0; i < mEffectChains.size(); i++) {
+                mEffectChains[i]->setDevice_l(value);
+            }
+
+            // store input device and output device but do not forward output device to audio HAL.
+            // Note that status is ignored by the caller for output device
+            // (see AudioFlinger::setParameters()
+            if (audio_is_output_devices(value)) {
+                mOutDevice = value;
+                status = BAD_VALUE;
+            } else {
+                mInDevice = value;
+                // disable AEC and NS if the device is a BT SCO headset supporting those pre processings
+                if (mTracks.size() > 0) {
+                    bool suspend = audio_is_bluetooth_sco_device(mInDevice) &&
+                                        mAudioFlinger->btNrecIsOff();
+                    for (size_t i = 0; i < mTracks.size(); i++) {
+                        sp<RecordTrack> track = mTracks[i];
+                        setEffectSuspended_l(FX_IID_AEC, suspend, track->sessionId());
+                        setEffectSuspended_l(FX_IID_NS, suspend, track->sessionId());
+                    }
+                }
+            }
+        }
+        if (param.getInt(String8(AudioParameter::keyInputSource), value) == NO_ERROR &&
+                mAudioSource != (audio_source_t)value) {
+            // forward device change to effects that have requested to be
+            // aware of attached audio device.
+            for (size_t i = 0; i < mEffectChains.size(); i++) {
+                mEffectChains[i]->setAudioSource_l((audio_source_t)value);
+            }
+            mAudioSource = (audio_source_t)value;
+        }
+        if (status == NO_ERROR) {
+            status = mInput->stream->common.set_parameters(&mInput->stream->common, keyValuePair.string());
+            if (status == INVALID_OPERATION) {
+                inputStandBy();
+                status = mInput->stream->common.set_parameters(&mInput->stream->common,
+                        keyValuePair.string());
+            }
+            if (reconfig) {
+                if (status == BAD_VALUE &&
+                    reqFormat == mInput->stream->common.get_format(&mInput->stream->common) &&
+                    reqFormat == AUDIO_FORMAT_PCM_16_BIT &&
+                    ((int)mInput->stream->common.get_sample_rate(&mInput->stream->common) <= (2 * reqSamplingRate)) &&
+                    popcount(mInput->stream->common.get_channels(&mInput->stream->common)) <= FCC_2 &&
+                    (reqChannelCount <= FCC_2)) {
+                    status = NO_ERROR;
+                }
+                if (status == NO_ERROR) {
+                    readInputParameters();
+                    sendIoConfigEvent_l(AudioSystem::INPUT_CONFIG_CHANGED);
+                }
+            }
+        }
+
+        mNewParameters.removeAt(0);
+
+        mParamStatus = status;
+        mParamCond.signal();
+        // wait for condition with time out in case the thread calling ThreadBase::setParameters()
+        // already timed out waiting for the status and will never signal the condition.
+        mWaitWorkCV.waitRelative(mLock, kSetParametersTimeoutNs);
+    }
+    return reconfig;
+!!!839436.cpp!!!	getParameters(in keys : String8) : String8
+    char *s;
+    String8 out_s8 = String8();
+
+    Mutex::Autolock _l(mLock);
+    if (initCheck() != NO_ERROR) {
+        return out_s8;
+    }
+
+    s = mInput->stream->common.get_parameters(&mInput->stream->common, keys.string());
+    out_s8 = String8(s);
+    free(s);
+    return out_s8;
+!!!839564.cpp!!!	audioConfigChanged_l(in event : int, in param : int = 0) : void
+    AudioSystem::OutputDescriptor desc;
+    void *param2 = NULL;
+
+    switch (event) {
+    case AudioSystem::INPUT_OPENED:
+    case AudioSystem::INPUT_CONFIG_CHANGED:
+        desc.channels = mChannelMask;
+        desc.samplingRate = mSampleRate;
+        desc.format = mFormat;
+        desc.frameCount = mFrameCount;
+        desc.latency = 0;
+        param2 = &desc;
+        break;
+
+    case AudioSystem::INPUT_CLOSED:
+    default:
+        break;
+    }
+    mAudioFlinger->audioConfigChanged_l(event, mId, param2);
+!!!839692.cpp!!!	readInputParameters() : void
+    delete mRsmpInBuffer;
+    // mRsmpInBuffer is always assigned a new[] below
+    delete mRsmpOutBuffer;
+    mRsmpOutBuffer = NULL;
+    delete mResampler;
+    mResampler = NULL;
+
+    mSampleRate = mInput->stream->common.get_sample_rate(&mInput->stream->common);
+    mChannelMask = mInput->stream->common.get_channels(&mInput->stream->common);
+    mChannelCount = (uint16_t)popcount(mChannelMask);
+    mFormat = mInput->stream->common.get_format(&mInput->stream->common);
+    mFrameSize = audio_stream_frame_size(&mInput->stream->common);
+    mInputBytes = mInput->stream->common.get_buffer_size(&mInput->stream->common);
+    mFrameCount = mInputBytes / mFrameSize;
+    mNormalFrameCount = mFrameCount; // not used by record, but used by input effects
+    mRsmpInBuffer = new int16_t[mFrameCount * mChannelCount];
+
+    if (mSampleRate != mReqSampleRate && mChannelCount <= FCC_2 && mReqChannelCount <= FCC_2)
+    {
+        int channelCount;
+        // optimization: if mono to mono, use the resampler in stereo to stereo mode to avoid
+        // stereo to mono post process as the resampler always outputs stereo.
+        if (mChannelCount == 1 && mReqChannelCount == 2) {
+            channelCount = 1;
+        } else {
+            channelCount = 2;
+        }
+        mResampler = AudioResampler::create(16, channelCount, mReqSampleRate);
+        mResampler->setSampleRate(mSampleRate);
+        mResampler->setVolume(AudioMixer::UNITY_GAIN, AudioMixer::UNITY_GAIN);
+        mRsmpOutBuffer = new int32_t[mFrameCount * 2];
+
+        // optmization: if mono to mono, alter input frame count as if we were inputing stereo samples
+        if (mChannelCount == 1 && mReqChannelCount == 1) {
+            mFrameCount >>= 1;
+        }
+
+    }
+    mRsmpInIndex = mFrameCount;
+!!!839820.cpp!!!	getInputFramesLost() : uint
+    Mutex::Autolock _l(mLock);
+    if (initCheck() != NO_ERROR) {
+        return 0;
+    }
+
+    return mInput->stream->get_input_frames_lost(mInput->stream);
+!!!839948.cpp!!!	addEffectChain_l(in chain : sp<EffectChain>) : status_t
+    // only one chain per input thread
+    if (mEffectChains.size() != 0) {
+        return INVALID_OPERATION;
+    }
+    ALOGV("addEffectChain_l() %p on thread %p", chain.get(), this);
+
+    chain->setInBuffer(NULL);
+    chain->setOutBuffer(NULL);
+
+    checkSuspendOnAddEffectChain_l(chain);
+
+    mEffectChains.add(chain);
+
+    return NO_ERROR;
+!!!840076.cpp!!!	removeEffectChain_l(in chain : sp<EffectChain>) : size_t
+    ALOGV("removeEffectChain_l() %p from thread %p", chain.get(), this);
+    ALOGW_IF(mEffectChains.size() != 1,
+            "removeEffectChain_l() %p invalid chain size %d on thread %p",
+            chain.get(), mEffectChains.size(), this);
+    if (mEffectChains.size() == 1) {
+        mEffectChains.removeAt(0);
+    }
+    return 0;
+!!!840204.cpp!!!	hasAudioSession(in sessionId : int) : uint32_t
+    Mutex::Autolock _l(mLock);
+    uint32_t result = 0;
+    if (getEffectChain_l(sessionId) != 0) {
+        result = EFFECT_SESSION;
+    }
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        if (sessionId == mTracks[i]->sessionId()) {
+            result |= TRACK_SESSION;
+            break;
+        }
+    }
+
+    return result;
+!!!840332.cpp!!!	sessionIds() : KeyedVector<int, bool>
+    KeyedVector<int, bool> ids;
+    Mutex::Autolock _l(mLock);
+    for (size_t j = 0; j < mTracks.size(); ++j) {
+        sp<RecordThread::RecordTrack> track = mTracks[j];
+        int sessionId = track->sessionId();
+        if (ids.indexOfKey(sessionId) < 0) {
+            ids.add(sessionId, true);
+        }
+    }
+    return ids;
+!!!840460.cpp!!!	setSyncEvent(in event : sp<SyncEvent>) : status_t
+#if 0   // This branch is currently dead code, but is preserved in case it will be needed in future
+    if (!isValidSyncEvent(event)) {
+        return BAD_VALUE;
+    }
+
+    int eventSession = event->triggerSession();
+    status_t ret = NAME_NOT_FOUND;
+
+    Mutex::Autolock _l(mLock);
+
+    for (size_t i = 0; i < mTracks.size(); i++) {
+        sp<RecordTrack> track = mTracks[i];
+        if (eventSession == track->sessionId()) {
+            (void) track->setSyncEvent(event);
+            ret = NO_ERROR;
+        }
+    }
+    return ret;
+#else
+    return BAD_VALUE;
+#endif
+!!!840588.cpp!!!	isValidSyncEvent(in event : sp<SyncEvent>) : bool
+    return false;
+!!!840716.cpp!!!	syncStartEventCallback(in event : wp<SyncEvent>) : void
+    sp<SyncEvent> strongEvent = event.promote();
+
+    if (strongEvent != 0) {
+        RecordThread *me = (RecordThread *)strongEvent->cookie();
+        me->handleSyncStartEvent(strongEvent);
+    }
+!!!840844.cpp!!!	handleSyncStartEvent(in event : sp<SyncEvent>) : void
+    if (event == mSyncStartEvent) {
+        // TODO: use actual buffer filling status instead of 2 buffers when info is available
+        // from audio HAL
+        mFramestoDrop = mFrameCount * 2;
+    }
+!!!840972.cpp!!!	clearSyncStartEvent() : void
+    if (mSyncStartEvent != 0) {
+        mSyncStartEvent->cancel();
+    }
+    mSyncStartEvent.clear();
+    mFramestoDrop = 0;
+!!!841100.cpp!!!	standby() : void
+    if (!mStandby) {
+        inputStandBy();
+        mStandby = true;
+    }
+!!!841228.cpp!!!	inputStandBy() : void
+    mInput->stream->common.standby(&mInput->stream->common);

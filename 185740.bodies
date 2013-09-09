@@ -1,0 +1,338 @@
+class SurfaceMediaSource
+!!!417548.cpp!!!	SurfaceMediaSource(in bufferWidth : uint32_t, in bufferHeight : uint32_t)
+    ALOGV("SurfaceMediaSource");
+
+    if (bufferWidth == 0 || bufferHeight == 0) {
+        ALOGE("Invalid dimensions %dx%d", bufferWidth, bufferHeight);
+    }
+
+    mBufferQueue = new BufferQueue(true);
+    mBufferQueue->setDefaultBufferSize(bufferWidth, bufferHeight);
+    mBufferQueue->setSynchronousMode(true);
+    mBufferQueue->setConsumerUsageBits(GRALLOC_USAGE_HW_VIDEO_ENCODER |
+            GRALLOC_USAGE_HW_TEXTURE);
+
+    sp<ISurfaceComposer> composer(ComposerService::getComposerService());
+
+    // Note that we can't create an sp<...>(this) in a ctor that will not keep a
+    // reference once the ctor ends, as that would cause the refcount of 'this'
+    // dropping to 0 at the end of the ctor.  Since all we need is a wp<...>
+    // that's what we create.
+    wp<BufferQueue::ConsumerListener> listener;
+    sp<BufferQueue::ConsumerListener> proxy;
+    listener = static_cast<BufferQueue::ConsumerListener*>(this);
+    proxy = new BufferQueue::ProxyConsumerListener(listener);
+
+    status_t err = mBufferQueue->consumerConnect(proxy);
+    if (err != NO_ERROR) {
+        ALOGE("SurfaceMediaSource: error connecting to BufferQueue: %s (%d)",
+                strerror(-err), err);
+    }
+!!!417676.cpp!!!	~SurfaceMediaSource()
+    ALOGV("~SurfaceMediaSource");
+    CHECK(!mStarted);
+!!!417804.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    ALOGV("start");
+
+    Mutex::Autolock lock(mMutex);
+
+    CHECK(!mStarted);
+
+    mStartTimeNs = 0;
+    int64_t startTimeUs;
+    int32_t bufferCount = 0;
+    if (params) {
+        if (params->findInt64(kKeyTime, &startTimeUs)) {
+            mStartTimeNs = startTimeUs * 1000;
+        }
+
+        if (!params->findInt32(kKeyNumBuffers, &bufferCount)) {
+            ALOGE("Failed to find the advertised buffer count");
+            return UNKNOWN_ERROR;
+        }
+
+        if (bufferCount <= 1) {
+            ALOGE("bufferCount %d is too small", bufferCount);
+            return BAD_VALUE;
+        }
+
+        mMaxAcquiredBufferCount = bufferCount;
+    }
+
+    CHECK_GT(mMaxAcquiredBufferCount, 1);
+
+    status_t err =
+        mBufferQueue->setMaxAcquiredBufferCount(mMaxAcquiredBufferCount);
+
+    if (err != OK) {
+        return err;
+    }
+
+    mNumPendingBuffers = 0;
+    mStarted = true;
+
+    return OK;
+!!!417932.cpp!!!	stop() : status_t
+    ALOGV("stop");
+    Mutex::Autolock lock(mMutex);
+
+    if (!mStarted) {
+        return OK;
+    }
+
+    while (mNumPendingBuffers > 0) {
+        ALOGI("Still waiting for %d buffers to be returned.",
+                mNumPendingBuffers);
+
+#if DEBUG_PENDING_BUFFERS
+        for (size_t i = 0; i < mPendingBuffers.size(); ++i) {
+            ALOGI("%d: %p", i, mPendingBuffers.itemAt(i));
+        }
+#endif
+
+        mMediaBuffersAvailableCondition.wait(mMutex);
+    }
+
+    mStarted = false;
+    mFrameAvailableCondition.signal();
+    mMediaBuffersAvailableCondition.signal();
+
+    return mBufferQueue->consumerDisconnect();
+!!!418060.cpp!!!	read(inout buffer : MediaBuffer, in options : ReadOptions = NULL) : status_t
+    ALOGV("read");
+    Mutex::Autolock lock(mMutex);
+
+    *buffer = NULL;
+
+    while (mStarted && mNumPendingBuffers == mMaxAcquiredBufferCount) {
+        mMediaBuffersAvailableCondition.wait(mMutex);
+    }
+
+    // Update the current buffer info
+    // TODO: mCurrentSlot can be made a bufferstate since there
+    // can be more than one "current" slots.
+
+    BufferQueue::BufferItem item;
+    // If the recording has started and the queue is empty, then just
+    // wait here till the frames come in from the client side
+    while (mStarted) {
+
+        status_t err = mBufferQueue->acquireBuffer(&item);
+        if (err == BufferQueue::NO_BUFFER_AVAILABLE) {
+            // wait for a buffer to be queued
+            mFrameAvailableCondition.wait(mMutex);
+        } else if (err == OK) {
+
+            // First time seeing the buffer?  Added it to the SMS slot
+            if (item.mGraphicBuffer != NULL) {
+                mBufferSlot[item.mBuf] = item.mGraphicBuffer;
+            }
+
+            // check for the timing of this buffer
+            if (mNumFramesReceived == 0 && !mUseAbsoluteTimestamps) {
+                mFirstFrameTimestamp = item.mTimestamp;
+                // Initial delay
+                if (mStartTimeNs > 0) {
+                    if (item.mTimestamp < mStartTimeNs) {
+                        // This frame predates start of record, discard
+                        mBufferQueue->releaseBuffer(item.mBuf, EGL_NO_DISPLAY,
+                                EGL_NO_SYNC_KHR, Fence::NO_FENCE);
+                        continue;
+                    }
+                    mStartTimeNs = item.mTimestamp - mStartTimeNs;
+                }
+            }
+            item.mTimestamp = mStartTimeNs + (item.mTimestamp - mFirstFrameTimestamp);
+
+            mNumFramesReceived++;
+
+            break;
+        } else {
+            ALOGE("read: acquire failed with error code %d", err);
+            return ERROR_END_OF_STREAM;
+        }
+
+    }
+
+    // If the loop was exited as a result of stopping the recording,
+    // it is OK
+    if (!mStarted) {
+        ALOGV("Read: SurfaceMediaSource is stopped. Returning ERROR_END_OF_STREAM.");
+        return ERROR_END_OF_STREAM;
+    }
+
+    mCurrentSlot = item.mBuf;
+
+    // First time seeing the buffer?  Added it to the SMS slot
+    if (item.mGraphicBuffer != NULL) {
+        mBufferSlot[mCurrentSlot] = item.mGraphicBuffer;
+    }
+
+    mCurrentBuffers.push_back(mBufferSlot[mCurrentSlot]);
+    int64_t prevTimeStamp = mCurrentTimestamp;
+    mCurrentTimestamp = item.mTimestamp;
+
+    mNumFramesEncoded++;
+    // Pass the data to the MediaBuffer. Pass in only the metadata
+
+    passMetadataBuffer(buffer, mBufferSlot[mCurrentSlot]->handle);
+
+    (*buffer)->setObserver(this);
+    (*buffer)->add_ref();
+    (*buffer)->meta_data()->setInt64(kKeyTime, mCurrentTimestamp / 1000);
+    ALOGV("Frames encoded = %d, timestamp = %lld, time diff = %lld",
+            mNumFramesEncoded, mCurrentTimestamp / 1000,
+            mCurrentTimestamp / 1000 - prevTimeStamp / 1000);
+
+    ++mNumPendingBuffers;
+
+#if DEBUG_PENDING_BUFFERS
+    mPendingBuffers.push_back(*buffer);
+#endif
+
+    ALOGV("returning mbuf %p", *buffer);
+
+    return OK;
+!!!418188.cpp!!!	getFormat() : sp<MetaData>
+    ALOGV("getFormat");
+
+    Mutex::Autolock lock(mMutex);
+    sp<MetaData> meta = new MetaData;
+
+    meta->setInt32(kKeyWidth, mWidth);
+    meta->setInt32(kKeyHeight, mHeight);
+    // The encoder format is set as an opaque colorformat
+    // The encoder will later find out the actual colorformat
+    // from the GL Frames itself.
+    meta->setInt32(kKeyColorFormat, OMX_COLOR_FormatAndroidOpaque);
+    meta->setInt32(kKeyStride, mWidth);
+    meta->setInt32(kKeySliceHeight, mHeight);
+    meta->setInt32(kKeyFrameRate, mFrameRate);
+    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_RAW);
+    return meta;
+!!!418316.cpp!!!	setFrameRate(in fps : int32_t) : status_t
+    ALOGV("setFrameRate");
+    Mutex::Autolock lock(mMutex);
+    const int MAX_FRAME_RATE = 60;
+    if (fps < 0 || fps > MAX_FRAME_RATE) {
+        return BAD_VALUE;
+    }
+    mFrameRate = fps;
+    return OK;
+!!!418444.cpp!!!	getFrameRate() : int32_t
+    ALOGV("getFrameRate");
+    Mutex::Autolock lock(mMutex);
+    return mFrameRate;
+!!!418572.cpp!!!	signalBufferReturned(inout buffer : MediaBuffer) : void
+    ALOGV("signalBufferReturned");
+
+    bool foundBuffer = false;
+
+    Mutex::Autolock lock(mMutex);
+
+    buffer_handle_t bufferHandle = getMediaBufferHandle(buffer);
+
+    for (size_t i = 0; i < mCurrentBuffers.size(); i++) {
+        if (mCurrentBuffers[i]->handle == bufferHandle) {
+            mCurrentBuffers.removeAt(i);
+            foundBuffer = true;
+            break;
+        }
+    }
+
+    if (!foundBuffer) {
+        ALOGW("returned buffer was not found in the current buffer list");
+    }
+
+    for (int id = 0; id < BufferQueue::NUM_BUFFER_SLOTS; id++) {
+        if (mBufferSlot[id] == NULL) {
+            continue;
+        }
+
+        if (bufferHandle == mBufferSlot[id]->handle) {
+            ALOGV("Slot %d returned, matches handle = %p", id,
+                    mBufferSlot[id]->handle);
+
+            mBufferQueue->releaseBuffer(id, EGL_NO_DISPLAY, EGL_NO_SYNC_KHR,
+                    Fence::NO_FENCE);
+
+            buffer->setObserver(0);
+            buffer->release();
+
+            foundBuffer = true;
+            break;
+        }
+    }
+
+    if (!foundBuffer) {
+        CHECK(!"signalBufferReturned: bogus buffer");
+    }
+
+#if DEBUG_PENDING_BUFFERS
+    for (size_t i = 0; i < mPendingBuffers.size(); ++i) {
+        if (mPendingBuffers.itemAt(i) == buffer) {
+            mPendingBuffers.removeAt(i);
+            break;
+        }
+    }
+#endif
+
+    --mNumPendingBuffers;
+    mMediaBuffersAvailableCondition.broadcast();
+!!!418700.cpp!!!	getTimestamp() : int64_t
+    ALOGV("getTimestamp");
+    Mutex::Autolock lock(mMutex);
+    return mCurrentTimestamp;
+!!!418828.cpp!!!	setFrameAvailableListener(in listener : sp<FrameAvailableListener>) : void
+    ALOGV("setFrameAvailableListener");
+    Mutex::Autolock lock(mMutex);
+    mFrameAvailableListener = listener;
+!!!418956.cpp!!!	dump(inout result : String8) : void
+    char buffer[1024];
+    dump(result, "", buffer, 1024);
+!!!419084.cpp!!!	dump(inout result : String8, in prefix : char, inout buffer : char, in SIZE : size_t) : void
+    Mutex::Autolock lock(mMutex);
+
+    result.append(buffer);
+    mBufferQueue->dump(result);
+!!!419212.cpp!!!	isMetaDataStoredInVideoBuffers() : bool
+    ALOGV("isMetaDataStoredInVideoBuffers");
+    return true;
+!!!419468.cpp!!!	setMaxAcquiredBufferCount(in count : size_t) : status_t
+    ALOGV("setMaxAcquiredBufferCount(%d)", count);
+    Mutex::Autolock lock(mMutex);
+
+    CHECK_GT(count, 1);
+    mMaxAcquiredBufferCount = count;
+
+    return OK;
+!!!419596.cpp!!!	setUseAbsoluteTimestamps() : status_t
+    ALOGV("setUseAbsoluteTimestamps");
+    Mutex::Autolock lock(mMutex);
+    mUseAbsoluteTimestamps = true;
+
+    return OK;
+!!!419724.cpp!!!	onFrameAvailable() : void
+    ALOGV("onFrameAvailable");
+
+    sp<FrameAvailableListener> listener;
+    { // scope for the lock
+        Mutex::Autolock lock(mMutex);
+        mFrameAvailableCondition.broadcast();
+        listener = mFrameAvailableListener;
+    }
+
+    if (listener != NULL) {
+        ALOGV("actually calling onFrameAvailable");
+        listener->onFrameAvailable();
+    }
+!!!419852.cpp!!!	onBuffersReleased() : void
+    ALOGV("onBuffersReleased");
+
+    Mutex::Autolock lock(mMutex);
+
+    mFrameAvailableCondition.signal();
+
+    for (int i = 0; i < BufferQueue::NUM_BUFFER_SLOTS; i++) {
+       mBufferSlot[i] = 0;
+    }

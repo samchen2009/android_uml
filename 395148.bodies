@@ -1,0 +1,162 @@
+class ReprocessStreamAdapter
+!!!897292.cpp!!!	ReprocessStreamAdapter(inout d : camera2_device_t)
+    ATRACE_CALL();
+    camera2_stream_in_ops::acquire_buffer = acquire_buffer;
+    camera2_stream_in_ops::release_buffer = release_buffer;
+!!!897420.cpp!!!	~ReprocessStreamAdapter()
+    ATRACE_CALL();
+    if (mState != RELEASED) {
+        release();
+    }
+!!!897548.cpp!!!	connectToDevice(in outputStream : sp<StreamAdapter>) : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: E", __FUNCTION__);
+
+    if (mState != RELEASED) return INVALID_OPERATION;
+    if (outputStream == NULL) {
+        ALOGE("%s: Null base stream passed to reprocess stream adapter",
+                __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    mBaseStream = outputStream;
+    mWidth = outputStream->getWidth();
+    mHeight = outputStream->getHeight();
+    mFormat = outputStream->getFormat();
+
+    ALOGV("%s: New reprocess stream parameters %d x %d, format 0x%x",
+            __FUNCTION__, mWidth, mHeight, mFormat);
+
+    // Allocate device-side stream interface
+
+    uint32_t id;
+    res = mDevice->ops->allocate_reprocess_stream_from_stream(mDevice,
+            outputStream->getId(), getStreamOps(),
+            &id);
+    if (res != OK) {
+        ALOGE("%s: Device reprocess stream allocation failed: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        return res;
+    }
+
+    ALOGV("%s: Allocated reprocess stream id %d based on stream %d",
+            __FUNCTION__, id, outputStream->getId());
+
+    mId = id;
+
+    mState = ACTIVE;
+
+    return OK;
+!!!897676.cpp!!!	release() : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: Releasing stream %d", __FUNCTION__, mId);
+    if (mState >= ACTIVE) {
+        res = mDevice->ops->release_reprocess_stream(mDevice, mId);
+        if (res != OK) {
+            ALOGE("%s: Unable to release stream %d",
+                    __FUNCTION__, mId);
+            return res;
+        }
+    }
+
+    List<QueueEntry>::iterator s;
+    for (s = mQueue.begin(); s != mQueue.end(); s++) {
+        sp<BufferReleasedListener> listener = s->releaseListener.promote();
+        if (listener != 0) listener->onBufferReleased(s->handle);
+    }
+    for (s = mInFlightQueue.begin(); s != mInFlightQueue.end(); s++) {
+        sp<BufferReleasedListener> listener = s->releaseListener.promote();
+        if (listener != 0) listener->onBufferReleased(s->handle);
+    }
+    mQueue.clear();
+    mInFlightQueue.clear();
+
+    mState = RELEASED;
+    return OK;
+!!!897804.cpp!!!	pushIntoStream(inout handle : buffer_handle_t, in releaseListener : wp<BufferReleasedListener>) : status_t
+    ATRACE_CALL();
+    // TODO: Some error checking here would be nice
+    ALOGV("%s: Pushing buffer %p to stream", __FUNCTION__, (void*)(*handle));
+
+    QueueEntry entry;
+    entry.handle = handle;
+    entry.releaseListener = releaseListener;
+    mQueue.push_back(entry);
+    return OK;
+!!!898444.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    ATRACE_CALL();
+    String8 result =
+            String8::format("      Reprocess stream %d: %d x %d, fmt 0x%x\n",
+                    mId, mWidth, mHeight, mFormat);
+    result.appendFormat("        acquired buffers: %d\n",
+            mActiveBuffers);
+    result.appendFormat("        frame count: %d\n",
+            mFrameCount);
+    write(fd, result.string(), result.size());
+    return OK;
+!!!898572.cpp!!!	getStreamOps() : camera2_stream_in_ops
+    return static_cast<camera2_stream_in_ops *>(this);
+!!!898700.cpp!!!	acquire_buffer(in w : camera2_stream_in_ops_t, inout buffer : buffer_handle_t) : int
+    ATRACE_CALL();
+    int res;
+    ReprocessStreamAdapter* stream =
+            const_cast<ReprocessStreamAdapter*>(
+                static_cast<const ReprocessStreamAdapter*>(w));
+    if (stream->mState != ACTIVE) {
+        ALOGE("%s: Called when in bad state: %d", __FUNCTION__, stream->mState);
+        return INVALID_OPERATION;
+    }
+
+    if (stream->mQueue.empty()) {
+        *buffer = NULL;
+        return OK;
+    }
+
+    QueueEntry &entry = *(stream->mQueue.begin());
+
+    *buffer = entry.handle;
+
+    stream->mInFlightQueue.push_back(entry);
+    stream->mQueue.erase(stream->mQueue.begin());
+
+    stream->mActiveBuffers++;
+
+    ALOGV("Stream %d acquire: Buffer %p acquired", stream->mId,
+            (void*)(**buffer));
+    return OK;
+!!!898828.cpp!!!	release_buffer(in w : camera2_stream_in_ops_t, inout buffer : buffer_handle_t) : int
+    ATRACE_CALL();
+    ReprocessStreamAdapter *stream =
+            const_cast<ReprocessStreamAdapter*>(
+                static_cast<const ReprocessStreamAdapter*>(w) );
+    stream->mFrameCount++;
+    ALOGV("Reprocess stream %d release: Frame %d (%p)",
+            stream->mId, stream->mFrameCount, (void*)*buffer);
+    int state = stream->mState;
+    if (state != ACTIVE) {
+        ALOGE("%s: Called when in bad state: %d", __FUNCTION__, state);
+        return INVALID_OPERATION;
+    }
+    stream->mActiveBuffers--;
+
+    List<QueueEntry>::iterator s;
+    for (s = stream->mInFlightQueue.begin(); s != stream->mInFlightQueue.end(); s++) {
+        if ( s->handle == buffer ) break;
+    }
+    if (s == stream->mInFlightQueue.end()) {
+        ALOGE("%s: Can't find buffer %p in in-flight list!", __FUNCTION__,
+                buffer);
+        return INVALID_OPERATION;
+    }
+
+    sp<BufferReleasedListener> listener = s->releaseListener.promote();
+    if (listener != 0) {
+        listener->onBufferReleased(s->handle);
+    } else {
+        ALOGE("%s: Can't free buffer - missing listener", __FUNCTION__);
+    }
+    stream->mInFlightQueue.erase(s);
+
+    return OK;

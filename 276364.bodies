@@ -1,0 +1,127 @@
+class NuPlayer::StreamingSource
+!!!561164.cpp!!!	start() : void
+    mStreamListener = new NuPlayerStreamListener(mSource, 0);
+
+    uint32_t sourceFlags = mSource->flags();
+
+    uint32_t parserFlags = ATSParser::TS_TIMESTAMPS_ARE_ABSOLUTE;
+    if (sourceFlags & IStreamSource::kFlagAlignedVideoData) {
+        parserFlags |= ATSParser::ALIGNED_VIDEO_DATA;
+    }
+
+    mTSParser = new ATSParser(parserFlags);
+
+    mStreamListener->start();
+!!!561292.cpp!!!	feedMoreTSData() : status_t
+    if (mFinalResult != OK) {
+        return mFinalResult;
+    }
+
+    for (int32_t i = 0; i < 50; ++i) {
+        char buffer[188];
+        sp<AMessage> extra;
+        ssize_t n = mStreamListener->read(buffer, sizeof(buffer), &extra);
+
+        if (n == 0) {
+            ALOGI("input data EOS reached.");
+            mTSParser->signalEOS(ERROR_END_OF_STREAM);
+            mFinalResult = ERROR_END_OF_STREAM;
+            break;
+        } else if (n == INFO_DISCONTINUITY) {
+            int32_t type = ATSParser::DISCONTINUITY_SEEK;
+
+            int32_t mask;
+            if (extra != NULL
+                    && extra->findInt32(
+                        IStreamListener::kKeyDiscontinuityMask, &mask)) {
+                if (mask == 0) {
+                    ALOGE("Client specified an illegal discontinuity type.");
+                    return ERROR_UNSUPPORTED;
+                }
+
+                type = mask;
+            }
+
+            mTSParser->signalDiscontinuity(
+                    (ATSParser::DiscontinuityType)type, extra);
+        } else if (n < 0) {
+            CHECK_EQ(n, -EWOULDBLOCK);
+            break;
+        } else {
+            if (buffer[0] == 0x00) {
+                // XXX legacy
+
+                if (extra == NULL) {
+                    extra = new AMessage;
+                }
+
+                uint8_t type = buffer[1];
+
+                if (type & 2) {
+                    int64_t mediaTimeUs;
+                    memcpy(&mediaTimeUs, &buffer[2], sizeof(mediaTimeUs));
+
+                    extra->setInt64(IStreamListener::kKeyMediaTimeUs, mediaTimeUs);
+                }
+
+                mTSParser->signalDiscontinuity(
+                        ((type & 1) == 0)
+                            ? ATSParser::DISCONTINUITY_SEEK
+                            : ATSParser::DISCONTINUITY_FORMATCHANGE,
+                        extra);
+            } else {
+                status_t err = mTSParser->feedTSPacket(buffer, sizeof(buffer));
+
+                if (err != OK) {
+                    ALOGE("TS Parser returned error %d", err);
+
+                    mTSParser->signalEOS(err);
+                    mFinalResult = err;
+                    break;
+                }
+            }
+        }
+    }
+
+    return OK;
+!!!561420.cpp!!!	dequeueAccessUnit(in audio : bool, inout accessUnit : sp<ABuffer>) : status_t
+    ATSParser::SourceType type =
+        audio ? ATSParser::AUDIO : ATSParser::VIDEO;
+
+    sp<AnotherPacketSource> source =
+        static_cast<AnotherPacketSource *>(mTSParser->getSource(type).get());
+
+    if (source == NULL) {
+        return -EWOULDBLOCK;
+    }
+
+    status_t finalResult;
+    if (!source->hasBufferAvailable(&finalResult)) {
+        return finalResult == OK ? -EWOULDBLOCK : finalResult;
+    }
+
+    status_t err = source->dequeueAccessUnit(accessUnit);
+
+#if !defined(LOG_NDEBUG) || LOG_NDEBUG == 0
+    if (err == OK) {
+        int64_t timeUs;
+        CHECK((*accessUnit)->meta()->findInt64("timeUs", &timeUs));
+        ALOGV("dequeueAccessUnit timeUs=%lld us", timeUs);
+    }
+#endif
+
+    return err;
+!!!561548.cpp!!!	flags() : uint32_t
+    return 0;
+!!!561676.cpp!!!	getFormatMeta(in audio : bool) : sp<MetaData>
+    ATSParser::SourceType type =
+        audio ? ATSParser::AUDIO : ATSParser::VIDEO;
+
+    sp<AnotherPacketSource> source =
+        static_cast<AnotherPacketSource *>(mTSParser->getSource(type).get());
+
+    if (source == NULL) {
+        return NULL;
+    }
+
+    return source->getFormat();

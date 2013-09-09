@@ -1,0 +1,225 @@
+class GroupCreatedState
+!!!9795596.java!!!	enter() : void
+            if (DBG) logd(getName());
+            mNetworkInfo.setDetailedState(NetworkInfo.DetailedState.CONNECTED, null, null);
+
+            updateThisDevice(WifiP2pDevice.CONNECTED);
+
+            //DHCP server has already been started if I am a group owner
+            if (mGroup.isGroupOwner()) {
+                setWifiP2pInfoOnGroupFormation(SERVER_ADDRESS);
+            }
+
+            // In case of a negotiation group, connection changed is sent
+            // after a client joins. For autonomous, send now
+            if (mAutonomousGroup) {
+                sendP2pConnectionChangedBroadcast();
+            }
+!!!9795724.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) logd(getName() + message.toString());
+            switch (message.what) {
+                case WifiMonitor.AP_STA_CONNECTED_EVENT:
+                    WifiP2pDevice device = (WifiP2pDevice) message.obj;
+                    String deviceAddress = device.deviceAddress;
+                    if (deviceAddress != null) {
+                        if (mSavedProvDiscDevice != null &&
+                                deviceAddress.equals(mSavedProvDiscDevice.deviceAddress)) {
+                            mSavedProvDiscDevice = null;
+                        }
+                        if (mPeers.get(deviceAddress) != null) {
+                            mGroup.addClient(mPeers.get(deviceAddress));
+                        } else {
+                            mGroup.addClient(deviceAddress);
+                        }
+                        mPeers.updateStatus(deviceAddress, WifiP2pDevice.CONNECTED);
+                        if (DBG) logd(getName() + " ap sta connected");
+                        sendP2pPeersChangedBroadcast();
+                    } else {
+                        loge("Connect on null device address, ignore");
+                    }
+                    sendP2pConnectionChangedBroadcast();
+                    break;
+                case WifiMonitor.AP_STA_DISCONNECTED_EVENT:
+                    device = (WifiP2pDevice) message.obj;
+                    deviceAddress = device.deviceAddress;
+                    if (deviceAddress != null) {
+                        mPeers.updateStatus(deviceAddress, WifiP2pDevice.AVAILABLE);
+                        if (mGroup.removeClient(deviceAddress)) {
+                            if (DBG) logd("Removed client " + deviceAddress);
+                            if (!mAutonomousGroup && mGroup.isClientListEmpty()) {
+                                Slog.d(TAG, "Client list empty, remove non-persistent p2p group");
+                                mWifiNative.p2pGroupRemove(mGroup.getInterface());
+                                // We end up sending connection changed broadcast
+                                // when this happens at exit()
+                            } else {
+                                // Notify when a client disconnects from group
+                                sendP2pConnectionChangedBroadcast();
+                            }
+                        } else {
+                            if (DBG) logd("Failed to remove client " + deviceAddress);
+                            for (WifiP2pDevice c : mGroup.getClientList()) {
+                                if (DBG) logd("client " + c.deviceAddress);
+                            }
+                        }
+                        sendP2pPeersChangedBroadcast();
+                        if (DBG) logd(getName() + " ap sta disconnected");
+                    } else {
+                        loge("Disconnect on unknown device: " + device);
+                    }
+                    break;
+                case DhcpStateMachine.CMD_POST_DHCP_ACTION:
+                    DhcpInfoInternal dhcpInfo = (DhcpInfoInternal) message.obj;
+                    if (message.arg1 == DhcpStateMachine.DHCP_SUCCESS &&
+                            dhcpInfo != null) {
+                        if (DBG) logd("DhcpInfo: " + dhcpInfo);
+                        setWifiP2pInfoOnGroupFormation(dhcpInfo.serverAddress);
+                        sendP2pConnectionChangedBroadcast();
+                        //Turn on power save on client
+                        mWifiNative.setP2pPowerSave(mGroup.getInterface(), true);
+                    } else {
+                        loge("DHCP failed");
+                        mWifiNative.p2pGroupRemove(mGroup.getInterface());
+                    }
+                    break;
+                case WifiP2pManager.REMOVE_GROUP:
+                    if (DBG) logd(getName() + " remove group");
+                    if (mWifiNative.p2pGroupRemove(mGroup.getInterface())) {
+                        transitionTo(mOngoingGroupRemovalState);
+                        replyToMessage(message, WifiP2pManager.REMOVE_GROUP_SUCCEEDED);
+                    } else {
+                        handleGroupRemoved();
+                        transitionTo(mInactiveState);
+                        replyToMessage(message, WifiP2pManager.REMOVE_GROUP_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                /* We do not listen to NETWORK_DISCONNECTION_EVENT for group removal
+                 * handling since supplicant actually tries to reconnect after a temporary
+                 * disconnect until group idle time out. Eventually, a group removal event
+                 * will come when group has been removed.
+                 *
+                 * When there are connectivity issues during temporary disconnect, the application
+                 * will also just remove the group.
+                 *
+                 * Treating network disconnection as group removal causes race conditions since
+                 * supplicant would still maintain the group at that stage.
+                 */
+                case WifiMonitor.P2P_GROUP_REMOVED_EVENT:
+                    if (DBG) logd(getName() + " group removed");
+                    handleGroupRemoved();
+                    transitionTo(mInactiveState);
+                    break;
+                case WifiMonitor.P2P_DEVICE_LOST_EVENT:
+                    device = (WifiP2pDevice) message.obj;
+                    //Device loss for a connected device indicates it is not in discovery any more
+                    if (mGroup.contains(device)) {
+                        if (DBG) logd("Add device to lost list " + device);
+                        mPeersLostDuringConnection.update(device);
+                        return HANDLED;
+                    }
+                    // Do the regular device lost handling
+                    return NOT_HANDLED;
+                case WifiStateMachine.CMD_DISABLE_P2P_REQ:
+                    sendMessage(WifiP2pManager.REMOVE_GROUP);
+                    deferMessage(message);
+                    break;
+                case WifiP2pManager.CONNECT:
+                    WifiP2pConfig config = (WifiP2pConfig) message.obj;
+                    if (config.deviceAddress == null ||
+                            (mSavedProvDiscDevice != null &&
+                                    mSavedProvDiscDevice.deviceAddress.equals(
+                                            config.deviceAddress))) {
+                        if (config.wps.setup == WpsInfo.PBC) {
+                            mWifiNative.startWpsPbc(mGroup.getInterface(), null);
+                        } else {
+                            if (config.wps.pin == null) {
+                                String pin = mWifiNative.startWpsPinDisplay(mGroup.getInterface());
+                                try {
+                                    Integer.parseInt(pin);
+                                    if (!sendShowPinReqToFrontApp(pin)) {
+                                        notifyInvitationSent(pin,
+                                                config.deviceAddress != null ?
+                                                        config.deviceAddress : "any");
+                                    }
+                                } catch (NumberFormatException ignore) {
+                                    // do nothing if pin is invalid
+                                }
+                            } else {
+                                mWifiNative.startWpsPinKeypad(mGroup.getInterface(),
+                                        config.wps.pin);
+                            }
+                        }
+                        if (config.deviceAddress != null) {
+                            mPeers.updateStatus(config.deviceAddress, WifiP2pDevice.INVITED);
+                            sendP2pPeersChangedBroadcast();
+                        }
+                        replyToMessage(message, WifiP2pManager.CONNECT_SUCCEEDED);
+                    } else {
+                        logd("Inviting device : " + config.deviceAddress);
+                        mSavedPeerConfig = config;
+                        if (mWifiNative.p2pInvite(mGroup, config.deviceAddress)) {
+                            mPeers.updateStatus(config.deviceAddress, WifiP2pDevice.INVITED);
+                            sendP2pPeersChangedBroadcast();
+                            replyToMessage(message, WifiP2pManager.CONNECT_SUCCEEDED);
+                        } else {
+                            replyToMessage(message, WifiP2pManager.CONNECT_FAILED,
+                                    WifiP2pManager.ERROR);
+                        }
+                    }
+                    // TODO: figure out updating the status to declined when invitation is rejected
+                    break;
+                case WifiMonitor.P2P_INVITATION_RESULT_EVENT:
+                    P2pStatus status = (P2pStatus)message.obj;
+                    logd("===> INVITATION RESULT EVENT : " + status);
+                    if (status == P2pStatus.SUCCESS) {
+                        // invocation was succeeded.
+                        break;
+                    } else if (status == P2pStatus.UNKNOWN_P2P_GROUP) {
+                        // target device has already removed the credential.
+                        // So, remove this credential accordingly.
+                        int netId = mGroup.getNetworkId();
+                        if (netId >= 0) {
+                            if (DBG) logd("Remove unknown client from the list");
+                            if (!removeClientFromList(netId,
+                                    mSavedPeerConfig.deviceAddress, false)) {
+                                // not found the client on the list
+                                Slog.e(TAG, "Already removed the client, ignore");
+                                break;
+                            }
+                            // try invitation.
+                            sendMessage(WifiP2pManager.CONNECT, mSavedPeerConfig);
+                        }
+                    }
+                    break;
+                case WifiMonitor.P2P_PROV_DISC_PBC_REQ_EVENT:
+                case WifiMonitor.P2P_PROV_DISC_ENTER_PIN_EVENT:
+                case WifiMonitor.P2P_PROV_DISC_SHOW_PIN_EVENT:
+                    WifiP2pProvDiscEvent provDisc = (WifiP2pProvDiscEvent) message.obj;
+                    mSavedProvDiscDevice = provDisc.device;
+                    mSavedPeerConfig = new WifiP2pConfig();
+                    mSavedPeerConfig.deviceAddress = provDisc.device.deviceAddress;
+                    if (message.what == WifiMonitor.P2P_PROV_DISC_ENTER_PIN_EVENT) {
+                        mSavedPeerConfig.wps.setup = WpsInfo.KEYPAD;
+                    } else if (message.what == WifiMonitor.P2P_PROV_DISC_SHOW_PIN_EVENT) {
+                        mSavedPeerConfig.wps.setup = WpsInfo.DISPLAY;
+                        mSavedPeerConfig.wps.pin = provDisc.pin;
+                    } else {
+                        mSavedPeerConfig.wps.setup = WpsInfo.PBC;
+                    }
+                    if (!sendConnectNoticeToApp(mSavedProvDiscDevice, mSavedPeerConfig)) {
+                        transitionTo(mUserAuthorizingJoinState);
+                    }
+                    break;
+                case WifiMonitor.P2P_GROUP_STARTED_EVENT:
+                    Slog.e(TAG, "Duplicate group creation event notice, ignore");
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+!!!9795852.java!!!	exit() : void
+            mSavedProvDiscDevice = null;
+            updateThisDevice(WifiP2pDevice.AVAILABLE);
+            resetWifiP2pInfo();
+            mNetworkInfo.setDetailedState(NetworkInfo.DetailedState.DISCONNECTED, null, null);
+            sendP2pConnectionChangedBroadcast();

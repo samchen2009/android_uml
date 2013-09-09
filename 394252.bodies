@@ -1,0 +1,273 @@
+class MetadataQueue
+!!!892044.cpp!!!	MetadataQueue()
+    ATRACE_CALL();
+    camera2_request_queue_src_ops::dequeue_request = consumer_dequeue;
+    camera2_request_queue_src_ops::request_count = consumer_buffer_count;
+    camera2_request_queue_src_ops::free_request = consumer_free;
+
+    camera2_frame_queue_dst_ops::dequeue_frame = producer_dequeue;
+    camera2_frame_queue_dst_ops::cancel_frame = producer_cancel;
+    camera2_frame_queue_dst_ops::enqueue_frame = producer_enqueue;
+!!!892172.cpp!!!	~MetadataQueue()
+    ATRACE_CALL();
+    Mutex::Autolock l(mMutex);
+    freeBuffers(mEntries.begin(), mEntries.end());
+    freeBuffers(mStreamSlot.begin(), mStreamSlot.end());
+!!!892556.cpp!!!	setConsumerDevice(inout d : camera2_device_t) : status_t
+    ATRACE_CALL();
+    status_t res;
+    res = d->ops->set_request_queue_src_ops(d,
+            this);
+    if (res != OK) return res;
+    mDevice = d;
+    return OK;
+!!!892684.cpp!!!	setProducerDevice(inout d : camera2_device_t) : status_t
+    ATRACE_CALL();
+    status_t res;
+    res = d->ops->set_frame_queue_dst_ops(d,
+            this);
+    return res;
+!!!892940.cpp!!!	enqueue(inout buf : camera_metadata_t) : status_t
+    ATRACE_CALL();
+    ALOGVV("%s: E", __FUNCTION__);
+    Mutex::Autolock l(mMutex);
+
+    mCount++;
+    mEntries.push_back(buf);
+
+    return signalConsumerLocked();
+!!!893068.cpp!!!	dequeue(inout buf : camera_metadata_t, in incrementCount : bool = false) : status_t
+    ATRACE_CALL();
+    ALOGVV("%s: E", __FUNCTION__);
+    status_t res;
+    Mutex::Autolock l(mMutex);
+
+    if (mCount == 0) {
+        if (mStreamSlotCount == 0) {
+            ALOGVV("%s: Empty", __FUNCTION__);
+            *buf = NULL;
+            mSignalConsumer = true;
+            return OK;
+        }
+        ALOGVV("%s: Streaming %d frames to queue", __FUNCTION__,
+              mStreamSlotCount);
+
+        for (List<camera_metadata_t*>::iterator slotEntry = mStreamSlot.begin();
+                slotEntry != mStreamSlot.end();
+                slotEntry++ ) {
+            size_t entries = get_camera_metadata_entry_count(*slotEntry);
+            size_t dataBytes = get_camera_metadata_data_count(*slotEntry);
+
+            camera_metadata_t *copy =
+                    allocate_camera_metadata(entries, dataBytes);
+            append_camera_metadata(copy, *slotEntry);
+            mEntries.push_back(copy);
+        }
+        mCount = mStreamSlotCount;
+    }
+    ALOGVV("MetadataQueue: deque (%d buffers)", mCount);
+    camera_metadata_t *b = *(mEntries.begin());
+    mEntries.erase(mEntries.begin());
+
+    if (incrementCount) {
+        ATRACE_INT("cam2_request", mFrameCount);
+        camera_metadata_entry_t frameCount;
+        res = find_camera_metadata_entry(b,
+                ANDROID_REQUEST_FRAME_COUNT,
+                &frameCount);
+        if (res != OK) {
+            ALOGE("%s: Unable to add frame count: %s (%d)",
+                    __FUNCTION__, strerror(-res), res);
+        } else {
+            *frameCount.data.i32 = mFrameCount;
+        }
+        mFrameCount++;
+    }
+
+    // Check for request ID, and if present, signal waiters.
+    camera_metadata_entry_t requestId;
+    res = find_camera_metadata_entry(b,
+            ANDROID_REQUEST_ID,
+            &requestId);
+    if (res == OK) {
+        mLatestRequestId = requestId.data.i32[0];
+        mNewRequestId.signal();
+    }
+
+    *buf = b;
+    mCount--;
+
+    return OK;
+!!!893196.cpp!!!	getBufferCount() : int
+    ATRACE_CALL();
+    Mutex::Autolock l(mMutex);
+    if (mStreamSlotCount > 0) {
+        return CAMERA2_REQUEST_QUEUE_IS_BOTTOMLESS;
+    }
+    return mCount;
+!!!893324.cpp!!!	waitForBuffer(in timeout : nsecs_t) : status_t
+    Mutex::Autolock l(mMutex);
+    status_t res;
+    while (mCount == 0) {
+        res = notEmpty.waitRelative(mMutex,timeout);
+        if (res != OK) return res;
+    }
+    return OK;
+!!!893452.cpp!!!	waitForDequeue(in id : int32_t, in timeout : nsecs_t) : status_t
+    Mutex::Autolock l(mMutex);
+    status_t res;
+    while (mLatestRequestId != id) {
+        nsecs_t startTime = systemTime();
+
+        res = mNewRequestId.waitRelative(mMutex, timeout);
+        if (res != OK) return res;
+
+        timeout -= (systemTime() - startTime);
+    }
+
+    return OK;
+!!!893580.cpp!!!	setStreamSlot(inout buf : camera_metadata_t) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    Mutex::Autolock l(mMutex);
+    if (buf == NULL) {
+        freeBuffers(mStreamSlot.begin(), mStreamSlot.end());
+        mStreamSlotCount = 0;
+        return OK;
+    }
+    camera_metadata_t *buf2 = clone_camera_metadata(buf);
+    if (!buf2) {
+        ALOGE("%s: Unable to clone metadata buffer!", __FUNCTION__);
+        return NO_MEMORY;
+    }
+
+    if (mStreamSlotCount > 1) {
+        List<camera_metadata_t*>::iterator deleter = ++mStreamSlot.begin();
+        freeBuffers(++mStreamSlot.begin(), mStreamSlot.end());
+        mStreamSlotCount = 1;
+    }
+    if (mStreamSlotCount == 1) {
+        free_camera_metadata( *(mStreamSlot.begin()) );
+        *(mStreamSlot.begin()) = buf2;
+    } else {
+        mStreamSlot.push_front(buf2);
+        mStreamSlotCount = 1;
+    }
+    return signalConsumerLocked();
+!!!893708.cpp!!!	setStreamSlot(in bufs : List<camera_metadata_t*>) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    Mutex::Autolock l(mMutex);
+    status_t res;
+
+    if (mStreamSlotCount > 0) {
+        freeBuffers(mStreamSlot.begin(), mStreamSlot.end());
+    }
+    mStreamSlotCount = 0;
+    for (List<camera_metadata_t*>::const_iterator r = bufs.begin();
+         r != bufs.end(); r++) {
+        camera_metadata_t *r2 = clone_camera_metadata(*r);
+        if (!r2) {
+            ALOGE("%s: Unable to clone metadata buffer!", __FUNCTION__);
+            return NO_MEMORY;
+        }
+        mStreamSlot.push_back(r2);
+        mStreamSlotCount++;
+    }
+    return signalConsumerLocked();
+!!!893836.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    ATRACE_CALL();
+    String8 result;
+    status_t notLocked;
+    notLocked = mMutex.tryLock();
+    if (notLocked) {
+        result.append("    (Unable to lock queue mutex)\n");
+    }
+    result.appendFormat("      Current frame number: %d\n", mFrameCount);
+    if (mStreamSlotCount == 0) {
+        result.append("      Stream slot: Empty\n");
+        write(fd, result.string(), result.size());
+    } else {
+        result.appendFormat("      Stream slot: %d entries\n",
+                mStreamSlot.size());
+        int i = 0;
+        for (List<camera_metadata_t*>::iterator r = mStreamSlot.begin();
+             r != mStreamSlot.end(); r++) {
+            result = String8::format("       Stream slot buffer %d:\n", i);
+            write(fd, result.string(), result.size());
+            dump_indented_camera_metadata(*r, fd, 2, 10);
+            i++;
+        }
+    }
+    if (mEntries.size() == 0) {
+        result = "      Main queue is empty\n";
+        write(fd, result.string(), result.size());
+    } else {
+        result = String8::format("      Main queue has %d entries:\n",
+                mEntries.size());
+        int i = 0;
+        for (List<camera_metadata_t*>::iterator r = mEntries.begin();
+             r != mEntries.end(); r++) {
+            result = String8::format("       Queue entry %d:\n", i);
+            write(fd, result.string(), result.size());
+            dump_indented_camera_metadata(*r, fd, 2, 10);
+            i++;
+        }
+    }
+
+    if (notLocked == 0) {
+        mMutex.unlock();
+    }
+
+    return OK;
+!!!893964.cpp!!!	signalConsumerLocked() : status_t
+    ATRACE_CALL();
+    status_t res = OK;
+    notEmpty.signal();
+    if (mSignalConsumer && mDevice != NULL) {
+        mSignalConsumer = false;
+
+        mMutex.unlock();
+        ALOGV("%s: Signaling consumer", __FUNCTION__);
+        res = mDevice->ops->notify_request_queue_not_empty(mDevice);
+        mMutex.lock();
+    }
+    return res;
+!!!894092.cpp!!!	freeBuffers(in start : iterator, in end : iterator) : status_t
+    ATRACE_CALL();
+    while (start != end) {
+        free_camera_metadata(*start);
+        start = mStreamSlot.erase(start);
+    }
+    return OK;
+!!!894220.cpp!!!	getInstance(in q : camera2_frame_queue_dst_ops_t) : MetadataQueue
+    const MetadataQueue* cmq = static_cast<const MetadataQueue*>(q);
+    return const_cast<MetadataQueue*>(cmq);
+!!!894348.cpp!!!	getInstance(in q : camera2_request_queue_src_ops_t) : MetadataQueue
+    const MetadataQueue* cmq = static_cast<const MetadataQueue*>(q);
+    return const_cast<MetadataQueue*>(cmq);
+!!!894476.cpp!!!	consumer_buffer_count(in q : camera2_request_queue_src_ops_t) : int
+    MetadataQueue *queue = getInstance(q);
+    return queue->getBufferCount();
+!!!894604.cpp!!!	consumer_dequeue(in q : camera2_request_queue_src_ops_t, inout buffer : camera_metadata_t) : int
+    MetadataQueue *queue = getInstance(q);
+    return queue->dequeue(buffer, true);
+!!!894732.cpp!!!	consumer_free(in q : camera2_request_queue_src_ops_t, inout old_buffer : camera_metadata_t) : int
+    ATRACE_CALL();
+    MetadataQueue *queue = getInstance(q);
+    free_camera_metadata(old_buffer);
+    return OK;
+!!!894860.cpp!!!	producer_dequeue(in q : camera2_frame_queue_dst_ops_t, in entries : size_t, in bytes : size_t, inout buffer : camera_metadata_t) : int
+    ATRACE_CALL();
+    camera_metadata_t *new_buffer =
+            allocate_camera_metadata(entries, bytes);
+    if (new_buffer == NULL) return NO_MEMORY;
+    *buffer = new_buffer;
+        return OK;
+!!!894988.cpp!!!	producer_cancel(in q : camera2_frame_queue_dst_ops_t, inout old_buffer : camera_metadata_t) : int
+    ATRACE_CALL();
+    free_camera_metadata(old_buffer);
+    return OK;
+!!!895116.cpp!!!	producer_enqueue(in q : camera2_frame_queue_dst_ops_t, inout filled_buffer : camera_metadata_t) : int
+    MetadataQueue *queue = getInstance(q);
+    return queue->enqueue(filled_buffer);

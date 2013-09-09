@@ -1,0 +1,157 @@
+class AsmAnalyzer
+!!!9569676.java!!!	AsmAnalyzer(inout log : Log, inout osJarPath : List<String>, inout gen : AsmGenerator, inout deriveFrom : String, inout includeGlobs : String)
+        mLog = log;
+        mGen = gen;
+        mOsSourceJar = osJarPath != null ? osJarPath : new ArrayList<String>();
+        mDeriveFrom = deriveFrom != null ? deriveFrom : new String[0];
+        mIncludeGlobs = includeGlobs != null ? includeGlobs : new String[0];
+!!!9569804.java!!!	analyze() : void
+
+        AsmAnalyzer visitor = this;
+
+        Map<String, ClassReader> zipClasses = parseZip(mOsSourceJar);
+        mLog.info("Found %d classes in input JAR%s.", zipClasses.size(),
+                mOsSourceJar.size() > 1 ? "s" : "");
+
+        Map<String, ClassReader> found = findIncludes(zipClasses);
+        Map<String, ClassReader> deps = findDeps(zipClasses, found);
+
+        if (mGen != null) {
+            mGen.setKeep(found);
+            mGen.setDeps(deps);
+        }
+!!!9569932.java!!!	parseZip(inout jarPathList : List<String>) : Map<String,ClassReader>
+        TreeMap<String, ClassReader> classes = new TreeMap<String, ClassReader>();
+
+        for (String jarPath : jarPathList) {
+            ZipFile zip = new ZipFile(jarPath);
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            ZipEntry entry;
+            while (entries.hasMoreElements()) {
+                entry = entries.nextElement();
+                if (entry.getName().endsWith(".class")) {
+                    ClassReader cr = new ClassReader(zip.getInputStream(entry));
+                    String className = classReaderToClassName(cr);
+                    classes.put(className, cr);
+                }
+            }
+        }
+
+        return classes;
+!!!9570060.java!!!	classReaderToClassName(inout classReader : ClassReader) : String
+        if (classReader == null) {
+            return null;
+        } else {
+            return classReader.getClassName().replace('/', '.');
+        }
+!!!9570188.java!!!	internalToBinaryClassName(in className : String) : String
+        if (className == null) {
+            return null;
+        } else {
+            return className.replace('/', '.');
+        }
+!!!9570316.java!!!	findIncludes(inout zipClasses : Map<String, ClassReader>) : Map<String, ClassReader>
+        TreeMap<String, ClassReader> found = new TreeMap<String, ClassReader>();
+
+        mLog.debug("Find classes to include.");
+
+        for (String s : mIncludeGlobs) {
+            findGlobs(s, zipClasses, found);
+        }
+        for (String s : mDeriveFrom) {
+            findClassesDerivingFrom(s, zipClasses, found);
+        }
+
+        return found;
+!!!9570444.java!!!	findClass(in className : String, inout zipClasses : Map<String, ClassReader>, inout inOutFound : Map<String, ClassReader>) : ClassReader
+        ClassReader classReader = zipClasses.get(className);
+        if (classReader == null) {
+            throw new LogAbortException("Class %s not found by ASM in %s",
+                    className, mOsSourceJar);
+        }
+
+        inOutFound.put(className, classReader);
+        return classReader;
+!!!9570572.java!!!	findGlobs(in globPattern : String, inout zipClasses : Map<String, ClassReader>, inout inOutFound : Map<String, ClassReader>) : void
+        // transforms the glob pattern in a regexp:
+        // - escape "." with "\."
+        // - replace "*" by "[^.]*"
+        // - escape "$" with "\$"
+        // - add end-of-line match $
+        globPattern = globPattern.replaceAll("\\$", "\\\\\\$");
+        globPattern = globPattern.replaceAll("\\.", "\\\\.");
+        // prevent ** from being altered by the next rule, then process the * rule and finally
+        // the real ** rule (which is now @)
+        globPattern = globPattern.replaceAll("\\*\\*", "@");
+        globPattern = globPattern.replaceAll("\\*", "[^.]*");
+        globPattern = globPattern.replaceAll("@", ".*");
+        globPattern += "$";
+
+        Pattern regexp = Pattern.compile(globPattern);
+
+        for (Entry<String, ClassReader> entry : zipClasses.entrySet()) {
+            String class_name = entry.getKey();
+            if (regexp.matcher(class_name).matches()) {
+                findClass(class_name, zipClasses, inOutFound);
+            }
+        }
+!!!9570700.java!!!	findClassesDerivingFrom(in super_name : String, inout zipClasses : Map<String, ClassReader>, inout inOutFound : Map<String, ClassReader>) : void
+        ClassReader super_clazz = findClass(super_name, zipClasses, inOutFound);
+
+        for (Entry<String, ClassReader> entry : zipClasses.entrySet()) {
+            String className = entry.getKey();
+            if (super_name.equals(className)) {
+                continue;
+            }
+            ClassReader classReader = entry.getValue();
+            ClassReader parent_cr = classReader;
+            while (parent_cr != null) {
+                String parent_name = internalToBinaryClassName(parent_cr.getSuperName());
+                if (parent_name == null) {
+                    // not found
+                    break;
+                } else if (super_name.equals(parent_name)) {
+                    inOutFound.put(className, classReader);
+                    break;
+                }
+                parent_cr = zipClasses.get(parent_name);
+            }
+        }
+!!!9570828.java!!!	getVisitor(inout zipClasses : Map<String, ClassReader>, inout inKeep : Map<String, ClassReader>, inout outKeep : Map<String, ClassReader>, inout inDeps : Map<String, ClassReader>, inout outDeps : Map<String, ClassReader>) : DependencyVisitor
+        return new DependencyVisitor(zipClasses, inKeep, outKeep, inDeps, outDeps);
+!!!9570956.java!!!	findDeps(inout zipClasses : Map<String, ClassReader>, inout inOutKeepClasses : Map<String, ClassReader>) : Map<String, ClassReader>
+
+        TreeMap<String, ClassReader> deps = new TreeMap<String, ClassReader>();
+        TreeMap<String, ClassReader> new_deps = new TreeMap<String, ClassReader>();
+        TreeMap<String, ClassReader> new_keep = new TreeMap<String, ClassReader>();
+        TreeMap<String, ClassReader> temp = new TreeMap<String, ClassReader>();
+
+        DependencyVisitor visitor = getVisitor(zipClasses,
+                inOutKeepClasses, new_keep,
+                deps, new_deps);
+
+        for (ClassReader cr : inOutKeepClasses.values()) {
+            cr.accept(visitor, 0 /* flags */);
+        }
+
+        while (new_deps.size() > 0 || new_keep.size() > 0) {
+            deps.putAll(new_deps);
+            inOutKeepClasses.putAll(new_keep);
+
+            temp.clear();
+            temp.putAll(new_deps);
+            temp.putAll(new_keep);
+            new_deps.clear();
+            new_keep.clear();
+            mLog.debug("Found %1$d to keep, %2$d dependencies.",
+                    inOutKeepClasses.size(), deps.size());
+
+            for (ClassReader cr : temp.values()) {
+                cr.accept(visitor, 0 /* flags */);
+            }
+        }
+
+        mLog.info("Found %1$d classes to keep, %2$d class dependencies.",
+                inOutKeepClasses.size(), deps.size());
+
+        return deps;

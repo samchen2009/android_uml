@@ -1,0 +1,571 @@
+class GlRenderer
+!!!4523788.java!!!	GlRenderer(in glVersion : int, inout translucent : boolean)
+            mGlVersion = glVersion;
+            mTranslucent = translucent;
+            
+            String property;
+
+            property = SystemProperties.get(DISABLE_VSYNC_PROPERTY, "false");
+            mVsyncDisabled = "true".equalsIgnoreCase(property);
+            if (mVsyncDisabled) {
+                Log.d(LOG_TAG, "Disabling v-sync");
+            }
+
+            property = SystemProperties.get(PROFILE_PROPERTY, "false");
+            mProfileEnabled = "true".equalsIgnoreCase(property);
+            if (mProfileEnabled) {
+                Log.d(LOG_TAG, "Profiling hardware renderer");
+            }
+
+            if (mProfileEnabled) {
+                property = SystemProperties.get(PROFILE_MAXFRAMES_PROPERTY,
+                        Integer.toString(PROFILE_MAX_FRAMES));
+                int maxProfileFrames = Integer.valueOf(property);
+                mProfileData = new float[maxProfileFrames * PROFILE_FRAME_DATA_COUNT];
+                for (int i = 0; i < mProfileData.length; i += PROFILE_FRAME_DATA_COUNT) {
+                    mProfileData[i] = mProfileData[i + 1] = mProfileData[i + 2] = -1;
+                }
+
+                mProfileLock = new ReentrantLock();
+            } else {
+                mProfileData = null;
+                mProfileLock = null;
+            }
+
+            property = SystemProperties.get(DEBUG_DIRTY_REGIONS_PROPERTY, "false");
+            mDebugDirtyRegions = "true".equalsIgnoreCase(property);
+            if (mDebugDirtyRegions) {
+                Log.d(LOG_TAG, "Debugging dirty regions");
+            }
+
+            mShowOverdraw = SystemProperties.getBoolean(
+                    HardwareRenderer.DEBUG_SHOW_OVERDRAW_PROPERTY, false);
+!!!4523916.java!!!	dumpGfxInfo(inout pw : PrintWriter) : void
+            if (mProfileEnabled) {
+                pw.printf("\n\tDraw\tProcess\tExecute\n");
+
+                mProfileLock.lock();
+                try {
+                    for (int i = 0; i < mProfileData.length; i += PROFILE_FRAME_DATA_COUNT) {
+                        if (mProfileData[i] < 0) {
+                            break;
+                        }
+                        pw.printf("\t%3.2f\t%3.2f\t%3.2f\n", mProfileData[i], mProfileData[i + 1],
+                                mProfileData[i + 2]);
+                        mProfileData[i] = mProfileData[i + 1] = mProfileData[i + 2] = -1;
+                    }
+                    mProfileCurrentFrame = mProfileData.length;
+                } finally {
+                    mProfileLock.unlock();
+                }
+            }
+!!!4524044.java!!!	getFrameCount() : long
+            return mFrameCount;
+!!!4524172.java!!!	hasDirtyRegions() : boolean
+            return mDirtyRegionsEnabled;
+!!!4524300.java!!!	checkEglErrors() : void
+            if (isEnabled()) {
+                checkEglErrorsForced();
+            }
+!!!4524428.java!!!	checkEglErrorsForced() : void
+            int error = sEgl.eglGetError();
+            if (error != EGL_SUCCESS) {
+                // something bad has happened revert to
+                // normal rendering.
+                Log.w(LOG_TAG, "EGL error: " + GLUtils.getEGLErrorString(error));
+                fallback(error != EGL11.EGL_CONTEXT_LOST);
+            }
+!!!4524556.java!!!	fallback(inout fallback : boolean) : void
+            destroy(true);
+            if (fallback) {
+                // we'll try again if it was context lost
+                setRequested(false);
+                Log.w(LOG_TAG, "Mountain View, we've had a problem here. " 
+                        + "Switching back to software rendering.");
+            }
+!!!4524684.java!!!	initialize(inout surface : Surface) : boolean
+            if (isRequested() && !isEnabled()) {
+                initializeEgl();
+                mGl = createEglSurface(surface);
+                mDestroyed = false;
+
+                if (mGl != null) {
+                    int err = sEgl.eglGetError();
+                    if (err != EGL_SUCCESS) {
+                        destroy(true);
+                        setRequested(false);
+                    } else {
+                        if (mCanvas == null) {
+                            mCanvas = createCanvas();
+                        }
+                        if (mCanvas != null) {
+                            setEnabled(true);
+                        } else {
+                            Log.w(LOG_TAG, "Hardware accelerated Canvas could not be created");
+                        }
+                    }
+
+                    return mCanvas != null;
+                }
+            }
+            return false;
+!!!4524812.java!!!	updateSurface(inout surface : Surface) : void
+            if (isRequested() && isEnabled()) {
+                createEglSurface(surface);
+            }
+!!!4525196.java!!!	initializeEgl() : void
+            synchronized (sEglLock) {
+                if (sEgl == null && sEglConfig == null) {
+                    sEgl = (EGL10) EGLContext.getEGL();
+                    
+                    // Get to the default display.
+                    sEglDisplay = sEgl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+                    
+                    if (sEglDisplay == EGL_NO_DISPLAY) {
+                        throw new RuntimeException("eglGetDisplay failed "
+                                + GLUtils.getEGLErrorString(sEgl.eglGetError()));
+                    }
+                    
+                    // We can now initialize EGL for that display
+                    int[] version = new int[2];
+                    if (!sEgl.eglInitialize(sEglDisplay, version)) {
+                        throw new RuntimeException("eglInitialize failed " +
+                                GLUtils.getEGLErrorString(sEgl.eglGetError()));
+                    }
+
+                    checkEglErrorsForced();
+
+                    sEglConfig = chooseEglConfig();
+                    if (sEglConfig == null) {
+                        // We tried to use EGL_SWAP_BEHAVIOR_PRESERVED_BIT, try again without
+                        if (sDirtyRegions) {
+                            sDirtyRegions = false;
+                            sEglConfig = chooseEglConfig();
+                            if (sEglConfig == null) {
+                                throw new RuntimeException("eglConfig not initialized");
+                            }
+                        } else {
+                            throw new RuntimeException("eglConfig not initialized");
+                        }
+                    }
+                }
+            }
+
+            ManagedEGLContext managedContext = sEglContextStorage.get();
+            mEglContext = managedContext != null ? managedContext.getContext() : null;
+            mEglThread = Thread.currentThread();
+
+            if (mEglContext == null) {
+                mEglContext = createContext(sEgl, sEglDisplay, sEglConfig);
+                sEglContextStorage.set(createManagedContext(mEglContext));
+            }
+!!!4525452.java!!!	chooseEglConfig() : EGLConfig
+            EGLConfig[] configs = new EGLConfig[1];
+            int[] configsCount = new int[1];
+            int[] configSpec = getConfig(sDirtyRegions);
+
+            // Debug
+            final String debug = SystemProperties.get(PRINT_CONFIG_PROPERTY, "");
+            if ("all".equalsIgnoreCase(debug)) {
+                sEgl.eglChooseConfig(sEglDisplay, configSpec, null, 0, configsCount);
+
+                EGLConfig[] debugConfigs = new EGLConfig[configsCount[0]];
+                sEgl.eglChooseConfig(sEglDisplay, configSpec, debugConfigs,
+                        configsCount[0], configsCount);
+
+                for (EGLConfig config : debugConfigs) {
+                    printConfig(config);
+                }
+            }
+
+            if (!sEgl.eglChooseConfig(sEglDisplay, configSpec, configs, 1, configsCount)) {
+                throw new IllegalArgumentException("eglChooseConfig failed " +
+                        GLUtils.getEGLErrorString(sEgl.eglGetError()));
+            } else if (configsCount[0] > 0) {
+                if ("choice".equalsIgnoreCase(debug)) {
+                    printConfig(configs[0]);
+                }
+                return configs[0];
+            }
+
+            return null;
+!!!4525580.java!!!	printConfig(inout config : EGLConfig) : void
+            int[] value = new int[1];
+
+            Log.d(LOG_TAG, "EGL configuration " + config + ":");
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_RED_SIZE, value);
+            Log.d(LOG_TAG, "  RED_SIZE = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_GREEN_SIZE, value);
+            Log.d(LOG_TAG, "  GREEN_SIZE = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_BLUE_SIZE, value);
+            Log.d(LOG_TAG, "  BLUE_SIZE = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_ALPHA_SIZE, value);
+            Log.d(LOG_TAG, "  ALPHA_SIZE = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_DEPTH_SIZE, value);
+            Log.d(LOG_TAG, "  DEPTH_SIZE = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_STENCIL_SIZE, value);
+            Log.d(LOG_TAG, "  STENCIL_SIZE = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_SAMPLE_BUFFERS, value);
+            Log.d(LOG_TAG, "  SAMPLE_BUFFERS = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_SAMPLES, value);
+            Log.d(LOG_TAG, "  SAMPLES = " + value[0]);
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_SURFACE_TYPE, value);
+            Log.d(LOG_TAG, "  SURFACE_TYPE = 0x" + Integer.toHexString(value[0]));
+
+            sEgl.eglGetConfigAttrib(sEglDisplay, config, EGL_CONFIG_CAVEAT, value);
+            Log.d(LOG_TAG, "  CONFIG_CAVEAT = 0x" + Integer.toHexString(value[0]));
+!!!4525708.java!!!	createEglSurface(inout surface : Surface) : GL
+            // Check preconditions.
+            if (sEgl == null) {
+                throw new RuntimeException("egl not initialized");
+            }
+            if (sEglDisplay == null) {
+                throw new RuntimeException("eglDisplay not initialized");
+            }
+            if (sEglConfig == null) {
+                throw new RuntimeException("eglConfig not initialized");
+            }
+            if (Thread.currentThread() != mEglThread) {
+                throw new IllegalStateException("HardwareRenderer cannot be used " 
+                        + "from multiple threads");
+            }
+
+            // In case we need to destroy an existing surface
+            destroySurface();
+
+            // Create an EGL surface we can render into.
+            if (!createSurface(surface)) {
+                return null;
+            }
+
+            initCaches();
+
+            return mEglContext.getGL();
+!!!4525836.java!!!	enableDirtyRegions() : void
+            // If mDirtyRegions is set, this means we have an EGL configuration
+            // with EGL_SWAP_BEHAVIOR_PRESERVED_BIT set
+            if (sDirtyRegions) {
+                if (!(mDirtyRegionsEnabled = preserveBackBuffer())) {
+                    Log.w(LOG_TAG, "Backbuffer cannot be preserved");
+                }
+            } else if (sDirtyRegionsRequested) {
+                // If mDirtyRegions is not set, our EGL configuration does not
+                // have EGL_SWAP_BEHAVIOR_PRESERVED_BIT; however, the default
+                // swap behavior might be EGL_BUFFER_PRESERVED, which means we
+                // want to set mDirtyRegions. We try to do this only if dirty
+                // regions were initially requested as part of the device
+                // configuration (see RENDER_DIRTY_REGIONS)
+                mDirtyRegionsEnabled = isBackBufferPreserved();
+            }
+!!!4526092.java!!!	createContext(inout egl : EGL10, inout eglDisplay : EGLDisplay, inout eglConfig : EGLConfig) : EGLContext
+            int[] attribs = { EGL14.EGL_CONTEXT_CLIENT_VERSION, mGlVersion, EGL_NONE };
+
+            EGLContext context = egl.eglCreateContext(eglDisplay, eglConfig, EGL_NO_CONTEXT,
+                    mGlVersion != 0 ? attribs : null);
+            if (context == null || context == EGL_NO_CONTEXT) {
+                //noinspection ConstantConditions
+                throw new IllegalStateException(
+                        "Could not create an EGL context. eglCreateContext failed with error: " +
+                        GLUtils.getEGLErrorString(sEgl.eglGetError()));
+            }
+            return context;
+!!!4526220.java!!!	destroy(inout full : boolean) : void
+            if (full && mCanvas != null) {
+                mCanvas = null;
+            }
+
+            if (!isEnabled() || mDestroyed) {
+                setEnabled(false);
+                return;
+            }
+
+            destroySurface();
+            setEnabled(false);
+
+            mDestroyed = true;
+            mGl = null;
+!!!4526348.java!!!	destroySurface() : void
+            if (mEglSurface != null && mEglSurface != EGL_NO_SURFACE) {
+                sEgl.eglMakeCurrent(sEglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                sEgl.eglDestroySurface(sEglDisplay, mEglSurface);
+                mEglSurface = null;
+            }
+!!!4526476.java!!!	invalidate(inout surface : Surface) : void
+            // Cancels any existing buffer to ensure we'll get a buffer
+            // of the right size before we call eglSwapBuffers
+            sEgl.eglMakeCurrent(sEglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+            if (mEglSurface != null && mEglSurface != EGL_NO_SURFACE) {
+                sEgl.eglDestroySurface(sEglDisplay, mEglSurface);
+                mEglSurface = null;
+                setEnabled(false);
+            }
+
+            if (surface.isValid()) {
+                if (!createSurface(surface)) {
+                    return;
+                }
+
+                mUpdateDirtyRegions = true;
+
+                if (mCanvas != null) {
+                    setEnabled(true);
+                }
+            }
+!!!4526604.java!!!	createSurface(inout surface : Surface) : boolean
+            mEglSurface = sEgl.eglCreateWindowSurface(sEglDisplay, sEglConfig, surface, null);
+
+            if (mEglSurface == null || mEglSurface == EGL_NO_SURFACE) {
+                int error = sEgl.eglGetError();
+                if (error == EGL_BAD_NATIVE_WINDOW) {
+                    Log.e(LOG_TAG, "createWindowSurface returned EGL_BAD_NATIVE_WINDOW.");
+                    return false;
+                }
+                throw new RuntimeException("createWindowSurface failed "
+                        + GLUtils.getEGLErrorString(error));
+            }
+
+            if (!sEgl.eglMakeCurrent(sEglDisplay, mEglSurface, mEglSurface, mEglContext)) {
+                throw new IllegalStateException("eglMakeCurrent failed " +
+                        GLUtils.getEGLErrorString(sEgl.eglGetError()));
+            }
+
+            enableDirtyRegions();
+
+            return true;
+!!!4526732.java!!!	validate() : boolean
+            return checkCurrent() != SURFACE_STATE_ERROR;
+!!!4526860.java!!!	setup(in width : int, in height : int) : void
+            if (validate()) {
+                mCanvas.setViewport(width, height);
+                mWidth = width;
+                mHeight = height;
+            }
+!!!4526988.java!!!	getWidth() : int
+            return mWidth;
+!!!4527116.java!!!	getHeight() : int
+            return mHeight;
+!!!4527244.java!!!	getCanvas() : HardwareCanvas
+            return mCanvas;
+!!!4527372.java!!!	canDraw() : boolean
+            return mGl != null && mCanvas != null;
+!!!4527500.java!!!	onPreDraw(inout dirty : Rect) : int
+            return DisplayList.STATUS_DONE;
+!!!4527884.java!!!	draw(inout view : View, inout attachInfo : AttachInfo, inout callbacks : HardwareDrawCallbacks, inout dirty : Rect) : boolean
+            if (canDraw()) {
+                if (!hasDirtyRegions()) {
+                    dirty = null;
+                }
+                attachInfo.mIgnoreDirtyState = true;
+                attachInfo.mDrawingTime = SystemClock.uptimeMillis();
+
+                view.mPrivateFlags |= View.PFLAG_DRAWN;
+
+                final int surfaceState = checkCurrent();
+                if (surfaceState != SURFACE_STATE_ERROR) {
+                    HardwareCanvas canvas = mCanvas;
+                    attachInfo.mHardwareCanvas = canvas;
+
+                    if (mProfileEnabled) {
+                        mProfileLock.lock();
+                    }
+
+                    // We had to change the current surface and/or context, redraw everything
+                    if (surfaceState == SURFACE_STATE_UPDATED) {
+                        dirty = null;
+                        beginFrame(null);
+                    } else {
+                        int[] size = mSurfaceSize;
+                        beginFrame(size);
+
+                        if (size[1] != mHeight || size[0] != mWidth) {
+                            mWidth = size[0];
+                            mHeight = size[1];
+
+                            canvas.setViewport(mWidth, mHeight);
+
+                            dirty = null;
+                        }
+                    }
+
+                    int saveCount = 0;
+                    int status = DisplayList.STATUS_DONE;
+
+                    try {
+                        view.mRecreateDisplayList = (view.mPrivateFlags & View.PFLAG_INVALIDATED)
+                                == View.PFLAG_INVALIDATED;
+                        view.mPrivateFlags &= ~View.PFLAG_INVALIDATED;
+
+                        long getDisplayListStartTime = 0;
+                        if (mProfileEnabled) {
+                            mProfileCurrentFrame += PROFILE_FRAME_DATA_COUNT;
+                            if (mProfileCurrentFrame >= mProfileData.length) {
+                                mProfileCurrentFrame = 0;
+                            }
+
+                            getDisplayListStartTime = System.nanoTime();
+                        }
+
+                        canvas.clearLayerUpdates();
+
+                        DisplayList displayList;
+                        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "getDisplayList");
+                        try {
+                            displayList = view.getDisplayList();
+                        } finally {
+                            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+                        }
+
+                        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "prepareFrame");
+                        try {
+                            status = onPreDraw(dirty);
+                        } finally {
+                            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+                        }
+                        saveCount = canvas.save();
+                        callbacks.onHardwarePreDraw(canvas);
+
+                        if (mProfileEnabled) {
+                            long now = System.nanoTime();
+                            float total = (now - getDisplayListStartTime) * 0.000001f;
+                            //noinspection PointlessArithmeticExpression
+                            mProfileData[mProfileCurrentFrame] = total;
+                        }
+
+                        if (displayList != null) {
+                            long drawDisplayListStartTime = 0;
+                            if (mProfileEnabled) {
+                                drawDisplayListStartTime = System.nanoTime();
+                            }
+
+                            Trace.traceBegin(Trace.TRACE_TAG_VIEW, "drawDisplayList");
+                            try {
+                                status |= canvas.drawDisplayList(displayList, mRedrawClip,
+                                        DisplayList.FLAG_CLIP_CHILDREN);
+                            } finally {
+                                Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+                            }
+
+                            if (mProfileEnabled) {
+                                long now = System.nanoTime();
+                                float total = (now - drawDisplayListStartTime) * 0.000001f;
+                                mProfileData[mProfileCurrentFrame + 1] = total;
+                            }
+
+                            handleFunctorStatus(attachInfo, status);
+                        } else {
+                            // Shouldn't reach here
+                            view.draw(canvas);
+                        }
+                    } finally {
+                        callbacks.onHardwarePostDraw(canvas);
+                        canvas.restoreToCount(saveCount);
+                        view.mRecreateDisplayList = false;
+
+                        mFrameCount++;
+
+                        if (mDebugDirtyRegions) {
+                            if (mDebugPaint == null) {
+                                mDebugPaint = new Paint();
+                                mDebugPaint.setColor(0x7fff0000);
+                            }
+
+                            if (dirty != null && (mFrameCount & 1) == 0) {
+                                canvas.drawRect(dirty, mDebugPaint);
+                            }
+                        }
+                    }
+
+                    onPostDraw();
+
+                    attachInfo.mIgnoreDirtyState = false;
+                    
+                    if ((status & DisplayList.STATUS_DREW) == DisplayList.STATUS_DREW) {
+                        long eglSwapBuffersStartTime = 0;
+                        if (mProfileEnabled) {
+                            eglSwapBuffersStartTime = System.nanoTime();
+                        }
+    
+                        sEgl.eglSwapBuffers(sEglDisplay, mEglSurface);
+    
+                        if (mProfileEnabled) {
+                            long now = System.nanoTime();
+                            float total = (now - eglSwapBuffersStartTime) * 0.000001f;
+                            mProfileData[mProfileCurrentFrame + 2] = total;
+                        }
+    
+                        checkEglErrors();
+                    }
+
+                    if (mProfileEnabled) {
+                        mProfileLock.unlock();
+                    }
+
+                    return dirty == null;
+                }
+            }
+
+            return false;
+!!!4528012.java!!!	handleFunctorStatus(inout attachInfo : AttachInfo, in status : int) : void
+            // If the draw flag is set, functors will be invoked while executing
+            // the tree of display lists
+            if ((status & DisplayList.STATUS_DRAW) != 0) {
+                if (mRedrawClip.isEmpty()) {
+                    attachInfo.mViewRootImpl.invalidate();
+                } else {
+                    attachInfo.mViewRootImpl.invalidateChildInParent(null, mRedrawClip);
+                    mRedrawClip.setEmpty();
+                }
+            }
+
+            if ((status & DisplayList.STATUS_INVOKE) != 0 ||
+                    attachInfo.mHandler.hasCallbacks(mFunctorsRunnable)) {
+                attachInfo.mHandler.removeCallbacks(mFunctorsRunnable);
+                mFunctorsRunnable.attachInfo = attachInfo;
+                attachInfo.mHandler.postDelayed(mFunctorsRunnable, FUNCTOR_PROCESS_DELAY);
+            }
+!!!4528140.java!!!	detachFunctor(in functor : int) : void
+            if (mCanvas != null) {
+                mCanvas.detachFunctor(functor);
+            }
+!!!4528268.java!!!	attachFunctor(inout attachInfo : AttachInfo, in functor : int) : boolean
+            if (mCanvas != null) {
+                mCanvas.attachFunctor(functor);
+                mFunctorsRunnable.attachInfo = attachInfo;
+                attachInfo.mHandler.removeCallbacks(mFunctorsRunnable);
+                attachInfo.mHandler.postDelayed(mFunctorsRunnable,  0);
+                return true;
+            }
+            return false;
+!!!4528396.java!!!	checkCurrent() : int
+            if (mEglThread != Thread.currentThread()) {
+                throw new IllegalStateException("Hardware acceleration can only be used with a " +
+                        "single UI thread.\nOriginal thread: " + mEglThread + "\n" +
+                        "Current thread: " + Thread.currentThread());
+            }
+
+            if (!mEglContext.equals(sEgl.eglGetCurrentContext()) ||
+                    !mEglSurface.equals(sEgl.eglGetCurrentSurface(EGL_DRAW))) {
+                if (!sEgl.eglMakeCurrent(sEglDisplay, mEglSurface, mEglSurface, mEglContext)) {
+                    Log.e(LOG_TAG, "eglMakeCurrent failed " +
+                            GLUtils.getEGLErrorString(sEgl.eglGetError()));
+                    fallback(true);
+                    return SURFACE_STATE_ERROR;
+                } else {
+                    if (mUpdateDirtyRegions) {
+                        enableDirtyRegions();
+                        mUpdateDirtyRegions = false;
+                    }
+                    return SURFACE_STATE_UPDATED;
+                }
+            }
+            return SURFACE_STATE_SUCCESS;

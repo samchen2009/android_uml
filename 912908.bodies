@@ -1,0 +1,140 @@
+class PlaybackSynthesisCallback
+!!!4162188.java!!!	PlaybackSynthesisCallback(in streamType : int, in volume : float, in pan : float, inout audioTrackHandler : AudioPlaybackHandler, inout dispatcher : UtteranceProgressDispatcher, inout callerIdentity : Object, inout logger : EventLogger)
+        mStreamType = streamType;
+        mVolume = volume;
+        mPan = pan;
+        mAudioTrackHandler = audioTrackHandler;
+        mDispatcher = dispatcher;
+        mCallerIdentity = callerIdentity;
+        mLogger = logger;
+!!!4162316.java!!!	stop() : void
+        stopImpl(false);
+!!!4162444.java!!!	stopImpl(inout wasError : boolean) : void
+        if (DBG) Log.d(TAG, "stop()");
+
+        // Note that mLogger.mError might be true too at this point.
+        mLogger.onStopped();
+
+        SynthesisPlaybackQueueItem item;
+        synchronized (mStateLock) {
+            if (mStopped) {
+                Log.w(TAG, "stop() called twice");
+                return;
+            }
+
+            item = mItem;
+            mStopped = true;
+        }
+
+        if (item != null) {
+            // This might result in the synthesis thread being woken up, at which
+            // point it will write an additional buffer to the item - but we
+            // won't worry about that because the audio playback queue will be cleared
+            // soon after (see SynthHandler#stop(String).
+            item.stop(wasError);
+        } else {
+            // This happens when stop() or error() were called before start() was.
+
+            // In all other cases, mAudioTrackHandler.stop() will
+            // result in onSynthesisDone being called, and we will
+            // write data there.
+            mLogger.onWriteData();
+
+            if (wasError) {
+                // We have to dispatch the error ourselves.
+                mDispatcher.dispatchOnError();
+            }
+        }
+!!!4162572.java!!!	getMaxBufferSize() : int
+        // The AudioTrack buffer will be at least MIN_AUDIO_BUFFER_SIZE, so that should always be
+        // a safe buffer size to pass in.
+        return MIN_AUDIO_BUFFER_SIZE;
+!!!4162700.java!!!	isDone() : boolean
+        return mDone;
+!!!4162828.java!!!	start(in sampleRateInHz : int, in audioFormat : int, in channelCount : int) : int
+        if (DBG) {
+            Log.d(TAG, "start(" + sampleRateInHz + "," + audioFormat
+                    + "," + channelCount + ")");
+        }
+
+        int channelConfig = BlockingAudioTrack.getChannelConfig(channelCount);
+        if (channelConfig == 0) {
+            Log.e(TAG, "Unsupported number of channels :" + channelCount);
+            return TextToSpeech.ERROR;
+        }
+
+        synchronized (mStateLock) {
+            if (mStopped) {
+                if (DBG) Log.d(TAG, "stop() called before start(), returning.");
+                return TextToSpeech.ERROR;
+            }
+            SynthesisPlaybackQueueItem item = new SynthesisPlaybackQueueItem(
+                    mStreamType, sampleRateInHz, audioFormat, channelCount, mVolume, mPan,
+                    mDispatcher, mCallerIdentity, mLogger);
+            mAudioTrackHandler.enqueue(item);
+            mItem = item;
+        }
+
+        return TextToSpeech.SUCCESS;
+!!!4162956.java!!!	audioAvailable(inout buffer : byte, in offset : int, in length : int) : int
+        if (DBG) {
+            Log.d(TAG, "audioAvailable(byte[" + buffer.length + "],"
+                    + offset + "," + length + ")");
+        }
+        if (length > getMaxBufferSize() || length <= 0) {
+            throw new IllegalArgumentException("buffer is too large or of zero length (" +
+                    + length + " bytes)");
+        }
+
+        SynthesisPlaybackQueueItem item = null;
+        synchronized (mStateLock) {
+            if (mItem == null || mStopped) {
+                return TextToSpeech.ERROR;
+            }
+            item = mItem;
+        }
+
+        // Sigh, another copy.
+        final byte[] bufferCopy = new byte[length];
+        System.arraycopy(buffer, offset, bufferCopy, 0, length);
+
+        // Might block on mItem.this, if there are too many buffers waiting to
+        // be consumed.
+        try {
+            item.put(bufferCopy);
+        } catch (InterruptedException ie) {
+            return TextToSpeech.ERROR;
+        }
+
+        mLogger.onEngineDataReceived();
+
+        return TextToSpeech.SUCCESS;
+!!!4163084.java!!!	done() : int
+        if (DBG) Log.d(TAG, "done()");
+
+        SynthesisPlaybackQueueItem item = null;
+        synchronized (mStateLock) {
+            if (mDone) {
+                Log.w(TAG, "Duplicate call to done()");
+                return TextToSpeech.ERROR;
+            }
+
+            mDone = true;
+
+            if (mItem == null) {
+                return TextToSpeech.ERROR;
+            }
+
+            item = mItem;
+        }
+
+        item.done();
+        mLogger.onEngineComplete();
+
+        return TextToSpeech.SUCCESS;
+!!!4163212.java!!!	error() : void
+        if (DBG) Log.d(TAG, "error() [will call stop]");
+        // Currently, this call will not be logged if error( ) is called
+        // before start.
+        mLogger.onError();
+        stopImpl(true);

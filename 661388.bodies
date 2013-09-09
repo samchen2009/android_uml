@@ -1,0 +1,101 @@
+class BpMemoryHeap
+!!!2039052.cpp!!!	~BpMemoryHeap()
+    if (mHeapId != -1) {
+        close(mHeapId);
+        if (mRealHeap) {
+            // by construction we're the last one
+            if (mBase != MAP_FAILED) {
+                sp<IBinder> binder = const_cast<BpMemoryHeap*>(this)->asBinder();
+
+                if (VERBOSE) {
+                    ALOGD("UNMAPPING binder=%p, heap=%p, size=%d, fd=%d",
+                            binder.get(), this, mSize, mHeapId);
+                    CallStack stack;
+                    stack.update();
+                    stack.dump("callstack");
+                }
+
+                munmap(mBase, mSize);
+            }
+        } else {
+            // remove from list only if it was mapped before
+            sp<IBinder> binder = const_cast<BpMemoryHeap*>(this)->asBinder();
+            free_heap(binder);
+        }
+    }
+!!!2039180.cpp!!!	getHeapID() : int
+    assertMapped();
+    return mHeapId;
+!!!2039308.cpp!!!	getBase() : void
+    assertMapped();
+    return mBase;
+!!!2039436.cpp!!!	getSize() : size_t
+    assertMapped();
+    return mSize;
+!!!2039564.cpp!!!	getFlags() : uint32_t
+    assertMapped();
+    return mFlags;
+!!!2039692.cpp!!!	getOffset() : uint32_t
+    assertMapped();
+    return mOffset;
+!!!2040332.cpp!!!	assertMapped() : void
+    if (mHeapId == -1) {
+        sp<IBinder> binder(const_cast<BpMemoryHeap*>(this)->asBinder());
+        sp<BpMemoryHeap> heap(static_cast<BpMemoryHeap*>(find_heap(binder).get()));
+        heap->assertReallyMapped();
+        if (heap->mBase != MAP_FAILED) {
+            Mutex::Autolock _l(mLock);
+            if (mHeapId == -1) {
+                mBase   = heap->mBase;
+                mSize   = heap->mSize;
+                mOffset = heap->mOffset;
+                android_atomic_write( dup( heap->mHeapId ), &mHeapId );
+            }
+        } else {
+            // something went wrong
+            free_heap(binder);
+        }
+    }
+!!!2040460.cpp!!!	assertReallyMapped() : void
+    if (mHeapId == -1) {
+
+        // remote call without mLock held, worse case scenario, we end up
+        // calling transact() from multiple threads, but that's not a problem,
+        // only mmap below must be in the critical section.
+
+        Parcel data, reply;
+        data.writeInterfaceToken(IMemoryHeap::getInterfaceDescriptor());
+        status_t err = remote()->transact(HEAP_ID, data, &reply);
+        int parcel_fd = reply.readFileDescriptor();
+        ssize_t size = reply.readInt32();
+        uint32_t flags = reply.readInt32();
+        uint32_t offset = reply.readInt32();
+
+        ALOGE_IF(err, "binder=%p transaction failed fd=%d, size=%ld, err=%d (%s)",
+                asBinder().get(), parcel_fd, size, err, strerror(-err));
+
+        int fd = dup( parcel_fd );
+        ALOGE_IF(fd==-1, "cannot dup fd=%d, size=%ld, err=%d (%s)",
+                parcel_fd, size, err, strerror(errno));
+
+        int access = PROT_READ;
+        if (!(flags & READ_ONLY)) {
+            access |= PROT_WRITE;
+        }
+
+        Mutex::Autolock _l(mLock);
+        if (mHeapId == -1) {
+            mRealHeap = true;
+            mBase = mmap(0, size, access, MAP_SHARED, fd, offset);
+            if (mBase == MAP_FAILED) {
+                ALOGE("cannot map BpMemoryHeap (binder=%p), size=%ld, fd=%d (%s)",
+                        asBinder().get(), size, fd, strerror(errno));
+                close(fd);
+            } else {
+                mSize = size;
+                mFlags = flags;
+                mOffset = offset;
+                android_atomic_write(fd, &mHeapId);
+            }
+        }
+    }

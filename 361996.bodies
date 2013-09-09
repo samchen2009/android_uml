@@ -1,0 +1,134 @@
+class AAMRAssembler
+!!!691084.cpp!!!	AAMRAssembler(in notify : sp<AMessage>, in isWide : bool, in params : AString)
+    AString value;
+    CHECK(GetAttribute(params.c_str(), "octet-align", &value) && value == "1");
+    CHECK(!GetAttribute(params.c_str(), "crc", &value) || value == "0");
+    CHECK(!GetAttribute(params.c_str(), "interleaving", &value));
+!!!691340.cpp!!!	assembleMore(in source : sp<ARTPSource>) : AssemblyStatus
+    return addPacket(source);
+!!!691468.cpp!!!	onByeReceived() : void
+    sp<AMessage> msg = mNotifyMsg->dup();
+    msg->setInt32("eos", true);
+    msg->post();
+!!!691596.cpp!!!	packetLost() : void
+    CHECK(mNextExpectedSeqNoValid);
+    ++mNextExpectedSeqNo;
+!!!691724.cpp!!!	addPacket(in source : sp<ARTPSource>) : AssemblyStatus
+    List<sp<ABuffer> > *queue = source->queue();
+
+    if (queue->empty()) {
+        return NOT_ENOUGH_DATA;
+    }
+
+    if (mNextExpectedSeqNoValid) {
+        List<sp<ABuffer> >::iterator it = queue->begin();
+        while (it != queue->end()) {
+            if ((uint32_t)(*it)->int32Data() >= mNextExpectedSeqNo) {
+                break;
+            }
+
+            it = queue->erase(it);
+        }
+
+        if (queue->empty()) {
+            return NOT_ENOUGH_DATA;
+        }
+    }
+
+    sp<ABuffer> buffer = *queue->begin();
+
+    if (!mNextExpectedSeqNoValid) {
+        mNextExpectedSeqNoValid = true;
+        mNextExpectedSeqNo = (uint32_t)buffer->int32Data();
+    } else if ((uint32_t)buffer->int32Data() != mNextExpectedSeqNo) {
+        ALOGV("Not the sequence number I expected");
+
+        return WRONG_SEQUENCE_NUMBER;
+    }
+
+    // hexdump(buffer->data(), buffer->size());
+
+    if (buffer->size() < 1) {
+        queue->erase(queue->begin());
+        ++mNextExpectedSeqNo;
+
+        ALOGV("AMR packet too short.");
+
+        return MALFORMED_PACKET;
+    }
+
+    unsigned payloadHeader = buffer->data()[0];
+    unsigned CMR = payloadHeader >> 4;
+    CHECK_EQ(payloadHeader & 0x0f, 0u);  // RR
+
+    Vector<uint8_t> tableOfContents;
+
+    size_t offset = 1;
+    size_t totalSize = 0;
+    for (;;) {
+        if (offset >= buffer->size()) {
+            queue->erase(queue->begin());
+            ++mNextExpectedSeqNo;
+
+            ALOGV("Unable to parse TOC.");
+
+            return MALFORMED_PACKET;
+        }
+
+        uint8_t toc = buffer->data()[offset++];
+
+        unsigned FT = (toc >> 3) & 0x0f;
+        if ((toc & 3) != 0
+                || (mIsWide && FT > 9 && FT != 15)
+                || (!mIsWide && FT > 8 && FT != 15)) {
+            queue->erase(queue->begin());
+            ++mNextExpectedSeqNo;
+
+            ALOGV("Illegal TOC entry.");
+
+            return MALFORMED_PACKET;
+        }
+
+        totalSize += getFrameSize(mIsWide, (toc >> 3) & 0x0f);
+
+        tableOfContents.push(toc);
+
+        if (0 == (toc & 0x80)) {
+            break;
+        }
+    }
+
+    sp<ABuffer> accessUnit = new ABuffer(totalSize);
+    CopyTimes(accessUnit, buffer);
+
+    size_t dstOffset = 0;
+    for (size_t i = 0; i < tableOfContents.size(); ++i) {
+        uint8_t toc = tableOfContents[i];
+
+        size_t frameSize = getFrameSize(mIsWide, (toc >> 3) & 0x0f);
+
+        if (offset + frameSize - 1 > buffer->size()) {
+            queue->erase(queue->begin());
+            ++mNextExpectedSeqNo;
+
+            ALOGV("AMR packet too short.");
+
+            return MALFORMED_PACKET;
+        }
+
+        accessUnit->data()[dstOffset++] = toc;
+        memcpy(accessUnit->data() + dstOffset,
+               buffer->data() + offset, frameSize - 1);
+
+        offset += frameSize - 1;
+        dstOffset += frameSize - 1;
+    }
+
+    sp<AMessage> msg = mNotifyMsg->dup();
+    msg->setBuffer("access-unit", accessUnit);
+    msg->post();
+
+    queue->erase(queue->begin());
+    ++mNextExpectedSeqNo;
+
+    return OK;

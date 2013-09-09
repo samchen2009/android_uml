@@ -1,0 +1,275 @@
+class SoftMP3
+!!!584972.cpp!!!	SoftMP3(in name : char, in callbacks : OMX_CALLBACKTYPE, in appData : OMX_PTR, inout component : OMX_COMPONENTTYPE)
+    initPorts();
+    initDecoder();
+!!!585100.cpp!!!	~SoftMP3()
+    if (mDecoderBuf != NULL) {
+        free(mDecoderBuf);
+        mDecoderBuf = NULL;
+    }
+
+    delete mConfig;
+    mConfig = NULL;
+!!!585228.cpp!!!	internalGetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (pcmParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            pcmParams->eNumData = OMX_NumericalDataSigned;
+            pcmParams->eEndian = OMX_EndianBig;
+            pcmParams->bInterleaved = OMX_TRUE;
+            pcmParams->nBitPerSample = 16;
+            pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
+            pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
+
+            pcmParams->nChannels = mNumChannels;
+            pcmParams->nSamplingRate = mSamplingRate;
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalGetParameter(index, params);
+    }
+!!!585356.cpp!!!	internalSetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamStandardComponentRole:
+        {
+            const OMX_PARAM_COMPONENTROLETYPE *roleParams =
+                (const OMX_PARAM_COMPONENTROLETYPE *)params;
+
+            if (strncmp((const char *)roleParams->cRole,
+                        "audio_decoder.mp3",
+                        OMX_MAX_STRINGNAME_SIZE - 1)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalSetParameter(index, params);
+    }
+!!!585484.cpp!!!	onQueueFilled(in portIndex : OMX_U32) : void
+    if (mSignalledError || mOutputPortSettingsChange != NONE) {
+        return;
+    }
+
+    List<BufferInfo *> &inQueue = getPortQueue(0);
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+
+    while (!inQueue.empty() && !outQueue.empty()) {
+        BufferInfo *inInfo = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+
+        BufferInfo *outInfo = *outQueue.begin();
+        OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            inQueue.erase(inQueue.begin());
+            inInfo->mOwnedByUs = false;
+            notifyEmptyBufferDone(inHeader);
+
+            if (!mIsFirst) {
+                // pad the end of the stream with 529 samples, since that many samples
+                // were trimmed off the beginning when decoding started
+                outHeader->nFilledLen =
+                    kPVMP3DecoderDelay * mNumChannels * sizeof(int16_t);
+
+                memset(outHeader->pBuffer, 0, outHeader->nFilledLen);
+            } else {
+                // Since we never discarded frames from the start, we won't have
+                // to add any padding at the end either.
+                outHeader->nFilledLen = 0;
+            }
+
+            outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+
+            outQueue.erase(outQueue.begin());
+            outInfo->mOwnedByUs = false;
+            notifyFillBufferDone(outHeader);
+            return;
+        }
+
+        if (inHeader->nOffset == 0) {
+            mAnchorTimeUs = inHeader->nTimeStamp;
+            mNumFramesOutput = 0;
+        }
+
+        mConfig->pInputBuffer =
+            inHeader->pBuffer + inHeader->nOffset;
+
+        mConfig->inputBufferCurrentLength = inHeader->nFilledLen;
+        mConfig->inputBufferMaxLength = 0;
+        mConfig->inputBufferUsedLength = 0;
+
+        mConfig->outputFrameSize = kOutputBufferSize / sizeof(int16_t);
+
+        mConfig->pOutputBuffer =
+            reinterpret_cast<int16_t *>(outHeader->pBuffer);
+
+        ERROR_CODE decoderErr;
+        if ((decoderErr = pvmp3_framedecoder(mConfig, mDecoderBuf))
+                != NO_DECODING_ERROR) {
+            ALOGV("mp3 decoder returned error %d", decoderErr);
+
+            if (decoderErr != NO_ENOUGH_MAIN_DATA_ERROR
+                        && decoderErr != SIDE_INFO_ERROR) {
+                ALOGE("mp3 decoder returned error %d", decoderErr);
+
+                notify(OMX_EventError, OMX_ErrorUndefined, decoderErr, NULL);
+                mSignalledError = true;
+                return;
+            }
+
+            if (mConfig->outputFrameSize == 0) {
+                mConfig->outputFrameSize = kOutputBufferSize / sizeof(int16_t);
+            }
+
+            // This is recoverable, just ignore the current frame and
+            // play silence instead.
+            memset(outHeader->pBuffer,
+                   0,
+                   mConfig->outputFrameSize * sizeof(int16_t));
+
+            mConfig->inputBufferUsedLength = inHeader->nFilledLen;
+        } else if (mConfig->samplingRate != mSamplingRate
+                || mConfig->num_channels != mNumChannels) {
+            mSamplingRate = mConfig->samplingRate;
+            mNumChannels = mConfig->num_channels;
+
+            notify(OMX_EventPortSettingsChanged, 1, 0, NULL);
+            mOutputPortSettingsChange = AWAITING_DISABLED;
+            return;
+        }
+
+        if (mIsFirst) {
+            mIsFirst = false;
+            // The decoder delay is 529 samples, so trim that many samples off
+            // the start of the first output buffer. This essentially makes this
+            // decoder have zero delay, which the rest of the pipeline assumes.
+            outHeader->nOffset =
+                kPVMP3DecoderDelay * mNumChannels * sizeof(int16_t);
+
+            outHeader->nFilledLen =
+                mConfig->outputFrameSize * sizeof(int16_t) - outHeader->nOffset;
+        } else {
+            outHeader->nOffset = 0;
+            outHeader->nFilledLen = mConfig->outputFrameSize * sizeof(int16_t);
+        }
+
+        outHeader->nTimeStamp =
+            mAnchorTimeUs
+                + (mNumFramesOutput * 1000000ll) / mConfig->samplingRate;
+
+        outHeader->nFlags = 0;
+
+        CHECK_GE(inHeader->nFilledLen, mConfig->inputBufferUsedLength);
+
+        inHeader->nOffset += mConfig->inputBufferUsedLength;
+        inHeader->nFilledLen -= mConfig->inputBufferUsedLength;
+
+        mNumFramesOutput += mConfig->outputFrameSize / mNumChannels;
+
+        if (inHeader->nFilledLen == 0) {
+            inInfo->mOwnedByUs = false;
+            inQueue.erase(inQueue.begin());
+            inInfo = NULL;
+            notifyEmptyBufferDone(inHeader);
+            inHeader = NULL;
+        }
+
+        outInfo->mOwnedByUs = false;
+        outQueue.erase(outQueue.begin());
+        outInfo = NULL;
+        notifyFillBufferDone(outHeader);
+        outHeader = NULL;
+    }
+!!!585612.cpp!!!	onPortFlushCompleted(in portIndex : OMX_U32) : void
+    if (portIndex == 0) {
+        // Make sure that the next buffer output does not still
+        // depend on fragments from the last one decoded.
+        pvmp3_InitDecoder(mConfig, mDecoderBuf);
+        mIsFirst = true;
+    }
+!!!585740.cpp!!!	onPortEnableCompleted(in portIndex : OMX_U32, in enabled : bool) : void
+    if (portIndex != 1) {
+        return;
+    }
+
+    switch (mOutputPortSettingsChange) {
+        case NONE:
+            break;
+
+        case AWAITING_DISABLED:
+        {
+            CHECK(!enabled);
+            mOutputPortSettingsChange = AWAITING_ENABLED;
+            break;
+        }
+
+        default:
+        {
+            CHECK_EQ((int)mOutputPortSettingsChange, (int)AWAITING_ENABLED);
+            CHECK(enabled);
+            mOutputPortSettingsChange = NONE;
+            break;
+        }
+    }
+!!!585868.cpp!!!	initPorts() : void
+    OMX_PARAM_PORTDEFINITIONTYPE def;
+    InitOMXParams(&def);
+
+    def.nPortIndex = 0;
+    def.eDir = OMX_DirInput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = 8192;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 1;
+
+    def.format.audio.cMIMEType =
+        const_cast<char *>(MEDIA_MIMETYPE_AUDIO_MPEG);
+
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingMP3;
+
+    addPort(def);
+
+    def.nPortIndex = 1;
+    def.eDir = OMX_DirOutput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = kOutputBufferSize;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 2;
+
+    def.format.audio.cMIMEType = const_cast<char *>("audio/raw");
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingPCM;
+
+    addPort(def);
+!!!585996.cpp!!!	initDecoder() : void
+    mConfig->equalizerType = flat;
+    mConfig->crcEnabled = false;
+
+    uint32_t memRequirements = pvmp3_decoderMemRequirements();
+    mDecoderBuf = malloc(memRequirements);
+
+    pvmp3_InitDecoder(mConfig, mDecoderBuf);
+    mIsFirst = true;

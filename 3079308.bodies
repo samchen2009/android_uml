@@ -1,0 +1,189 @@
+class BinaryDictionaryFileDumper
+!!!12771468.java!!!	getProviderUriBuilder(in path : String) : Builder
+        return new Uri.Builder().scheme(ContentResolver.SCHEME_CONTENT)
+                .authority(BinaryDictionary.DICTIONARY_PACK_AUTHORITY).appendPath(
+                        path);
+!!!12771596.java!!!	getWordListWordListInfos(in locale : Locale, in context : Context, in hasDefaultWordList : boolean) : WordListInfo
+        final ContentResolver resolver = context.getContentResolver();
+        final Uri.Builder builder = getProviderUriBuilder(locale.toString());
+        if (!hasDefaultWordList) {
+            builder.appendQueryParameter(QUERY_PARAMETER_MAY_PROMPT_USER, QUERY_PARAMETER_TRUE);
+        }
+        final Uri dictionaryPackUri = builder.build();
+
+        final Cursor c = resolver.query(dictionaryPackUri, DICTIONARY_PROJECTION, null, null, null);
+        if (null == c) return Collections.<WordListInfo>emptyList();
+        if (c.getCount() <= 0 || !c.moveToFirst()) {
+            c.close();
+            return Collections.<WordListInfo>emptyList();
+        }
+
+        try {
+            final List<WordListInfo> list = new ArrayList<WordListInfo>();
+            do {
+                final String wordListId = c.getString(0);
+                final String wordListLocale = c.getString(1);
+                if (TextUtils.isEmpty(wordListId)) continue;
+                list.add(new WordListInfo(wordListId, wordListLocale));
+            } while (c.moveToNext());
+            c.close();
+            return list;
+        } catch (Exception e) {
+            // Just in case we hit a problem in communication with the dictionary pack.
+            // We don't want to die.
+            Log.e(TAG, "Exception communicating with the dictionary pack : " + e);
+            return Collections.<WordListInfo>emptyList();
+        }
+!!!12771724.java!!!	openAssetFileDescriptor(in resolver : ContentResolver, in uri : Uri) : AssetFileDescriptor
+        try {
+            return resolver.openAssetFileDescriptor(uri, "r");
+        } catch (FileNotFoundException e) {
+            // I don't want to log the word list URI here for security concerns
+            Log.e(TAG, "Could not find a word list from the dictionary provider.");
+            return null;
+        }
+!!!12771852.java!!!	cacheWordList(in id : String, in locale : String, in resolver : ContentResolver, in context : Context) : AssetFileAddress
+
+        final int COMPRESSED_CRYPTED_COMPRESSED = 0;
+        final int CRYPTED_COMPRESSED = 1;
+        final int COMPRESSED_CRYPTED = 2;
+        final int COMPRESSED_ONLY = 3;
+        final int CRYPTED_ONLY = 4;
+        final int NONE = 5;
+        final int MODE_MIN = COMPRESSED_CRYPTED_COMPRESSED;
+        final int MODE_MAX = NONE;
+
+        final Uri.Builder wordListUriBuilder = getProviderUriBuilder(id);
+        final String finalFileName = BinaryDictionaryGetter.getCacheFileName(id, locale, context);
+        final String tempFileName = finalFileName + ".tmp";
+
+        for (int mode = MODE_MIN; mode <= MODE_MAX; ++mode) {
+            InputStream originalSourceStream = null;
+            InputStream inputStream = null;
+            File outputFile = null;
+            FileOutputStream outputStream = null;
+            AssetFileDescriptor afd = null;
+            final Uri wordListUri = wordListUriBuilder.build();
+            try {
+                // Open input.
+                afd = openAssetFileDescriptor(resolver, wordListUri);
+                // If we can't open it at all, don't even try a number of times.
+                if (null == afd) return null;
+                originalSourceStream = afd.createInputStream();
+                // Open output.
+                outputFile = new File(tempFileName);
+                // Just to be sure, delete the file. This may fail silently, and return false: this
+                // is the right thing to do, as we just want to continue anyway.
+                outputFile.delete();
+                outputStream = new FileOutputStream(outputFile);
+                // Get the appropriate decryption method for this try
+                switch (mode) {
+                    case COMPRESSED_CRYPTED_COMPRESSED:
+                        inputStream = FileTransforms.getUncompressedStream(
+                                FileTransforms.getDecryptedStream(
+                                        FileTransforms.getUncompressedStream(
+                                                originalSourceStream)));
+                        break;
+                    case CRYPTED_COMPRESSED:
+                        inputStream = FileTransforms.getUncompressedStream(
+                                FileTransforms.getDecryptedStream(originalSourceStream));
+                        break;
+                    case COMPRESSED_CRYPTED:
+                        inputStream = FileTransforms.getDecryptedStream(
+                                FileTransforms.getUncompressedStream(originalSourceStream));
+                        break;
+                    case COMPRESSED_ONLY:
+                        inputStream = FileTransforms.getUncompressedStream(originalSourceStream);
+                        break;
+                    case CRYPTED_ONLY:
+                        inputStream = FileTransforms.getDecryptedStream(originalSourceStream);
+                        break;
+                    case NONE:
+                        inputStream = originalSourceStream;
+                        break;
+                    }
+                checkMagicAndCopyFileTo(new BufferedInputStream(inputStream), outputStream);
+                outputStream.flush();
+                outputStream.close();
+                final File finalFile = new File(finalFileName);
+                if (!outputFile.renameTo(finalFile)) {
+                    throw new IOException("Can't move the file to its final name");
+                }
+                wordListUriBuilder.appendQueryParameter(QUERY_PARAMETER_DELETE_RESULT,
+                        QUERY_PARAMETER_SUCCESS);
+                if (0 >= resolver.delete(wordListUriBuilder.build(), null, null)) {
+                    Log.e(TAG, "Could not have the dictionary pack delete a word list");
+                }
+                BinaryDictionaryGetter.removeFilesWithIdExcept(context, id, finalFile);
+                // Success! Close files (through the finally{} clause) and return.
+                return AssetFileAddress.makeFromFileName(finalFileName);
+            } catch (Exception e) {
+                if (DEBUG) {
+                    Log.i(TAG, "Can't open word list in mode " + mode + " : " + e);
+                }
+                if (null != outputFile) {
+                    // This may or may not fail. The file may not have been created if the
+                    // exception was thrown before it could be. Hence, both failure and
+                    // success are expected outcomes, so we don't check the return value.
+                    outputFile.delete();
+                }
+                // Try the next method.
+            } finally {
+                // Ignore exceptions while closing files.
+                try {
+                    // inputStream.close() will close afd, we should not call afd.close().
+                    if (null != inputStream) inputStream.close();
+                } catch (Exception e) {
+                    Log.e(TAG, "Exception while closing a cross-process file descriptor : " + e);
+                }
+                try {
+                    if (null != outputStream) outputStream.close();
+                } catch (Exception e) {
+                    Log.e(TAG, "Exception while closing a file : " + e);
+                }
+            }
+        }
+
+        // We could not copy the file at all. This is very unexpected.
+        // I'd rather not print the word list ID to the log out of security concerns
+        Log.e(TAG, "Could not copy a word list. Will not be able to use it.");
+        // If we can't copy it we should warn the dictionary provider so that it can mark it
+        // as invalid.
+        wordListUriBuilder.appendQueryParameter(QUERY_PARAMETER_DELETE_RESULT,
+                QUERY_PARAMETER_FAILURE);
+        if (0 >= resolver.delete(wordListUriBuilder.build(), null, null)) {
+            Log.e(TAG, "In addition, we were unable to delete it.");
+        }
+        return null;
+!!!12771980.java!!!	cacheWordListsFromContentProvider(in locale : Locale, in context : Context, in hasDefaultWordList : boolean) : AssetFileAddress
+        final ContentResolver resolver = context.getContentResolver();
+        final List<WordListInfo> idList = getWordListWordListInfos(locale, context,
+                hasDefaultWordList);
+        final List<AssetFileAddress> fileAddressList = new ArrayList<AssetFileAddress>();
+        for (WordListInfo id : idList) {
+            final AssetFileAddress afd = cacheWordList(id.mId, id.mLocale, resolver, context);
+            if (null != afd) {
+                fileAddressList.add(afd);
+            }
+        }
+        return fileAddressList;
+!!!12772108.java!!!	checkMagicAndCopyFileTo(in input : BufferedInputStream, in output : FileOutputStream) : void
+        // Check the magic number
+        final int length = MAGIC_NUMBER_VERSION_2.length;
+        final byte[] magicNumberBuffer = new byte[length];
+        final int readMagicNumberSize = input.read(magicNumberBuffer, 0, length);
+        if (readMagicNumberSize < length) {
+            throw new IOException("Less bytes to read than the magic number length");
+        }
+        if (!Arrays.equals(MAGIC_NUMBER_VERSION_2, magicNumberBuffer)) {
+            if (!Arrays.equals(MAGIC_NUMBER_VERSION_1, magicNumberBuffer)) {
+                throw new IOException("Wrong magic number for downloaded file");
+            }
+        }
+        output.write(magicNumberBuffer);
+
+        // Actually copy the file
+        final byte[] buffer = new byte[FILE_READ_BUFFER_SIZE];
+        for (int readBytes = input.read(buffer); readBytes >= 0; readBytes = input.read(buffer))
+            output.write(buffer, 0, readBytes);
+        input.close();

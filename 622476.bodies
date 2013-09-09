@@ -1,0 +1,142 @@
+class WAVSource
+!!!1888780.cpp!!!	WAVSource(in dataSource : sp<DataSource>, in meta : sp<MetaData>, in waveFormat : uint16_t, in bitsPerSample : int32_t, in offset : off64_t, in size : size_t)
+    CHECK(mMeta->findInt32(kKeySampleRate, &mSampleRate));
+    CHECK(mMeta->findInt32(kKeyChannelCount, &mNumChannels));
+
+    mMeta->setInt32(kKeyMaxInputSize, kMaxFrameSize);
+!!!1888908.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    ALOGV("WAVSource::start");
+
+    CHECK(!mStarted);
+
+    mGroup = new MediaBufferGroup;
+    mGroup->add_buffer(new MediaBuffer(kMaxFrameSize));
+
+    if (mBitsPerSample == 8) {
+        // As a temporary buffer for 8->16 bit conversion.
+        mGroup->add_buffer(new MediaBuffer(kMaxFrameSize));
+    }
+
+    mCurrentPos = mOffset;
+
+    mStarted = true;
+
+    return OK;
+!!!1889036.cpp!!!	stop() : status_t
+    ALOGV("WAVSource::stop");
+
+    CHECK(mStarted);
+
+    delete mGroup;
+    mGroup = NULL;
+
+    mStarted = false;
+
+    return OK;
+!!!1889164.cpp!!!	getFormat() : sp<MetaData>
+    ALOGV("WAVSource::getFormat");
+
+    return mMeta;
+!!!1889292.cpp!!!	read(inout out : MediaBuffer, in options : ReadOptions = NULL) : status_t
+    *out = NULL;
+
+    int64_t seekTimeUs;
+    ReadOptions::SeekMode mode;
+    if (options != NULL && options->getSeekTo(&seekTimeUs, &mode)) {
+        int64_t pos = (seekTimeUs * mSampleRate) / 1000000 * mNumChannels * (mBitsPerSample >> 3);
+        if (pos > mSize) {
+            pos = mSize;
+        }
+        mCurrentPos = pos + mOffset;
+    }
+
+    MediaBuffer *buffer;
+    status_t err = mGroup->acquire_buffer(&buffer);
+    if (err != OK) {
+        return err;
+    }
+
+    size_t maxBytesToRead =
+        mBitsPerSample == 8 ? kMaxFrameSize / 2 : kMaxFrameSize;
+
+    size_t maxBytesAvailable =
+        (mCurrentPos - mOffset >= (off64_t)mSize)
+            ? 0 : mSize - (mCurrentPos - mOffset);
+
+    if (maxBytesToRead > maxBytesAvailable) {
+        maxBytesToRead = maxBytesAvailable;
+    }
+
+    ssize_t n = mDataSource->readAt(
+            mCurrentPos, buffer->data(),
+            maxBytesToRead);
+
+    if (n <= 0) {
+        buffer->release();
+        buffer = NULL;
+
+        return ERROR_END_OF_STREAM;
+    }
+
+    buffer->set_range(0, n);
+
+    if (mWaveFormat == WAVE_FORMAT_PCM) {
+        if (mBitsPerSample == 8) {
+            // Convert 8-bit unsigned samples to 16-bit signed.
+
+            MediaBuffer *tmp;
+            CHECK_EQ(mGroup->acquire_buffer(&tmp), (status_t)OK);
+
+            // The new buffer holds the sample number of samples, but each
+            // one is 2 bytes wide.
+            tmp->set_range(0, 2 * n);
+
+            int16_t *dst = (int16_t *)tmp->data();
+            const uint8_t *src = (const uint8_t *)buffer->data();
+            ssize_t numBytes = n;
+
+            while (numBytes-- > 0) {
+                *dst++ = ((int16_t)(*src) - 128) * 256;
+                ++src;
+            }
+
+            buffer->release();
+            buffer = tmp;
+        } else if (mBitsPerSample == 24) {
+            // Convert 24-bit signed samples to 16-bit signed.
+
+            const uint8_t *src =
+                (const uint8_t *)buffer->data() + buffer->range_offset();
+            int16_t *dst = (int16_t *)src;
+
+            size_t numSamples = buffer->range_length() / 3;
+            for (size_t i = 0; i < numSamples; ++i) {
+                int32_t x = (int32_t)(src[0] | src[1] << 8 | src[2] << 16);
+                x = (x << 8) >> 8;  // sign extension
+
+                x = x >> 8;
+                *dst++ = (int16_t)x;
+                src += 3;
+            }
+
+            buffer->set_range(buffer->range_offset(), 2 * numSamples);
+        }
+    }
+
+    size_t bytesPerSample = mBitsPerSample >> 3;
+
+    buffer->meta_data()->setInt64(
+            kKeyTime,
+            1000000LL * (mCurrentPos - mOffset)
+                / (mNumChannels * bytesPerSample) / mSampleRate);
+
+    buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+    mCurrentPos += n;
+
+    *out = buffer;
+
+    return OK;
+!!!1889420.cpp!!!	~WAVSource()
+    if (mStarted) {
+        stop();
+    }

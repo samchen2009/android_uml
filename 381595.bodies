@@ -1,0 +1,681 @@
+class DiskLruCacheTest
+!!!2609563.java!!!	setUp() : void
+        super.setUp();
+        javaTmpDir = System.getProperty("java.io.tmpdir");
+        cacheDir = new File(javaTmpDir, "DiskLruCacheTest");
+        cacheDir.mkdir();
+        journalFile = new File(cacheDir, JOURNAL_FILE);
+        for (File file : cacheDir.listFiles()) {
+            file.delete();
+        }
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        mockOs.install();
+!!!2609691.java!!!	tearDown() : void
+        mockOs.uninstall();
+        cache.close();
+        super.tearDown();
+!!!2609819.java!!!	testEmptyCache() : void
+        cache.close();
+        assertJournalEquals();
+!!!2609947.java!!!	testWriteAndReadEntry() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        creator.set(0, "ABC");
+        creator.set(1, "DE");
+        assertNull(creator.getString(0));
+        assertNull(creator.newInputStream(0));
+        assertNull(creator.getString(1));
+        assertNull(creator.newInputStream(1));
+        creator.commit();
+
+        DiskLruCache.Snapshot snapshot = cache.get("k1");
+        assertEquals("ABC", snapshot.getString(0));
+        assertEquals("DE", snapshot.getString(1));
+!!!2610075.java!!!	testReadAndWriteEntryAcrossCacheOpenAndClose() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        creator.set(0, "A");
+        creator.set(1, "B");
+        creator.commit();
+        cache.close();
+
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        DiskLruCache.Snapshot snapshot = cache.get("k1");
+        assertEquals("A", snapshot.getString(0));
+        assertEquals("B", snapshot.getString(1));
+        snapshot.close();
+!!!2610203.java!!!	testJournalWithEditAndPublish() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        assertJournalEquals("DIRTY k1"); // DIRTY must always be flushed
+        creator.set(0, "AB");
+        creator.set(1, "C");
+        creator.commit();
+        cache.close();
+        assertJournalEquals("DIRTY k1", "CLEAN k1 2 1");
+!!!2610331.java!!!	testRevertedNewFileIsRemoveInJournal() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        assertJournalEquals("DIRTY k1"); // DIRTY must always be flushed
+        creator.set(0, "AB");
+        creator.set(1, "C");
+        creator.abort();
+        cache.close();
+        assertJournalEquals("DIRTY k1", "REMOVE k1");
+!!!2610459.java!!!	testUnterminatedEditIsRevertedOnClose() : void
+        cache.edit("k1");
+        cache.close();
+        assertJournalEquals("DIRTY k1", "REMOVE k1");
+!!!2610587.java!!!	testJournalDoesNotIncludeReadOfYetUnpublishedValue() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        assertNull(cache.get("k1"));
+        creator.set(0, "A");
+        creator.set(1, "BC");
+        creator.commit();
+        cache.close();
+        assertJournalEquals("DIRTY k1", "CLEAN k1 1 2");
+!!!2610715.java!!!	testJournalWithEditAndPublishAndRead() : void
+        DiskLruCache.Editor k1Creator = cache.edit("k1");
+        k1Creator.set(0, "AB");
+        k1Creator.set(1, "C");
+        k1Creator.commit();
+        DiskLruCache.Editor k2Creator = cache.edit("k2");
+        k2Creator.set(0, "DEF");
+        k2Creator.set(1, "G");
+        k2Creator.commit();
+        DiskLruCache.Snapshot k1Snapshot = cache.get("k1");
+        k1Snapshot.close();
+        cache.close();
+        assertJournalEquals("DIRTY k1", "CLEAN k1 2 1",
+                "DIRTY k2", "CLEAN k2 3 1",
+                "READ k1");
+!!!2610843.java!!!	testCannotOperateOnEditAfterPublish() : void
+        DiskLruCache.Editor editor = cache.edit("k1");
+        editor.set(0, "A");
+        editor.set(1, "B");
+        editor.commit();
+        assertInoperable(editor);
+!!!2610971.java!!!	testCannotOperateOnEditAfterRevert() : void
+        DiskLruCache.Editor editor = cache.edit("k1");
+        editor.set(0, "A");
+        editor.set(1, "B");
+        editor.abort();
+        assertInoperable(editor);
+!!!2611099.java!!!	testExplicitRemoveAppliedToDiskImmediately() : void
+        DiskLruCache.Editor editor = cache.edit("k1");
+        editor.set(0, "ABC");
+        editor.set(1, "B");
+        editor.commit();
+        File k1 = getCleanFile("k1", 0);
+        assertEquals("ABC", readFile(k1));
+        cache.remove("k1");
+        assertFalse(k1.exists());
+!!!2611227.java!!!	testReadAndWriteOverlapsMaintainConsistency() : void
+        DiskLruCache.Editor v1Creator = cache.edit("k1");
+        v1Creator.set(0, "AAaa");
+        v1Creator.set(1, "BBbb");
+        v1Creator.commit();
+
+        DiskLruCache.Snapshot snapshot1 = cache.get("k1");
+        InputStream inV1 = snapshot1.getInputStream(0);
+        assertEquals('A', inV1.read());
+        assertEquals('A', inV1.read());
+
+        DiskLruCache.Editor v1Updater = cache.edit("k1");
+        v1Updater.set(0, "CCcc");
+        v1Updater.set(1, "DDdd");
+        v1Updater.commit();
+
+        DiskLruCache.Snapshot snapshot2 = cache.get("k1");
+        assertEquals("CCcc", snapshot2.getString(0));
+        assertEquals("DDdd", snapshot2.getString(1));
+        snapshot2.close();
+
+        assertEquals('a', inV1.read());
+        assertEquals('a', inV1.read());
+        assertEquals("BBbb", snapshot1.getString(1));
+        snapshot1.close();
+!!!2611355.java!!!	testOpenWithDirtyKeyDeletesAllFilesForThatKey() : void
+        cache.close();
+        File cleanFile0 = getCleanFile("k1", 0);
+        File cleanFile1 = getCleanFile("k1", 1);
+        File dirtyFile0 = getDirtyFile("k1", 0);
+        File dirtyFile1 = getDirtyFile("k1", 1);
+        writeFile(cleanFile0, "A");
+        writeFile(cleanFile1, "B");
+        writeFile(dirtyFile0, "C");
+        writeFile(dirtyFile1, "D");
+        createJournal("CLEAN k1 1 1", "DIRTY   k1");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertFalse(cleanFile0.exists());
+        assertFalse(cleanFile1.exists());
+        assertFalse(dirtyFile0.exists());
+        assertFalse(dirtyFile1.exists());
+        assertNull(cache.get("k1"));
+!!!2611483.java!!!	testOpenWithInvalidVersionClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournalWithHeader(MAGIC, "0", "100", "2", "");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+!!!2611611.java!!!	testOpenWithInvalidAppVersionClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournalWithHeader(MAGIC, "1", "101", "2", "");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+!!!2611739.java!!!	testOpenWithInvalidValueCountClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournalWithHeader(MAGIC, "1", "100", "1", "");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+!!!2611867.java!!!	testOpenWithInvalidBlankLineClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournalWithHeader(MAGIC, "1", "100", "2", "x");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+!!!2611995.java!!!	testOpenWithInvalidJournalLineClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournal("CLEAN k1 1 1", "BOGUS");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+        assertNull(cache.get("k1"));
+!!!2612123.java!!!	testOpenWithInvalidFileSizeClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournal("CLEAN k1 0000x001 1");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+        assertNull(cache.get("k1"));
+!!!2612251.java!!!	testOpenWithTruncatedLineDiscardsThatLine() : void
+        cache.close();
+        writeFile(getCleanFile("k1", 0), "A");
+        writeFile(getCleanFile("k1", 1), "B");
+        Writer writer = new FileWriter(journalFile);
+        writer.write(MAGIC + "\n" + VERSION_1 + "\n100\n2\n\nCLEAN k1 1 1"); // no trailing newline
+        writer.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertNull(cache.get("k1"));
+!!!2612379.java!!!	testOpenWithTooManyFileSizesClearsDirectory() : void
+        cache.close();
+        generateSomeGarbageFiles();
+        createJournal("CLEAN k1 1 1 1");
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+        assertGarbageFilesAllDeleted();
+        assertNull(cache.get("k1"));
+!!!2612507.java!!!	testKeyWithSpaceNotPermitted() : void
+        try {
+            cache.edit("my key");
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+!!!2612635.java!!!	testKeyWithNewlineNotPermitted() : void
+        try {
+            cache.edit("my\nkey");
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+!!!2612763.java!!!	testKeyWithCarriageReturnNotPermitted() : void
+        try {
+            cache.edit("my\rkey");
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+!!!2612891.java!!!	testNullKeyThrows() : void
+        try {
+            cache.edit(null);
+            fail();
+        } catch (NullPointerException expected) {
+        }
+!!!2613019.java!!!	testCreateNewEntryWithTooFewValuesFails() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        creator.set(1, "A");
+        try {
+            creator.commit();
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+
+        assertFalse(getCleanFile("k1", 0).exists());
+        assertFalse(getCleanFile("k1", 1).exists());
+        assertFalse(getDirtyFile("k1", 0).exists());
+        assertFalse(getDirtyFile("k1", 1).exists());
+        assertNull(cache.get("k1"));
+
+        DiskLruCache.Editor creator2 = cache.edit("k1");
+        creator2.set(0, "B");
+        creator2.set(1, "C");
+        creator2.commit();
+!!!2613147.java!!!	testCreateNewEntryWithMissingFileAborts() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        creator.set(0, "A");
+        creator.set(1, "A");
+        assertTrue(getDirtyFile("k1", 0).exists());
+        assertTrue(getDirtyFile("k1", 1).exists());
+        assertTrue(getDirtyFile("k1", 0).delete());
+        assertFalse(getDirtyFile("k1", 0).exists());
+        creator.commit();  // silently abort if file does not exist due to I/O issue
+
+        assertFalse(getCleanFile("k1", 0).exists());
+        assertFalse(getCleanFile("k1", 1).exists());
+        assertFalse(getDirtyFile("k1", 0).exists());
+        assertFalse(getDirtyFile("k1", 1).exists());
+        assertNull(cache.get("k1"));
+
+        DiskLruCache.Editor creator2 = cache.edit("k1");
+        creator2.set(0, "B");
+        creator2.set(1, "C");
+        creator2.commit();
+!!!2613275.java!!!	testRevertWithTooFewValues() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        creator.set(1, "A");
+        creator.abort();
+        assertFalse(getCleanFile("k1", 0).exists());
+        assertFalse(getCleanFile("k1", 1).exists());
+        assertFalse(getDirtyFile("k1", 0).exists());
+        assertFalse(getDirtyFile("k1", 1).exists());
+        assertNull(cache.get("k1"));
+!!!2613403.java!!!	testUpdateExistingEntryWithTooFewValuesReusesPreviousValues() : void
+        DiskLruCache.Editor creator = cache.edit("k1");
+        creator.set(0, "A");
+        creator.set(1, "B");
+        creator.commit();
+
+        DiskLruCache.Editor updater = cache.edit("k1");
+        updater.set(0, "C");
+        updater.commit();
+
+        DiskLruCache.Snapshot snapshot = cache.get("k1");
+        assertEquals("C", snapshot.getString(0));
+        assertEquals("B", snapshot.getString(1));
+        snapshot.close();
+!!!2613531.java!!!	testEvictOnInsert() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+
+        set("A", "a", "aaa"); // size 4
+        set("B", "bb", "bbbb"); // size 6
+        assertEquals(10, cache.size());
+
+        // cause the size to grow to 12 should evict 'A'
+        set("C", "c", "c");
+        cache.flush();
+        assertEquals(8, cache.size());
+        assertAbsent("A");
+        assertValue("B", "bb", "bbbb");
+        assertValue("C", "c", "c");
+
+        // causing the size to grow to 10 should evict nothing
+        set("D", "d", "d");
+        cache.flush();
+        assertEquals(10, cache.size());
+        assertAbsent("A");
+        assertValue("B", "bb", "bbbb");
+        assertValue("C", "c", "c");
+        assertValue("D", "d", "d");
+
+        // causing the size to grow to 18 should evict 'B' and 'C'
+        set("E", "eeee", "eeee");
+        cache.flush();
+        assertEquals(10, cache.size());
+        assertAbsent("A");
+        assertAbsent("B");
+        assertAbsent("C");
+        assertValue("D", "d", "d");
+        assertValue("E", "eeee", "eeee");
+!!!2613659.java!!!	testEvictOnUpdate() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+
+        set("A", "a", "aa"); // size 3
+        set("B", "b", "bb"); // size 3
+        set("C", "c", "cc"); // size 3
+        assertEquals(9, cache.size());
+
+        // causing the size to grow to 11 should evict 'A'
+        set("B", "b", "bbbb");
+        cache.flush();
+        assertEquals(8, cache.size());
+        assertAbsent("A");
+        assertValue("B", "b", "bbbb");
+        assertValue("C", "c", "cc");
+!!!2613787.java!!!	testEvictionHonorsLruFromCurrentSession() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+        set("A", "a", "a");
+        set("B", "b", "b");
+        set("C", "c", "c");
+        set("D", "d", "d");
+        set("E", "e", "e");
+        cache.get("B").close(); // 'B' is now least recently used
+
+        // causing the size to grow to 12 should evict 'A'
+        set("F", "f", "f");
+        // causing the size to grow to 12 should evict 'C'
+        set("G", "g", "g");
+        cache.flush();
+        assertEquals(10, cache.size());
+        assertAbsent("A");
+        assertValue("B", "b", "b");
+        assertAbsent("C");
+        assertValue("D", "d", "d");
+        assertValue("E", "e", "e");
+        assertValue("F", "f", "f");
+!!!2613915.java!!!	testEvictionHonorsLruFromPreviousSession() : void
+        set("A", "a", "a");
+        set("B", "b", "b");
+        set("C", "c", "c");
+        set("D", "d", "d");
+        set("E", "e", "e");
+        set("F", "f", "f");
+        cache.get("B").close(); // 'B' is now least recently used
+        assertEquals(12, cache.size());
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+
+        set("G", "g", "g");
+        cache.flush();
+        assertEquals(10, cache.size());
+        assertAbsent("A");
+        assertValue("B", "b", "b");
+        assertAbsent("C");
+        assertValue("D", "d", "d");
+        assertValue("E", "e", "e");
+        assertValue("F", "f", "f");
+        assertValue("G", "g", "g");
+!!!2614043.java!!!	testCacheSingleEntryOfSizeGreaterThanMaxSize() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+        set("A", "aaaaa", "aaaaaa"); // size=11
+        cache.flush();
+        assertAbsent("A");
+!!!2614171.java!!!	testCacheSingleValueOfSizeGreaterThanMaxSize() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+        set("A", "aaaaaaaaaaa", "a"); // size=12
+        cache.flush();
+        assertAbsent("A");
+!!!2614299.java!!!	testConstructorDoesNotAllowZeroCacheSize() : void
+        try {
+            DiskLruCache.open(cacheDir, appVersion, 2, 0);
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+!!!2614427.java!!!	testConstructorDoesNotAllowZeroValuesPerEntry() : void
+        try {
+            DiskLruCache.open(cacheDir, appVersion, 0, 10);
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+!!!2614555.java!!!	testRemoveAbsentElement() : void
+        cache.remove("A");
+!!!2614683.java!!!	testReadingTheSameStreamMultipleTimes() : void
+        set("A", "a", "b");
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        assertSame(snapshot.getInputStream(0), snapshot.getInputStream(0));
+        snapshot.close();
+!!!2614811.java!!!	testRebuildJournalOnRepeatedReads() : void
+        set("A", "a", "a");
+        set("B", "b", "b");
+        long lastJournalLength = 0;
+        while (true) {
+            long journalLength = journalFile.length();
+            assertValue("A", "a", "a");
+            assertValue("B", "b", "b");
+            if (journalLength < lastJournalLength) {
+                System.out.printf("Journal compacted from %s bytes to %s bytes\n",
+                        lastJournalLength, journalLength);
+                break; // test passed!
+            }
+            lastJournalLength = journalLength;
+        }
+!!!2614939.java!!!	testRebuildJournalOnRepeatedEdits() : void
+        long lastJournalLength = 0;
+        while (true) {
+            long journalLength = journalFile.length();
+            set("A", "a", "a");
+            set("B", "b", "b");
+            if (journalLength < lastJournalLength) {
+                System.out.printf("Journal compacted from %s bytes to %s bytes\n",
+                        lastJournalLength, journalLength);
+                break;
+            }
+            lastJournalLength = journalLength;
+        }
+
+        // sanity check that a rebuilt journal behaves normally
+        assertValue("A", "a", "a");
+        assertValue("B", "b", "b");
+!!!2615067.java!!!	testRebuildJournalOnRepeatedReadsWithOpenAndClose() : void
+        set("a", "a", "a");
+        set("b", "b", "b");
+        long lastJournalLength = 0;
+        while (true) {
+            long journalLength = journalFile.length();
+            assertValue("a", "a", "a");
+            assertValue("b", "b", "b");
+            cache.close();
+            cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+            if (journalLength < lastJournalLength) {
+                System.out.printf("Journal compacted from %s bytes to %s bytes\n",
+                        lastJournalLength, journalLength);
+                break; // test passed!
+            }
+            lastJournalLength = journalLength;
+        }
+!!!2615195.java!!!	testRebuildJournalOnRepeatedEditsWithOpenAndClose() : void
+        long lastJournalLength = 0;
+        while (true) {
+            long journalLength = journalFile.length();
+            set("a", "a", "a");
+            set("b", "b", "b");
+            cache.close();
+            cache = DiskLruCache.open(cacheDir, appVersion, 2, Integer.MAX_VALUE);
+            if (journalLength < lastJournalLength) {
+                System.out.printf("Journal compacted from %s bytes to %s bytes\n",
+                        lastJournalLength, journalLength);
+                break;
+            }
+            lastJournalLength = journalLength;
+        }
+!!!2615323.java!!!	testOpenCreatesDirectoryIfNecessary() : void
+        cache.close();
+        File dir = new File(javaTmpDir, "testOpenCreatesDirectoryIfNecessary");
+        cache = DiskLruCache.open(dir, appVersion, 2, Integer.MAX_VALUE);
+        set("A", "a", "a");
+        assertTrue(new File(dir, "A.0").exists());
+        assertTrue(new File(dir, "A.1").exists());
+        assertTrue(new File(dir, "journal").exists());
+!!!2615451.java!!!	testFileDeletedExternally() : void
+        set("A", "a", "a");
+        getCleanFile("A", 1).delete();
+        assertNull(cache.get("A"));
+!!!2615579.java!!!	testFileBecomesInaccessibleDuringReadResultsInIoException() : void
+        set("A", "aaaaa", "a");
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        InputStream in = snapshot.getInputStream(0);
+        assertEquals('a', in.read());
+        mockOs.enqueueFault("read");
+        try {
+            in.read();
+            fail();
+        } catch (IOException expected) {
+        }
+        snapshot.close();
+!!!2615707.java!!!	testFileBecomesInaccessibleDuringWriteIsSilentlyDiscarded() : void
+        set("A", "a", "a");
+        DiskLruCache.Editor editor = cache.edit("A");
+        OutputStream out0 = editor.newOutputStream(0);
+        out0.write('b');
+        out0.close();
+        OutputStream out1 = editor.newOutputStream(1);
+        out1.write('c');
+        mockOs.enqueueFault("write");
+        out1.write('c'); // this doesn't throw...
+        out1.close();
+        editor.commit(); // ... but this will abort
+        assertAbsent("A");
+!!!2615835.java!!!	testEditSameVersion() : void
+        set("A", "a", "a");
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        DiskLruCache.Editor editor = snapshot.edit();
+        editor.set(1, "a2");
+        editor.commit();
+        assertValue("A", "a", "a2");
+!!!2615963.java!!!	testEditSnapshotAfterChangeAborted() : void
+        set("A", "a", "a");
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        DiskLruCache.Editor toAbort = snapshot.edit();
+        toAbort.set(0, "b");
+        toAbort.abort();
+        DiskLruCache.Editor editor = snapshot.edit();
+        editor.set(1, "a2");
+        editor.commit();
+        assertValue("A", "a", "a2");
+!!!2616091.java!!!	testEditSnapshotAfterChangeCommitted() : void
+        set("A", "a", "a");
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        DiskLruCache.Editor toAbort = snapshot.edit();
+        toAbort.set(0, "b");
+        toAbort.commit();
+        assertNull(snapshot.edit());
+!!!2616219.java!!!	testEditSinceEvicted() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+        set("A", "aa", "aaa"); // size 5
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        set("B", "bb", "bbb"); // size 5
+        set("C", "cc", "ccc"); // size 5; will evict 'A'
+        cache.flush();
+        assertNull(snapshot.edit());
+!!!2616347.java!!!	testEditSinceEvictedAndRecreated() : void
+        cache.close();
+        cache = DiskLruCache.open(cacheDir, appVersion, 2, 10);
+        set("A", "aa", "aaa"); // size 5
+        DiskLruCache.Snapshot snapshot = cache.get("A");
+        set("B", "bb", "bbb"); // size 5
+        set("C", "cc", "ccc"); // size 5; will evict 'A'
+        set("A", "a", "aaaa"); // size 5; will evict 'B'
+        cache.flush();
+        assertNull(snapshot.edit());
+!!!2616475.java!!!	assertJournalEquals(inout  : String...expectedBodyLines) : void
+        List<String> expectedLines = new ArrayList<String>();
+        expectedLines.add(MAGIC);
+        expectedLines.add(VERSION_1);
+        expectedLines.add("100");
+        expectedLines.add("2");
+        expectedLines.add("");
+        expectedLines.addAll(Arrays.asList(expectedBodyLines));
+        assertEquals(expectedLines, readJournalLines());
+!!!2616603.java!!!	createJournal(inout  : String...bodyLines) : void
+        createJournalWithHeader(MAGIC, VERSION_1, "100", "2", "", bodyLines);
+!!!2616731.java!!!	createJournalWithHeader(inout magic : String, inout version : String, inout appVersion : String, inout valueCount : String, inout blank : String, inout  : String...bodyLines) : void
+        Writer writer = new FileWriter(journalFile);
+        writer.write(magic + "\n");
+        writer.write(version + "\n");
+        writer.write(appVersion + "\n");
+        writer.write(valueCount + "\n");
+        writer.write(blank + "\n");
+        for (String line : bodyLines) {
+            writer.write(line);
+            writer.write('\n');
+        }
+        writer.close();
+!!!2616859.java!!!	readJournalLines() : List
+        List<String> result = new ArrayList<String>();
+        BufferedReader reader = new BufferedReader(new FileReader(journalFile));
+        String line;
+        while ((line = reader.readLine()) != null) {
+            result.add(line);
+        }
+        reader.close();
+        return result;
+!!!2616987.java!!!	getCleanFile(inout key : String, in index : int) : File
+        return new File(cacheDir, key + "." + index);
+!!!2617115.java!!!	getDirtyFile(inout key : String, in index : int) : File
+        return new File(cacheDir, key + "." + index + ".tmp");
+!!!2617243.java!!!	readFile(inout file : File) : String
+        Reader reader = new FileReader(file);
+        StringWriter writer = new StringWriter();
+        char[] buffer = new char[1024];
+        int count;
+        while ((count = reader.read(buffer)) != -1) {
+            writer.write(buffer, 0, count);
+        }
+        reader.close();
+        return writer.toString();
+!!!2617371.java!!!	writeFile(inout file : File, inout content : String) : void
+        FileWriter writer = new FileWriter(file);
+        writer.write(content);
+        writer.close();
+!!!2617499.java!!!	assertInoperable(inout editor : Editor) : void
+        try {
+            editor.getString(0);
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            editor.set(0, "A");
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            editor.newInputStream(0);
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            editor.newOutputStream(0);
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            editor.commit();
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+        try {
+            editor.abort();
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+!!!2617627.java!!!	generateSomeGarbageFiles() : void
+        File dir1 = new File(cacheDir, "dir1");
+        File dir2 = new File(dir1, "dir2");
+        writeFile(getCleanFile("g1", 0), "A");
+        writeFile(getCleanFile("g1", 1), "B");
+        writeFile(getCleanFile("g2", 0), "C");
+        writeFile(getCleanFile("g2", 1), "D");
+        writeFile(getCleanFile("g2", 1), "D");
+        writeFile(new File(cacheDir, "otherFile0"), "E");
+        dir1.mkdir();
+        dir2.mkdir();
+        writeFile(new File(dir2, "otherFile1"), "F");
+!!!2617755.java!!!	assertGarbageFilesAllDeleted() : void
+        assertFalse(getCleanFile("g1", 0).exists());
+        assertFalse(getCleanFile("g1", 1).exists());
+        assertFalse(getCleanFile("g2", 0).exists());
+        assertFalse(getCleanFile("g2", 1).exists());
+        assertFalse(new File(cacheDir, "otherFile0").exists());
+        assertFalse(new File(cacheDir, "dir1").exists());
+!!!2617883.java!!!	set(inout key : String, inout value0 : String, inout value1 : String) : void
+        DiskLruCache.Editor editor = cache.edit(key);
+        editor.set(0, value0);
+        editor.set(1, value1);
+        editor.commit();
+!!!2618011.java!!!	assertAbsent(inout key : String) : void
+        DiskLruCache.Snapshot snapshot = cache.get(key);
+        if (snapshot != null) {
+            snapshot.close();
+            fail();
+        }
+        assertFalse(getCleanFile(key, 0).exists());
+        assertFalse(getCleanFile(key, 1).exists());
+        assertFalse(getDirtyFile(key, 0).exists());
+        assertFalse(getDirtyFile(key, 1).exists());
+!!!2618139.java!!!	assertValue(inout key : String, inout value0 : String, inout value1 : String) : void
+        DiskLruCache.Snapshot snapshot = cache.get(key);
+        assertEquals(value0, snapshot.getString(0));
+        assertEquals(value1, snapshot.getString(1));
+        assertTrue(getCleanFile(key, 0).exists());
+        assertTrue(getCleanFile(key, 1).exists());
+        snapshot.close();

@@ -1,0 +1,272 @@
+class Watchdog
+!!!8113548.java!!!	getInstance() : Watchdog
+        if (sWatchdog == null) {
+            sWatchdog = new Watchdog();
+        }
+
+        return sWatchdog;
+!!!8113676.java!!!	Watchdog()
+        super("watchdog");
+        mHandler = new HeartbeatHandler();
+!!!8113804.java!!!	init(inout context : Context, inout battery : BatteryService, inout power : PowerManagerService, inout alarm : AlarmManagerService, inout activity : ActivityManagerService) : void
+        mResolver = context.getContentResolver();
+        mBattery = battery;
+        mPower = power;
+        mAlarm = alarm;
+        mActivity = activity;
+
+        context.registerReceiver(new RebootReceiver(),
+                new IntentFilter(REBOOT_ACTION));
+        mRebootIntent = PendingIntent.getBroadcast(context,
+                0, new Intent(REBOOT_ACTION), 0);
+
+        context.registerReceiver(new RebootRequestReceiver(),
+                new IntentFilter(Intent.ACTION_REBOOT),
+                android.Manifest.permission.REBOOT, null);
+
+        mBootTime = System.currentTimeMillis();
+!!!8113932.java!!!	processStarted(in name : String, in pid : int) : void
+        synchronized (this) {
+            if ("com.android.phone".equals(name)) {
+                mPhonePid = pid;
+            }
+        }
+!!!8114060.java!!!	addMonitor(inout monitor : Monitor) : void
+        synchronized (this) {
+            if (isAlive()) {
+                throw new RuntimeException("Monitors can't be added while the Watchdog is running");
+            }
+            mMonitors.add(monitor);
+        }
+!!!8114188.java!!!	checkReboot(inout fromAlarm : boolean) : void
+        int rebootInterval = mReqRebootInterval >= 0 ? mReqRebootInterval
+                : REBOOT_DEFAULT_INTERVAL;
+        mRebootInterval = rebootInterval;
+        if (rebootInterval <= 0) {
+            // No reboot interval requested.
+            if (localLOGV) Slog.v(TAG, "No need to schedule a reboot alarm!");
+            mAlarm.remove(mRebootIntent);
+            return;
+        }
+
+        long rebootStartTime = mReqRebootStartTime >= 0 ? mReqRebootStartTime
+                : REBOOT_DEFAULT_START_TIME;
+        long rebootWindowMillis = (mReqRebootWindow >= 0 ? mReqRebootWindow
+                : REBOOT_DEFAULT_WINDOW) * 1000;
+        long recheckInterval = (mReqRecheckInterval >= 0 ? mReqRecheckInterval
+                : MEMCHECK_DEFAULT_RECHECK_INTERVAL) * 1000;
+
+        retrieveBrutalityAmount();
+
+        long realStartTime;
+        long now;
+
+        synchronized (this) {
+            now = System.currentTimeMillis();
+            realStartTime = computeCalendarTime(mCalendar, now,
+                    rebootStartTime);
+
+            long rebootIntervalMillis = rebootInterval*24*60*60*1000;
+            if (DB || mReqRebootNoWait ||
+                    (now-mBootTime) >= (rebootIntervalMillis-rebootWindowMillis)) {
+                if (fromAlarm && rebootWindowMillis <= 0) {
+                    // No reboot window -- just immediately reboot.
+                    EventLog.writeEvent(EventLogTags.WATCHDOG_SCHEDULED_REBOOT, now,
+                            (int)rebootIntervalMillis, (int)rebootStartTime*1000,
+                            (int)rebootWindowMillis, "");
+                    rebootSystem("Checkin scheduled forced");
+                    return;
+                }
+
+                // Are we within the reboot window?
+                if (now < realStartTime) {
+                    // Schedule alarm for next check interval.
+                    realStartTime = computeCalendarTime(mCalendar,
+                            now, rebootStartTime);
+                } else if (now < (realStartTime+rebootWindowMillis)) {
+                    String doit = shouldWeBeBrutalLocked(now);
+                    EventLog.writeEvent(EventLogTags.WATCHDOG_SCHEDULED_REBOOT, now,
+                            (int)rebootInterval, (int)rebootStartTime*1000,
+                            (int)rebootWindowMillis, doit != null ? doit : "");
+                    if (doit == null) {
+                        rebootSystem("Checked scheduled range");
+                        return;
+                    }
+
+                    // Schedule next alarm either within the window or in the
+                    // next interval.
+                    if ((now+recheckInterval) >= (realStartTime+rebootWindowMillis)) {
+                        realStartTime = computeCalendarTime(mCalendar,
+                                now + rebootIntervalMillis, rebootStartTime);
+                    } else {
+                        realStartTime = now + recheckInterval;
+                    }
+                } else {
+                    // Schedule alarm for next check interval.
+                    realStartTime = computeCalendarTime(mCalendar,
+                            now + rebootIntervalMillis, rebootStartTime);
+                }
+            }
+        }
+
+        if (localLOGV) Slog.v(TAG, "Scheduling next reboot alarm for "
+                + ((realStartTime-now)/1000/60) + "m from now");
+        mAlarm.remove(mRebootIntent);
+        mAlarm.set(AlarmManager.RTC_WAKEUP, realStartTime, mRebootIntent);
+!!!8114316.java!!!	rebootSystem(in reason : String) : void
+        Slog.i(TAG, "Rebooting system because: " + reason);
+        PowerManagerService pms = (PowerManagerService) ServiceManager.getService("power");
+        pms.reboot(false, reason, false);
+!!!8114444.java!!!	retrieveBrutalityAmount() : void
+        mMinScreenOff = (mReqMinScreenOff >= 0 ? mReqMinScreenOff
+                : MEMCHECK_DEFAULT_MIN_SCREEN_OFF) * 1000;
+        mMinAlarm = (mReqMinNextAlarm >= 0 ? mReqMinNextAlarm
+                : MEMCHECK_DEFAULT_MIN_ALARM) * 1000;
+!!!8114572.java!!!	shouldWeBeBrutalLocked(in curTime : long) : String
+        if (mBattery == null || !mBattery.isPowered(BatteryManager.BATTERY_PLUGGED_ANY)) {
+            return "battery";
+        }
+
+        if (mMinScreenOff >= 0 && (mPower == null ||
+                mPower.timeSinceScreenWasLastOn() < mMinScreenOff)) {
+            return "screen";
+        }
+
+        if (mMinAlarm >= 0 && (mAlarm == null ||
+                mAlarm.timeToNextAlarm() < mMinAlarm)) {
+            return "alarm";
+        }
+
+        return null;
+!!!8114700.java!!!	computeCalendarTime(inout c : Calendar, in curTime : long, in secondsSinceMidnight : long) : long
+
+        // start with now
+        c.setTimeInMillis(curTime);
+
+        int val = (int)secondsSinceMidnight / (60*60);
+        c.set(Calendar.HOUR_OF_DAY, val);
+        secondsSinceMidnight -= val * (60*60);
+        val = (int)secondsSinceMidnight / 60;
+        c.set(Calendar.MINUTE, val);
+        c.set(Calendar.SECOND, (int)secondsSinceMidnight - (val*60));
+        c.set(Calendar.MILLISECOND, 0);
+
+        long newTime = c.getTimeInMillis();
+        if (newTime < curTime) {
+            // The given time (in seconds since midnight) has already passed for today, so advance
+            // by one day (due to daylight savings, etc., the delta may differ from 24 hours).
+            c.add(Calendar.DAY_OF_MONTH, 1);
+            newTime = c.getTimeInMillis();
+        }
+
+        return newTime;
+!!!8114828.java!!!	run() : void
+        boolean waitedHalf = false;
+        while (true) {
+            mCompleted = false;
+            mHandler.sendEmptyMessage(MONITOR);
+
+            synchronized (this) {
+                long timeout = TIME_TO_WAIT;
+
+                // NOTE: We use uptimeMillis() here because we do not want to increment the time we
+                // wait while asleep. If the device is asleep then the thing that we are waiting
+                // to timeout on is asleep as well and won't have a chance to run, causing a false
+                // positive on when to kill things.
+                long start = SystemClock.uptimeMillis();
+                while (timeout > 0 && !mForceKillSystem) {
+                    try {
+                        wait(timeout);  // notifyAll() is called when mForceKillSystem is set
+                    } catch (InterruptedException e) {
+                        Log.wtf(TAG, e);
+                    }
+                    timeout = TIME_TO_WAIT - (SystemClock.uptimeMillis() - start);
+                }
+
+                if (mCompleted && !mForceKillSystem) {
+                    // The monitors have returned.
+                    waitedHalf = false;
+                    continue;
+                }
+
+                if (!waitedHalf) {
+                    // We've waited half the deadlock-detection interval.  Pull a stack
+                    // trace and wait another half.
+                    ArrayList<Integer> pids = new ArrayList<Integer>();
+                    pids.add(Process.myPid());
+                    ActivityManagerService.dumpStackTraces(true, pids, null, null,
+                            NATIVE_STACKS_OF_INTEREST);
+                    waitedHalf = true;
+                    continue;
+                }
+            }
+
+            // If we got here, that means that the system is most likely hung.
+            // First collect stack traces from all threads of the system process.
+            // Then kill this process so that the system will restart.
+
+            final String name = (mCurrentMonitor != null) ?
+                    mCurrentMonitor.getClass().getName() : "null";
+            EventLog.writeEvent(EventLogTags.WATCHDOG, name);
+
+            ArrayList<Integer> pids = new ArrayList<Integer>();
+            pids.add(Process.myPid());
+            if (mPhonePid > 0) pids.add(mPhonePid);
+            // Pass !waitedHalf so that just in case we somehow wind up here without having
+            // dumped the halfway stacks, we properly re-initialize the trace file.
+            final File stack = ActivityManagerService.dumpStackTraces(
+                    !waitedHalf, pids, null, null, NATIVE_STACKS_OF_INTEREST);
+
+            // Give some extra time to make sure the stack traces get written.
+            // The system's been hanging for a minute, another second or two won't hurt much.
+            SystemClock.sleep(2000);
+
+            // Pull our own kernel thread stacks as well if we're configured for that
+            if (RECORD_KERNEL_THREADS) {
+                dumpKernelStackTraces();
+            }
+
+            // Trigger the kernel to dump all blocked threads to the kernel log
+            try {
+                FileWriter sysrq_trigger = new FileWriter("/proc/sysrq-trigger");
+                sysrq_trigger.write("w");
+                sysrq_trigger.close();
+            } catch (IOException e) {
+                Slog.e(TAG, "Failed to write to /proc/sysrq-trigger");
+                Slog.e(TAG, e.getMessage());
+            }
+
+            // Try to add the error to the dropbox, but assuming that the ActivityManager
+            // itself may be deadlocked.  (which has happened, causing this statement to
+            // deadlock and the watchdog as a whole to be ineffective)
+            Thread dropboxThread = new Thread("watchdogWriteToDropbox") {
+                    public void run() {
+                        mActivity.addErrorToDropBox(
+                                "watchdog", null, "system_server", null, null,
+                                name, null, stack, null);
+                    }
+                };
+            dropboxThread.start();
+            try {
+                dropboxThread.join(2000);  // wait up to 2 seconds for it to return.
+            } catch (InterruptedException ignored) {}
+
+            // Only kill the process if the debugger is not attached.
+            if (!Debug.isDebuggerConnected()) {
+                Slog.w(TAG, "*** WATCHDOG KILLING SYSTEM PROCESS: " + name);
+                Process.killProcess(Process.myPid());
+                System.exit(10);
+            } else {
+                Slog.w(TAG, "Debugger connected: Watchdog is *not* killing the system process");
+            }
+
+            waitedHalf = false;
+        }
+!!!8114956.java!!!	dumpKernelStackTraces() : File
+        String tracesPath = SystemProperties.get("dalvik.vm.stack-trace-file", null);
+        if (tracesPath == null || tracesPath.length() == 0) {
+            return null;
+        }
+
+        native_dumpKernelStacks(tracesPath);
+        return new File(tracesPath);

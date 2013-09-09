@@ -1,0 +1,636 @@
+class UsbSettingsManager
+!!!8703628.java!!!	UsbSettingsManager(inout context : Context, inout user : UserHandle)
+        if (DEBUG) Slog.v(TAG, "Creating settings for " + user);
+
+        try {
+            mUserContext = context.createPackageContextAsUser("android", 0, user);
+        } catch (NameNotFoundException e) {
+            throw new RuntimeException("Missing android package");
+        }
+
+        mContext = context;
+        mPackageManager = mUserContext.getPackageManager();
+
+        mUser = user;
+        mSettingsFile = new AtomicFile(new File(
+                Environment.getUserSystemDirectory(user.getIdentifier()),
+                "usb_device_manager.xml"));
+
+        synchronized (mLock) {
+            if (UserHandle.OWNER.equals(user)) {
+                upgradeSingleUserLocked();
+            }
+            readSettingsLocked();
+        }
+
+        mPackageMonitor.register(mUserContext, null, true);
+!!!8703756.java!!!	readPreference(inout parser : XmlPullParser) : void
+        String packageName = null;
+        int count = parser.getAttributeCount();
+        for (int i = 0; i < count; i++) {
+            if ("package".equals(parser.getAttributeName(i))) {
+                packageName = parser.getAttributeValue(i);
+                break;
+            }
+        }
+        XmlUtils.nextElement(parser);
+        if ("usb-device".equals(parser.getName())) {
+            DeviceFilter filter = DeviceFilter.read(parser);
+            mDevicePreferenceMap.put(filter, packageName);
+        } else if ("usb-accessory".equals(parser.getName())) {
+            AccessoryFilter filter = AccessoryFilter.read(parser);
+            mAccessoryPreferenceMap.put(filter, packageName);
+        }
+        XmlUtils.nextElement(parser);
+!!!8703884.java!!!	upgradeSingleUserLocked() : void
+        if (sSingleUserSettingsFile.exists()) {
+            mDevicePreferenceMap.clear();
+            mAccessoryPreferenceMap.clear();
+
+            FileInputStream fis = null;
+            try {
+                fis = new FileInputStream(sSingleUserSettingsFile);
+                XmlPullParser parser = Xml.newPullParser();
+                parser.setInput(fis, null);
+
+                XmlUtils.nextElement(parser);
+                while (parser.getEventType() != XmlPullParser.END_DOCUMENT) {
+                    final String tagName = parser.getName();
+                    if ("preference".equals(tagName)) {
+                        readPreference(parser);
+                    } else {
+                        XmlUtils.nextElement(parser);
+                    }
+                }
+            } catch (IOException e) {
+                Log.wtf(TAG, "Failed to read single-user settings", e);
+            } catch (XmlPullParserException e) {
+                Log.wtf(TAG, "Failed to read single-user settings", e);
+            } finally {
+                IoUtils.closeQuietly(fis);
+            }
+
+            writeSettingsLocked();
+
+            // Success or failure, we delete single-user file
+            sSingleUserSettingsFile.delete();
+        }
+!!!8704012.java!!!	readSettingsLocked() : void
+        if (DEBUG) Slog.v(TAG, "readSettingsLocked()");
+
+        mDevicePreferenceMap.clear();
+        mAccessoryPreferenceMap.clear();
+
+        FileInputStream stream = null;
+        try {
+            stream = mSettingsFile.openRead();
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setInput(stream, null);
+
+            XmlUtils.nextElement(parser);
+            while (parser.getEventType() != XmlPullParser.END_DOCUMENT) {
+                String tagName = parser.getName();
+                if ("preference".equals(tagName)) {
+                    readPreference(parser);
+                } else {
+                    XmlUtils.nextElement(parser);
+                }
+            }
+        } catch (FileNotFoundException e) {
+            if (DEBUG) Slog.d(TAG, "settings file not found");
+        } catch (Exception e) {
+            Slog.e(TAG, "error reading settings file, deleting to start fresh", e);
+            mSettingsFile.delete();
+        } finally {
+            IoUtils.closeQuietly(stream);
+        }
+!!!8704140.java!!!	writeSettingsLocked() : void
+        if (DEBUG) Slog.v(TAG, "writeSettingsLocked()");
+
+        FileOutputStream fos = null;
+        try {
+            fos = mSettingsFile.startWrite();
+
+            FastXmlSerializer serializer = new FastXmlSerializer();
+            serializer.setOutput(fos, "utf-8");
+            serializer.startDocument(null, true);
+            serializer.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true);
+            serializer.startTag(null, "settings");
+
+            for (DeviceFilter filter : mDevicePreferenceMap.keySet()) {
+                serializer.startTag(null, "preference");
+                serializer.attribute(null, "package", mDevicePreferenceMap.get(filter));
+                filter.write(serializer);
+                serializer.endTag(null, "preference");
+            }
+
+            for (AccessoryFilter filter : mAccessoryPreferenceMap.keySet()) {
+                serializer.startTag(null, "preference");
+                serializer.attribute(null, "package", mAccessoryPreferenceMap.get(filter));
+                filter.write(serializer);
+                serializer.endTag(null, "preference");
+            }
+
+            serializer.endTag(null, "settings");
+            serializer.endDocument();
+
+            mSettingsFile.finishWrite(fos);
+        } catch (IOException e) {
+            Slog.e(TAG, "Failed to write settings", e);
+            if (fos != null) {
+                mSettingsFile.failWrite(fos);
+            }
+        }
+!!!8704268.java!!!	packageMatchesLocked(inout info : ResolveInfo, in metaDataName : String, inout device : UsbDevice, inout accessory : UsbAccessory) : boolean
+        ActivityInfo ai = info.activityInfo;
+
+        XmlResourceParser parser = null;
+        try {
+            parser = ai.loadXmlMetaData(mPackageManager, metaDataName);
+            if (parser == null) {
+                Slog.w(TAG, "no meta-data for " + info);
+                return false;
+            }
+
+            XmlUtils.nextElement(parser);
+            while (parser.getEventType() != XmlPullParser.END_DOCUMENT) {
+                String tagName = parser.getName();
+                if (device != null && "usb-device".equals(tagName)) {
+                    DeviceFilter filter = DeviceFilter.read(parser);
+                    if (filter.matches(device)) {
+                        return true;
+                    }
+                }
+                else if (accessory != null && "usb-accessory".equals(tagName)) {
+                    AccessoryFilter filter = AccessoryFilter.read(parser);
+                    if (filter.matches(accessory)) {
+                        return true;
+                    }
+                }
+                XmlUtils.nextElement(parser);
+            }
+        } catch (Exception e) {
+            Slog.w(TAG, "Unable to load component info " + info.toString(), e);
+        } finally {
+            if (parser != null) parser.close();
+        }
+        return false;
+!!!8704396.java!!!	getDeviceMatchesLocked(inout device : UsbDevice, inout intent : Intent) : ResolveInfo
+        ArrayList<ResolveInfo> matches = new ArrayList<ResolveInfo>();
+        List<ResolveInfo> resolveInfos = mPackageManager.queryIntentActivities(intent,
+                PackageManager.GET_META_DATA);
+        int count = resolveInfos.size();
+        for (int i = 0; i < count; i++) {
+            ResolveInfo resolveInfo = resolveInfos.get(i);
+            if (packageMatchesLocked(resolveInfo, intent.getAction(), device, null)) {
+                matches.add(resolveInfo);
+            }
+        }
+        return matches;
+!!!8704524.java!!!	getAccessoryMatchesLocked(inout accessory : UsbAccessory, inout intent : Intent) : ResolveInfo
+        ArrayList<ResolveInfo> matches = new ArrayList<ResolveInfo>();
+        List<ResolveInfo> resolveInfos = mPackageManager.queryIntentActivities(intent,
+                PackageManager.GET_META_DATA);
+        int count = resolveInfos.size();
+        for (int i = 0; i < count; i++) {
+            ResolveInfo resolveInfo = resolveInfos.get(i);
+            if (packageMatchesLocked(resolveInfo, intent.getAction(), null, accessory)) {
+                matches.add(resolveInfo);
+            }
+        }
+        return matches;
+!!!8704652.java!!!	deviceAttached(inout device : UsbDevice) : void
+        Intent intent = new Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        intent.putExtra(UsbManager.EXTRA_DEVICE, device);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        ArrayList<ResolveInfo> matches;
+        String defaultPackage;
+        synchronized (mLock) {
+            matches = getDeviceMatchesLocked(device, intent);
+            // Launch our default activity directly, if we have one.
+            // Otherwise we will start the UsbResolverActivity to allow the user to choose.
+            defaultPackage = mDevicePreferenceMap.get(new DeviceFilter(device));
+        }
+
+        // Send broadcast to running activity with registered intent
+        mUserContext.sendBroadcast(intent);
+
+        // Start activity with registered intent
+        resolveActivity(intent, matches, defaultPackage, device, null);
+!!!8704780.java!!!	deviceDetached(inout device : UsbDevice) : void
+        // clear temporary permissions for the device
+        mDevicePermissionMap.remove(device.getDeviceName());
+
+        Intent intent = new Intent(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        intent.putExtra(UsbManager.EXTRA_DEVICE, device);
+        if (DEBUG) Slog.d(TAG, "usbDeviceRemoved, sending " + intent);
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+!!!8704908.java!!!	accessoryAttached(inout accessory : UsbAccessory) : void
+        Intent intent = new Intent(UsbManager.ACTION_USB_ACCESSORY_ATTACHED);
+        intent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        ArrayList<ResolveInfo> matches;
+        String defaultPackage;
+        synchronized (mLock) {
+            matches = getAccessoryMatchesLocked(accessory, intent);
+            // Launch our default activity directly, if we have one.
+            // Otherwise we will start the UsbResolverActivity to allow the user to choose.
+            defaultPackage = mAccessoryPreferenceMap.get(new AccessoryFilter(accessory));
+        }
+
+        resolveActivity(intent, matches, defaultPackage, null, accessory);
+!!!8705036.java!!!	accessoryDetached(inout accessory : UsbAccessory) : void
+        // clear temporary permissions for the accessory
+        mAccessoryPermissionMap.remove(accessory);
+
+        Intent intent = new Intent(
+                UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+        intent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+!!!8705164.java!!!	resolveActivity(inout intent : Intent, inout matches : ArrayList<ResolveInfo>, in defaultPackage : String, inout device : UsbDevice, inout accessory : UsbAccessory) : void
+        int count = matches.size();
+
+        // don't show the resolver activity if there are no choices available
+        if (count == 0) {
+            if (accessory != null) {
+                String uri = accessory.getUri();
+                if (uri != null && uri.length() > 0) {
+                    // display URI to user
+                    // start UsbResolverActivity so user can choose an activity
+                    Intent dialogIntent = new Intent();
+                    dialogIntent.setClassName("com.android.systemui",
+                            "com.android.systemui.usb.UsbAccessoryUriActivity");
+                    dialogIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    dialogIntent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+                    dialogIntent.putExtra("uri", uri);
+                    try {
+                        mUserContext.startActivityAsUser(dialogIntent, mUser);
+                    } catch (ActivityNotFoundException e) {
+                        Slog.e(TAG, "unable to start UsbAccessoryUriActivity");
+                    }
+                }
+            }
+
+            // do nothing
+            return;
+        }
+
+        ResolveInfo defaultRI = null;
+        if (count == 1 && defaultPackage == null) {
+            // Check to see if our single choice is on the system partition.
+            // If so, treat it as our default without calling UsbResolverActivity
+            ResolveInfo rInfo = matches.get(0);
+            if (rInfo.activityInfo != null &&
+                    rInfo.activityInfo.applicationInfo != null &&
+                    (rInfo.activityInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
+                defaultRI = rInfo;
+            }
+        }
+
+        if (defaultRI == null && defaultPackage != null) {
+            // look for default activity
+            for (int i = 0; i < count; i++) {
+                ResolveInfo rInfo = matches.get(i);
+                if (rInfo.activityInfo != null &&
+                        defaultPackage.equals(rInfo.activityInfo.packageName)) {
+                    defaultRI = rInfo;
+                    break;
+                }
+            }
+        }
+
+        if (defaultRI != null) {
+            // grant permission for default activity
+            if (device != null) {
+                grantDevicePermission(device, defaultRI.activityInfo.applicationInfo.uid);
+            } else if (accessory != null) {
+                grantAccessoryPermission(accessory, defaultRI.activityInfo.applicationInfo.uid);
+            }
+
+            // start default activity directly
+            try {
+                intent.setComponent(
+                        new ComponentName(defaultRI.activityInfo.packageName,
+                                defaultRI.activityInfo.name));
+                mUserContext.startActivityAsUser(intent, mUser);
+            } catch (ActivityNotFoundException e) {
+                Slog.e(TAG, "startActivity failed", e);
+            }
+        } else {
+            Intent resolverIntent = new Intent();
+            resolverIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+            if (count == 1) {
+                // start UsbConfirmActivity if there is only one choice
+                resolverIntent.setClassName("com.android.systemui",
+                        "com.android.systemui.usb.UsbConfirmActivity");
+                resolverIntent.putExtra("rinfo", matches.get(0));
+
+                if (device != null) {
+                    resolverIntent.putExtra(UsbManager.EXTRA_DEVICE, device);
+                } else {
+                    resolverIntent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+                }
+            } else {
+                // start UsbResolverActivity so user can choose an activity
+                resolverIntent.setClassName("com.android.systemui",
+                        "com.android.systemui.usb.UsbResolverActivity");
+                resolverIntent.putParcelableArrayListExtra("rlist", matches);
+                resolverIntent.putExtra(Intent.EXTRA_INTENT, intent);
+            }
+            try {
+                mUserContext.startActivityAsUser(resolverIntent, mUser);
+            } catch (ActivityNotFoundException e) {
+                Slog.e(TAG, "unable to start activity " + resolverIntent);
+            }
+        }
+!!!8705292.java!!!	clearCompatibleMatchesLocked(in packageName : String, inout filter : DeviceFilter) : boolean
+        boolean changed = false;
+        for (DeviceFilter test : mDevicePreferenceMap.keySet()) {
+            if (filter.matches(test)) {
+                mDevicePreferenceMap.remove(test);
+                changed = true;
+            }
+        }
+        return changed;
+!!!8705420.java!!!	clearCompatibleMatchesLocked(in packageName : String, inout filter : AccessoryFilter) : boolean
+        boolean changed = false;
+        for (AccessoryFilter test : mAccessoryPreferenceMap.keySet()) {
+            if (filter.matches(test)) {
+                mAccessoryPreferenceMap.remove(test);
+                changed = true;
+            }
+        }
+        return changed;
+!!!8705548.java!!!	handlePackageUpdateLocked(in packageName : String, inout aInfo : ActivityInfo, in metaDataName : String) : boolean
+        XmlResourceParser parser = null;
+        boolean changed = false;
+
+        try {
+            parser = aInfo.loadXmlMetaData(mPackageManager, metaDataName);
+            if (parser == null) return false;
+
+            XmlUtils.nextElement(parser);
+            while (parser.getEventType() != XmlPullParser.END_DOCUMENT) {
+                String tagName = parser.getName();
+                if ("usb-device".equals(tagName)) {
+                    DeviceFilter filter = DeviceFilter.read(parser);
+                    if (clearCompatibleMatchesLocked(packageName, filter)) {
+                        changed = true;
+                    }
+                }
+                else if ("usb-accessory".equals(tagName)) {
+                    AccessoryFilter filter = AccessoryFilter.read(parser);
+                    if (clearCompatibleMatchesLocked(packageName, filter)) {
+                        changed = true;
+                    }
+                }
+                XmlUtils.nextElement(parser);
+            }
+        } catch (Exception e) {
+            Slog.w(TAG, "Unable to load component info " + aInfo.toString(), e);
+        } finally {
+            if (parser != null) parser.close();
+        }
+        return changed;
+!!!8705676.java!!!	handlePackageUpdate(in packageName : String) : void
+        synchronized (mLock) {
+            PackageInfo info;
+            boolean changed = false;
+
+            try {
+                info = mPackageManager.getPackageInfo(packageName,
+                        PackageManager.GET_ACTIVITIES | PackageManager.GET_META_DATA);
+            } catch (NameNotFoundException e) {
+                Slog.e(TAG, "handlePackageUpdate could not find package " + packageName, e);
+                return;
+            }
+
+            ActivityInfo[] activities = info.activities;
+            if (activities == null) return;
+            for (int i = 0; i < activities.length; i++) {
+                // check for meta-data, both for devices and accessories
+                if (handlePackageUpdateLocked(packageName, activities[i],
+                        UsbManager.ACTION_USB_DEVICE_ATTACHED)) {
+                    changed = true;
+                }
+                if (handlePackageUpdateLocked(packageName, activities[i],
+                        UsbManager.ACTION_USB_ACCESSORY_ATTACHED)) {
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                writeSettingsLocked();
+            }
+        }
+!!!8705804.java!!!	hasPermission(inout device : UsbDevice) : boolean
+        synchronized (mLock) {
+            SparseBooleanArray uidList = mDevicePermissionMap.get(device.getDeviceName());
+            if (uidList == null) {
+                return false;
+            }
+            return uidList.get(Binder.getCallingUid());
+        }
+!!!8705932.java!!!	hasPermission(inout accessory : UsbAccessory) : boolean
+        synchronized (mLock) {
+            SparseBooleanArray uidList = mAccessoryPermissionMap.get(accessory);
+            if (uidList == null) {
+                return false;
+            }
+            return uidList.get(Binder.getCallingUid());
+        }
+!!!8706060.java!!!	checkPermission(inout device : UsbDevice) : void
+        if (!hasPermission(device)) {
+            throw new SecurityException("User has not given permission to device " + device);
+        }
+!!!8706188.java!!!	checkPermission(inout accessory : UsbAccessory) : void
+        if (!hasPermission(accessory)) {
+            throw new SecurityException("User has not given permission to accessory " + accessory);
+        }
+!!!8706316.java!!!	requestPermissionDialog(inout intent : Intent, in packageName : String, inout pi : PendingIntent) : void
+        final int uid = Binder.getCallingUid();
+
+        // compare uid with packageName to foil apps pretending to be someone else
+        try {
+            ApplicationInfo aInfo = mPackageManager.getApplicationInfo(packageName, 0);
+            if (aInfo.uid != uid) {
+                throw new IllegalArgumentException("package " + packageName +
+                        " does not match caller's uid " + uid);
+            }
+        } catch (PackageManager.NameNotFoundException e) {
+            throw new IllegalArgumentException("package " + packageName + " not found");
+        }
+
+        long identity = Binder.clearCallingIdentity();
+        intent.setClassName("com.android.systemui",
+                "com.android.systemui.usb.UsbPermissionActivity");
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        intent.putExtra(Intent.EXTRA_INTENT, pi);
+        intent.putExtra("package", packageName);
+        intent.putExtra(Intent.EXTRA_UID, uid);
+        try {
+            mUserContext.startActivityAsUser(intent, mUser);
+        } catch (ActivityNotFoundException e) {
+            Slog.e(TAG, "unable to start UsbPermissionActivity");
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!8706444.java!!!	requestPermission(inout device : UsbDevice, in packageName : String, inout pi : PendingIntent) : void
+      Intent intent = new Intent();
+
+        // respond immediately if permission has already been granted
+      if (hasPermission(device)) {
+            intent.putExtra(UsbManager.EXTRA_DEVICE, device);
+            intent.putExtra(UsbManager.EXTRA_PERMISSION_GRANTED, true);
+            try {
+                pi.send(mUserContext, 0, intent);
+            } catch (PendingIntent.CanceledException e) {
+                if (DEBUG) Slog.d(TAG, "requestPermission PendingIntent was cancelled");
+            }
+            return;
+        }
+
+        // start UsbPermissionActivity so user can choose an activity
+        intent.putExtra(UsbManager.EXTRA_DEVICE, device);
+        requestPermissionDialog(intent, packageName, pi);
+!!!8706572.java!!!	requestPermission(inout accessory : UsbAccessory, in packageName : String, inout pi : PendingIntent) : void
+        Intent intent = new Intent();
+
+        // respond immediately if permission has already been granted
+        if (hasPermission(accessory)) {
+            intent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+            intent.putExtra(UsbManager.EXTRA_PERMISSION_GRANTED, true);
+            try {
+                pi.send(mUserContext, 0, intent);
+            } catch (PendingIntent.CanceledException e) {
+                if (DEBUG) Slog.d(TAG, "requestPermission PendingIntent was cancelled");
+            }
+            return;
+        }
+
+        intent.putExtra(UsbManager.EXTRA_ACCESSORY, accessory);
+        requestPermissionDialog(intent, packageName, pi);
+!!!8706700.java!!!	setDevicePackage(inout device : UsbDevice, in packageName : String) : void
+        DeviceFilter filter = new DeviceFilter(device);
+        boolean changed = false;
+        synchronized (mLock) {
+            if (packageName == null) {
+                changed = (mDevicePreferenceMap.remove(filter) != null);
+            } else {
+                changed = !packageName.equals(mDevicePreferenceMap.get(filter));
+                if (changed) {
+                    mDevicePreferenceMap.put(filter, packageName);
+                }
+            }
+            if (changed) {
+                writeSettingsLocked();
+            }
+        }
+!!!8706828.java!!!	setAccessoryPackage(inout accessory : UsbAccessory, in packageName : String) : void
+        AccessoryFilter filter = new AccessoryFilter(accessory);
+        boolean changed = false;
+        synchronized (mLock) {
+            if (packageName == null) {
+                changed = (mAccessoryPreferenceMap.remove(filter) != null);
+            } else {
+                changed = !packageName.equals(mAccessoryPreferenceMap.get(filter));
+                if (changed) {
+                    mAccessoryPreferenceMap.put(filter, packageName);
+                }
+            }
+            if (changed) {
+                writeSettingsLocked();
+            }
+        }
+!!!8706956.java!!!	grantDevicePermission(inout device : UsbDevice, in uid : int) : void
+        synchronized (mLock) {
+            String deviceName = device.getDeviceName();
+            SparseBooleanArray uidList = mDevicePermissionMap.get(deviceName);
+            if (uidList == null) {
+                uidList = new SparseBooleanArray(1);
+                mDevicePermissionMap.put(deviceName, uidList);
+            }
+            uidList.put(uid, true);
+        }
+!!!8707084.java!!!	grantAccessoryPermission(inout accessory : UsbAccessory, in uid : int) : void
+        synchronized (mLock) {
+            SparseBooleanArray uidList = mAccessoryPermissionMap.get(accessory);
+            if (uidList == null) {
+                uidList = new SparseBooleanArray(1);
+                mAccessoryPermissionMap.put(accessory, uidList);
+            }
+            uidList.put(uid, true);
+        }
+!!!8707212.java!!!	hasDefaults(in packageName : String) : boolean
+        synchronized (mLock) {
+            if (mDevicePreferenceMap.values().contains(packageName)) return true;
+            if (mAccessoryPreferenceMap.values().contains(packageName)) return true;
+            return false;
+        }
+!!!8707340.java!!!	clearDefaults(in packageName : String) : void
+        synchronized (mLock) {
+            if (clearPackageDefaultsLocked(packageName)) {
+                writeSettingsLocked();
+            }
+        }
+!!!8707468.java!!!	clearPackageDefaultsLocked(in packageName : String) : boolean
+        boolean cleared = false;
+        synchronized (mLock) {
+            if (mDevicePreferenceMap.containsValue(packageName)) {
+                // make a copy of the key set to avoid ConcurrentModificationException
+                Object[] keys = mDevicePreferenceMap.keySet().toArray();
+                for (int i = 0; i < keys.length; i++) {
+                    Object key = keys[i];
+                    if (packageName.equals(mDevicePreferenceMap.get(key))) {
+                        mDevicePreferenceMap.remove(key);
+                        cleared = true;
+                    }
+                }
+            }
+            if (mAccessoryPreferenceMap.containsValue(packageName)) {
+                // make a copy of the key set to avoid ConcurrentModificationException
+                Object[] keys = mAccessoryPreferenceMap.keySet().toArray();
+                for (int i = 0; i < keys.length; i++) {
+                    Object key = keys[i];
+                    if (packageName.equals(mAccessoryPreferenceMap.get(key))) {
+                        mAccessoryPreferenceMap.remove(key);
+                        cleared = true;
+                    }
+                }
+            }
+            return cleared;
+        }
+!!!8707596.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter) : void
+        synchronized (mLock) {
+            pw.println("  Device permissions:");
+            for (String deviceName : mDevicePermissionMap.keySet()) {
+                pw.print("    " + deviceName + ": ");
+                SparseBooleanArray uidList = mDevicePermissionMap.get(deviceName);
+                int count = uidList.size();
+                for (int i = 0; i < count; i++) {
+                    pw.print(Integer.toString(uidList.keyAt(i)) + " ");
+                }
+                pw.println("");
+            }
+            pw.println("  Accessory permissions:");
+            for (UsbAccessory accessory : mAccessoryPermissionMap.keySet()) {
+                pw.print("    " + accessory + ": ");
+                SparseBooleanArray uidList = mAccessoryPermissionMap.get(accessory);
+                int count = uidList.size();
+                for (int i = 0; i < count; i++) {
+                    pw.print(Integer.toString(uidList.keyAt(i)) + " ");
+                }
+                pw.println("");
+            }
+            pw.println("  Device preferences:");
+            for (DeviceFilter filter : mDevicePreferenceMap.keySet()) {
+                pw.println("    " + filter + ": " + mDevicePreferenceMap.get(filter));
+            }
+            pw.println("  Accessory preferences:");
+            for (AccessoryFilter filter : mAccessoryPreferenceMap.keySet()) {
+                pw.println("    " + filter + ": " + mAccessoryPreferenceMap.get(filter));
+            }
+        }

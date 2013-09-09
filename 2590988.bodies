@@ -1,0 +1,379 @@
+class Sqlite3TableDatabase
+!!!10962572.cpp!!!	Sqlite3TableDatabase(in db_path : String8, in default_db : String8)
+    db_path_ = db_path;
+    default_db_ = default_db;
+    db_log_path_ = String8::format("%s-journal", db_path.string());
+    backup_path_ = String8::format("%s.bak", db_path.string());
+    backup_log_path_ = String8::format("%s-journal", backup_path_.string());
+!!!10962700.cpp!!!	Sqlite3TableDatabase(in db_path : char, in default_db : char)
+    db_log_path_ = String8::format("%s-journal", db_path);
+    backup_path_ = String8::format("%s.bak", db_path);
+    backup_log_path_ = String8::format("%s-journal", backup_path_.string());
+!!!10962828.cpp!!!	~Sqlite3TableDatabase()
+    system(SHELL_SYNC);
+    //Mutex::Autolock _l(update_thread_lock_);
+    update_thread_lock_.lock();
+
+    if (update_thread_id_) {
+        void* junk;
+        quit_update_thread_ = true;
+        poll_cond_.signal();
+
+        update_thread_lock_.unlock();
+        pthread_join(update_thread_id_, &junk);
+        update_thread_lock_.lock();
+    }
+    quit_update_thread_ = false;
+    update_thread_lock_.unlock();
+!!!10962956.cpp!!!	InitDbFile(in reset : int32_t = false) : bool
+    String8 shell_cmd;
+    Mutex::Autolock _l(sql_lock_);
+
+    if(reset) {
+        unlink(db_path_.string());
+        unlink(backup_path_.string());
+    }
+
+    if(access(db_path_.string(), F_OK) == -1)
+    {
+        //copy default pq database to /user setting
+        shell_cmd = String8::format(SHELL_COPY, default_db_.string(), db_path_.string());
+        AVSLOGD("%s", shell_cmd.string());
+        system(shell_cmd.string());
+
+        //backup pq database
+        shell_cmd = String8::format(SHELL_COPY, default_db_.string(), backup_path_.string());
+        AVSLOGD("%s", shell_cmd.string());
+        system(shell_cmd.string());
+
+        // Flush data
+        system(SHELL_SYNC);
+    }
+    else if (access(db_log_path_.string(), F_OK) == 0) // journal file of database is found.
+    {
+        unlink(db_log_path_.string());
+        unlink(db_path_.string());
+
+        shell_cmd = String8::format(SHELL_COPY, backup_path_.string(), db_path_.string());
+        AVSLOGD("%s", shell_cmd.string());
+        system(shell_cmd.string());
+
+        // Flush data
+        system(SHELL_SYNC);
+    }
+    else if (access(backup_log_path_.string(), F_OK) == 0)
+        // journal file of backup database is found.
+    {
+        unlink(backup_log_path_.string());
+        unlink(backup_path_.string());
+
+        shell_cmd = String8::format(SHELL_COPY, db_path_.string(), backup_path_.string());
+        AVSLOGD("%s", shell_cmd.string());
+        system(shell_cmd.string());
+
+        // Flush data
+        system(SHELL_SYNC);
+    }
+
+    int err;
+    quit_update_thread_ = false;
+    err = pthread_create(&update_thread_id_, NULL, staticUpdateThreadEntry, this);
+    if (0 != err) {
+        AVSLOGE("Failed to create pthread while starting update thread! (%d)", err);
+    }
+    return true;
+!!!10963084.cpp!!!	CreateTable(in table_name : String8, inout field_name : Vector<String8>, inout field_type : Vector<String8>) : bool
+    bool ret;
+    Mutex::Autolock _l(sql_lock_);
+    ret = createTable(db_path_, table_name, field_name, field_type);
+
+    return ret;
+!!!10963212.cpp!!!	InsertTableRecord(in table_name : String8, inout field_name : Vector<String8>, inout default_value : Vector<String8>) : bool
+    bool ret;
+    Mutex::Autolock _l(sql_lock_);
+    ret = insertTableRecord(db_path_, table_name, field_name, default_value);
+
+    return ret;
+!!!10963340.cpp!!!	FetchTableRecord(in table_name : String8, inout data_field : Vector<String8>, inout data_matix : int32_t) : bool
+    bool ret;
+    Mutex::Autolock _l(sql_lock_);
+    ret = fetchTableRecord(db_path_, table_name, data_field, data_matix);
+    ret = ret || fetchTableRecord(backup_path_, table_name, data_field, data_matix);
+
+    return ret;
+!!!10963468.cpp!!!	UpdateTableRecord(in table_name : String8, inout data_field : Vector<String8>, inout record_value : Vector<String8>) : bool
+    String8 sql_cmd;
+    sql_cmd = String8::format("UPDATE %s SET %s = %s WHERE %s = %s;",
+        table_name.string(), data_field[1].string(), record_value[1].string(),
+        data_field[0].string(), record_value[0].string());
+    AVSLOGD("SQL CMD: %s\n",sql_cmd.string());
+
+#ifdef SQL_COMMAND_LOCK
+    {
+        Mutex::Autolock _l(cmd_lock_);
+        sql_command_.add(sql_cmd);
+    }
+#else
+    sql_command_.add(sql_cmd);
+#endif
+    poll_cond_.signal();
+    return true;
+
+#if 0
+    int sql_ret = SQLITE_OK;
+    sqlite3 *sql_db = NULL;
+    char* sql_err = 0;
+    char* sql_cmd = 0;
+
+    Mutex::Autolock _l(sql_lock_);
+
+    /* Open or create sqlite db file */
+    sql_ret = sqlite3_open_v2(db_path_.string(), &sql_db, SQLITE_OPEN_READWRITE, NULL);
+    if ((sql_ret != SQLITE_OK)||(sql_db == NULL)) {
+        AVSLOGE("createDB:Cannot create db %s", db_path_.string());
+        return false;
+    }
+
+    do {
+        /* Generate SQL command */
+        sql_cmd = sqlite3_mprintf("UPDATE %s SET %s = %s WHERE %s = %s;",
+        table_name.string(), data_field[1].string(), record_value[1].string(),
+        data_field[0].string(), record_value[0].string());
+
+        AVSLOGD("SQL CMD: %s\n",sql_cmd);
+
+        /* Excute the sql cmd to create main settings table*/
+        sql_ret = sqlite3_exec(sql_db, sql_cmd, NULL, NULL, &sql_err);
+        if(sql_ret != SQLITE_OK){
+            AVSLOGE("Failure to create settings table, err %s", sql_err);
+            sqlite3_free(sql_err);
+            break;
+        }
+    }while(0);
+
+    sqlite3_free(sql_cmd);
+    sqlite3_close(sql_db);
+
+    return (sql_ret == SQLITE_OK);
+#endif
+!!!10963596.cpp!!!	ExecuteSqlCommand(in sql_command : String8) : bool
+    bool ret;
+    Mutex::Autolock _l(sql_lock_);
+    ret = executeSqlCommand(db_path_, sql_command);
+    ret = executeSqlCommand(backup_path_, sql_command) && ret;
+
+    return ret;
+!!!10963724.cpp!!!	createTable(inout db_path : String8, inout table_name : String8, inout field_name : Vector<String8>, inout field_type : Vector<String8>) : bool
+    int sql_ret = SQLITE_OK;
+    sqlite3 *sql_db = NULL;
+    char* sql_err = 0;
+    char* sql_cmd = 0;
+    unsigned int i = 0;
+
+    /* Open or create sqlite db file */
+    sql_ret = sqlite3_open_v2(db_path.string(), &sql_db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if ((sql_ret != SQLITE_OK)||(sql_db == NULL)) {
+        AVSLOGE("createDB:Cannot create db %s", db_path.string());
+        return false;
+    }
+
+    /* Generate SQL command */
+    String8 fieldStr;
+    for(i = 0; i < field_name.size() -1; i++)
+        fieldStr.appendFormat("%s %s,", field_name[i].string(), field_type[i].string());
+    fieldStr.appendFormat("%s %s", field_name[i].string(), field_type[i].string());
+
+    sql_cmd = sqlite3_mprintf("CREATE TABLE '%s' (%s);",table_name.string(), fieldStr.string());
+
+    AVSLOGD("SQL CMD: %s\n",sql_cmd);
+
+    do {
+        /* Excute the sql cmd to create main settings table*/
+        sql_ret = sqlite3_exec(sql_db, sql_cmd, NULL, NULL, &sql_err);
+        if(sql_ret != SQLITE_OK){
+            AVSLOGE("Failure to create settings table, err %s", sql_err);
+            sqlite3_free(sql_err);
+            break;
+        }
+    }while(0);
+
+    sqlite3_free(sql_cmd);
+    sqlite3_close(sql_db);
+
+    return (sql_ret == SQLITE_OK);
+!!!10963852.cpp!!!	insertTableRecord(inout db_path : String8, inout table_name : String8, inout field_name : Vector<String8>, inout default_value : Vector<String8>) : bool
+    int sql_ret = SQLITE_OK;
+    sqlite3 *sql_db = NULL;
+    char* sql_err = 0;
+    char* sql_cmd = 0;
+    unsigned int i = 0;
+
+    /* Open or create sqlite db file */
+    sql_ret = sqlite3_open_v2(db_path.string(), &sql_db, SQLITE_OPEN_READWRITE, NULL);
+    if ((sql_ret != SQLITE_OK)||(sql_db == NULL)) {
+        AVSLOGE("createDB:Cannot create db %s", db_path.string());
+        return false;
+    }
+
+    /* Generate SQL command */
+    String8 fieldStr, valueStr;
+    for(i = 0; i < field_name.size() -1; i++) {
+        fieldStr.appendFormat("%s, ", field_name[i].string());
+        valueStr.appendFormat("%s, ", default_value[i].string());
+    }
+    fieldStr.appendFormat("%s", field_name[i].string());
+    valueStr.appendFormat("%s", default_value[i].string());
+
+    sql_cmd = sqlite3_mprintf("INSERT INTO '%s' (%s) VALUES (%s);",
+        table_name.string(), fieldStr.string(), valueStr.string());
+
+    AVSLOGD("SQL CMD: %s\n",sql_cmd);
+
+    do {
+        /* Excute the sql cmd to create main settings table*/
+        sql_ret = sqlite3_exec(sql_db, sql_cmd, NULL, NULL, &sql_err);
+        if(sql_ret != SQLITE_OK){
+            AVSLOGE("Failure to create settings table, err %s", sql_err);
+            sqlite3_free(sql_err);
+            break;
+        }
+    }while(0);
+
+    sqlite3_free(sql_cmd);
+    sqlite3_close(sql_db);
+
+    return (sql_ret == SQLITE_OK);
+!!!10963980.cpp!!!	fetchTableRecord(inout db_path : String8, inout table_name : String8, inout data_field : Vector<String8>, inout data_matix : int32_t) : bool
+    int sql_ret = SQLITE_OK;
+    sqlite3_stmt *sql_stmt = NULL;
+    sqlite3 *sql_db = NULL;
+    const char *sql_tail = NULL;
+    char* sql_cmd = 0;
+    unsigned int i = 0, j;
+
+    /* open db file */
+    sql_ret = sqlite3_open_v2(db_path.string(), &sql_db, SQLITE_OPEN_READONLY, NULL);
+    if ((sql_ret != SQLITE_OK)||(sql_db == NULL)){
+        AVSLOGE("fetchDB:Cannot open %s", db_path.string());
+        return false;
+    }
+
+    /* Generate SQL command */
+    String8 fieldStr;
+    for(i = 0; i < data_field.size() -1; i++) {
+        fieldStr.appendFormat("%s, ", data_field[i].string());
+    }
+    fieldStr.appendFormat("%s", data_field[i].string());
+
+    sql_cmd = sqlite3_mprintf("SELECT %s FROM %s;",fieldStr.string(), table_name.string());
+
+    AVSLOGD("SQL CMD: %s\n",sql_cmd);
+    do {
+        sql_ret = sqlite3_prepare_v2(sql_db, sql_cmd, (strlen(sql_cmd) + 1), &sql_stmt, &sql_tail);
+        if (SQLITE_OK != sql_ret)
+        {
+            AVSLOGE("fetchDB:sqlite3_prepare_v2 failed, return code: %d, err msg: %s",
+                sql_ret, sqlite3_errmsg(sql_db));
+            /* will return detail error code during sqlite3_step */
+            break;
+        }
+
+        sql_ret = sqlite3_step(sql_stmt);
+        if(SQLITE_ROW != sql_ret)
+        {
+            AVSLOGE("fetchDB:search result is NULL, return code: %d, err msg: %s",
+                sql_ret, sqlite3_errmsg(sql_db));
+            break;
+        }
+
+        j = 0;
+        do {
+            int32_t * dataRecord = data_matix[j];
+            for(i = 0; i < data_field.size(); i++) {
+                dataRecord[i] = sqlite3_column_int(sql_stmt, i);
+            }
+            j++;
+
+            sql_ret = sqlite3_step(sql_stmt);
+            if(SQLITE_ROW != sql_ret)
+                break;
+        }while(1);
+        sql_ret = (sql_ret == SQLITE_DONE)?SQLITE_OK:SQLITE_ERROR;
+    }while(0);
+
+    sqlite3_free(sql_cmd);
+    sqlite3_finalize(sql_stmt);
+    sqlite3_close(sql_db);
+
+    return (sql_ret == SQLITE_OK);
+!!!10964108.cpp!!!	executeSqlCommand(inout db_path : String8, inout sql_command : String8) : bool
+    int sql_ret = SQLITE_OK;
+    sqlite3 *sql_db = NULL;
+    char* sql_err = 0;
+    char* sql_cmd = 0;
+
+    /* Open or create sqlite db file */
+    sql_ret = sqlite3_open_v2(db_path.string(), &sql_db, SQLITE_OPEN_READWRITE, NULL);
+    if ((sql_ret != SQLITE_OK)||(sql_db == NULL)) {
+        AVSLOGE("createDB:Cannot create db %s", db_path.string());
+        return false;
+    }
+
+    do {
+        /* Generate SQL command */
+        sql_cmd = sqlite3_mprintf("%s;", sql_command.string());
+
+        AVSLOGD("SQL CMD: %s\n",sql_cmd);
+
+        /* Excute the sql cmd to create main settings table*/
+        sql_ret = sqlite3_exec(sql_db, sql_cmd, NULL, NULL, &sql_err);
+        if(sql_ret != SQLITE_OK){
+            AVSLOGE("Failure to create settings table, err %s", sql_err);
+            sqlite3_free(sql_err);
+            break;
+        }
+    }while(0);
+
+    sqlite3_free(sql_cmd);
+    sqlite3_close(sql_db);
+    return (sql_ret == SQLITE_OK);
+!!!10964236.cpp!!!	updateSqlThread() : void
+    update_thread_lock_.lock();
+    while (!quit_update_thread_) {
+        bool ret;
+        if(sql_command_.size() == 0)
+        {
+            AVSLOGD("Wait for sql command");
+            poll_cond_.wait(update_thread_lock_);
+            //poll_cond_.waitRelative(update_thread_lock_, 2*THREAD_SECOND_TICK);
+            if(sql_command_.size() == 0)
+            {
+                continue;
+            }
+        }
+        String8 sql_cmd;
+#ifdef SQL_COMMAND_LOCK
+        {
+            Mutex::Autolock _l(cmd_lock_);
+            size_t count = sql_command_.size();
+            for(size_t i = 0; i < count; i++)
+                sql_cmd.append(sql_command_[i]);
+            sql_command_.removeItemsAt(0, count);
+        }
+#else
+        sql_cmd = sql_command_[0];
+        sql_command_.removeAt(0);
+#endif
+        AVSLOGD("SQL CMD: %s\n",sql_cmd.string());
+        {
+            Mutex::Autolock _l(sql_lock_);
+            ret = executeSqlCommand(db_path_, sql_cmd);
+            ret = executeSqlCommand(backup_path_, sql_cmd) && ret;
+        }
+        //system(SHELL_SYNC);
+        //sleep(1);
+    }
+    update_thread_lock_.unlock();
+    return NULL;
+

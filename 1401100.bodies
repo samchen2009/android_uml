@@ -1,0 +1,700 @@
+class NetworkStatsService
+!!!8574732.java!!!	NetworkStatsService(inout context : Context, inout networkManager : INetworkManagementService, inout alarmManager : IAlarmManager)
+        this(context, networkManager, alarmManager, NtpTrustedTime.getInstance(context),
+                getDefaultSystemDir(), new DefaultNetworkStatsSettings(context));
+!!!8574860.java!!!	getDefaultSystemDir() : File
+        return new File(Environment.getDataDirectory(), "system");
+!!!8574988.java!!!	NetworkStatsService(inout context : Context, inout networkManager : INetworkManagementService, inout alarmManager : IAlarmManager, inout time : TrustedTime, inout systemDir : File, inout settings : NetworkStatsSettings)
+        mContext = checkNotNull(context, "missing Context");
+        mNetworkManager = checkNotNull(networkManager, "missing INetworkManagementService");
+        mAlarmManager = checkNotNull(alarmManager, "missing IAlarmManager");
+        mTime = checkNotNull(time, "missing TrustedTime");
+        mTeleManager = checkNotNull(TelephonyManager.getDefault(), "missing TelephonyManager");
+        mSettings = checkNotNull(settings, "missing NetworkStatsSettings");
+
+        final PowerManager powerManager = (PowerManager) context.getSystemService(
+                Context.POWER_SERVICE);
+        mWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+
+        mHandlerThread = new HandlerThread(TAG);
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper(), mHandlerCallback);
+
+        mSystemDir = checkNotNull(systemDir);
+        mBaseDir = new File(systemDir, "netstats");
+        mBaseDir.mkdirs();
+!!!8575116.java!!!	bindConnectivityManager(inout connManager : IConnectivityManager) : void
+        mConnManager = checkNotNull(connManager, "missing IConnectivityManager");
+!!!8575244.java!!!	systemReady() : void
+        mSystemReady = true;
+
+        if (!isBandwidthControlEnabled()) {
+            Slog.w(TAG, "bandwidth controls disabled, unable to track stats");
+            return;
+        }
+
+        // create data recorders along with historical rotators
+        mDevRecorder = buildRecorder(PREFIX_DEV, mSettings.getDevConfig(), false);
+        mXtRecorder = buildRecorder(PREFIX_XT, mSettings.getXtConfig(), false);
+        mUidRecorder = buildRecorder(PREFIX_UID, mSettings.getUidConfig(), false);
+        mUidTagRecorder = buildRecorder(PREFIX_UID_TAG, mSettings.getUidTagConfig(), true);
+
+        updatePersistThresholds();
+
+        synchronized (mStatsLock) {
+            // upgrade any legacy stats, migrating them to rotated files
+            maybeUpgradeLegacyStatsLocked();
+
+            // read historical network stats from disk, since policy service
+            // might need them right away.
+            mDevStatsCached = mDevRecorder.getOrLoadCompleteLocked();
+            mXtStatsCached = mXtRecorder.getOrLoadCompleteLocked();
+
+            // bootstrap initial stats to prevent double-counting later
+            bootstrapStatsLocked();
+        }
+
+        // watch for network interfaces to be claimed
+        final IntentFilter connFilter = new IntentFilter(CONNECTIVITY_ACTION_IMMEDIATE);
+        mContext.registerReceiver(mConnReceiver, connFilter, CONNECTIVITY_INTERNAL, mHandler);
+
+        // watch for tethering changes
+        final IntentFilter tetherFilter = new IntentFilter(ACTION_TETHER_STATE_CHANGED);
+        mContext.registerReceiver(mTetherReceiver, tetherFilter, CONNECTIVITY_INTERNAL, mHandler);
+
+        // listen for periodic polling events
+        final IntentFilter pollFilter = new IntentFilter(ACTION_NETWORK_STATS_POLL);
+        mContext.registerReceiver(mPollReceiver, pollFilter, READ_NETWORK_USAGE_HISTORY, mHandler);
+
+        // listen for uid removal to clean stats
+        final IntentFilter removedFilter = new IntentFilter(ACTION_UID_REMOVED);
+        mContext.registerReceiver(mRemovedReceiver, removedFilter, null, mHandler);
+
+        // listen for user changes to clean stats
+        final IntentFilter userFilter = new IntentFilter(ACTION_USER_REMOVED);
+        mContext.registerReceiver(mUserReceiver, userFilter, null, mHandler);
+
+        // persist stats during clean shutdown
+        final IntentFilter shutdownFilter = new IntentFilter(ACTION_SHUTDOWN);
+        mContext.registerReceiver(mShutdownReceiver, shutdownFilter);
+
+        try {
+            mNetworkManager.registerObserver(mAlertObserver);
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+        }
+
+        // watch for networkType changes that aren't broadcast through
+        // CONNECTIVITY_ACTION_IMMEDIATE above.
+        if (!COMBINE_SUBTYPE_ENABLED) {
+            mTeleManager.listen(mPhoneListener, LISTEN_DATA_CONNECTION_STATE);
+        }
+
+        registerPollAlarmLocked();
+        registerGlobalAlert();
+!!!8575372.java!!!	buildRecorder(in prefix : String, inout config : Config, inout includeTags : boolean) : NetworkStatsRecorder
+        final DropBoxManager dropBox = (DropBoxManager) mContext.getSystemService(
+                Context.DROPBOX_SERVICE);
+        return new NetworkStatsRecorder(new FileRotator(
+                mBaseDir, prefix, config.rotateAgeMillis, config.deleteAgeMillis),
+                mNonMonotonicObserver, dropBox, prefix, config.bucketDuration, includeTags);
+!!!8575500.java!!!	shutdownLocked() : void
+        mContext.unregisterReceiver(mConnReceiver);
+        mContext.unregisterReceiver(mTetherReceiver);
+        mContext.unregisterReceiver(mPollReceiver);
+        mContext.unregisterReceiver(mRemovedReceiver);
+        mContext.unregisterReceiver(mShutdownReceiver);
+
+        if (!COMBINE_SUBTYPE_ENABLED) {
+            mTeleManager.listen(mPhoneListener, LISTEN_NONE);
+        }
+
+        final long currentTime = mTime.hasCache() ? mTime.currentTimeMillis()
+                : System.currentTimeMillis();
+
+        // persist any pending stats
+        mDevRecorder.forcePersistLocked(currentTime);
+        mXtRecorder.forcePersistLocked(currentTime);
+        mUidRecorder.forcePersistLocked(currentTime);
+        mUidTagRecorder.forcePersistLocked(currentTime);
+
+        mDevRecorder = null;
+        mXtRecorder = null;
+        mUidRecorder = null;
+        mUidTagRecorder = null;
+
+        mDevStatsCached = null;
+        mXtStatsCached = null;
+
+        mSystemReady = false;
+!!!8575628.java!!!	maybeUpgradeLegacyStatsLocked() : void
+        File file;
+        try {
+            file = new File(mSystemDir, "netstats.bin");
+            if (file.exists()) {
+                mDevRecorder.importLegacyNetworkLocked(file);
+                file.delete();
+            }
+
+            file = new File(mSystemDir, "netstats_xt.bin");
+            if (file.exists()) {
+                file.delete();
+            }
+
+            file = new File(mSystemDir, "netstats_uid.bin");
+            if (file.exists()) {
+                mUidRecorder.importLegacyUidLocked(file);
+                mUidTagRecorder.importLegacyUidLocked(file);
+                file.delete();
+            }
+        } catch (IOException e) {
+            Log.wtf(TAG, "problem during legacy upgrade", e);
+        }
+!!!8575756.java!!!	registerPollAlarmLocked() : void
+        try {
+            if (mPollIntent != null) {
+                mAlarmManager.remove(mPollIntent);
+            }
+
+            mPollIntent = PendingIntent.getBroadcast(
+                    mContext, 0, new Intent(ACTION_NETWORK_STATS_POLL), 0);
+
+            final long currentRealtime = SystemClock.elapsedRealtime();
+            mAlarmManager.setInexactRepeating(AlarmManager.ELAPSED_REALTIME, currentRealtime,
+                    mSettings.getPollInterval(), mPollIntent);
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+        }
+!!!8575884.java!!!	registerGlobalAlert() : void
+        try {
+            mNetworkManager.setGlobalAlert(mGlobalAlertBytes);
+        } catch (IllegalStateException e) {
+            Slog.w(TAG, "problem registering for global alert: " + e);
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+        }
+!!!8576012.java!!!	openSession() : INetworkStatsSession
+        mContext.enforceCallingOrSelfPermission(READ_NETWORK_USAGE_HISTORY, TAG);
+        assertBandwidthControlEnabled();
+
+        // return an IBinder which holds strong references to any loaded stats
+        // for its lifetime; when caller closes only weak references remain.
+
+        return new INetworkStatsSession.Stub() {
+            private NetworkStatsCollection mUidComplete;
+            private NetworkStatsCollection mUidTagComplete;
+
+            private NetworkStatsCollection getUidComplete() {
+                if (mUidComplete == null) {
+                    synchronized (mStatsLock) {
+                        mUidComplete = mUidRecorder.getOrLoadCompleteLocked();
+                    }
+                }
+                return mUidComplete;
+            }
+
+            private NetworkStatsCollection getUidTagComplete() {
+                if (mUidTagComplete == null) {
+                    synchronized (mStatsLock) {
+                        mUidTagComplete = mUidTagRecorder.getOrLoadCompleteLocked();
+                    }
+                }
+                return mUidTagComplete;
+            }
+
+            @Override
+            public NetworkStats getSummaryForNetwork(
+                    NetworkTemplate template, long start, long end) {
+                return internalGetSummaryForNetwork(template, start, end);
+            }
+
+            @Override
+            public NetworkStatsHistory getHistoryForNetwork(NetworkTemplate template, int fields) {
+                return internalGetHistoryForNetwork(template, fields);
+            }
+
+            @Override
+            public NetworkStats getSummaryForAllUid(
+                    NetworkTemplate template, long start, long end, boolean includeTags) {
+                final NetworkStats stats = getUidComplete().getSummary(template, start, end);
+                if (includeTags) {
+                    final NetworkStats tagStats = getUidTagComplete()
+                            .getSummary(template, start, end);
+                    stats.combineAllValues(tagStats);
+                }
+                return stats;
+            }
+
+            @Override
+            public NetworkStatsHistory getHistoryForUid(
+                    NetworkTemplate template, int uid, int set, int tag, int fields) {
+                if (tag == TAG_NONE) {
+                    return getUidComplete().getHistory(template, uid, set, tag, fields);
+                } else {
+                    return getUidTagComplete().getHistory(template, uid, set, tag, fields);
+                }
+            }
+
+            @Override
+            public void close() {
+                mUidComplete = null;
+                mUidTagComplete = null;
+            }
+        };
+!!!8576140.java!!!	internalGetSummaryForNetwork(inout template : NetworkTemplate, in start : long, in end : long) : NetworkStats
+        if (!mSettings.getReportXtOverDev()) {
+            // shortcut when XT reporting disabled
+            return mDevStatsCached.getSummary(template, start, end);
+        }
+
+        // splice stats between DEV and XT, switching over from DEV to XT at
+        // first atomic bucket.
+        final long firstAtomicBucket = mXtStatsCached.getFirstAtomicBucketMillis();
+        final NetworkStats dev = mDevStatsCached.getSummary(
+                template, Math.min(start, firstAtomicBucket), Math.min(end, firstAtomicBucket));
+        final NetworkStats xt = mXtStatsCached.getSummary(
+                template, Math.max(start, firstAtomicBucket), Math.max(end, firstAtomicBucket));
+
+        xt.combineAllValues(dev);
+        return xt;
+!!!8576268.java!!!	internalGetHistoryForNetwork(inout template : NetworkTemplate, in fields : int) : NetworkStatsHistory
+        if (!mSettings.getReportXtOverDev()) {
+            // shortcut when XT reporting disabled
+            return mDevStatsCached.getHistory(template, UID_ALL, SET_ALL, TAG_NONE, fields);
+        }
+
+        // splice stats between DEV and XT, switching over from DEV to XT at
+        // first atomic bucket.
+        final long firstAtomicBucket = mXtStatsCached.getFirstAtomicBucketMillis();
+        final NetworkStatsHistory dev = mDevStatsCached.getHistory(
+                template, UID_ALL, SET_ALL, TAG_NONE, fields, Long.MIN_VALUE, firstAtomicBucket);
+        final NetworkStatsHistory xt = mXtStatsCached.getHistory(
+                template, UID_ALL, SET_ALL, TAG_NONE, fields, firstAtomicBucket, Long.MAX_VALUE);
+
+        xt.recordEntireHistory(dev);
+        return xt;
+!!!8576396.java!!!	getNetworkTotalBytes(inout template : NetworkTemplate, in start : long, in end : long) : long
+        mContext.enforceCallingOrSelfPermission(READ_NETWORK_USAGE_HISTORY, TAG);
+        assertBandwidthControlEnabled();
+        return internalGetSummaryForNetwork(template, start, end).getTotalBytes();
+!!!8576524.java!!!	getDataLayerSnapshotForUid(in uid : int) : NetworkStats
+        if (Binder.getCallingUid() != uid) {
+            mContext.enforceCallingOrSelfPermission(ACCESS_NETWORK_STATE, TAG);
+        }
+        assertBandwidthControlEnabled();
+
+        // TODO: switch to data layer stats once kernel exports
+        // for now, read network layer stats and flatten across all ifaces
+        final long token = Binder.clearCallingIdentity();
+        final NetworkStats networkLayer;
+        try {
+            networkLayer = mNetworkManager.getNetworkStatsUidDetail(uid);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+
+        // splice in operation counts
+        networkLayer.spliceOperationsFrom(mUidOperations);
+
+        final NetworkStats dataLayer = new NetworkStats(
+                networkLayer.getElapsedRealtime(), networkLayer.size());
+
+        NetworkStats.Entry entry = null;
+        for (int i = 0; i < networkLayer.size(); i++) {
+            entry = networkLayer.getValues(i, entry);
+            entry.iface = IFACE_ALL;
+            dataLayer.combineValues(entry);
+        }
+
+        return dataLayer;
+!!!8576652.java!!!	getMobileIfaces() : String
+        return mMobileIfaces;
+!!!8576780.java!!!	incrementOperationCount(in uid : int, in tag : int, in operationCount : int) : void
+        if (Binder.getCallingUid() != uid) {
+            mContext.enforceCallingOrSelfPermission(MODIFY_NETWORK_ACCOUNTING, TAG);
+        }
+
+        if (operationCount < 0) {
+            throw new IllegalArgumentException("operation count can only be incremented");
+        }
+        if (tag == TAG_NONE) {
+            throw new IllegalArgumentException("operation count must have specific tag");
+        }
+
+        synchronized (mStatsLock) {
+            final int set = mActiveUidCounterSet.get(uid, SET_DEFAULT);
+            mUidOperations.combineValues(
+                    mActiveIface, uid, set, tag, 0L, 0L, 0L, 0L, operationCount);
+            mUidOperations.combineValues(
+                    mActiveIface, uid, set, TAG_NONE, 0L, 0L, 0L, 0L, operationCount);
+        }
+!!!8576908.java!!!	setUidForeground(in uid : int, inout uidForeground : boolean) : void
+        mContext.enforceCallingOrSelfPermission(MODIFY_NETWORK_ACCOUNTING, TAG);
+
+        synchronized (mStatsLock) {
+            final int set = uidForeground ? SET_FOREGROUND : SET_DEFAULT;
+            final int oldSet = mActiveUidCounterSet.get(uid, SET_DEFAULT);
+            if (oldSet != set) {
+                mActiveUidCounterSet.put(uid, set);
+                setKernelCounterSet(uid, set);
+            }
+        }
+!!!8577036.java!!!	forceUpdate() : void
+        mContext.enforceCallingOrSelfPermission(READ_NETWORK_USAGE_HISTORY, TAG);
+        assertBandwidthControlEnabled();
+
+        final long token = Binder.clearCallingIdentity();
+        try {
+            performPoll(FLAG_PERSIST_ALL);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!8577164.java!!!	advisePersistThreshold(in thresholdBytes : long) : void
+        mContext.enforceCallingOrSelfPermission(MODIFY_NETWORK_ACCOUNTING, TAG);
+        assertBandwidthControlEnabled();
+
+        // clamp threshold into safe range
+        mPersistThreshold = MathUtils.constrain(thresholdBytes, 128 * KB_IN_BYTES, 2 * MB_IN_BYTES);
+        if (LOGV) {
+            Slog.v(TAG, "advisePersistThreshold() given " + thresholdBytes + ", clamped to "
+                    + mPersistThreshold);
+        }
+
+        // update and persist if beyond new thresholds
+        final long currentTime = mTime.hasCache() ? mTime.currentTimeMillis()
+                : System.currentTimeMillis();
+        synchronized (mStatsLock) {
+            if (!mSystemReady) return;
+
+            updatePersistThresholds();
+
+            mDevRecorder.maybePersistLocked(currentTime);
+            mXtRecorder.maybePersistLocked(currentTime);
+            mUidRecorder.maybePersistLocked(currentTime);
+            mUidTagRecorder.maybePersistLocked(currentTime);
+        }
+
+        // re-arm global alert
+        registerGlobalAlert();
+!!!8577292.java!!!	updatePersistThresholds() : void
+        mDevRecorder.setPersistThreshold(mSettings.getDevPersistBytes(mPersistThreshold));
+        mXtRecorder.setPersistThreshold(mSettings.getXtPersistBytes(mPersistThreshold));
+        mUidRecorder.setPersistThreshold(mSettings.getUidPersistBytes(mPersistThreshold));
+        mUidTagRecorder.setPersistThreshold(mSettings.getUidTagPersistBytes(mPersistThreshold));
+        mGlobalAlertBytes = mSettings.getGlobalAlertBytes(mPersistThreshold);
+!!!8577420.java!!!	updateIfaces() : void
+        synchronized (mStatsLock) {
+            mWakeLock.acquire();
+            try {
+                updateIfacesLocked();
+            } finally {
+                mWakeLock.release();
+            }
+        }
+!!!8577548.java!!!	updateIfacesLocked() : void
+        if (!mSystemReady) return;
+        if (LOGV) Slog.v(TAG, "updateIfacesLocked()");
+
+        // take one last stats snapshot before updating iface mapping. this
+        // isn't perfect, since the kernel may already be counting traffic from
+        // the updated network.
+
+        // poll, but only persist network stats to keep codepath fast. UID stats
+        // will be persisted during next alarm poll event.
+        performPollLocked(FLAG_PERSIST_NETWORK);
+
+        final NetworkState[] states;
+        final LinkProperties activeLink;
+        try {
+            states = mConnManager.getAllNetworkState();
+            activeLink = mConnManager.getActiveLinkProperties();
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+            return;
+        }
+
+        mActiveIface = activeLink != null ? activeLink.getInterfaceName() : null;
+
+        // rebuild active interfaces based on connected networks
+        mActiveIfaces.clear();
+
+        for (NetworkState state : states) {
+            if (state.networkInfo.isConnected()) {
+                // collect networks under their parent interfaces
+                final String iface = state.linkProperties.getInterfaceName();
+
+                NetworkIdentitySet ident = mActiveIfaces.get(iface);
+                if (ident == null) {
+                    ident = new NetworkIdentitySet();
+                    mActiveIfaces.put(iface, ident);
+                }
+
+                ident.add(NetworkIdentity.buildNetworkIdentity(mContext, state));
+
+                // remember any ifaces associated with mobile networks
+                if (isNetworkTypeMobile(state.networkInfo.getType()) && iface != null) {
+                    if (!contains(mMobileIfaces, iface)) {
+                        mMobileIfaces = appendElement(String.class, mMobileIfaces, iface);
+                    }
+                }
+            }
+        }
+!!!8577676.java!!!	bootstrapStatsLocked() : void
+        final long currentTime = mTime.hasCache() ? mTime.currentTimeMillis()
+                : System.currentTimeMillis();
+
+        try {
+            // snapshot and record current counters; read UID stats first to
+            // avoid overcounting dev stats.
+            final NetworkStats uidSnapshot = getNetworkStatsUidDetail();
+            final NetworkStats xtSnapshot = mNetworkManager.getNetworkStatsSummaryXt();
+            final NetworkStats devSnapshot = mNetworkManager.getNetworkStatsSummaryDev();
+
+            mDevRecorder.recordSnapshotLocked(devSnapshot, mActiveIfaces, currentTime);
+            mXtRecorder.recordSnapshotLocked(xtSnapshot, mActiveIfaces, currentTime);
+            mUidRecorder.recordSnapshotLocked(uidSnapshot, mActiveIfaces, currentTime);
+            mUidTagRecorder.recordSnapshotLocked(uidSnapshot, mActiveIfaces, currentTime);
+
+        } catch (IllegalStateException e) {
+            Slog.w(TAG, "problem reading network stats: " + e);
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+        }
+!!!8577804.java!!!	performPoll(in flags : int) : void
+        synchronized (mStatsLock) {
+            mWakeLock.acquire();
+
+            // try refreshing time source when stale
+            if (mTime.getCacheAge() > mSettings.getTimeCacheMaxAge()) {
+                mTime.forceRefresh();
+            }
+
+            try {
+                performPollLocked(flags);
+            } finally {
+                mWakeLock.release();
+            }
+        }
+!!!8577932.java!!!	performPollLocked(in flags : int) : void
+        if (!mSystemReady) return;
+        if (LOGV) Slog.v(TAG, "performPollLocked(flags=0x" + Integer.toHexString(flags) + ")");
+
+        final long startRealtime = SystemClock.elapsedRealtime();
+
+        final boolean persistNetwork = (flags & FLAG_PERSIST_NETWORK) != 0;
+        final boolean persistUid = (flags & FLAG_PERSIST_UID) != 0;
+        final boolean persistForce = (flags & FLAG_PERSIST_FORCE) != 0;
+
+        // TODO: consider marking "untrusted" times in historical stats
+        final long currentTime = mTime.hasCache() ? mTime.currentTimeMillis()
+                : System.currentTimeMillis();
+
+        try {
+            // snapshot and record current counters; read UID stats first to
+            // avoid overcounting dev stats.
+            final NetworkStats uidSnapshot = getNetworkStatsUidDetail();
+            final NetworkStats xtSnapshot = mNetworkManager.getNetworkStatsSummaryXt();
+            final NetworkStats devSnapshot = mNetworkManager.getNetworkStatsSummaryDev();
+
+            mDevRecorder.recordSnapshotLocked(devSnapshot, mActiveIfaces, currentTime);
+            mXtRecorder.recordSnapshotLocked(xtSnapshot, mActiveIfaces, currentTime);
+            mUidRecorder.recordSnapshotLocked(uidSnapshot, mActiveIfaces, currentTime);
+            mUidTagRecorder.recordSnapshotLocked(uidSnapshot, mActiveIfaces, currentTime);
+
+        } catch (IllegalStateException e) {
+            Log.wtf(TAG, "problem reading network stats", e);
+            return;
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+            return;
+        }
+
+        // persist any pending data depending on requested flags
+        if (persistForce) {
+            mDevRecorder.forcePersistLocked(currentTime);
+            mXtRecorder.forcePersistLocked(currentTime);
+            mUidRecorder.forcePersistLocked(currentTime);
+            mUidTagRecorder.forcePersistLocked(currentTime);
+        } else {
+            if (persistNetwork) {
+                mDevRecorder.maybePersistLocked(currentTime);
+                mXtRecorder.maybePersistLocked(currentTime);
+            }
+            if (persistUid) {
+                mUidRecorder.maybePersistLocked(currentTime);
+                mUidTagRecorder.maybePersistLocked(currentTime);
+            }
+        }
+
+        if (LOGV) {
+            final long duration = SystemClock.elapsedRealtime() - startRealtime;
+            Slog.v(TAG, "performPollLocked() took " + duration + "ms");
+        }
+
+        if (mSettings.getSampleEnabled()) {
+            // sample stats after each full poll
+            performSampleLocked();
+        }
+
+        // finally, dispatch updated event to any listeners
+        final Intent updatedIntent = new Intent(ACTION_NETWORK_STATS_UPDATED);
+        updatedIntent.setFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
+        mContext.sendBroadcastAsUser(updatedIntent, UserHandle.ALL,
+                READ_NETWORK_USAGE_HISTORY);
+!!!8578060.java!!!	performSampleLocked() : void
+        // TODO: migrate trustedtime fixes to separate binary log events
+        final long trustedTime = mTime.hasCache() ? mTime.currentTimeMillis() : -1;
+
+        NetworkTemplate template;
+        NetworkStats.Entry devTotal;
+        NetworkStats.Entry xtTotal;
+        NetworkStats.Entry uidTotal;
+
+        // collect mobile sample
+        template = buildTemplateMobileWildcard();
+        devTotal = mDevRecorder.getTotalSinceBootLocked(template);
+        xtTotal = mXtRecorder.getTotalSinceBootLocked(template);
+        uidTotal = mUidRecorder.getTotalSinceBootLocked(template);
+
+        EventLogTags.writeNetstatsMobileSample(
+                devTotal.rxBytes, devTotal.rxPackets, devTotal.txBytes, devTotal.txPackets,
+                xtTotal.rxBytes, xtTotal.rxPackets, xtTotal.txBytes, xtTotal.txPackets,
+                uidTotal.rxBytes, uidTotal.rxPackets, uidTotal.txBytes, uidTotal.txPackets,
+                trustedTime);
+
+        // collect wifi sample
+        template = buildTemplateWifiWildcard();
+        devTotal = mDevRecorder.getTotalSinceBootLocked(template);
+        xtTotal = mXtRecorder.getTotalSinceBootLocked(template);
+        uidTotal = mUidRecorder.getTotalSinceBootLocked(template);
+
+        EventLogTags.writeNetstatsWifiSample(
+                devTotal.rxBytes, devTotal.rxPackets, devTotal.txBytes, devTotal.txPackets,
+                xtTotal.rxBytes, xtTotal.rxPackets, xtTotal.txBytes, xtTotal.txPackets,
+                uidTotal.rxBytes, uidTotal.rxPackets, uidTotal.txBytes, uidTotal.txPackets,
+                trustedTime);
+!!!8578188.java!!!	removeUidsLocked(inout  : int...uids) : void
+        if (LOGV) Slog.v(TAG, "removeUidsLocked() for UIDs " + Arrays.toString(uids));
+
+        // Perform one last poll before removing
+        performPollLocked(FLAG_PERSIST_ALL);
+
+        mUidRecorder.removeUidsLocked(uids);
+        mUidTagRecorder.removeUidsLocked(uids);
+
+        // Clear kernel stats associated with UID
+        for (int uid : uids) {
+            resetKernelUidStats(uid);
+        }
+!!!8578316.java!!!	removeUserLocked(in userId : int) : void
+        if (LOGV) Slog.v(TAG, "removeUserLocked() for userId=" + userId);
+
+        // Build list of UIDs that we should clean up
+        int[] uids = new int[0];
+        final List<ApplicationInfo> apps = mContext.getPackageManager().getInstalledApplications(
+                PackageManager.GET_UNINSTALLED_PACKAGES | PackageManager.GET_DISABLED_COMPONENTS);
+        for (ApplicationInfo app : apps) {
+            final int uid = UserHandle.getUid(userId, app.uid);
+            uids = ArrayUtils.appendInt(uids, uid);
+        }
+
+        removeUidsLocked(uids);
+!!!8578444.java!!!	dump(inout fd : FileDescriptor, inout writer : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(DUMP, TAG);
+
+        final HashSet<String> argSet = new HashSet<String>();
+        for (String arg : args) {
+            argSet.add(arg);
+        }
+
+        // usage: dumpsys netstats --full --uid --tag --poll --checkin
+        final boolean poll = argSet.contains("--poll") || argSet.contains("poll");
+        final boolean checkin = argSet.contains("--checkin");
+        final boolean fullHistory = argSet.contains("--full") || argSet.contains("full");
+        final boolean includeUid = argSet.contains("--uid") || argSet.contains("detail");
+        final boolean includeTag = argSet.contains("--tag") || argSet.contains("detail");
+
+        final IndentingPrintWriter pw = new IndentingPrintWriter(writer, "  ");
+
+        synchronized (mStatsLock) {
+            if (poll) {
+                performPollLocked(FLAG_PERSIST_ALL | FLAG_PERSIST_FORCE);
+                pw.println("Forced poll");
+                return;
+            }
+
+            if (checkin) {
+                // list current stats files to verify rotation
+                pw.println("Current files:");
+                pw.increaseIndent();
+                for (String file : mBaseDir.list()) {
+                    pw.println(file);
+                }
+                pw.decreaseIndent();
+                return;
+            }
+
+            pw.println("Active interfaces:");
+            pw.increaseIndent();
+            for (String iface : mActiveIfaces.keySet()) {
+                final NetworkIdentitySet ident = mActiveIfaces.get(iface);
+                pw.print("iface="); pw.print(iface);
+                pw.print(" ident="); pw.println(ident.toString());
+            }
+            pw.decreaseIndent();
+
+            pw.println("Dev stats:");
+            pw.increaseIndent();
+            mDevRecorder.dumpLocked(pw, fullHistory);
+            pw.decreaseIndent();
+
+            pw.println("Xt stats:");
+            pw.increaseIndent();
+            mXtRecorder.dumpLocked(pw, fullHistory);
+            pw.decreaseIndent();
+
+            if (includeUid) {
+                pw.println("UID stats:");
+                pw.increaseIndent();
+                mUidRecorder.dumpLocked(pw, fullHistory);
+                pw.decreaseIndent();
+            }
+
+            if (includeTag) {
+                pw.println("UID tag stats:");
+                pw.increaseIndent();
+                mUidTagRecorder.dumpLocked(pw, fullHistory);
+                pw.decreaseIndent();
+            }
+        }
+!!!8578572.java!!!	getNetworkStatsUidDetail() : NetworkStats
+        final NetworkStats uidSnapshot = mNetworkManager.getNetworkStatsUidDetail(UID_ALL);
+
+        // fold tethering stats and operations into uid snapshot
+        final NetworkStats tetherSnapshot = getNetworkStatsTethering();
+        uidSnapshot.combineAllValues(tetherSnapshot);
+        uidSnapshot.combineAllValues(mUidOperations);
+
+        return uidSnapshot;
+!!!8578700.java!!!	getNetworkStatsTethering() : NetworkStats
+        try {
+            final String[] tetheredIfacePairs = mConnManager.getTetheredIfacePairs();
+            return mNetworkManager.getNetworkStatsTethering(tetheredIfacePairs);
+        } catch (IllegalStateException e) {
+            Log.wtf(TAG, "problem reading network stats", e);
+            return new NetworkStats(0L, 10);
+        }
+!!!8578828.java!!!	assertBandwidthControlEnabled() : void
+        if (!isBandwidthControlEnabled()) {
+            throw new IllegalStateException("Bandwidth module disabled");
+        }
+!!!8578956.java!!!	isBandwidthControlEnabled() : boolean
+        final long token = Binder.clearCallingIdentity();
+        try {
+            return mNetworkManager.isBandwidthControlEnabled();
+        } catch (RemoteException e) {
+            // ignored; service lives in system_server
+            return false;
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }

@@ -1,0 +1,1539 @@
+class MPEG4Extractor
+!!!638220.cpp!!!	countTracks() : size_t
+    status_t err;
+    if ((err = readMetaData()) != OK) {
+        return 0;
+    }
+
+    size_t n = 0;
+    Track *track = mFirstTrack;
+    while (track) {
+        ++n;
+        track = track->next;
+    }
+
+    return n;
+!!!638348.cpp!!!	getTrack(in index : size_t) : sp<MediaSource>
+    status_t err;
+    if ((err = readMetaData()) != OK) {
+        return NULL;
+    }
+
+    Track *track = mFirstTrack;
+    while (index > 0) {
+        if (track == NULL) {
+            return NULL;
+        }
+
+        track = track->next;
+        --index;
+    }
+
+    if (track == NULL) {
+        return NULL;
+    }
+
+    return new MPEG4Source(
+            track->meta, mDataSource, track->timescale, track->sampleTable);
+!!!638476.cpp!!!	getTrackMetaData(in index : size_t, in flags : uint32_t) : sp<MetaData>
+    status_t err;
+    if ((err = readMetaData()) != OK) {
+        return NULL;
+    }
+
+    Track *track = mFirstTrack;
+    while (index > 0) {
+        if (track == NULL) {
+            return NULL;
+        }
+
+        track = track->next;
+        --index;
+    }
+
+    if (track == NULL) {
+        return NULL;
+    }
+
+    if ((flags & kIncludeExtensiveMetaData)
+            && !track->includes_expensive_metadata) {
+        track->includes_expensive_metadata = true;
+
+        const char *mime;
+        CHECK(track->meta->findCString(kKeyMIMEType, &mime));
+        if (!strncasecmp("video/", mime, 6)) {
+            uint32_t sampleIndex;
+            uint32_t sampleTime;
+            if (track->sampleTable->findThumbnailSample(&sampleIndex) == OK
+                    && track->sampleTable->getMetaDataForSample(
+                        sampleIndex, NULL /* offset */, NULL /* size */,
+                        &sampleTime) == OK) {
+                track->meta->setInt64(
+                        kKeyThumbnailTime,
+                        ((int64_t)sampleTime * 1000000) / track->timescale);
+            }
+        }
+    }
+
+    return track->meta;
+!!!638604.cpp!!!	getMetaData() : sp<MetaData>
+    status_t err;
+    if ((err = readMetaData()) != OK) {
+        return new MetaData;
+    }
+
+    return mFileMetaData;
+!!!638732.cpp!!!	getDrmTrackInfo(in trackID : size_t, inout len : int) : char
+    if (mFirstSINF == NULL) {
+        return NULL;
+    }
+
+    SINF *sinf = mFirstSINF;
+    while (sinf && (trackID != sinf->trackID)) {
+        sinf = sinf->next;
+    }
+
+    if (sinf == NULL) {
+        return NULL;
+    }
+
+    *len = sinf->len;
+    return sinf->IPMPData;
+!!!638860.cpp!!!	~MPEG4Extractor()
+    Track *track = mFirstTrack;
+    while (track) {
+        Track *next = track->next;
+
+        delete track;
+        track = next;
+    }
+    mFirstTrack = mLastTrack = NULL;
+
+    SINF *sinf = mFirstSINF;
+    while (sinf) {
+        SINF *next = sinf->next;
+        delete sinf->IPMPData;
+        delete sinf;
+        sinf = next;
+    }
+    mFirstSINF = NULL;
+!!!638988.cpp!!!	readMetaData() : status_t
+    if (mInitCheck != NO_INIT) {
+        return mInitCheck;
+    }
+
+    off64_t offset = 0;
+    status_t err;
+    while ((err = parseChunk(&offset, 0)) == OK) {
+    }
+
+    if (mInitCheck == OK) {
+        if (mHasVideo) {
+            mFileMetaData->setCString(
+                    kKeyMIMEType, MEDIA_MIMETYPE_CONTAINER_MPEG4);
+        } else {
+            mFileMetaData->setCString(kKeyMIMEType, "audio/mp4");
+        }
+
+        mInitCheck = OK;
+    } else {
+        mInitCheck = err;
+    }
+
+    CHECK_NE(err, (status_t)NO_INIT);
+    return mInitCheck;
+!!!639116.cpp!!!	parseChunk(inout offset : off64_t, in depth : int) : status_t
+    ALOGV("entering parseChunk %lld/%d", *offset, depth);
+    uint32_t hdr[2];
+    if (mDataSource->readAt(*offset, hdr, 8) < 8) {
+        return ERROR_IO;
+    }
+    uint64_t chunk_size = ntohl(hdr[0]);
+    uint32_t chunk_type = ntohl(hdr[1]);
+    off64_t data_offset = *offset + 8;
+
+    if (chunk_size == 1) {
+        if (mDataSource->readAt(*offset + 8, &chunk_size, 8) < 8) {
+            return ERROR_IO;
+        }
+        chunk_size = ntoh64(chunk_size);
+        data_offset += 8;
+
+        if (chunk_size < 16) {
+            // The smallest valid chunk is 16 bytes long in this case.
+            return ERROR_MALFORMED;
+        }
+    } else if (chunk_size < 8) {
+        // The smallest valid chunk is 8 bytes long.
+        return ERROR_MALFORMED;
+    }
+
+    char chunk[5];
+    MakeFourCCString(chunk_type, chunk);
+    ALOGV("chunk: %s @ %lld", chunk, *offset);
+
+#if 0
+    static const char kWhitespace[] = "                                        ";
+    const char *indent = &kWhitespace[sizeof(kWhitespace) - 1 - 2 * depth];
+    printf("%sfound chunk '%s' of size %lld\n", indent, chunk, chunk_size);
+
+    char buffer[256];
+    size_t n = chunk_size;
+    if (n > sizeof(buffer)) {
+        n = sizeof(buffer);
+    }
+    if (mDataSource->readAt(*offset, buffer, n)
+            < (ssize_t)n) {
+        return ERROR_IO;
+    }
+
+    hexdump(buffer, n);
+#endif
+
+    PathAdder autoAdder(&mPath, chunk_type);
+
+    off64_t chunk_data_size = *offset + chunk_size - data_offset;
+
+    if (chunk_type != FOURCC('c', 'p', 'r', 't')
+            && chunk_type != FOURCC('c', 'o', 'v', 'r')
+            && mPath.size() == 5 && underMetaDataPath(mPath)) {
+        off64_t stop_offset = *offset + chunk_size;
+        *offset = data_offset;
+        while (*offset < stop_offset) {
+            status_t err = parseChunk(offset, depth + 1);
+            if (err != OK) {
+                return err;
+            }
+        }
+
+        if (*offset != stop_offset) {
+            return ERROR_MALFORMED;
+        }
+
+        return OK;
+    }
+
+    switch(chunk_type) {
+        case FOURCC('m', 'o', 'o', 'v'):
+        case FOURCC('t', 'r', 'a', 'k'):
+        case FOURCC('m', 'd', 'i', 'a'):
+        case FOURCC('m', 'i', 'n', 'f'):
+        case FOURCC('d', 'i', 'n', 'f'):
+        case FOURCC('s', 't', 'b', 'l'):
+        case FOURCC('m', 'v', 'e', 'x'):
+        case FOURCC('m', 'o', 'o', 'f'):
+        case FOURCC('t', 'r', 'a', 'f'):
+        case FOURCC('m', 'f', 'r', 'a'):
+        case FOURCC('u', 'd', 't', 'a'):
+        case FOURCC('i', 'l', 's', 't'):
+        {
+            if (chunk_type == FOURCC('s', 't', 'b', 'l')) {
+                ALOGV("sampleTable chunk is %d bytes long.", (size_t)chunk_size);
+
+                if (mDataSource->flags()
+                        & (DataSource::kWantsPrefetching
+                            | DataSource::kIsCachingDataSource)) {
+                    sp<MPEG4DataSource> cachedSource =
+                        new MPEG4DataSource(mDataSource);
+
+                    if (cachedSource->setCachedRange(*offset, chunk_size) == OK) {
+                        mDataSource = cachedSource;
+                    }
+                }
+
+                mLastTrack->sampleTable = new SampleTable(mDataSource);
+            }
+
+            bool isTrack = false;
+            if (chunk_type == FOURCC('t', 'r', 'a', 'k')) {
+                isTrack = true;
+
+                Track *track = new Track;
+                track->next = NULL;
+                if (mLastTrack) {
+                    mLastTrack->next = track;
+                } else {
+                    mFirstTrack = track;
+                }
+                mLastTrack = track;
+
+                track->meta = new MetaData;
+                track->includes_expensive_metadata = false;
+                track->skipTrack = false;
+                track->timescale = 0;
+                track->meta->setCString(kKeyMIMEType, "application/octet-stream");
+            }
+
+            off64_t stop_offset = *offset + chunk_size;
+            *offset = data_offset;
+            while (*offset < stop_offset) {
+                status_t err = parseChunk(offset, depth + 1);
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            if (*offset != stop_offset) {
+                return ERROR_MALFORMED;
+            }
+
+            if (isTrack) {
+                if (mLastTrack->skipTrack) {
+                    Track *cur = mFirstTrack;
+
+                    if (cur == mLastTrack) {
+                        delete cur;
+                        mFirstTrack = mLastTrack = NULL;
+                    } else {
+                        while (cur && cur->next != mLastTrack) {
+                            cur = cur->next;
+                        }
+                        cur->next = NULL;
+                        delete mLastTrack;
+                        mLastTrack = cur;
+                    }
+
+                    return OK;
+                }
+
+                status_t err = verifyTrack(mLastTrack);
+
+                if (err != OK) {
+                    return err;
+                }
+            } else if (chunk_type == FOURCC('m', 'o', 'o', 'v')) {
+                mInitCheck = OK;
+
+                if (!mIsDrm) {
+                    return UNKNOWN_ERROR;  // Return a dummy error.
+                } else {
+                    return OK;
+                }
+            }
+            break;
+        }
+
+        case FOURCC('t', 'k', 'h', 'd'):
+        {
+            status_t err;
+            if ((err = parseTrackHeader(data_offset, chunk_data_size)) != OK) {
+                return err;
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('m', 'd', 'h', 'd'):
+        {
+            if (chunk_data_size < 4) {
+                return ERROR_MALFORMED;
+            }
+
+            uint8_t version;
+            if (mDataSource->readAt(
+                        data_offset, &version, sizeof(version))
+                    < (ssize_t)sizeof(version)) {
+                return ERROR_IO;
+            }
+
+            off64_t timescale_offset;
+
+            if (version == 1) {
+                timescale_offset = data_offset + 4 + 16;
+            } else if (version == 0) {
+                timescale_offset = data_offset + 4 + 8;
+            } else {
+                return ERROR_IO;
+            }
+
+            uint32_t timescale;
+            if (mDataSource->readAt(
+                        timescale_offset, &timescale, sizeof(timescale))
+                    < (ssize_t)sizeof(timescale)) {
+                return ERROR_IO;
+            }
+
+            mLastTrack->timescale = ntohl(timescale);
+
+            int64_t duration;
+            if (version == 1) {
+                if (mDataSource->readAt(
+                            timescale_offset + 4, &duration, sizeof(duration))
+                        < (ssize_t)sizeof(duration)) {
+                    return ERROR_IO;
+                }
+                duration = ntoh64(duration);
+            } else {
+                int32_t duration32;
+                if (mDataSource->readAt(
+                            timescale_offset + 4, &duration32, sizeof(duration32))
+                        < (ssize_t)sizeof(duration32)) {
+                    return ERROR_IO;
+                }
+                duration = ntohl(duration32);
+            }
+            mLastTrack->meta->setInt64(
+                    kKeyDuration, (duration * 1000000) / mLastTrack->timescale);
+
+            uint8_t lang[2];
+            off64_t lang_offset;
+            if (version == 1) {
+                lang_offset = timescale_offset + 4 + 8;
+            } else if (version == 0) {
+                lang_offset = timescale_offset + 4 + 4;
+            } else {
+                return ERROR_IO;
+            }
+
+            if (mDataSource->readAt(lang_offset, &lang, sizeof(lang))
+                    < (ssize_t)sizeof(lang)) {
+                return ERROR_IO;
+            }
+
+            // To get the ISO-639-2/T three character language code
+            // 1 bit pad followed by 3 5-bits characters. Each character
+            // is packed as the difference between its ASCII value and 0x60.
+            char lang_code[4];
+            lang_code[0] = ((lang[0] >> 2) & 0x1f) + 0x60;
+            lang_code[1] = ((lang[0] & 0x3) << 3 | (lang[1] >> 5)) + 0x60;
+            lang_code[2] = (lang[1] & 0x1f) + 0x60;
+            lang_code[3] = '\0';
+
+            mLastTrack->meta->setCString(
+                    kKeyMediaLanguage, lang_code);
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('s', 't', 's', 'd'):
+        {
+            if (chunk_data_size < 8) {
+                return ERROR_MALFORMED;
+            }
+
+            uint8_t buffer[8];
+            if (chunk_data_size < (off64_t)sizeof(buffer)) {
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset, buffer, 8) < 8) {
+                return ERROR_IO;
+            }
+
+            if (U32_AT(buffer) != 0) {
+                // Should be version 0, flags 0.
+                return ERROR_MALFORMED;
+            }
+
+            uint32_t entry_count = U32_AT(&buffer[4]);
+
+            if (entry_count > 1) {
+                // For 3GPP timed text, there could be multiple tx3g boxes contain
+                // multiple text display formats. These formats will be used to
+                // display the timed text.
+                const char *mime;
+                CHECK(mLastTrack->meta->findCString(kKeyMIMEType, &mime));
+                if (strcasecmp(mime, MEDIA_MIMETYPE_TEXT_3GPP)) {
+                    // For now we only support a single type of media per track.
+                    mLastTrack->skipTrack = true;
+                    *offset += chunk_size;
+                    break;
+                }
+            }
+
+            off64_t stop_offset = *offset + chunk_size;
+            *offset = data_offset + 8;
+            for (uint32_t i = 0; i < entry_count; ++i) {
+                status_t err = parseChunk(offset, depth + 1);
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            if (*offset != stop_offset) {
+                return ERROR_MALFORMED;
+            }
+            break;
+        }
+
+        case FOURCC('m', 'p', '4', 'a'):
+        case FOURCC('s', 'a', 'm', 'r'):
+        case FOURCC('s', 'a', 'w', 'b'):
+        {
+            uint8_t buffer[8 + 20];
+            if (chunk_data_size < (ssize_t)sizeof(buffer)) {
+                // Basic AudioSampleEntry size.
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset, buffer, sizeof(buffer)) < (ssize_t)sizeof(buffer)) {
+                return ERROR_IO;
+            }
+
+            uint16_t data_ref_index = U16_AT(&buffer[6]);
+            uint16_t num_channels = U16_AT(&buffer[16]);
+
+            uint16_t sample_size = U16_AT(&buffer[18]);
+            uint32_t sample_rate = U32_AT(&buffer[24]) >> 16;
+
+            if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_NB,
+                            FourCC2MIME(chunk_type))) {
+                // AMR NB audio is always mono, 8kHz
+                num_channels = 1;
+                sample_rate = 8000;
+            } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_WB,
+                               FourCC2MIME(chunk_type))) {
+                // AMR WB audio is always mono, 16kHz
+                num_channels = 1;
+                sample_rate = 16000;
+            }
+
+#if 0
+            printf("*** coding='%s' %d channels, size %d, rate %d\n",
+                   chunk, num_channels, sample_size, sample_rate);
+#endif
+
+            mLastTrack->meta->setCString(kKeyMIMEType, FourCC2MIME(chunk_type));
+            mLastTrack->meta->setInt32(kKeyChannelCount, num_channels);
+            mLastTrack->meta->setInt32(kKeySampleRate, sample_rate);
+
+            off64_t stop_offset = *offset + chunk_size;
+            *offset = data_offset + sizeof(buffer);
+            while (*offset < stop_offset) {
+                status_t err = parseChunk(offset, depth + 1);
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            if (*offset != stop_offset) {
+                return ERROR_MALFORMED;
+            }
+            break;
+        }
+
+        case FOURCC('m', 'p', '4', 'v'):
+        case FOURCC('s', '2', '6', '3'):
+        case FOURCC('H', '2', '6', '3'):
+        case FOURCC('h', '2', '6', '3'):
+        case FOURCC('a', 'v', 'c', '1'):
+        {
+            mHasVideo = true;
+
+            uint8_t buffer[78];
+            if (chunk_data_size < (ssize_t)sizeof(buffer)) {
+                // Basic VideoSampleEntry size.
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset, buffer, sizeof(buffer)) < (ssize_t)sizeof(buffer)) {
+                return ERROR_IO;
+            }
+
+            uint16_t data_ref_index = U16_AT(&buffer[6]);
+            uint16_t width = U16_AT(&buffer[6 + 18]);
+            uint16_t height = U16_AT(&buffer[6 + 20]);
+
+            // The video sample is not stand-compliant if it has invalid dimension.
+            // Use some default width and height value, and
+            // let the decoder figure out the actual width and height (and thus
+            // be prepared for INFO_FOMRAT_CHANGED event).
+            if (width == 0)  width  = 352;
+            if (height == 0) height = 288;
+
+            // printf("*** coding='%s' width=%d height=%d\n",
+            //        chunk, width, height);
+
+            mLastTrack->meta->setCString(kKeyMIMEType, FourCC2MIME(chunk_type));
+            mLastTrack->meta->setInt32(kKeyWidth, width);
+            mLastTrack->meta->setInt32(kKeyHeight, height);
+
+            off64_t stop_offset = *offset + chunk_size;
+            *offset = data_offset + sizeof(buffer);
+            while (*offset < stop_offset) {
+                status_t err = parseChunk(offset, depth + 1);
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            if (*offset != stop_offset) {
+                return ERROR_MALFORMED;
+            }
+            break;
+        }
+
+        case FOURCC('s', 't', 'c', 'o'):
+        case FOURCC('c', 'o', '6', '4'):
+        {
+            status_t err =
+                mLastTrack->sampleTable->setChunkOffsetParams(
+                        chunk_type, data_offset, chunk_data_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('s', 't', 's', 'c'):
+        {
+            status_t err =
+                mLastTrack->sampleTable->setSampleToChunkParams(
+                        data_offset, chunk_data_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('s', 't', 's', 'z'):
+        case FOURCC('s', 't', 'z', '2'):
+        {
+            status_t err =
+                mLastTrack->sampleTable->setSampleSizeParams(
+                        chunk_type, data_offset, chunk_data_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            size_t max_size;
+            err = mLastTrack->sampleTable->getMaxSampleSize(&max_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            // Assume that a given buffer only contains at most 10 fragments,
+            // each fragment originally prefixed with a 2 byte length will
+            // have a 4 byte header (0x00 0x00 0x00 0x01) after conversion,
+            // and thus will grow by 2 bytes per fragment.
+            mLastTrack->meta->setInt32(kKeyMaxInputSize, max_size + 10 * 2);
+            *offset += chunk_size;
+
+            // Calculate average frame rate.
+            const char *mime;
+            CHECK(mLastTrack->meta->findCString(kKeyMIMEType, &mime));
+            if (!strncasecmp("video/", mime, 6)) {
+                size_t nSamples = mLastTrack->sampleTable->countSamples();
+                int64_t durationUs;
+                if (mLastTrack->meta->findInt64(kKeyDuration, &durationUs)) {
+                    if (durationUs > 0) {
+                        int32_t frameRate = (nSamples * 1000000LL +
+                                    (durationUs >> 1)) / durationUs;
+                        mLastTrack->meta->setInt32(kKeyFrameRate, frameRate);
+                    }
+                }
+            }
+
+            break;
+        }
+
+        case FOURCC('s', 't', 't', 's'):
+        {
+            status_t err =
+                mLastTrack->sampleTable->setTimeToSampleParams(
+                        data_offset, chunk_data_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('c', 't', 't', 's'):
+        {
+            status_t err =
+                mLastTrack->sampleTable->setCompositionTimeToSampleParams(
+                        data_offset, chunk_data_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('s', 't', 's', 's'):
+        {
+            status_t err =
+                mLastTrack->sampleTable->setSyncSampleParams(
+                        data_offset, chunk_data_size);
+
+            if (err != OK) {
+                return err;
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        // @xyz
+        case FOURCC('\xA9', 'x', 'y', 'z'):
+        {
+            // Best case the total data length inside "@xyz" box
+            // would be 8, for instance "@xyz" + "\x00\x04\x15\xc7" + "0+0/",
+            // where "\x00\x04" is the text string length with value = 4,
+            // "\0x15\xc7" is the language code = en, and "0+0" is a
+            // location (string) value with longitude = 0 and latitude = 0.
+            if (chunk_data_size < 8) {
+                return ERROR_MALFORMED;
+            }
+
+            // Worst case the location string length would be 18,
+            // for instance +90.0000-180.0000, without the trailing "/" and
+            // the string length + language code.
+            char buffer[18];
+
+            // Substracting 5 from the data size is because the text string length +
+            // language code takes 4 bytes, and the trailing slash "/" takes 1 byte.
+            off64_t location_length = chunk_data_size - 5;
+            if (location_length >= (off64_t) sizeof(buffer)) {
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset + 4, buffer, location_length) < location_length) {
+                return ERROR_IO;
+            }
+
+            buffer[location_length] = '\0';
+            mFileMetaData->setCString(kKeyLocation, buffer);
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('e', 's', 'd', 's'):
+        {
+            if (chunk_data_size < 4) {
+                return ERROR_MALFORMED;
+            }
+
+            uint8_t buffer[256];
+            if (chunk_data_size > (off64_t)sizeof(buffer)) {
+                return ERROR_BUFFER_TOO_SMALL;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset, buffer, chunk_data_size) < chunk_data_size) {
+                return ERROR_IO;
+            }
+
+            if (U32_AT(buffer) != 0) {
+                // Should be version 0, flags 0.
+                return ERROR_MALFORMED;
+            }
+
+            mLastTrack->meta->setData(
+                    kKeyESDS, kTypeESDS, &buffer[4], chunk_data_size - 4);
+
+            if (mPath.size() >= 2
+                    && mPath[mPath.size() - 2] == FOURCC('m', 'p', '4', 'a')) {
+                // Information from the ESDS must be relied on for proper
+                // setup of sample rate and channel count for MPEG4 Audio.
+                // The generic header appears to only contain generic
+                // information...
+
+                status_t err = updateAudioTrackInfoFromESDS_MPEG4Audio(
+                        &buffer[4], chunk_data_size - 4);
+
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('a', 'v', 'c', 'C'):
+        {
+            char buffer[256];
+            if (chunk_data_size > (off64_t)sizeof(buffer)) {
+                return ERROR_BUFFER_TOO_SMALL;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset, buffer, chunk_data_size) < chunk_data_size) {
+                return ERROR_IO;
+            }
+
+            mLastTrack->meta->setData(
+                    kKeyAVCC, kTypeAVCC, buffer, chunk_data_size);
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('d', '2', '6', '3'):
+        {
+            /*
+             * d263 contains a fixed 7 bytes part:
+             *   vendor - 4 bytes
+             *   version - 1 byte
+             *   level - 1 byte
+             *   profile - 1 byte
+             * optionally, "d263" box itself may contain a 16-byte
+             * bit rate box (bitr)
+             *   average bit rate - 4 bytes
+             *   max bit rate - 4 bytes
+             */
+            char buffer[23];
+            if (chunk_data_size != 7 &&
+                chunk_data_size != 23) {
+                ALOGE("Incorrect D263 box size %lld", chunk_data_size);
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(
+                    data_offset, buffer, chunk_data_size) < chunk_data_size) {
+                return ERROR_IO;
+            }
+
+            mLastTrack->meta->setData(kKeyD263, kTypeD263, buffer, chunk_data_size);
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('m', 'e', 't', 'a'):
+        {
+            uint8_t buffer[4];
+            if (chunk_data_size < (off64_t)sizeof(buffer)) {
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(
+                        data_offset, buffer, 4) < 4) {
+                return ERROR_IO;
+            }
+
+            if (U32_AT(buffer) != 0) {
+                // Should be version 0, flags 0.
+
+                // If it's not, let's assume this is one of those
+                // apparently malformed chunks that don't have flags
+                // and completely different semantics than what's
+                // in the MPEG4 specs and skip it.
+                *offset += chunk_size;
+                return OK;
+            }
+
+            off64_t stop_offset = *offset + chunk_size;
+            *offset = data_offset + sizeof(buffer);
+            while (*offset < stop_offset) {
+                status_t err = parseChunk(offset, depth + 1);
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            if (*offset != stop_offset) {
+                return ERROR_MALFORMED;
+            }
+            break;
+        }
+
+        case FOURCC('m', 'e', 'a', 'n'):
+        case FOURCC('n', 'a', 'm', 'e'):
+        case FOURCC('d', 'a', 't', 'a'):
+        {
+            if (mPath.size() == 6 && underMetaDataPath(mPath)) {
+                status_t err = parseMetaData(data_offset, chunk_data_size);
+
+                if (err != OK) {
+                    return err;
+                }
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('m', 'v', 'h', 'd'):
+        {
+            if (chunk_data_size < 12) {
+                return ERROR_MALFORMED;
+            }
+
+            uint8_t header[12];
+            if (mDataSource->readAt(
+                        data_offset, header, sizeof(header))
+                    < (ssize_t)sizeof(header)) {
+                return ERROR_IO;
+            }
+
+            int64_t creationTime;
+            if (header[0] == 1) {
+                creationTime = U64_AT(&header[4]);
+            } else if (header[0] != 0) {
+                return ERROR_MALFORMED;
+            } else {
+                creationTime = U32_AT(&header[4]);
+            }
+
+            String8 s;
+            convertTimeToDate(creationTime, &s);
+
+            mFileMetaData->setCString(kKeyDate, s.string());
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('m', 'd', 'a', 't'):
+        {
+            if (!mIsDrm) {
+                *offset += chunk_size;
+                break;
+            }
+
+            if (chunk_size < 8) {
+                return ERROR_MALFORMED;
+            }
+
+            return parseDrmSINF(offset, data_offset);
+        }
+
+        case FOURCC('h', 'd', 'l', 'r'):
+        {
+            uint32_t buffer;
+            if (mDataSource->readAt(
+                        data_offset + 8, &buffer, 4) < 4) {
+                return ERROR_IO;
+            }
+
+            uint32_t type = ntohl(buffer);
+            // For the 3GPP file format, the handler-type within the 'hdlr' box
+            // shall be 'text'. We also want to support 'sbtl' handler type
+            // for a practical reason as various MPEG4 containers use it.
+            if (type == FOURCC('t', 'e', 'x', 't') || type == FOURCC('s', 'b', 't', 'l')) {
+                mLastTrack->meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_TEXT_3GPP);
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('t', 'x', '3', 'g'):
+        {
+            uint32_t type;
+            const void *data;
+            size_t size = 0;
+            if (!mLastTrack->meta->findData(
+                    kKeyTextFormatData, &type, &data, &size)) {
+                size = 0;
+            }
+
+            uint8_t *buffer = new uint8_t[size + chunk_size];
+
+            if (size > 0) {
+                memcpy(buffer, data, size);
+            }
+
+            if ((size_t)(mDataSource->readAt(*offset, buffer + size, chunk_size))
+                    < chunk_size) {
+                delete[] buffer;
+                buffer = NULL;
+
+                return ERROR_IO;
+            }
+
+            mLastTrack->meta->setData(
+                    kKeyTextFormatData, 0, buffer, size + chunk_size);
+
+            delete[] buffer;
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('c', 'o', 'v', 'r'):
+        {
+            if (mFileMetaData != NULL) {
+                ALOGV("chunk_data_size = %lld and data_offset = %lld",
+                        chunk_data_size, data_offset);
+                uint8_t *buffer = new uint8_t[chunk_data_size + 1];
+                if (mDataSource->readAt(
+                    data_offset, buffer, chunk_data_size) != (ssize_t)chunk_data_size) {
+                    delete[] buffer;
+                    buffer = NULL;
+
+                    return ERROR_IO;
+                }
+                const int kSkipBytesOfDataBox = 16;
+                mFileMetaData->setData(
+                    kKeyAlbumArt, MetaData::TYPE_NONE,
+                    buffer + kSkipBytesOfDataBox, chunk_data_size - kSkipBytesOfDataBox);
+            }
+
+            *offset += chunk_size;
+            break;
+        }
+
+        case FOURCC('-', '-', '-', '-'):
+        {
+            mLastCommentMean.clear();
+            mLastCommentName.clear();
+            mLastCommentData.clear();
+            *offset += chunk_size;
+            break;
+        }
+
+        default:
+        {
+            *offset += chunk_size;
+            break;
+        }
+    }
+
+    return OK;
+!!!639244.cpp!!!	parseMetaData(in offset : off64_t, in size : size_t) : status_t
+    if (size < 4) {
+        return ERROR_MALFORMED;
+    }
+
+    uint8_t *buffer = new uint8_t[size + 1];
+    if (mDataSource->readAt(
+                offset, buffer, size) != (ssize_t)size) {
+        delete[] buffer;
+        buffer = NULL;
+
+        return ERROR_IO;
+    }
+
+    uint32_t flags = U32_AT(buffer);
+
+    uint32_t metadataKey = 0;
+    char chunk[5];
+    MakeFourCCString(mPath[4], chunk);
+    ALOGV("meta: %s @ %lld", chunk, offset);
+    switch (mPath[4]) {
+        case FOURCC(0xa9, 'a', 'l', 'b'):
+        {
+            metadataKey = kKeyAlbum;
+            break;
+        }
+        case FOURCC(0xa9, 'A', 'R', 'T'):
+        {
+            metadataKey = kKeyArtist;
+            break;
+        }
+        case FOURCC('a', 'A', 'R', 'T'):
+        {
+            metadataKey = kKeyAlbumArtist;
+            break;
+        }
+        case FOURCC(0xa9, 'd', 'a', 'y'):
+        {
+            metadataKey = kKeyYear;
+            break;
+        }
+        case FOURCC(0xa9, 'n', 'a', 'm'):
+        {
+            metadataKey = kKeyTitle;
+            break;
+        }
+        case FOURCC(0xa9, 'w', 'r', 't'):
+        {
+            metadataKey = kKeyWriter;
+            break;
+        }
+        case FOURCC('c', 'o', 'v', 'r'):
+        {
+            metadataKey = kKeyAlbumArt;
+            break;
+        }
+        case FOURCC('g', 'n', 'r', 'e'):
+        {
+            metadataKey = kKeyGenre;
+            break;
+        }
+        case FOURCC(0xa9, 'g', 'e', 'n'):
+        {
+            metadataKey = kKeyGenre;
+            break;
+        }
+        case FOURCC('c', 'p', 'i', 'l'):
+        {
+            if (size == 9 && flags == 21) {
+                char tmp[16];
+                sprintf(tmp, "%d",
+                        (int)buffer[size - 1]);
+
+                mFileMetaData->setCString(kKeyCompilation, tmp);
+            }
+            break;
+        }
+        case FOURCC('t', 'r', 'k', 'n'):
+        {
+            if (size == 16 && flags == 0) {
+                char tmp[16];
+                sprintf(tmp, "%d/%d",
+                        (int)buffer[size - 5], (int)buffer[size - 3]);
+
+                mFileMetaData->setCString(kKeyCDTrackNumber, tmp);
+            }
+            break;
+        }
+        case FOURCC('d', 'i', 's', 'k'):
+        {
+            if (size == 14 && flags == 0) {
+                char tmp[16];
+                sprintf(tmp, "%d/%d",
+                        (int)buffer[size - 3], (int)buffer[size - 1]);
+
+                mFileMetaData->setCString(kKeyDiscNumber, tmp);
+            }
+            break;
+        }
+        case FOURCC('-', '-', '-', '-'):
+        {
+            buffer[size] = '\0';
+            switch (mPath[5]) {
+                case FOURCC('m', 'e', 'a', 'n'):
+                    mLastCommentMean.setTo((const char *)buffer + 4);
+                    break;
+                case FOURCC('n', 'a', 'm', 'e'):
+                    mLastCommentName.setTo((const char *)buffer + 4);
+                    break;
+                case FOURCC('d', 'a', 't', 'a'):
+                    mLastCommentData.setTo((const char *)buffer + 8);
+                    break;
+            }
+
+            // Once we have a set of mean/name/data info, go ahead and process
+            // it to see if its something we are interested in.  Whether or not
+            // were are interested in the specific tag, make sure to clear out
+            // the set so we can be ready to process another tuple should one
+            // show up later in the file.
+            if ((mLastCommentMean.length() != 0) &&
+                (mLastCommentName.length() != 0) &&
+                (mLastCommentData.length() != 0)) {
+
+                if (mLastCommentMean == "com.apple.iTunes"
+                        && mLastCommentName == "iTunSMPB") {
+                    int32_t delay, padding;
+                    if (sscanf(mLastCommentData,
+                               " %*x %x %x %*x", &delay, &padding) == 2) {
+                        mLastTrack->meta->setInt32(kKeyEncoderDelay, delay);
+                        mLastTrack->meta->setInt32(kKeyEncoderPadding, padding);
+                    }
+                }
+
+                mLastCommentMean.clear();
+                mLastCommentName.clear();
+                mLastCommentData.clear();
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    if (size >= 8 && metadataKey) {
+        if (metadataKey == kKeyAlbumArt) {
+            mFileMetaData->setData(
+                    kKeyAlbumArt, MetaData::TYPE_NONE,
+                    buffer + 8, size - 8);
+        } else if (metadataKey == kKeyGenre) {
+            if (flags == 0) {
+                // uint8_t genre code, iTunes genre codes are
+                // the standard id3 codes, except they start
+                // at 1 instead of 0 (e.g. Pop is 14, not 13)
+                // We use standard id3 numbering, so subtract 1.
+                int genrecode = (int)buffer[size - 1];
+                genrecode--;
+                if (genrecode < 0) {
+                    genrecode = 255; // reserved for 'unknown genre'
+                }
+                char genre[10];
+                sprintf(genre, "%d", genrecode);
+
+                mFileMetaData->setCString(metadataKey, genre);
+            } else if (flags == 1) {
+                // custom genre string
+                buffer[size] = '\0';
+
+                mFileMetaData->setCString(
+                        metadataKey, (const char *)buffer + 8);
+            }
+        } else {
+            buffer[size] = '\0';
+
+            mFileMetaData->setCString(
+                    metadataKey, (const char *)buffer + 8);
+        }
+    }
+
+    delete[] buffer;
+    buffer = NULL;
+
+    return OK;
+!!!639372.cpp!!!	updateAudioTrackInfoFromESDS_MPEG4Audio(in esds_data : void, in esds_size : size_t) : status_t
+    ESDS esds(esds_data, esds_size);
+
+    uint8_t objectTypeIndication;
+    if (esds.getObjectTypeIndication(&objectTypeIndication) != OK) {
+        return ERROR_MALFORMED;
+    }
+
+    if (objectTypeIndication == 0xe1) {
+        // This isn't MPEG4 audio at all, it's QCELP 14k...
+        mLastTrack->meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_QCELP);
+        return OK;
+    }
+
+    if (objectTypeIndication  == 0x6b) {
+        // The media subtype is MP3 audio
+        // Our software MP3 audio decoder may not be able to handle
+        // packetized MP3 audio; for now, lets just return ERROR_UNSUPPORTED
+        ALOGE("MP3 track in MP4/3GPP file is not supported");
+        return ERROR_UNSUPPORTED;
+    }
+
+    const uint8_t *csd;
+    size_t csd_size;
+    if (esds.getCodecSpecificInfo(
+                (const void **)&csd, &csd_size) != OK) {
+        return ERROR_MALFORMED;
+    }
+
+#if 0
+    printf("ESD of size %d\n", csd_size);
+    hexdump(csd, csd_size);
+#endif
+
+    if (csd_size == 0) {
+        // There's no further information, i.e. no codec specific data
+        // Let's assume that the information provided in the mpeg4 headers
+        // is accurate and hope for the best.
+
+        return OK;
+    }
+
+    if (csd_size < 2) {
+        return ERROR_MALFORMED;
+    }
+
+    ABitReader br(csd, csd_size);
+    uint32_t objectType = br.getBits(5);
+
+    if (objectType == 31) {  // AAC-ELD => additional 6 bits
+        objectType = 32 + br.getBits(6);
+    }
+
+    uint32_t freqIndex = br.getBits(4);
+
+    int32_t sampleRate = 0;
+    int32_t numChannels = 0;
+    if (freqIndex == 15) {
+        if (csd_size < 5) {
+            return ERROR_MALFORMED;
+        }
+        sampleRate = br.getBits(24);
+        numChannels = br.getBits(4);
+    } else {
+        static uint32_t kSamplingRate[] = {
+            96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+            16000, 12000, 11025, 8000, 7350
+        };
+
+        if (freqIndex == 13 || freqIndex == 14) {
+            return ERROR_MALFORMED;
+        }
+
+        sampleRate = kSamplingRate[freqIndex];
+        numChannels = br.getBits(4);
+    }
+
+    if (numChannels == 0) {
+        return ERROR_UNSUPPORTED;
+    }
+
+    int32_t prevSampleRate;
+    CHECK(mLastTrack->meta->findInt32(kKeySampleRate, &prevSampleRate));
+
+    if (prevSampleRate != sampleRate) {
+        ALOGV("mpeg4 audio sample rate different from previous setting. "
+             "was: %d, now: %d", prevSampleRate, sampleRate);
+    }
+
+    mLastTrack->meta->setInt32(kKeySampleRate, sampleRate);
+
+    int32_t prevChannelCount;
+    CHECK(mLastTrack->meta->findInt32(kKeyChannelCount, &prevChannelCount));
+
+    if (prevChannelCount != numChannels) {
+        ALOGV("mpeg4 audio channel count different from previous setting. "
+             "was: %d, now: %d", prevChannelCount, numChannels);
+    }
+
+    mLastTrack->meta->setInt32(kKeyChannelCount, numChannels);
+
+    return OK;
+!!!639500.cpp!!!	verifyTrack(inout track : Track) : status_t
+    const char *mime;
+    CHECK(track->meta->findCString(kKeyMIMEType, &mime));
+
+    uint32_t type;
+    const void *data;
+    size_t size;
+    if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)) {
+        if (!track->meta->findData(kKeyAVCC, &type, &data, &size)
+                || type != kTypeAVCC) {
+            return ERROR_MALFORMED;
+        }
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_MPEG4)
+            || !strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
+        if (!track->meta->findData(kKeyESDS, &type, &data, &size)
+                || type != kTypeESDS) {
+            return ERROR_MALFORMED;
+        }
+    }
+
+    if (!track->sampleTable->isValid()) {
+        // Make sure we have all the metadata we need.
+        return ERROR_MALFORMED;
+    }
+
+    return OK;
+!!!639628.cpp!!!	parseDrmSINF(inout offset : off64_t, in data_offset : off64_t) : status_t
+    uint8_t updateIdTag;
+    if (mDataSource->readAt(data_offset, &updateIdTag, 1) < 1) {
+        return ERROR_IO;
+    }
+    data_offset ++;
+
+    if (0x01/*OBJECT_DESCRIPTOR_UPDATE_ID_TAG*/ != updateIdTag) {
+        return ERROR_MALFORMED;
+    }
+
+    uint8_t numOfBytes;
+    int32_t size = readSize(data_offset, mDataSource, &numOfBytes);
+    if (size < 0) {
+        return ERROR_IO;
+    }
+    int32_t classSize = size;
+    data_offset += numOfBytes;
+
+    while(size >= 11 ) {
+        uint8_t descriptorTag;
+        if (mDataSource->readAt(data_offset, &descriptorTag, 1) < 1) {
+            return ERROR_IO;
+        }
+        data_offset ++;
+
+        if (0x11/*OBJECT_DESCRIPTOR_ID_TAG*/ != descriptorTag) {
+            return ERROR_MALFORMED;
+        }
+
+        uint8_t buffer[8];
+        //ObjectDescriptorID and ObjectDescriptor url flag
+        if (mDataSource->readAt(data_offset, buffer, 2) < 2) {
+            return ERROR_IO;
+        }
+        data_offset += 2;
+
+        if ((buffer[1] >> 5) & 0x0001) { //url flag is set
+            return ERROR_MALFORMED;
+        }
+
+        if (mDataSource->readAt(data_offset, buffer, 8) < 8) {
+            return ERROR_IO;
+        }
+        data_offset += 8;
+
+        if ((0x0F/*ES_ID_REF_TAG*/ != buffer[1])
+                || ( 0x0A/*IPMP_DESCRIPTOR_POINTER_ID_TAG*/ != buffer[5])) {
+            return ERROR_MALFORMED;
+        }
+
+        SINF *sinf = new SINF;
+        sinf->trackID = U16_AT(&buffer[3]);
+        sinf->IPMPDescriptorID = buffer[7];
+        sinf->next = mFirstSINF;
+        mFirstSINF = sinf;
+
+        size -= (8 + 2 + 1);
+    }
+
+    if (size != 0) {
+        return ERROR_MALFORMED;
+    }
+
+    if (mDataSource->readAt(data_offset, &updateIdTag, 1) < 1) {
+        return ERROR_IO;
+    }
+    data_offset ++;
+
+    if(0x05/*IPMP_DESCRIPTOR_UPDATE_ID_TAG*/ != updateIdTag) {
+        return ERROR_MALFORMED;
+    }
+
+    size = readSize(data_offset, mDataSource, &numOfBytes);
+    if (size < 0) {
+        return ERROR_IO;
+    }
+    classSize = size;
+    data_offset += numOfBytes;
+
+    while (size > 0) {
+        uint8_t tag;
+        int32_t dataLen;
+        if (mDataSource->readAt(data_offset, &tag, 1) < 1) {
+            return ERROR_IO;
+        }
+        data_offset ++;
+
+        if (0x0B/*IPMP_DESCRIPTOR_ID_TAG*/ == tag) {
+            uint8_t id;
+            dataLen = readSize(data_offset, mDataSource, &numOfBytes);
+            if (dataLen < 0) {
+                return ERROR_IO;
+            } else if (dataLen < 4) {
+                return ERROR_MALFORMED;
+            }
+            data_offset += numOfBytes;
+
+            if (mDataSource->readAt(data_offset, &id, 1) < 1) {
+                return ERROR_IO;
+            }
+            data_offset ++;
+
+            SINF *sinf = mFirstSINF;
+            while (sinf && (sinf->IPMPDescriptorID != id)) {
+                sinf = sinf->next;
+            }
+            if (sinf == NULL) {
+                return ERROR_MALFORMED;
+            }
+            sinf->len = dataLen - 3;
+            sinf->IPMPData = new char[sinf->len];
+
+            if (mDataSource->readAt(data_offset + 2, sinf->IPMPData, sinf->len) < sinf->len) {
+                return ERROR_IO;
+            }
+            data_offset += sinf->len;
+
+            size -= (dataLen + numOfBytes + 1);
+        }
+    }
+
+    if (size != 0) {
+        return ERROR_MALFORMED;
+    }
+
+    return UNKNOWN_ERROR;  // Return a dummy error.
+!!!639756.cpp!!!	parseTrackHeader(in data_offset : off64_t, in data_size : off64_t) : status_t
+    if (data_size < 4) {
+        return ERROR_MALFORMED;
+    }
+
+    uint8_t version;
+    if (mDataSource->readAt(data_offset, &version, 1) < 1) {
+        return ERROR_IO;
+    }
+
+    size_t dynSize = (version == 1) ? 36 : 24;
+
+    uint8_t buffer[36 + 60];
+
+    if (data_size != (off64_t)dynSize + 60) {
+        return ERROR_MALFORMED;
+    }
+
+    if (mDataSource->readAt(
+                data_offset, buffer, data_size) < (ssize_t)data_size) {
+        return ERROR_IO;
+    }
+
+    uint64_t ctime, mtime, duration;
+    int32_t id;
+
+    if (version == 1) {
+        ctime = U64_AT(&buffer[4]);
+        mtime = U64_AT(&buffer[12]);
+        id = U32_AT(&buffer[20]);
+        duration = U64_AT(&buffer[28]);
+    } else {
+        CHECK_EQ((unsigned)version, 0u);
+
+        ctime = U32_AT(&buffer[4]);
+        mtime = U32_AT(&buffer[8]);
+        id = U32_AT(&buffer[12]);
+        duration = U32_AT(&buffer[20]);
+    }
+
+    mLastTrack->meta->setInt32(kKeyTrackID, id);
+
+    size_t matrixOffset = dynSize + 16;
+    int32_t a00 = U32_AT(&buffer[matrixOffset]);
+    int32_t a01 = U32_AT(&buffer[matrixOffset + 4]);
+    int32_t dx = U32_AT(&buffer[matrixOffset + 8]);
+    int32_t a10 = U32_AT(&buffer[matrixOffset + 12]);
+    int32_t a11 = U32_AT(&buffer[matrixOffset + 16]);
+    int32_t dy = U32_AT(&buffer[matrixOffset + 20]);
+
+#if 0
+    ALOGI("x' = %.2f * x + %.2f * y + %.2f",
+         a00 / 65536.0f, a01 / 65536.0f, dx / 65536.0f);
+    ALOGI("y' = %.2f * x + %.2f * y + %.2f",
+         a10 / 65536.0f, a11 / 65536.0f, dy / 65536.0f);
+#endif
+
+    uint32_t rotationDegrees;
+
+    static const int32_t kFixedOne = 0x10000;
+    if (a00 == kFixedOne && a01 == 0 && a10 == 0 && a11 == kFixedOne) {
+        // Identity, no rotation
+        rotationDegrees = 0;
+    } else if (a00 == 0 && a01 == kFixedOne && a10 == -kFixedOne && a11 == 0) {
+        rotationDegrees = 90;
+    } else if (a00 == 0 && a01 == -kFixedOne && a10 == kFixedOne && a11 == 0) {
+        rotationDegrees = 270;
+    } else if (a00 == -kFixedOne && a01 == 0 && a10 == 0 && a11 == -kFixedOne) {
+        rotationDegrees = 180;
+    } else {
+        ALOGW("We only support 0,90,180,270 degree rotation matrices");
+        rotationDegrees = 0;
+    }
+
+    if (rotationDegrees != 0) {
+        mLastTrack->meta->setInt32(kKeyRotation, rotationDegrees);
+    }
+
+    // Handle presentation display size, which could be different
+    // from the image size indicated by kKeyWidth and kKeyHeight.
+    uint32_t width = U32_AT(&buffer[dynSize + 52]);
+    uint32_t height = U32_AT(&buffer[dynSize + 56]);
+    mLastTrack->meta->setInt32(kKeyDisplayWidth, width >> 16);
+    mLastTrack->meta->setInt32(kKeyDisplayHeight, height >> 16);
+
+    return OK;
+!!!639884.cpp!!!	findTrackByMimePrefix(in mimePrefix : char) : Track
+    for (Track *track = mFirstTrack; track != NULL; track = track->next) {
+        const char *mime;
+        if (track->meta != NULL
+                && track->meta->findCString(kKeyMIMEType, &mime)
+                && !strncasecmp(mime, mimePrefix, strlen(mimePrefix))) {
+            return track;
+        }
+    }
+
+    return NULL;

@@ -1,0 +1,462 @@
+class KeyCharacterMap
+!!!1013772.cpp!!!	load(in filename : String8, in format : Format, inout outMap : sp<KeyCharacterMap>) : status_t
+    outMap->clear();
+
+    Tokenizer* tokenizer;
+    status_t status = Tokenizer::open(filename, &tokenizer);
+    if (status) {
+        ALOGE("Error %d opening key character map file %s.", status, filename.string());
+    } else {
+        status = load(tokenizer, format, outMap);
+        delete tokenizer;
+    }
+    return status;
+!!!1013900.cpp!!!	loadContents(in filename : String8, in contents : char, in format : Format, inout outMap : sp<KeyCharacterMap>) : status_t
+    outMap->clear();
+
+    Tokenizer* tokenizer;
+    status_t status = Tokenizer::fromContents(filename, contents, &tokenizer);
+    if (status) {
+        ALOGE("Error %d opening key character map.", status);
+    } else {
+        status = load(tokenizer, format, outMap);
+        delete tokenizer;
+    }
+    return status;
+!!!1014028.cpp!!!	combine(in base : sp<KeyCharacterMap>, in overlay : sp<KeyCharacterMap>) : sp<KeyCharacterMap>
+    if (overlay == NULL) {
+        return base;
+    }
+    if (base == NULL) {
+        return overlay;
+    }
+
+    sp<KeyCharacterMap> map = new KeyCharacterMap(*base.get());
+    for (size_t i = 0; i < overlay->mKeys.size(); i++) {
+        int32_t keyCode = overlay->mKeys.keyAt(i);
+        Key* key = overlay->mKeys.valueAt(i);
+        ssize_t oldIndex = map->mKeys.indexOfKey(keyCode);
+        if (oldIndex >= 0) {
+            delete map->mKeys.valueAt(oldIndex);
+            map->mKeys.editValueAt(oldIndex) = new Key(*key);
+        } else {
+            map->mKeys.add(keyCode, new Key(*key));
+        }
+    }
+
+    for (size_t i = 0; i < overlay->mKeysByScanCode.size(); i++) {
+        map->mKeysByScanCode.replaceValueFor(overlay->mKeysByScanCode.keyAt(i),
+                overlay->mKeysByScanCode.valueAt(i));
+    }
+
+    for (size_t i = 0; i < overlay->mKeysByUsageCode.size(); i++) {
+        map->mKeysByUsageCode.replaceValueFor(overlay->mKeysByUsageCode.keyAt(i),
+                overlay->mKeysByUsageCode.valueAt(i));
+    }
+    return map;
+!!!1014156.cpp!!!	empty() : sp<KeyCharacterMap>
+    return sEmpty;
+!!!1014284.cpp!!!	getKeyboardType() : int32_t
+    return mType;
+!!!1014412.cpp!!!	getDisplayLabel(in keyCode : int32_t) : char16_t
+    char16_t result = 0;
+    const Key* key;
+    if (getKey(keyCode, &key)) {
+        result = key->label;
+    }
+#if DEBUG_MAPPING
+    ALOGD("getDisplayLabel: keyCode=%d ~ Result %d.", keyCode, result);
+#endif
+    return result;
+!!!1014540.cpp!!!	getNumber(in keyCode : int32_t) : char16_t
+    char16_t result = 0;
+    const Key* key;
+    if (getKey(keyCode, &key)) {
+        result = key->number;
+    }
+#if DEBUG_MAPPING
+    ALOGD("getNumber: keyCode=%d ~ Result %d.", keyCode, result);
+#endif
+    return result;
+!!!1014668.cpp!!!	getCharacter(in keyCode : int32_t, in metaState : int32_t) : char16_t
+    char16_t result = 0;
+    const Key* key;
+    const Behavior* behavior;
+    if (getKeyBehavior(keyCode, metaState, &key, &behavior)) {
+        result = behavior->character;
+    }
+#if DEBUG_MAPPING
+    ALOGD("getCharacter: keyCode=%d, metaState=0x%08x ~ Result %d.", keyCode, metaState, result);
+#endif
+    return result;
+!!!1014796.cpp!!!	getFallbackAction(in keyCode : int32_t, in metaState : int32_t, inout outFallbackAction : FallbackAction) : bool
+    outFallbackAction->keyCode = 0;
+    outFallbackAction->metaState = 0;
+
+    bool result = false;
+    const Key* key;
+    const Behavior* behavior;
+    if (getKeyBehavior(keyCode, metaState, &key, &behavior)) {
+        if (behavior->fallbackKeyCode) {
+            outFallbackAction->keyCode = behavior->fallbackKeyCode;
+            outFallbackAction->metaState = metaState & ~behavior->metaState;
+            result = true;
+        }
+    }
+#if DEBUG_MAPPING
+    ALOGD("getFallbackKeyCode: keyCode=%d, metaState=0x%08x ~ Result %s, "
+            "fallback keyCode=%d, fallback metaState=0x%08x.",
+            keyCode, metaState, result ? "true" : "false",
+            outFallbackAction->keyCode, outFallbackAction->metaState);
+#endif
+    return result;
+!!!1014924.cpp!!!	getMatch(in keyCode : int32_t, in chars : char16_t, in numChars : size_t, in metaState : int32_t) : char16_t
+    char16_t result = 0;
+    const Key* key;
+    if (getKey(keyCode, &key)) {
+        // Try to find the most general behavior that maps to this character.
+        // For example, the base key behavior will usually be last in the list.
+        // However, if we find a perfect meta state match for one behavior then use that one.
+        for (const Behavior* behavior = key->firstBehavior; behavior; behavior = behavior->next) {
+            if (behavior->character) {
+                for (size_t i = 0; i < numChars; i++) {
+                    if (behavior->character == chars[i]) {
+                        result = behavior->character;
+                        if ((behavior->metaState & metaState) == behavior->metaState) {
+                            goto ExactMatch;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    ExactMatch: ;
+    }
+#if DEBUG_MAPPING
+    ALOGD("getMatch: keyCode=%d, chars=[%s], metaState=0x%08x ~ Result %d.",
+            keyCode, toString(chars, numChars).string(), metaState, result);
+#endif
+    return result;
+!!!1015052.cpp!!!	getEvents(in deviceId : int32_t, in chars : char16_t, in numChars : size_t, inout outEvents : Vector<KeyEvent>) : bool
+    nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+
+    for (size_t i = 0; i < numChars; i++) {
+        int32_t keyCode, metaState;
+        char16_t ch = chars[i];
+        if (!findKey(ch, &keyCode, &metaState)) {
+#if DEBUG_MAPPING
+            ALOGD("getEvents: deviceId=%d, chars=[%s] ~ Failed to find mapping for character %d.",
+                    deviceId, toString(chars, numChars).string(), ch);
+#endif
+            return false;
+        }
+
+        int32_t currentMetaState = 0;
+        addMetaKeys(outEvents, deviceId, metaState, true, now, &currentMetaState);
+        addKey(outEvents, deviceId, keyCode, currentMetaState, true, now);
+        addKey(outEvents, deviceId, keyCode, currentMetaState, false, now);
+        addMetaKeys(outEvents, deviceId, metaState, false, now, &currentMetaState);
+    }
+#if DEBUG_MAPPING
+    ALOGD("getEvents: deviceId=%d, chars=[%s] ~ Generated %d events.",
+            deviceId, toString(chars, numChars).string(), int32_t(outEvents.size()));
+    for (size_t i = 0; i < outEvents.size(); i++) {
+        ALOGD("  Key: keyCode=%d, metaState=0x%08x, %s.",
+                outEvents[i].getKeyCode(), outEvents[i].getMetaState(),
+                outEvents[i].getAction() == AKEY_EVENT_ACTION_DOWN ? "down" : "up");
+    }
+#endif
+    return true;
+!!!1015180.cpp!!!	mapKey(in scanCode : int32_t, in usageCode : int32_t, inout outKeyCode : int32_t) : status_t
+    if (usageCode) {
+        ssize_t index = mKeysByUsageCode.indexOfKey(usageCode);
+        if (index >= 0) {
+#if DEBUG_MAPPING
+    ALOGD("mapKey: scanCode=%d, usageCode=0x%08x ~ Result keyCode=%d.",
+            scanCode, usageCode, *outKeyCode);
+#endif
+            *outKeyCode = mKeysByUsageCode.valueAt(index);
+            return OK;
+        }
+    }
+    if (scanCode) {
+        ssize_t index = mKeysByScanCode.indexOfKey(scanCode);
+        if (index >= 0) {
+#if DEBUG_MAPPING
+    ALOGD("mapKey: scanCode=%d, usageCode=0x%08x ~ Result keyCode=%d.",
+            scanCode, usageCode, *outKeyCode);
+#endif
+            *outKeyCode = mKeysByScanCode.valueAt(index);
+            return OK;
+        }
+    }
+
+#if DEBUG_MAPPING
+        ALOGD("mapKey: scanCode=%d, usageCode=0x%08x ~ Failed.", scanCode, usageCode);
+#endif
+    *outKeyCode = AKEYCODE_UNKNOWN;
+    return NAME_NOT_FOUND;
+!!!1015308.cpp!!!	readFromParcel(inout parcel : Parcel) : sp<KeyCharacterMap>
+    sp<KeyCharacterMap> map = new KeyCharacterMap();
+    map->mType = parcel->readInt32();
+    size_t numKeys = parcel->readInt32();
+    if (parcel->errorCheck()) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < numKeys; i++) {
+        int32_t keyCode = parcel->readInt32();
+        char16_t label = parcel->readInt32();
+        char16_t number = parcel->readInt32();
+        if (parcel->errorCheck()) {
+            return NULL;
+        }
+
+        Key* key = new Key();
+        key->label = label;
+        key->number = number;
+        map->mKeys.add(keyCode, key);
+
+        Behavior* lastBehavior = NULL;
+        while (parcel->readInt32()) {
+            int32_t metaState = parcel->readInt32();
+            char16_t character = parcel->readInt32();
+            int32_t fallbackKeyCode = parcel->readInt32();
+            if (parcel->errorCheck()) {
+                return NULL;
+            }
+
+            Behavior* behavior = new Behavior();
+            behavior->metaState = metaState;
+            behavior->character = character;
+            behavior->fallbackKeyCode = fallbackKeyCode;
+            if (lastBehavior) {
+                lastBehavior->next = behavior;
+            } else {
+                key->firstBehavior = behavior;
+            }
+            lastBehavior = behavior;
+        }
+
+        if (parcel->errorCheck()) {
+            return NULL;
+        }
+    }
+    return map;
+!!!1015436.cpp!!!	writeToParcel(inout parcel : Parcel) : void
+    parcel->writeInt32(mType);
+
+    size_t numKeys = mKeys.size();
+    parcel->writeInt32(numKeys);
+    for (size_t i = 0; i < numKeys; i++) {
+        int32_t keyCode = mKeys.keyAt(i);
+        const Key* key = mKeys.valueAt(i);
+        parcel->writeInt32(keyCode);
+        parcel->writeInt32(key->label);
+        parcel->writeInt32(key->number);
+        for (const Behavior* behavior = key->firstBehavior; behavior != NULL;
+                behavior = behavior->next) {
+            parcel->writeInt32(1);
+            parcel->writeInt32(behavior->metaState);
+            parcel->writeInt32(behavior->character);
+            parcel->writeInt32(behavior->fallbackKeyCode);
+        }
+        parcel->writeInt32(0);
+    }
+!!!1015564.cpp!!!	~KeyCharacterMap()
+    for (size_t i = 0; i < mKeys.size(); i++) {
+        Key* key = mKeys.editValueAt(i);
+        delete key;
+    }
+!!!1017996.cpp!!!	KeyCharacterMap(in other : KeyCharacterMap)
+    for (size_t i = 0; i < other.mKeys.size(); i++) {
+        mKeys.add(other.mKeys.keyAt(i), new Key(*other.mKeys.valueAt(i)));
+    }
+!!!1018124.cpp!!!	getKey(in keyCode : int32_t, in outKey : Key) : bool
+    ssize_t index = mKeys.indexOfKey(keyCode);
+    if (index >= 0) {
+        *outKey = mKeys.valueAt(index);
+        return true;
+    }
+    return false;
+!!!1018252.cpp!!!	getKeyBehavior(in keyCode : int32_t, in metaState : int32_t, in outKey : Key, in outBehavior : Behavior) : bool
+    const Key* key;
+    if (getKey(keyCode, &key)) {
+        const Behavior* behavior = key->firstBehavior;
+        while (behavior) {
+            if (matchesMetaState(metaState, behavior->metaState)) {
+                *outKey = key;
+                *outBehavior = behavior;
+                return true;
+            }
+            behavior = behavior->next;
+        }
+    }
+    return false;
+!!!1018380.cpp!!!	matchesMetaState(in eventMetaState : int32_t, in behaviorMetaState : int32_t) : bool
+    // Behavior must have at least the set of meta states specified.
+    // And if the key event has CTRL, ALT or META then the behavior must exactly
+    // match those, taking into account that a behavior can specify that it handles
+    // one, both or either of a left/right modifier pair.
+    if ((eventMetaState & behaviorMetaState) == behaviorMetaState) {
+        const int32_t EXACT_META_STATES =
+                AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON | AMETA_CTRL_RIGHT_ON
+                | AMETA_ALT_ON | AMETA_ALT_LEFT_ON | AMETA_ALT_RIGHT_ON
+                | AMETA_META_ON | AMETA_META_LEFT_ON | AMETA_META_RIGHT_ON;
+        int32_t unmatchedMetaState = eventMetaState & ~behaviorMetaState & EXACT_META_STATES;
+        if (behaviorMetaState & AMETA_CTRL_ON) {
+            unmatchedMetaState &= ~(AMETA_CTRL_LEFT_ON | AMETA_CTRL_RIGHT_ON);
+        } else if (behaviorMetaState & (AMETA_CTRL_LEFT_ON | AMETA_CTRL_RIGHT_ON)) {
+            unmatchedMetaState &= ~AMETA_CTRL_ON;
+        }
+        if (behaviorMetaState & AMETA_ALT_ON) {
+            unmatchedMetaState &= ~(AMETA_ALT_LEFT_ON | AMETA_ALT_RIGHT_ON);
+        } else if (behaviorMetaState & (AMETA_ALT_LEFT_ON | AMETA_ALT_RIGHT_ON)) {
+            unmatchedMetaState &= ~AMETA_ALT_ON;
+        }
+        if (behaviorMetaState & AMETA_META_ON) {
+            unmatchedMetaState &= ~(AMETA_META_LEFT_ON | AMETA_META_RIGHT_ON);
+        } else if (behaviorMetaState & (AMETA_META_LEFT_ON | AMETA_META_RIGHT_ON)) {
+            unmatchedMetaState &= ~AMETA_META_ON;
+        }
+        return !unmatchedMetaState;
+    }
+    return false;
+!!!1018508.cpp!!!	findKey(in ch : char16_t, inout outKeyCode : int32_t, inout outMetaState : int32_t) : bool
+    if (!ch) {
+        return false;
+    }
+
+    for (size_t i = 0; i < mKeys.size(); i++) {
+        const Key* key = mKeys.valueAt(i);
+
+        // Try to find the most general behavior that maps to this character.
+        // For example, the base key behavior will usually be last in the list.
+        const Behavior* found = NULL;
+        for (const Behavior* behavior = key->firstBehavior; behavior; behavior = behavior->next) {
+            if (behavior->character == ch) {
+                found = behavior;
+            }
+        }
+        if (found) {
+            *outKeyCode = mKeys.keyAt(i);
+            *outMetaState = found->metaState;
+            return true;
+        }
+    }
+    return false;
+!!!1018636.cpp!!!	load(inout tokenizer : Tokenizer, in format : Format, inout outMap : sp<KeyCharacterMap>) : status_t
+    status_t status = OK;
+    sp<KeyCharacterMap> map = new KeyCharacterMap();
+    if (!map.get()) {
+        ALOGE("Error allocating key character map.");
+        status = NO_MEMORY;
+    } else {
+#if DEBUG_PARSER_PERFORMANCE
+        nsecs_t startTime = systemTime(SYSTEM_TIME_MONOTONIC);
+#endif
+        Parser parser(map.get(), tokenizer, format);
+        status = parser.parse();
+#if DEBUG_PARSER_PERFORMANCE
+        nsecs_t elapsedTime = systemTime(SYSTEM_TIME_MONOTONIC) - startTime;
+        ALOGD("Parsed key character map file '%s' %d lines in %0.3fms.",
+                tokenizer->getFilename().string(), tokenizer->getLineNumber(),
+                elapsedTime / 1000000.0);
+#endif
+        if (!status) {
+            *outMap = map;
+        }
+    }
+    return status;
+!!!1018764.cpp!!!	addKey(inout outEvents : Vector<KeyEvent>, in deviceId : int32_t, in keyCode : int32_t, in metaState : int32_t, in down : bool, in time : nsecs_t) : void
+    outEvents.push();
+    KeyEvent& event = outEvents.editTop();
+    event.initialize(deviceId, AINPUT_SOURCE_KEYBOARD,
+            down ? AKEY_EVENT_ACTION_DOWN : AKEY_EVENT_ACTION_UP,
+            0, keyCode, 0, metaState, 0, time, time);
+!!!1018892.cpp!!!	addMetaKeys(inout outEvents : Vector<KeyEvent>, in deviceId : int32_t, in metaState : int32_t, in down : bool, in time : nsecs_t, inout currentMetaState : int32_t) : void
+    // Add and remove meta keys symmetrically.
+    if (down) {
+        addLockedMetaKey(outEvents, deviceId, metaState, time,
+                AKEYCODE_CAPS_LOCK, AMETA_CAPS_LOCK_ON, currentMetaState);
+        addLockedMetaKey(outEvents, deviceId, metaState, time,
+                AKEYCODE_NUM_LOCK, AMETA_NUM_LOCK_ON, currentMetaState);
+        addLockedMetaKey(outEvents, deviceId, metaState, time,
+                AKEYCODE_SCROLL_LOCK, AMETA_SCROLL_LOCK_ON, currentMetaState);
+
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, true, time,
+                AKEYCODE_SHIFT_LEFT, AMETA_SHIFT_LEFT_ON,
+                AKEYCODE_SHIFT_RIGHT, AMETA_SHIFT_RIGHT_ON,
+                AMETA_SHIFT_ON, currentMetaState);
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, true, time,
+                AKEYCODE_ALT_LEFT, AMETA_ALT_LEFT_ON,
+                AKEYCODE_ALT_RIGHT, AMETA_ALT_RIGHT_ON,
+                AMETA_ALT_ON, currentMetaState);
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, true, time,
+                AKEYCODE_CTRL_LEFT, AMETA_CTRL_LEFT_ON,
+                AKEYCODE_CTRL_RIGHT, AMETA_CTRL_RIGHT_ON,
+                AMETA_CTRL_ON, currentMetaState);
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, true, time,
+                AKEYCODE_META_LEFT, AMETA_META_LEFT_ON,
+                AKEYCODE_META_RIGHT, AMETA_META_RIGHT_ON,
+                AMETA_META_ON, currentMetaState);
+
+        addSingleEphemeralMetaKey(outEvents, deviceId, metaState, true, time,
+                AKEYCODE_SYM, AMETA_SYM_ON, currentMetaState);
+        addSingleEphemeralMetaKey(outEvents, deviceId, metaState, true, time,
+                AKEYCODE_FUNCTION, AMETA_FUNCTION_ON, currentMetaState);
+    } else {
+        addSingleEphemeralMetaKey(outEvents, deviceId, metaState, false, time,
+                AKEYCODE_FUNCTION, AMETA_FUNCTION_ON, currentMetaState);
+        addSingleEphemeralMetaKey(outEvents, deviceId, metaState, false, time,
+                AKEYCODE_SYM, AMETA_SYM_ON, currentMetaState);
+
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, false, time,
+                AKEYCODE_META_LEFT, AMETA_META_LEFT_ON,
+                AKEYCODE_META_RIGHT, AMETA_META_RIGHT_ON,
+                AMETA_META_ON, currentMetaState);
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, false, time,
+                AKEYCODE_CTRL_LEFT, AMETA_CTRL_LEFT_ON,
+                AKEYCODE_CTRL_RIGHT, AMETA_CTRL_RIGHT_ON,
+                AMETA_CTRL_ON, currentMetaState);
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, false, time,
+                AKEYCODE_ALT_LEFT, AMETA_ALT_LEFT_ON,
+                AKEYCODE_ALT_RIGHT, AMETA_ALT_RIGHT_ON,
+                AMETA_ALT_ON, currentMetaState);
+        addDoubleEphemeralMetaKey(outEvents, deviceId, metaState, false, time,
+                AKEYCODE_SHIFT_LEFT, AMETA_SHIFT_LEFT_ON,
+                AKEYCODE_SHIFT_RIGHT, AMETA_SHIFT_RIGHT_ON,
+                AMETA_SHIFT_ON, currentMetaState);
+
+        addLockedMetaKey(outEvents, deviceId, metaState, time,
+                AKEYCODE_SCROLL_LOCK, AMETA_SCROLL_LOCK_ON, currentMetaState);
+        addLockedMetaKey(outEvents, deviceId, metaState, time,
+                AKEYCODE_NUM_LOCK, AMETA_NUM_LOCK_ON, currentMetaState);
+        addLockedMetaKey(outEvents, deviceId, metaState, time,
+                AKEYCODE_CAPS_LOCK, AMETA_CAPS_LOCK_ON, currentMetaState);
+    }
+!!!1019020.cpp!!!	addSingleEphemeralMetaKey(inout outEvents : Vector<KeyEvent>, in deviceId : int32_t, in metaState : int32_t, in down : bool, in time : nsecs_t, in keyCode : int32_t, in keyMetaState : int32_t, inout currentMetaState : int32_t) : bool
+    if ((metaState & keyMetaState) == keyMetaState) {
+        *currentMetaState = updateMetaState(keyCode, down, *currentMetaState);
+        addKey(outEvents, deviceId, keyCode, *currentMetaState, down, time);
+        return true;
+    }
+    return false;
+!!!1019148.cpp!!!	addDoubleEphemeralMetaKey(inout outEvents : Vector<KeyEvent>, in deviceId : int32_t, in metaState : int32_t, in down : bool, in time : nsecs_t, in leftKeyCode : int32_t, in leftKeyMetaState : int32_t, in rightKeyCode : int32_t, in rightKeyMetaState : int32_t, in eitherKeyMetaState : int32_t, inout currentMetaState : int32_t) : void
+    bool specific = false;
+    specific |= addSingleEphemeralMetaKey(outEvents, deviceId, metaState, down, time,
+            leftKeyCode, leftKeyMetaState, currentMetaState);
+    specific |= addSingleEphemeralMetaKey(outEvents, deviceId, metaState, down, time,
+            rightKeyCode, rightKeyMetaState, currentMetaState);
+
+    if (!specific) {
+        addSingleEphemeralMetaKey(outEvents, deviceId, metaState, down, time,
+                leftKeyCode, eitherKeyMetaState, currentMetaState);
+    }
+!!!1019276.cpp!!!	addLockedMetaKey(inout outEvents : Vector<KeyEvent>, in deviceId : int32_t, in metaState : int32_t, in time : nsecs_t, in keyCode : int32_t, in keyMetaState : int32_t, inout currentMetaState : int32_t) : void
+    if ((metaState & keyMetaState) == keyMetaState) {
+        *currentMetaState = updateMetaState(keyCode, true, *currentMetaState);
+        addKey(outEvents, deviceId, keyCode, *currentMetaState, true, time);
+        *currentMetaState = updateMetaState(keyCode, false, *currentMetaState);
+        addKey(outEvents, deviceId, keyCode, *currentMetaState, false, time);
+    }

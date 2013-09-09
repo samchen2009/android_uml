@@ -1,0 +1,347 @@
+class InterfaceCmd
+!!!9967116.cpp!!!	runCommand(inout cli : SocketClient, in argc : int, inout argv : char) : int
+    if (argc < 2) {
+        cli->sendMsg(ResponseCode::CommandSyntaxError, "Missing argument", false);
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "list")) {
+        DIR *d;
+        struct dirent *de;
+
+        if (!(d = opendir("/sys/class/net"))) {
+            cli->sendMsg(ResponseCode::OperationFailed, "Failed to open sysfs dir", true);
+            return 0;
+        }
+
+        while((de = readdir(d))) {
+            if (de->d_name[0] == '.')
+                continue;
+            cli->sendMsg(ResponseCode::InterfaceListResult, de->d_name, false);
+        }
+        closedir(d);
+        cli->sendMsg(ResponseCode::CommandOkay, "Interface list completed", false);
+        return 0;
+    } else if (!strcmp(argv[1], "readrxcounter")) {
+        if (argc != 3) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError,
+                    "Usage: interface readrxcounter <interface>", false);
+            return 0;
+        }
+        unsigned long rx = 0, tx = 0;
+        if (readInterfaceCounters(argv[2], &rx, &tx)) {
+            cli->sendMsg(ResponseCode::OperationFailed, "Failed to read counters", true);
+            return 0;
+        }
+
+        char *msg;
+        asprintf(&msg, "%lu", rx);
+        cli->sendMsg(ResponseCode::InterfaceRxCounterResult, msg, false);
+        free(msg);
+
+        return 0;
+    } else if (!strcmp(argv[1], "readtxcounter")) {
+        if (argc != 3) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError,
+                    "Usage: interface readtxcounter <interface>", false);
+            return 0;
+        }
+        unsigned long rx = 0, tx = 0;
+        if (readInterfaceCounters(argv[2], &rx, &tx)) {
+            cli->sendMsg(ResponseCode::OperationFailed, "Failed to read counters", true);
+            return 0;
+        }
+
+        char *msg = NULL;
+        asprintf(&msg, "%lu", tx);
+        cli->sendMsg(ResponseCode::InterfaceTxCounterResult, msg, false);
+        free(msg);
+        return 0;
+    } else if (!strcmp(argv[1], "getthrottle")) {
+        if (argc != 4 || (argc == 4 && (strcmp(argv[3], "rx") && (strcmp(argv[3], "tx"))))) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError,
+                    "Usage: interface getthrottle <interface> <rx|tx>", false);
+            return 0;
+        }
+        int val = 0;
+        int rc = 0;
+        int voldRc = ResponseCode::InterfaceRxThrottleResult;
+
+        if (!strcmp(argv[3], "rx")) {
+            rc = ThrottleController::getInterfaceRxThrottle(argv[2], &val);
+        } else {
+            rc = ThrottleController::getInterfaceTxThrottle(argv[2], &val);
+            voldRc = ResponseCode::InterfaceTxThrottleResult;
+        }
+        if (rc) {
+            cli->sendMsg(ResponseCode::OperationFailed, "Failed to get throttle", true);
+        } else {
+            char *msg = NULL;
+            asprintf(&msg, "%u", val);
+            cli->sendMsg(voldRc, msg, false);
+            free(msg);
+            return 0;
+        }
+        return 0;
+    } else if (!strcmp(argv[1], "setthrottle")) {
+        if (argc != 5) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError,
+                    "Usage: interface setthrottle <interface> <rx_kbps> <tx_kbps>", false);
+            return 0;
+        }
+        if (ThrottleController::setInterfaceThrottle(argv[2], atoi(argv[3]), atoi(argv[4]))) {
+            cli->sendMsg(ResponseCode::OperationFailed, "Failed to set throttle", true);
+        } else {
+            cli->sendMsg(ResponseCode::CommandOkay, "Interface throttling set", false);
+        }
+        return 0;
+    } else if (!strcmp(argv[1], "driver")) {
+        int rc;
+        char *rbuf;
+
+        if (argc < 4) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError,
+                    "Usage: interface driver <interface> <cmd> <args>", false);
+            return 0;
+        }
+        rc = sInterfaceCtrl->interfaceCommand(argc, argv, &rbuf);
+        if (rc) {
+            cli->sendMsg(ResponseCode::OperationFailed, "Failed to execute command", true);
+        } else {
+            cli->sendMsg(ResponseCode::CommandOkay, rbuf, false);
+        }
+        return 0;
+    } else {
+        /*
+         * These commands take a minimum of 3 arguments
+         */
+        if (argc < 3) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError, "Missing argument", false);
+            return 0;
+        }
+
+        //     0       1       2        3          4           5     6      7
+        // interface route add/remove iface default/secondary dest prefix gateway
+        if (!strcmp(argv[1], "route")) {
+            int prefix_length = 0;
+            if (argc < 8) {
+                cli->sendMsg(ResponseCode::CommandSyntaxError, "Missing argument", false);
+                return 0;
+            }
+            if (sscanf(argv[6], "%d", &prefix_length) != 1) {
+                cli->sendMsg(ResponseCode::CommandParameterError, "Invalid route prefix", false);
+                return 0;
+            }
+            if (!strcmp(argv[2], "add")) {
+                if (!strcmp(argv[4], "default")) {
+                    if (ifc_add_route(argv[3], argv[5], prefix_length, argv[7])) {
+                        cli->sendMsg(ResponseCode::OperationFailed,
+                                "Failed to add route to default table", true);
+                    } else {
+                        cli->sendMsg(ResponseCode::CommandOkay,
+                                "Route added to default table", false);
+                    }
+                } else if (!strcmp(argv[4], "secondary")) {
+                    return sSecondaryTableCtrl->addRoute(cli, argv[3], argv[5],
+                            prefix_length, argv[7]);
+                } else {
+                    cli->sendMsg(ResponseCode::CommandParameterError,
+                            "Invalid route type, expecting 'default' or 'secondary'", false);
+                    return 0;
+                }
+            } else if (!strcmp(argv[2], "remove")) {
+                if (!strcmp(argv[4], "default")) {
+                    if (ifc_remove_route(argv[3], argv[5], prefix_length, argv[7])) {
+                        cli->sendMsg(ResponseCode::OperationFailed,
+                                "Failed to remove route from default table", true);
+                    } else {
+                        cli->sendMsg(ResponseCode::CommandOkay,
+                                "Route removed from default table", false);
+                    }
+                } else if (!strcmp(argv[4], "secondary")) {
+                    return sSecondaryTableCtrl->removeRoute(cli, argv[3], argv[5],
+                            prefix_length, argv[7]);
+                } else {
+                    cli->sendMsg(ResponseCode::CommandParameterError,
+                            "Invalid route type, expecting 'default' or 'secondary'", false);
+                    return 0;
+                }
+            } else {
+                cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown interface cmd", false);
+            }
+            return 0;
+        }
+
+        if (!strcmp(argv[1], "getcfg")) {
+            struct in_addr addr;
+            int prefixLength;
+            unsigned char hwaddr[6];
+            unsigned flags = 0;
+
+            ifc_init();
+            memset(hwaddr, 0, sizeof(hwaddr));
+
+            if (ifc_get_info(argv[2], &addr.s_addr, &prefixLength, &flags)) {
+                cli->sendMsg(ResponseCode::OperationFailed, "Interface not found", true);
+                ifc_close();
+                return 0;
+            }
+
+            if (ifc_get_hwaddr(argv[2], (void *) hwaddr)) {
+                ALOGW("Failed to retrieve HW addr for %s (%s)", argv[2], strerror(errno));
+            }
+
+            char *addr_s = strdup(inet_ntoa(addr));
+            const char *updown, *brdcst, *loopbk, *ppp, *running, *multi;
+
+            updown =  (flags & IFF_UP)           ? "up" : "down";
+            brdcst =  (flags & IFF_BROADCAST)    ? " broadcast" : "";
+            loopbk =  (flags & IFF_LOOPBACK)     ? " loopback" : "";
+            ppp =     (flags & IFF_POINTOPOINT)  ? " point-to-point" : "";
+            running = (flags & IFF_RUNNING)      ? " running" : "";
+            multi =   (flags & IFF_MULTICAST)    ? " multicast" : "";
+
+            char *flag_s;
+
+            asprintf(&flag_s, "%s%s%s%s%s%s", updown, brdcst, loopbk, ppp, running, multi);
+
+            char *msg = NULL;
+            asprintf(&msg, "%.2x:%.2x:%.2x:%.2x:%.2x:%.2x %s %d %s",
+                     hwaddr[0], hwaddr[1], hwaddr[2], hwaddr[3], hwaddr[4], hwaddr[5],
+                     addr_s, prefixLength, flag_s);
+
+            cli->sendMsg(ResponseCode::InterfaceGetCfgResult, msg, false);
+
+            free(addr_s);
+            free(flag_s);
+            free(msg);
+
+            ifc_close();
+            return 0;
+        } else if (!strcmp(argv[1], "setcfg")) {
+            // arglist: iface [addr prefixLength] flags
+            if (argc < 4) {
+                cli->sendMsg(ResponseCode::CommandSyntaxError, "Missing argument", false);
+                return 0;
+            }
+            ALOGD("Setting iface cfg");
+
+            struct in_addr addr;
+            unsigned flags = 0;
+            int index = 5;
+
+            ifc_init();
+
+            if (!inet_aton(argv[3], &addr)) {
+                // Handle flags only case
+                index = 3;
+            } else {
+                if (ifc_set_addr(argv[2], addr.s_addr)) {
+                    cli->sendMsg(ResponseCode::OperationFailed, "Failed to set address", true);
+                    ifc_close();
+                    return 0;
+                }
+
+                // Set prefix length on a non zero address
+                if (addr.s_addr != 0 && ifc_set_prefixLength(argv[2], atoi(argv[4]))) {
+                   cli->sendMsg(ResponseCode::OperationFailed, "Failed to set prefixLength", true);
+                   ifc_close();
+                   return 0;
+               }
+            }
+
+            /* Process flags */
+            for (int i = index; i < argc; i++) {
+                char *flag = argv[i];
+                if (!strcmp(flag, "up")) {
+                    ALOGD("Trying to bring up %s", argv[2]);
+                    if (ifc_up(argv[2])) {
+                        ALOGE("Error upping interface");
+                        cli->sendMsg(ResponseCode::OperationFailed, "Failed to up interface", true);
+                        ifc_close();
+                        return 0;
+                    }
+                } else if (!strcmp(flag, "down")) {
+                    ALOGD("Trying to bring down %s", argv[2]);
+                    if (ifc_down(argv[2])) {
+                        ALOGE("Error downing interface");
+                        cli->sendMsg(ResponseCode::OperationFailed, "Failed to down interface", true);
+                        ifc_close();
+                        return 0;
+                    }
+                } else if (!strcmp(flag, "broadcast")) {
+                    // currently ignored
+                } else if (!strcmp(flag, "multicast")) {
+                    // currently ignored
+                } else if (!strcmp(flag, "running")) {
+                    // currently ignored
+                } else if (!strcmp(flag, "loopback")) {
+                    // currently ignored
+                } else if (!strcmp(flag, "point-to-point")) {
+                    // currently ignored
+                } else {
+                    cli->sendMsg(ResponseCode::CommandParameterError, "Flag unsupported", false);
+                    ifc_close();
+                    return 0;
+                }
+            }
+
+            cli->sendMsg(ResponseCode::CommandOkay, "Interface configuration set", false);
+            ifc_close();
+            return 0;
+        } else if (!strcmp(argv[1], "clearaddrs")) {
+            // arglist: iface
+            ALOGD("Clearing all IP addresses on %s", argv[2]);
+
+            ifc_clear_addresses(argv[2]);
+
+            cli->sendMsg(ResponseCode::CommandOkay, "Interface IP addresses cleared", false);
+            return 0;
+        } else if (!strcmp(argv[1], "ipv6privacyextensions")) {
+            if (argc != 4) {
+                cli->sendMsg(ResponseCode::CommandSyntaxError,
+                        "Usage: interface ipv6privacyextensions <interface> <enable|disable>",
+                        false);
+                return 0;
+            }
+
+            char *tmp;
+            asprintf(&tmp, "/proc/sys/net/ipv6/conf/%s/use_tempaddr", argv[2]);
+
+            if (writeFile(tmp, !strncmp(argv[3], "enable", 7) ? "2" : "0", 1) < 0) {
+                free(tmp);
+                cli->sendMsg(ResponseCode::OperationFailed,
+                        "Failed to set ipv6 privacy extensions", true);
+                return 0;
+            }
+
+            free(tmp);
+            cli->sendMsg(ResponseCode::CommandOkay, "IPv6 privacy extensions changed", false);
+            return 0;
+        } else if (!strcmp(argv[1], "ipv6")) {
+            if (argc != 4) {
+                cli->sendMsg(ResponseCode::CommandSyntaxError,
+                        "Usage: interface ipv6 <interface> <enable|disable>",
+                        false);
+                return 0;
+            }
+
+            char *tmp;
+            asprintf(&tmp, "/proc/sys/net/ipv6/conf/%s/disable_ipv6", argv[2]);
+
+            if (writeFile(tmp, !strncmp(argv[3], "enable", 7) ? "0" : "1", 1) < 0) {
+                free(tmp);
+                cli->sendMsg(ResponseCode::OperationFailed,
+                        "Failed to change IPv6 state", true);
+                return 0;
+            }
+
+            free(tmp);
+            cli->sendMsg(ResponseCode::CommandOkay, "IPv6 state changed", false);
+            return 0;
+        } else {
+            cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown interface cmd", false);
+            return 0;
+        }
+    }
+    return 0;

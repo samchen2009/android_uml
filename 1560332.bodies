@@ -1,0 +1,640 @@
+class SipAudioCall
+!!!9640588.java!!!	SipAudioCall(inout context : Context, inout localProfile : SipProfile)
+        mContext = context;
+        mLocalProfile = localProfile;
+        mWm = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+!!!9640716.java!!!	setListener(inout listener : Listener) : void
+        setListener(listener, false);
+!!!9640844.java!!!	setListener(inout listener : Listener, inout callbackImmediately : boolean) : void
+        mListener = listener;
+        try {
+            if ((listener == null) || !callbackImmediately) {
+                // do nothing
+            } else if (mErrorCode != SipErrorCode.NO_ERROR) {
+                listener.onError(this, mErrorCode, mErrorMessage);
+            } else if (mInCall) {
+                if (mHold) {
+                    listener.onCallHeld(this);
+                } else {
+                    listener.onCallEstablished(this);
+                }
+            } else {
+                int state = getState();
+                switch (state) {
+                    case SipSession.State.READY_TO_CALL:
+                        listener.onReadyToCall(this);
+                        break;
+                    case SipSession.State.INCOMING_CALL:
+                        listener.onRinging(this, getPeerProfile());
+                        break;
+                    case SipSession.State.OUTGOING_CALL:
+                        listener.onCalling(this);
+                        break;
+                    case SipSession.State.OUTGOING_CALL_RING_BACK:
+                        listener.onRingingBack(this);
+                        break;
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "setListener()", t);
+        }
+!!!9640972.java!!!	isInCall() : boolean
+        synchronized (this) {
+            return mInCall;
+        }
+!!!9641100.java!!!	isOnHold() : boolean
+        synchronized (this) {
+            return mHold;
+        }
+!!!9641228.java!!!	close() : void
+        close(true);
+!!!9641356.java!!!	close(inout closeRtp : boolean) : void
+        if (closeRtp) stopCall(RELEASE_SOCKET);
+
+        mInCall = false;
+        mHold = false;
+        mSessionId = System.currentTimeMillis();
+        mErrorCode = SipErrorCode.NO_ERROR;
+        mErrorMessage = null;
+
+        if (mSipSession != null) {
+            mSipSession.setListener(null);
+            mSipSession = null;
+        }
+!!!9641484.java!!!	getLocalProfile() : SipProfile
+        synchronized (this) {
+            return mLocalProfile;
+        }
+!!!9641612.java!!!	getPeerProfile() : SipProfile
+        synchronized (this) {
+            return (mSipSession == null) ? null : mSipSession.getPeerProfile();
+        }
+!!!9641740.java!!!	getState() : int
+        synchronized (this) {
+            if (mSipSession == null) return SipSession.State.READY_TO_CALL;
+            return mSipSession.getState();
+        }
+!!!9641868.java!!!	getSipSession() : SipSession
+        synchronized (this) {
+            return mSipSession;
+        }
+!!!9641996.java!!!	transferToNewSession() : void
+        if (mTransferringSession == null) return;
+        SipSession origin = mSipSession;
+        mSipSession = mTransferringSession;
+        mTransferringSession = null;
+
+        // stop the replaced call.
+        if (mAudioStream != null) {
+            mAudioStream.join(null);
+        } else {
+            try {
+                mAudioStream = new AudioStream(InetAddress.getByName(
+                        getLocalIp()));
+            } catch (Throwable t) {
+                Log.i(TAG, "transferToNewSession(): " + t);
+            }
+        }
+        if (origin != null) origin.endCall();
+        startAudio();
+!!!9642124.java!!!	createListener() : Listener
+        return new SipSession.Listener() {
+            @Override
+            public void onCalling(SipSession session) {
+                Log.d(TAG, "calling... " + session);
+                Listener listener = mListener;
+                if (listener != null) {
+                    try {
+                        listener.onCalling(SipAudioCall.this);
+                    } catch (Throwable t) {
+                        Log.i(TAG, "onCalling(): " + t);
+                    }
+                }
+            }
+
+            @Override
+            public void onRingingBack(SipSession session) {
+                Log.d(TAG, "sip call ringing back: " + session);
+                Listener listener = mListener;
+                if (listener != null) {
+                    try {
+                        listener.onRingingBack(SipAudioCall.this);
+                    } catch (Throwable t) {
+                        Log.i(TAG, "onRingingBack(): " + t);
+                    }
+                }
+            }
+
+            @Override
+            public void onRinging(SipSession session,
+                    SipProfile peerProfile, String sessionDescription) {
+                // this callback is triggered only for reinvite.
+                synchronized (SipAudioCall.this) {
+                    if ((mSipSession == null) || !mInCall
+                            || !session.getCallId().equals(
+                                    mSipSession.getCallId())) {
+                        // should not happen
+                        session.endCall();
+                        return;
+                    }
+
+                    // session changing request
+                    try {
+                        String answer = createAnswer(sessionDescription).encode();
+                        mSipSession.answerCall(answer, SESSION_TIMEOUT);
+                    } catch (Throwable e) {
+                        Log.e(TAG, "onRinging()", e);
+                        session.endCall();
+                    }
+                }
+            }
+
+            @Override
+            public void onCallEstablished(SipSession session,
+                    String sessionDescription) {
+                mPeerSd = sessionDescription;
+                Log.v(TAG, "onCallEstablished()" + mPeerSd);
+
+                // TODO: how to notify the UI that the remote party is changed
+                if ((mTransferringSession != null)
+                        && (session == mTransferringSession)) {
+                    transferToNewSession();
+                    return;
+                }
+
+                Listener listener = mListener;
+                if (listener != null) {
+                    try {
+                        if (mHold) {
+                            listener.onCallHeld(SipAudioCall.this);
+                        } else {
+                            listener.onCallEstablished(SipAudioCall.this);
+                        }
+                    } catch (Throwable t) {
+                        Log.i(TAG, "onCallEstablished(): " + t);
+                    }
+                }
+            }
+
+            @Override
+            public void onCallEnded(SipSession session) {
+                Log.d(TAG, "sip call ended: " + session + " mSipSession:" + mSipSession);
+                // reset the trasnferring session if it is the one.
+                if (session == mTransferringSession) {
+                    mTransferringSession = null;
+                    return;
+                }
+                // or ignore the event if the original session is being
+                // transferred to the new one.
+                if ((mTransferringSession != null) ||
+                    (session != mSipSession)) return;
+
+                Listener listener = mListener;
+                if (listener != null) {
+                    try {
+                        listener.onCallEnded(SipAudioCall.this);
+                    } catch (Throwable t) {
+                        Log.i(TAG, "onCallEnded(): " + t);
+                    }
+                }
+                close();
+            }
+
+            @Override
+            public void onCallBusy(SipSession session) {
+                Log.d(TAG, "sip call busy: " + session);
+                Listener listener = mListener;
+                if (listener != null) {
+                    try {
+                        listener.onCallBusy(SipAudioCall.this);
+                    } catch (Throwable t) {
+                        Log.i(TAG, "onCallBusy(): " + t);
+                    }
+                }
+                close(false);
+            }
+
+            @Override
+            public void onCallChangeFailed(SipSession session, int errorCode,
+                    String message) {
+                Log.d(TAG, "sip call change failed: " + message);
+                mErrorCode = errorCode;
+                mErrorMessage = message;
+                Listener listener = mListener;
+                if (listener != null) {
+                    try {
+                        listener.onError(SipAudioCall.this, mErrorCode,
+                                message);
+                    } catch (Throwable t) {
+                        Log.i(TAG, "onCallBusy(): " + t);
+                    }
+                }
+            }
+
+            @Override
+            public void onError(SipSession session, int errorCode,
+                    String message) {
+                SipAudioCall.this.onError(errorCode, message);
+            }
+
+            @Override
+            public void onRegistering(SipSession session) {
+                // irrelevant
+            }
+
+            @Override
+            public void onRegistrationTimeout(SipSession session) {
+                // irrelevant
+            }
+
+            @Override
+            public void onRegistrationFailed(SipSession session, int errorCode,
+                    String message) {
+                // irrelevant
+            }
+
+            @Override
+            public void onRegistrationDone(SipSession session, int duration) {
+                // irrelevant
+            }
+
+            @Override
+            public void onCallTransferring(SipSession newSession,
+                    String sessionDescription) {
+                Log.v(TAG, "onCallTransferring mSipSession:"
+                        + mSipSession + " newSession:" + newSession);
+                mTransferringSession = newSession;
+                try {
+                    if (sessionDescription == null) {
+                        newSession.makeCall(newSession.getPeerProfile(),
+                                createOffer().encode(), TRANSFER_TIMEOUT);
+                    } else {
+                        String answer = createAnswer(sessionDescription).encode();
+                        newSession.answerCall(answer, SESSION_TIMEOUT);
+                    }
+                } catch (Throwable e) {
+                    Log.e(TAG, "onCallTransferring()", e);
+                    newSession.endCall();
+                }
+            }
+        };
+!!!9642252.java!!!	onError(in errorCode : int, in message : String) : void
+        Log.d(TAG, "sip session error: "
+                + SipErrorCode.toString(errorCode) + ": " + message);
+        mErrorCode = errorCode;
+        mErrorMessage = message;
+        Listener listener = mListener;
+        if (listener != null) {
+            try {
+                listener.onError(this, errorCode, message);
+            } catch (Throwable t) {
+                Log.i(TAG, "onError(): " + t);
+            }
+        }
+        synchronized (this) {
+            if ((errorCode == SipErrorCode.DATA_CONNECTION_LOST)
+                    || !isInCall()) {
+                close(true);
+            }
+        }
+!!!9642380.java!!!	attachCall(inout session : SipSession, in sessionDescription : String) : void
+        if (!SipManager.isVoipSupported(mContext)) {
+            throw new SipException("VOIP API is not supported");
+        }
+
+        synchronized (this) {
+            mSipSession = session;
+            mPeerSd = sessionDescription;
+            Log.v(TAG, "attachCall()" + mPeerSd);
+            try {
+                session.setListener(createListener());
+            } catch (Throwable e) {
+                Log.e(TAG, "attachCall()", e);
+                throwSipException(e);
+            }
+        }
+!!!9642508.java!!!	makeCall(inout peerProfile : SipProfile, inout sipSession : SipSession, in timeout : int) : void
+        if (!SipManager.isVoipSupported(mContext)) {
+            throw new SipException("VOIP API is not supported");
+        }
+
+        synchronized (this) {
+            mSipSession = sipSession;
+            try {
+                mAudioStream = new AudioStream(InetAddress.getByName(
+                        getLocalIp()));
+                sipSession.setListener(createListener());
+                sipSession.makeCall(peerProfile, createOffer().encode(),
+                        timeout);
+            } catch (IOException e) {
+                throw new SipException("makeCall()", e);
+            }
+        }
+!!!9642636.java!!!	endCall() : void
+        synchronized (this) {
+            stopCall(RELEASE_SOCKET);
+            mInCall = false;
+
+            // perform the above local ops first and then network op
+            if (mSipSession != null) mSipSession.endCall();
+        }
+!!!9642764.java!!!	holdCall(in timeout : int) : void
+        synchronized (this) {
+            if (mHold) return;
+            if (mSipSession == null) {
+                throw new SipException("Not in a call to hold call");
+            }
+            mSipSession.changeCall(createHoldOffer().encode(), timeout);
+            mHold = true;
+            setAudioGroupMode();
+        }
+!!!9642892.java!!!	answerCall(in timeout : int) : void
+        synchronized (this) {
+            if (mSipSession == null) {
+                throw new SipException("No call to answer");
+            }
+            try {
+                mAudioStream = new AudioStream(InetAddress.getByName(
+                        getLocalIp()));
+                mSipSession.answerCall(createAnswer(mPeerSd).encode(), timeout);
+            } catch (IOException e) {
+                throw new SipException("answerCall()", e);
+            }
+        }
+!!!9643020.java!!!	continueCall(in timeout : int) : void
+        synchronized (this) {
+            if (!mHold) return;
+            mSipSession.changeCall(createContinueOffer().encode(), timeout);
+            mHold = false;
+            setAudioGroupMode();
+        }
+!!!9643148.java!!!	createOffer() : SimpleSessionDescription
+        SimpleSessionDescription offer =
+                new SimpleSessionDescription(mSessionId, getLocalIp());
+        AudioCodec[] codecs = AudioCodec.getCodecs();
+        Media media = offer.newMedia(
+                "audio", mAudioStream.getLocalPort(), 1, "RTP/AVP");
+        for (AudioCodec codec : AudioCodec.getCodecs()) {
+            media.setRtpPayload(codec.type, codec.rtpmap, codec.fmtp);
+        }
+        media.setRtpPayload(127, "telephone-event/8000", "0-15");
+        return offer;
+!!!9643276.java!!!	createAnswer(in offerSd : String) : SimpleSessionDescription
+        if (TextUtils.isEmpty(offerSd)) return createOffer();
+        SimpleSessionDescription offer =
+                new SimpleSessionDescription(offerSd);
+        SimpleSessionDescription answer =
+                new SimpleSessionDescription(mSessionId, getLocalIp());
+        AudioCodec codec = null;
+        for (Media media : offer.getMedia()) {
+            if ((codec == null) && (media.getPort() > 0)
+                    && "audio".equals(media.getType())
+                    && "RTP/AVP".equals(media.getProtocol())) {
+                // Find the first audio codec we supported.
+                for (int type : media.getRtpPayloadTypes()) {
+                    codec = AudioCodec.getCodec(type, media.getRtpmap(type),
+                            media.getFmtp(type));
+                    if (codec != null) {
+                        break;
+                    }
+                }
+                if (codec != null) {
+                    Media reply = answer.newMedia(
+                            "audio", mAudioStream.getLocalPort(), 1, "RTP/AVP");
+                    reply.setRtpPayload(codec.type, codec.rtpmap, codec.fmtp);
+
+                    // Check if DTMF is supported in the same media.
+                    for (int type : media.getRtpPayloadTypes()) {
+                        String rtpmap = media.getRtpmap(type);
+                        if ((type != codec.type) && (rtpmap != null)
+                                && rtpmap.startsWith("telephone-event")) {
+                            reply.setRtpPayload(
+                                    type, rtpmap, media.getFmtp(type));
+                        }
+                    }
+
+                    // Handle recvonly and sendonly.
+                    if (media.getAttribute("recvonly") != null) {
+                        answer.setAttribute("sendonly", "");
+                    } else if(media.getAttribute("sendonly") != null) {
+                        answer.setAttribute("recvonly", "");
+                    } else if(offer.getAttribute("recvonly") != null) {
+                        answer.setAttribute("sendonly", "");
+                    } else if(offer.getAttribute("sendonly") != null) {
+                        answer.setAttribute("recvonly", "");
+                    }
+                    continue;
+                }
+            }
+            // Reject the media.
+            Media reply = answer.newMedia(
+                    media.getType(), 0, 1, media.getProtocol());
+            for (String format : media.getFormats()) {
+                reply.setFormat(format, null);
+            }
+        }
+        if (codec == null) {
+            throw new IllegalStateException("Reject SDP: no suitable codecs");
+        }
+        return answer;
+!!!9643404.java!!!	createHoldOffer() : SimpleSessionDescription
+        SimpleSessionDescription offer = createContinueOffer();
+        offer.setAttribute("sendonly", "");
+        return offer;
+!!!9643532.java!!!	createContinueOffer() : SimpleSessionDescription
+        SimpleSessionDescription offer =
+                new SimpleSessionDescription(mSessionId, getLocalIp());
+        Media media = offer.newMedia(
+                "audio", mAudioStream.getLocalPort(), 1, "RTP/AVP");
+        AudioCodec codec = mAudioStream.getCodec();
+        media.setRtpPayload(codec.type, codec.rtpmap, codec.fmtp);
+        int dtmfType = mAudioStream.getDtmfType();
+        if (dtmfType != -1) {
+            media.setRtpPayload(dtmfType, "telephone-event/8000", "0-15");
+        }
+        return offer;
+!!!9643660.java!!!	grabWifiHighPerfLock() : void
+        if (mWifiHighPerfLock == null) {
+            Log.v(TAG, "acquire wifi high perf lock");
+            mWifiHighPerfLock = ((WifiManager)
+                    mContext.getSystemService(Context.WIFI_SERVICE))
+                    .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, TAG);
+            mWifiHighPerfLock.acquire();
+        }
+!!!9643788.java!!!	releaseWifiHighPerfLock() : void
+        if (mWifiHighPerfLock != null) {
+            Log.v(TAG, "release wifi high perf lock");
+            mWifiHighPerfLock.release();
+            mWifiHighPerfLock = null;
+        }
+!!!9643916.java!!!	isWifiOn() : boolean
+        return (mWm.getConnectionInfo().getBSSID() == null) ? false : true;
+!!!9644044.java!!!	toggleMute() : void
+        synchronized (this) {
+            mMuted = !mMuted;
+            setAudioGroupMode();
+        }
+!!!9644172.java!!!	isMuted() : boolean
+        synchronized (this) {
+            return mMuted;
+        }
+!!!9644300.java!!!	setSpeakerMode(inout speakerMode : boolean) : void
+        synchronized (this) {
+            ((AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE))
+                    .setSpeakerphoneOn(speakerMode);
+            setAudioGroupMode();
+        }
+!!!9644428.java!!!	isSpeakerOn() : boolean
+        return ((AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE))
+                .isSpeakerphoneOn();
+!!!9644556.java!!!	sendDtmf(in code : int) : void
+        sendDtmf(code, null);
+!!!9644684.java!!!	sendDtmf(in code : int, inout result : Message) : void
+        synchronized (this) {
+            AudioGroup audioGroup = getAudioGroup();
+            if ((audioGroup != null) && (mSipSession != null)
+                    && (SipSession.State.IN_CALL == getState())) {
+                Log.v(TAG, "send DTMF: " + code);
+                audioGroup.sendDtmf(code);
+            }
+            if (result != null) result.sendToTarget();
+        }
+!!!9644812.java!!!	getAudioStream() : AudioStream
+        synchronized (this) {
+            return mAudioStream;
+        }
+!!!9644940.java!!!	getAudioGroup() : AudioGroup
+        synchronized (this) {
+            if (mAudioGroup != null) return mAudioGroup;
+            return ((mAudioStream == null) ? null : mAudioStream.getGroup());
+        }
+!!!9645068.java!!!	setAudioGroup(inout group : AudioGroup) : void
+        synchronized (this) {
+            if ((mAudioStream != null) && (mAudioStream.getGroup() != null)) {
+                mAudioStream.join(group);
+            }
+            mAudioGroup = group;
+        }
+!!!9645196.java!!!	startAudio() : void
+        try {
+            startAudioInternal();
+        } catch (UnknownHostException e) {
+            onError(SipErrorCode.PEER_NOT_REACHABLE, e.getMessage());
+        } catch (Throwable e) {
+            onError(SipErrorCode.CLIENT_ERROR, e.getMessage());
+        }
+!!!9645324.java!!!	startAudioInternal() : void
+        if (mPeerSd == null) {
+            Log.v(TAG, "startAudioInternal() mPeerSd = null");
+            throw new IllegalStateException("mPeerSd = null");
+        }
+
+        stopCall(DONT_RELEASE_SOCKET);
+        mInCall = true;
+
+        // Run exact the same logic in createAnswer() to setup mAudioStream.
+        SimpleSessionDescription offer =
+                new SimpleSessionDescription(mPeerSd);
+        AudioStream stream = mAudioStream;
+        AudioCodec codec = null;
+        for (Media media : offer.getMedia()) {
+            if ((codec == null) && (media.getPort() > 0)
+                    && "audio".equals(media.getType())
+                    && "RTP/AVP".equals(media.getProtocol())) {
+                // Find the first audio codec we supported.
+                for (int type : media.getRtpPayloadTypes()) {
+                    codec = AudioCodec.getCodec(
+                            type, media.getRtpmap(type), media.getFmtp(type));
+                    if (codec != null) {
+                        break;
+                    }
+                }
+
+                if (codec != null) {
+                    // Associate with the remote host.
+                    String address = media.getAddress();
+                    if (address == null) {
+                        address = offer.getAddress();
+                    }
+                    stream.associate(InetAddress.getByName(address),
+                            media.getPort());
+
+                    stream.setDtmfType(-1);
+                    stream.setCodec(codec);
+                    // Check if DTMF is supported in the same media.
+                    for (int type : media.getRtpPayloadTypes()) {
+                        String rtpmap = media.getRtpmap(type);
+                        if ((type != codec.type) && (rtpmap != null)
+                                && rtpmap.startsWith("telephone-event")) {
+                            stream.setDtmfType(type);
+                        }
+                    }
+
+                    // Handle recvonly and sendonly.
+                    if (mHold) {
+                        stream.setMode(RtpStream.MODE_NORMAL);
+                    } else if (media.getAttribute("recvonly") != null) {
+                        stream.setMode(RtpStream.MODE_SEND_ONLY);
+                    } else if(media.getAttribute("sendonly") != null) {
+                        stream.setMode(RtpStream.MODE_RECEIVE_ONLY);
+                    } else if(offer.getAttribute("recvonly") != null) {
+                        stream.setMode(RtpStream.MODE_SEND_ONLY);
+                    } else if(offer.getAttribute("sendonly") != null) {
+                        stream.setMode(RtpStream.MODE_RECEIVE_ONLY);
+                    } else {
+                        stream.setMode(RtpStream.MODE_NORMAL);
+                    }
+                    break;
+                }
+            }
+        }
+        if (codec == null) {
+            throw new IllegalStateException("Reject SDP: no suitable codecs");
+        }
+
+        if (isWifiOn()) grabWifiHighPerfLock();
+
+        // AudioGroup logic:
+        AudioGroup audioGroup = getAudioGroup();
+        if (mHold) {
+            // don't create an AudioGroup here; doing so will fail if
+            // there's another AudioGroup out there that's active
+        } else {
+            if (audioGroup == null) audioGroup = new AudioGroup();
+            stream.join(audioGroup);
+        }
+        setAudioGroupMode();
+!!!9645452.java!!!	setAudioGroupMode() : void
+        AudioGroup audioGroup = getAudioGroup();
+        if (audioGroup != null) {
+            if (mHold) {
+                audioGroup.setMode(AudioGroup.MODE_ON_HOLD);
+            } else if (mMuted) {
+                audioGroup.setMode(AudioGroup.MODE_MUTED);
+            } else if (isSpeakerOn()) {
+                audioGroup.setMode(AudioGroup.MODE_ECHO_SUPPRESSION);
+            } else {
+                audioGroup.setMode(AudioGroup.MODE_NORMAL);
+            }
+        }
+!!!9645580.java!!!	stopCall(inout releaseSocket : boolean) : void
+        Log.d(TAG, "stop audiocall");
+        releaseWifiHighPerfLock();
+        if (mAudioStream != null) {
+            mAudioStream.join(null);
+
+            if (releaseSocket) {
+                mAudioStream.release();
+                mAudioStream = null;
+            }
+        }
+!!!9645708.java!!!	getLocalIp() : String
+        return mSipSession.getLocalIp();
+!!!9645836.java!!!	throwSipException(inout throwable : Throwable) : void
+        if (throwable instanceof SipException) {
+            throw (SipException) throwable;
+        } else {
+            throw new SipException("", throwable);
+        }
+!!!9645964.java!!!	getPeerProfile(inout session : SipSession) : SipProfile
+        return session.getPeerProfile();

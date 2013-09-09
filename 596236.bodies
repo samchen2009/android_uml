@@ -1,0 +1,350 @@
+class DisplayDevice
+!!!1735820.cpp!!!	DisplayDevice(in flinger : sp<SurfaceFlinger>, in type : DisplayType, in isSecure : bool, in displayToken : wp<IBinder>, in nativeWindow : sp<ANativeWindow>, in framebufferSurface : sp<FramebufferSurface>, in config : EGLConfig)
+    init(config);
+!!!1735948.cpp!!!	~DisplayDevice()
+    if (mSurface != EGL_NO_SURFACE) {
+        eglDestroySurface(mDisplay, mSurface);
+        mSurface = EGL_NO_SURFACE;
+    }
+#if __i386__
+    if (mConsoleManagerThread != 0) {
+        mConsoleManagerThread->requestExitAndWait();
+        ALOGD("ConsoleManagerThread: destroy primary DisplayDevice");
+    }
+#endif
+!!!1736076.cpp!!!	isValid() : bool
+    return mFlinger != NULL;
+!!!1736332.cpp!!!	flip(in dirty : Region) : void
+    checkGLErrors();
+
+    EGLDisplay dpy = mDisplay;
+    EGLSurface surface = mSurface;
+
+#ifdef EGL_ANDROID_swap_rectangle
+    if (mFlags & SWAP_RECTANGLE) {
+        const Region newDirty(dirty.intersect(bounds()));
+        const Rect b(newDirty.getBounds());
+        eglSetSwapRectangleANDROID(dpy, surface,
+                b.left, b.top, b.width(), b.height());
+    }
+#endif
+
+    mPageFlipCount++;
+!!!1736460.cpp!!!	getWidth() : int
+    return mDisplayWidth;
+!!!1736588.cpp!!!	getHeight() : int
+    return mDisplayHeight;
+!!!1736716.cpp!!!	getFormat() : PixelFormat
+    return mFormat;
+!!!1736844.cpp!!!	getFlags() : uint32_t
+    return mFlags;
+!!!1736972.cpp!!!	getEGLSurface() : EGLSurface
+    return mSurface;
+!!!1737100.cpp!!!	setVisibleLayersSortedByZ(in layers : Vector< sp<LayerBase> >) : void
+    mVisibleLayersSortedByZ = layers;
+    mSecureLayerVisible = false;
+    size_t count = layers.size();
+    for (size_t i=0 ; i<count ; i++) {
+        if (layers[i]->isSecure()) {
+            mSecureLayerVisible = true;
+        }
+    }
+!!!1737228.cpp!!!	getVisibleLayersSortedByZ() : Vector< sp<LayerBase> >
+    return mVisibleLayersSortedByZ;
+!!!1737356.cpp!!!	getSecureLayerVisible() : bool
+    return mSecureLayerVisible;
+!!!1737484.cpp!!!	getDirtyRegion(in repaintEverything : bool) : Region
+    Region dirty;
+    if (repaintEverything) {
+        dirty.set(getBounds());
+    } else {
+        const Transform& planeTransform(mGlobalTransform);
+        dirty = planeTransform.transform(this->dirtyRegion);
+        dirty.andSelf(getBounds());
+    }
+    return dirty;
+!!!1737612.cpp!!!	setLayerStack(in stack : uint32_t) : void
+    mLayerStack = stack;
+    dirtyRegion.set(bounds());
+!!!1737740.cpp!!!	setProjection(in orientation : int, in newViewport : Rect, in newFrame : Rect) : void
+    Rect viewport(newViewport);
+    Rect frame(newFrame);
+
+    const int w = mDisplayWidth;
+    const int h = mDisplayHeight;
+
+    Transform R;
+    DisplayDevice::orientationToTransfrom(orientation, w, h, &R);
+
+    if (!frame.isValid()) {
+        // the destination frame can be invalid if it has never been set,
+        // in that case we assume the whole display frame.
+        frame = Rect(w, h);
+    }
+
+    if (viewport.isEmpty()) {
+        // viewport can be invalid if it has never been set, in that case
+        // we assume the whole display size.
+        // it's also invalid to have an empty viewport, so we handle that
+        // case in the same way.
+        viewport = Rect(w, h);
+        if (R.getOrientation() & Transform::ROT_90) {
+            // viewport is always specified in the logical orientation
+            // of the display (ie: post-rotation).
+            swap(viewport.right, viewport.bottom);
+        }
+    }
+
+    dirtyRegion.set(getBounds());
+
+    Transform TL, TP, S;
+    float src_width  = viewport.width();
+    float src_height = viewport.height();
+    float dst_width  = frame.width();
+    float dst_height = frame.height();
+    if (src_width != dst_width || src_height != dst_height) {
+        float sx = dst_width  / src_width;
+        float sy = dst_height / src_height;
+        S.set(sx, 0, 0, sy);
+    }
+
+    float src_x = viewport.left;
+    float src_y = viewport.top;
+    float dst_x = frame.left;
+    float dst_y = frame.top;
+    TL.set(-src_x, -src_y);
+    TP.set(dst_x, dst_y);
+
+    // The viewport and frame are both in the logical orientation.
+    // Apply the logical translation, scale to physical size, apply the
+    // physical translation and finally rotate to the physical orientation.
+    mGlobalTransform = R * TP * S * TL;
+
+    const uint8_t type = mGlobalTransform.getType();
+    mNeedsFiltering = (!mGlobalTransform.preserveRects() ||
+            (type >= Transform::SCALE));
+
+    mScissor = mGlobalTransform.transform(viewport);
+    if (mScissor.isEmpty()) {
+        mScissor.set(getBounds());
+    }
+
+    mOrientation = orientation;
+    mViewport = viewport;
+    mFrame = frame;
+!!!1739020.cpp!!!	swapBuffers(inout hwc : HWComposer) : void
+    // We need to call eglSwapBuffers() unless:
+    // (a) there was no GLES composition this frame, or
+    // (b) we're using a legacy HWC with no framebuffer target support (in
+    //     which case HWComposer::commit() handles things).
+    if (hwc.initCheck() != NO_ERROR ||
+            (hwc.hasGlesComposition(mHwcDisplayId) &&
+             hwc.supportsFramebufferTarget())) {
+        EGLBoolean success = eglSwapBuffers(mDisplay, mSurface);
+        if (!success) {
+            EGLint error = eglGetError();
+            if (error == EGL_CONTEXT_LOST ||
+                    mType == DisplayDevice::DISPLAY_PRIMARY) {
+                LOG_ALWAYS_FATAL("eglSwapBuffers(%p, %p) failed with 0x%08x",
+                        mDisplay, mSurface, error);
+            } else {
+                ALOGE("eglSwapBuffers(%p, %p) failed with 0x%08x",
+                        mDisplay, mSurface, error);
+            }
+        }
+    }
+
+    status_t result = mDisplaySurface->advanceFrame();
+    if (result != NO_ERROR) {
+        ALOGE("[%s] failed pushing new frame to HWC: %d",
+                mDisplayName.string(), result);
+    }
+!!!1739148.cpp!!!	compositionComplete() : status_t
+    return mDisplaySurface->compositionComplete();
+!!!1739276.cpp!!!	onSwapBuffersCompleted(inout hwc : HWComposer) : void
+    if (hwc.initCheck() == NO_ERROR) {
+        mDisplaySurface->onFrameCommitted();
+    }
+!!!1739660.cpp!!!	setDisplayName(in displayName : String8) : void
+    if (!displayName.isEmpty()) {
+        // never override the name with an empty name
+        mDisplayName = displayName;
+    }
+!!!1739916.cpp!!!	makeCurrent(in dpy : EGLDisplay, in hw : sp<const DisplayDevice>, in ctx : EGLContext) : EGLBoolean
+    EGLBoolean result = EGL_TRUE;
+    EGLSurface sur = eglGetCurrentSurface(EGL_DRAW);
+    if (sur != hw->mSurface) {
+        result = eglMakeCurrent(dpy, hw->mSurface, hw->mSurface, ctx);
+        if (result == EGL_TRUE) {
+            setViewportAndProjection(hw);
+        }
+    }
+    return result;
+!!!1740044.cpp!!!	setViewportAndProjection(in hw : sp<const DisplayDevice>) : void
+    GLsizei w = hw->mDisplayWidth;
+    GLsizei h = hw->mDisplayHeight;
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    // put the origin in the left-bottom corner
+    glOrthof(0, w, 0, h, 0, 1); // l=0, r=w ; b=0, t=h
+    glMatrixMode(GL_MODELVIEW);
+!!!1740172.cpp!!!	releaseScreen() : void
+    mScreenAcquired = false;
+    if (mConsoleManagerThread != 0) {
+        mConsoleManagerThread->releaseScreen();
+    }
+!!!1740300.cpp!!!	acquireScreen() : void
+    mScreenAcquired = true;
+!!!1740428.cpp!!!	isScreenAcquired() : bool
+    return mScreenAcquired;
+!!!1740556.cpp!!!	canDraw() : bool
+    return mScreenAcquired;
+!!!1740684.cpp!!!	getPageFlipCount() : uint32_t
+    return mPageFlipCount;
+!!!1740812.cpp!!!	dump(inout result : String8, inout buffer : char, in SIZE : size_t) : void
+    const Transform& tr(mGlobalTransform);
+    snprintf(buffer, SIZE,
+        "+ DisplayDevice: %s\n"
+        "   type=%x, hwcId=%d, layerStack=%u, (%4dx%4d), ANativeWindow=%p, orient=%2d (type=%08x), "
+        "flips=%u, isSecure=%d, secureVis=%d, acquired=%d, numLayers=%u\n"
+        "   v:[%d,%d,%d,%d], f:[%d,%d,%d,%d], s:[%d,%d,%d,%d],"
+        "transform:[[%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f]]\n",
+        mDisplayName.string(), mType, mHwcDisplayId,
+        mLayerStack, mDisplayWidth, mDisplayHeight, mNativeWindow.get(),
+        mOrientation, tr.getType(), getPageFlipCount(),
+        mIsSecure, mSecureLayerVisible, mScreenAcquired, mVisibleLayersSortedByZ.size(),
+        mViewport.left, mViewport.top, mViewport.right, mViewport.bottom,
+        mFrame.left, mFrame.top, mFrame.right, mFrame.bottom,
+        mScissor.left, mScissor.top, mScissor.right, mScissor.bottom,
+        tr[0][0], tr[1][0], tr[2][0],
+        tr[0][1], tr[1][1], tr[2][1],
+        tr[0][2], tr[1][2], tr[2][2]);
+
+    result.append(buffer);
+
+    String8 surfaceDump;
+    mDisplaySurface->dump(surfaceDump);
+    result.append(surfaceDump);
+!!!1740940.cpp!!!	init(in config : EGLConfig) : void
+    ANativeWindow* const window = mNativeWindow.get();
+
+    int format;
+    window->query(window, NATIVE_WINDOW_FORMAT, &format);
+
+    /*
+     * Create our display's surface
+     */
+
+    EGLSurface surface;
+    EGLint w, h;
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    surface = eglCreateWindowSurface(display, config, window, NULL);
+    eglQuerySurface(display, surface, EGL_WIDTH,  &mDisplayWidth);
+    eglQuerySurface(display, surface, EGL_HEIGHT, &mDisplayHeight);
+
+    mDisplay = display;
+    mSurface = surface;
+    mFormat  = format;
+    mPageFlipCount = 0;
+    mViewport.makeInvalid();
+    mFrame.makeInvalid();
+
+    // external displays are always considered enabled
+    mScreenAcquired = (mType >= DisplayDevice::NUM_DISPLAY_TYPES);
+
+    // get an h/w composer ID
+    mHwcDisplayId = mFlinger->allocateHwcDisplayId(mType);
+
+    // Name the display.  The name will be replaced shortly if the display
+    // was created with createDisplay().
+    switch (mType) {
+        case DISPLAY_PRIMARY:
+            mDisplayName = "Built-in Screen";
+            break;
+        case DISPLAY_EXTERNAL:
+            mDisplayName = "HDMI Screen";
+            break;
+        default:
+            mDisplayName = "Virtual Screen";    // e.g. Overlay #n
+            break;
+    }
+
+    // initialize the display orientation transform.
+    setProjection(DisplayState::eOrientationDefault, mViewport, mFrame);
+!!!1741068.cpp!!!	orientationToTransfrom(in orientation : int, in w : int, in h : int, inout tr : Transform) : status_t
+    uint32_t flags = 0;
+    switch (orientation) {
+    case DisplayState::eOrientationDefault:
+        flags = Transform::ROT_0;
+        break;
+    case DisplayState::eOrientation90:
+        flags = Transform::ROT_90;
+        break;
+    case DisplayState::eOrientation180:
+        flags = Transform::ROT_180;
+        break;
+    case DisplayState::eOrientation270:
+        flags = Transform::ROT_270;
+        break;
+    default:
+        return BAD_VALUE;
+    }
+    tr->set(flags, w, h);
+    return NO_ERROR;
+!!!1741196.cpp!!!	updateGeometryTransform() : void
+    int w = mDisplayWidth;
+    int h = mDisplayHeight;
+    Transform TL, TP, R, S;
+    if (DisplayDevice::orientationToTransfrom(
+            mOrientation, w, h, &R) == NO_ERROR) {
+        dirtyRegion.set(bounds());
+
+        Rect viewport(mViewport);
+        Rect frame(mFrame);
+
+        if (!frame.isValid()) {
+            // the destination frame can be invalid if it has never been set,
+            // in that case we assume the whole display frame.
+            frame = Rect(w, h);
+        }
+
+        if (viewport.isEmpty()) {
+            // viewport can be invalid if it has never been set, in that case
+            // we assume the whole display size.
+            // it's also invalid to have an empty viewport, so we handle that
+            // case in the same way.
+            viewport = Rect(w, h);
+            if (R.getOrientation() & Transform::ROT_90) {
+                // viewport is always specified in the logical orientation
+                // of the display (ie: post-rotation).
+                swap(viewport.right, viewport.bottom);
+            }
+        }
+
+        float src_width  = viewport.width();
+        float src_height = viewport.height();
+        float dst_width  = frame.width();
+        float dst_height = frame.height();
+        if (src_width != dst_width || src_height != dst_height) {
+            float sx = dst_width  / src_width;
+            float sy = dst_height / src_height;
+            S.set(sx, 0, 0, sy);
+        }
+
+        float src_x = viewport.left;
+        float src_y = viewport.top;
+        float dst_x = frame.left;
+        float dst_y = frame.top;
+        TL.set(-src_x, -src_y);
+        TP.set(dst_x, dst_y);
+
+        // The viewport and frame are both in the logical orientation.
+        // Apply the logical translation, scale to physical size, apply the
+        // physical translation and finally rotate to the physical orientation.
+        mGlobalTransform = R * TP * S * TL;
+
+        const uint8_t type = mGlobalTransform.getType();
+        mNeedsFiltering = (!mGlobalTransform.preserveRects() ||
+                (type >= Transform::SCALE));
+    }

@@ -1,0 +1,356 @@
+class TextToSpeech
+!!!4166284.java!!!	TextToSpeech(inout context : Context, inout listener : OnInitListener)
+        this(context, listener, null);
+!!!4166412.java!!!	TextToSpeech(inout context : Context, inout listener : OnInitListener, in engine : String)
+        this(context, listener, engine, null, true);
+!!!4166540.java!!!	TextToSpeech(inout context : Context, inout listener : OnInitListener, in engine : String, in packageName : String, inout useFallback : boolean)
+        mContext = context;
+        mInitListener = listener;
+        mRequestedEngine = engine;
+        mUseFallback = useFallback;
+
+        mEarcons = new HashMap<String, Uri>();
+        mUtterances = new HashMap<String, Uri>();
+        mUtteranceProgressListener = null;
+
+        mEnginesHelper = new TtsEngines(mContext);
+        if (packageName != null) {
+            mPackageName = packageName;
+        } else {
+            mPackageName = mContext.getPackageName();
+        }
+        initTts();
+!!!4166668.java!!!	runActionNoReconnect(inout action : Action, inout errorResult : R, in method : String) : R
+        return runAction(action, errorResult, method, false);
+!!!4166796.java!!!	runAction(inout action : Action, inout errorResult : R, in method : String) : R
+        return runAction(action, errorResult, method, true);
+!!!4166924.java!!!	runAction(inout action : Action, inout errorResult : R, in method : String, inout reconnect : boolean) : R
+        synchronized (mStartLock) {
+            if (mServiceConnection == null) {
+                Log.w(TAG, method + " failed: not bound to TTS engine");
+                return errorResult;
+            }
+            return mServiceConnection.runAction(action, errorResult, method, reconnect);
+        }
+!!!4167052.java!!!	initTts() : int
+        // Step 1: Try connecting to the engine that was requested.
+        if (mRequestedEngine != null) {
+            if (mEnginesHelper.isEngineInstalled(mRequestedEngine)) {
+                if (connectToEngine(mRequestedEngine)) {
+                    mCurrentEngine = mRequestedEngine;
+                    return SUCCESS;
+                } else if (!mUseFallback) {
+                    mCurrentEngine = null;
+                    dispatchOnInit(ERROR);
+                    return ERROR;
+                }
+            } else if (!mUseFallback) {
+                Log.i(TAG, "Requested engine not installed: " + mRequestedEngine);
+                mCurrentEngine = null;
+                dispatchOnInit(ERROR);
+                return ERROR;
+            }
+        }
+
+        // Step 2: Try connecting to the user's default engine.
+        final String defaultEngine = getDefaultEngine();
+        if (defaultEngine != null && !defaultEngine.equals(mRequestedEngine)) {
+            if (connectToEngine(defaultEngine)) {
+                mCurrentEngine = defaultEngine;
+                return SUCCESS;
+            }
+        }
+
+        // Step 3: Try connecting to the highest ranked engine in the
+        // system.
+        final String highestRanked = mEnginesHelper.getHighestRankedEngineName();
+        if (highestRanked != null && !highestRanked.equals(mRequestedEngine) &&
+                !highestRanked.equals(defaultEngine)) {
+            if (connectToEngine(highestRanked)) {
+                mCurrentEngine = highestRanked;
+                return SUCCESS;
+            }
+        }
+
+        // NOTE: The API currently does not allow the caller to query whether
+        // they are actually connected to any engine. This might fail for various
+        // reasons like if the user disables all her TTS engines.
+
+        mCurrentEngine = null;
+        dispatchOnInit(ERROR);
+        return ERROR;
+!!!4167180.java!!!	connectToEngine(in engine : String) : boolean
+        Connection connection = new Connection();
+        Intent intent = new Intent(Engine.INTENT_ACTION_TTS_SERVICE);
+        intent.setPackage(engine);
+        boolean bound = mContext.bindService(intent, connection, Context.BIND_AUTO_CREATE);
+        if (!bound) {
+            Log.e(TAG, "Failed to bind to " + engine);
+            return false;
+        } else {
+            Log.i(TAG, "Sucessfully bound to " + engine);
+            return true;
+        }
+!!!4167308.java!!!	dispatchOnInit(in result : int) : void
+        synchronized (mStartLock) {
+            if (mInitListener != null) {
+                mInitListener.onInit(result);
+                mInitListener = null;
+            }
+        }
+!!!4167436.java!!!	getCallerIdentity() : IBinder
+        return mServiceConnection.getCallerIdentity();
+!!!4167564.java!!!	shutdown() : void
+        runActionNoReconnect(new Action<Void>() {
+            @Override
+            public Void run(ITextToSpeechService service) throws RemoteException {
+                service.setCallback(getCallerIdentity(), null);
+                service.stop(getCallerIdentity());
+                mServiceConnection.disconnect();
+                // Context#unbindService does not result in a call to
+                // ServiceConnection#onServiceDisconnected. As a result, the
+                // service ends up being destroyed (if there are no other open
+                // connections to it) but the process lives on and the
+                // ServiceConnection continues to refer to the destroyed service.
+                //
+                // This leads to tons of log spam about SynthThread being dead.
+                mServiceConnection = null;
+                mCurrentEngine = null;
+                return null;
+            }
+        }, null, "shutdown");
+!!!4167692.java!!!	addSpeech(in text : String, in packagename : String, in resourceId : int) : int
+        synchronized (mStartLock) {
+            mUtterances.put(text, makeResourceUri(packagename, resourceId));
+            return SUCCESS;
+        }
+!!!4167820.java!!!	addSpeech(in text : String, in filename : String) : int
+        synchronized (mStartLock) {
+            mUtterances.put(text, Uri.parse(filename));
+            return SUCCESS;
+        }
+!!!4167948.java!!!	addEarcon(in earcon : String, in packagename : String, in resourceId : int) : int
+        synchronized(mStartLock) {
+            mEarcons.put(earcon, makeResourceUri(packagename, resourceId));
+            return SUCCESS;
+        }
+!!!4168076.java!!!	addEarcon(in earcon : String, in filename : String) : int
+        synchronized(mStartLock) {
+            mEarcons.put(earcon, Uri.parse(filename));
+            return SUCCESS;
+        }
+!!!4168204.java!!!	makeResourceUri(in packageName : String, in resourceId : int) : Uri
+        return new Uri.Builder()
+                .scheme(ContentResolver.SCHEME_ANDROID_RESOURCE)
+                .encodedAuthority(packageName)
+                .appendEncodedPath(String.valueOf(resourceId))
+                .build();
+!!!4168332.java!!!	speak(in text : String, in queueMode : int, in params : HashMap<String, String>) : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                Uri utteranceUri = mUtterances.get(text);
+                if (utteranceUri != null) {
+                    return service.playAudio(getCallerIdentity(), utteranceUri, queueMode,
+                            getParams(params));
+                } else {
+                    return service.speak(getCallerIdentity(), text, queueMode, getParams(params));
+                }
+            }
+        }, ERROR, "speak");
+!!!4168460.java!!!	playEarcon(in earcon : String, in queueMode : int, in params : HashMap<String, String>) : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                Uri earconUri = mEarcons.get(earcon);
+                if (earconUri == null) {
+                    return ERROR;
+                }
+                return service.playAudio(getCallerIdentity(), earconUri, queueMode,
+                        getParams(params));
+            }
+        }, ERROR, "playEarcon");
+!!!4168588.java!!!	playSilence(in durationInMs : long, in queueMode : int, in params : HashMap<String, String>) : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                return service.playSilence(getCallerIdentity(), durationInMs, queueMode,
+                        getParams(params));
+            }
+        }, ERROR, "playSilence");
+!!!4168716.java!!!	getFeatures(in locale : Locale) : Set<String>
+        return runAction(new Action<Set<String>>() {
+            @Override
+            public Set<String> run(ITextToSpeechService service) throws RemoteException {
+                String[] features = service.getFeaturesForLanguage(
+                        locale.getISO3Language(), locale.getISO3Country(), locale.getVariant());
+                if (features != null) {
+                    final Set<String> featureSet = new HashSet<String>();
+                    Collections.addAll(featureSet, features);
+                    return featureSet;
+                }
+                return null;
+            }
+        }, null, "getFeatures");
+!!!4168844.java!!!	isSpeaking() : boolean
+        return runAction(new Action<Boolean>() {
+            @Override
+            public Boolean run(ITextToSpeechService service) throws RemoteException {
+                return service.isSpeaking();
+            }
+        }, false, "isSpeaking");
+!!!4168972.java!!!	stop() : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                return service.stop(getCallerIdentity());
+            }
+        }, ERROR, "stop");
+!!!4169100.java!!!	setSpeechRate(in speechRate : float) : int
+        if (speechRate > 0.0f) {
+            int intRate = (int)(speechRate * 100);
+            if (intRate > 0) {
+                synchronized (mStartLock) {
+                    mParams.putInt(Engine.KEY_PARAM_RATE, intRate);
+                }
+                return SUCCESS;
+            }
+        }
+        return ERROR;
+!!!4169228.java!!!	setPitch(in pitch : float) : int
+        if (pitch > 0.0f) {
+            int intPitch = (int)(pitch * 100);
+            if (intPitch > 0) {
+                synchronized (mStartLock) {
+                    mParams.putInt(Engine.KEY_PARAM_PITCH, intPitch);
+                }
+                return SUCCESS;
+            }
+        }
+        return ERROR;
+!!!4169356.java!!!	getCurrentEngine() : String
+        return mCurrentEngine;
+!!!4169484.java!!!	setLanguage(in loc : Locale) : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                if (loc == null) {
+                    return LANG_NOT_SUPPORTED;
+                }
+                String language = loc.getISO3Language();
+                String country = loc.getISO3Country();
+                String variant = loc.getVariant();
+                // Check if the language, country, variant are available, and cache
+                // the available parts.
+                // Note that the language is not actually set here, instead it is cached so it
+                // will be associated with all upcoming utterances.
+                int result = service.loadLanguage(language, country, variant);
+                if (result >= LANG_AVAILABLE){
+                    if (result < LANG_COUNTRY_VAR_AVAILABLE) {
+                        variant = "";
+                        if (result < LANG_COUNTRY_AVAILABLE) {
+                            country = "";
+                        }
+                    }
+                    mParams.putString(Engine.KEY_PARAM_LANGUAGE, language);
+                    mParams.putString(Engine.KEY_PARAM_COUNTRY, country);
+                    mParams.putString(Engine.KEY_PARAM_VARIANT, variant);
+                }
+                return result;
+            }
+        }, LANG_NOT_SUPPORTED, "setLanguage");
+!!!4169612.java!!!	getLanguage() : Locale
+        return runAction(new Action<Locale>() {
+            @Override
+            public Locale run(ITextToSpeechService service) throws RemoteException {
+                String[] locStrings = service.getLanguage();
+                if (locStrings != null && locStrings.length == 3) {
+                    return new Locale(locStrings[0], locStrings[1], locStrings[2]);
+                }
+                return null;
+            }
+        }, null, "getLanguage");
+!!!4169740.java!!!	isLanguageAvailable(in loc : Locale) : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                return service.isLanguageAvailable(loc.getISO3Language(),
+                        loc.getISO3Country(), loc.getVariant());
+            }
+        }, LANG_NOT_SUPPORTED, "isLanguageAvailable");
+!!!4169868.java!!!	synthesizeToFile(in text : String, in params : HashMap<String, String>, in filename : String) : int
+        return runAction(new Action<Integer>() {
+            @Override
+            public Integer run(ITextToSpeechService service) throws RemoteException {
+                return service.synthesizeToFile(getCallerIdentity(), text, filename,
+                        getParams(params));
+            }
+        }, ERROR, "synthesizeToFile");
+!!!4169996.java!!!	getParams(inout params : HashMap<String, String>) : Bundle
+        if (params != null && !params.isEmpty()) {
+            Bundle bundle = new Bundle(mParams);
+            copyIntParam(bundle, params, Engine.KEY_PARAM_STREAM);
+            copyStringParam(bundle, params, Engine.KEY_PARAM_UTTERANCE_ID);
+            copyFloatParam(bundle, params, Engine.KEY_PARAM_VOLUME);
+            copyFloatParam(bundle, params, Engine.KEY_PARAM_PAN);
+
+            // Copy feature strings defined by the framework.
+            copyStringParam(bundle, params, Engine.KEY_FEATURE_NETWORK_SYNTHESIS);
+            copyStringParam(bundle, params, Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS);
+
+            // Copy over all parameters that start with the name of the
+            // engine that we are currently connected to. The engine is
+            // free to interpret them as it chooses.
+            if (!TextUtils.isEmpty(mCurrentEngine)) {
+                for (Map.Entry<String, String> entry : params.entrySet()) {
+                    final String key = entry.getKey();
+                    if (key != null && key.startsWith(mCurrentEngine)) {
+                        bundle.putString(key, entry.getValue());
+                    }
+                }
+            }
+
+            return bundle;
+        } else {
+            return mParams;
+        }
+!!!4170124.java!!!	copyStringParam(inout bundle : Bundle, inout params : HashMap<String, String>, in key : String) : void
+        String value = params.get(key);
+        if (value != null) {
+            bundle.putString(key, value);
+        }
+!!!4170252.java!!!	copyIntParam(inout bundle : Bundle, inout params : HashMap<String, String>, in key : String) : void
+        String valueString = params.get(key);
+        if (!TextUtils.isEmpty(valueString)) {
+            try {
+                int value = Integer.parseInt(valueString);
+                bundle.putInt(key, value);
+            } catch (NumberFormatException ex) {
+                // don't set the value in the bundle
+            }
+        }
+!!!4170380.java!!!	copyFloatParam(inout bundle : Bundle, inout params : HashMap<String, String>, in key : String) : void
+        String valueString = params.get(key);
+        if (!TextUtils.isEmpty(valueString)) {
+            try {
+                float value = Float.parseFloat(valueString);
+                bundle.putFloat(key, value);
+            } catch (NumberFormatException ex) {
+                // don't set the value in the bundle
+            }
+        }
+!!!4170508.java!!!	setOnUtteranceCompletedListener(in listener : OnUtteranceCompletedListener) : int
+        mUtteranceProgressListener = UtteranceProgressListener.from(listener);
+        return TextToSpeech.SUCCESS;
+!!!4170636.java!!!	setOnUtteranceProgressListener(inout listener : UtteranceProgressListener) : int
+        mUtteranceProgressListener = listener;
+        return TextToSpeech.SUCCESS;
+!!!4170764.java!!!	setEngineByPackageName(in enginePackageName : String) : int
+        mRequestedEngine = enginePackageName;
+        return initTts();
+!!!4170892.java!!!	getDefaultEngine() : String
+        return mEnginesHelper.getDefaultEngine();
+!!!4171020.java!!!	areDefaultsEnforced() : boolean
+        return false;
+!!!4171148.java!!!	getEngines() : EngineInfo
+        return mEnginesHelper.getEngines();

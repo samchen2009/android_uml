@@ -1,0 +1,777 @@
+class DisplayPowerController
+!!!8650892.java!!!	DisplayPowerController(inout looper : Looper, inout context : Context, inout notifier : Notifier, inout lights : LightsService, inout twilight : TwilightService, inout sensorManager : SensorManager, inout displayManager : DisplayManagerService, inout displayBlanker : DisplayBlanker, inout callbacks : Callbacks, inout callbackHandler : Handler)
+        mHandler = new DisplayControllerHandler(looper);
+        mNotifier = notifier;
+        mDisplayBlanker = displayBlanker;
+        mCallbacks = callbacks;
+        mCallbackHandler = callbackHandler;
+
+        mLights = lights;
+        mTwilight = twilight;
+        mSensorManager = sensorManager;
+        mDisplayManager = displayManager;
+
+        final Resources resources = context.getResources();
+
+        mScreenBrightnessDimConfig = clampAbsoluteBrightness(resources.getInteger(
+                com.android.internal.R.integer.config_screenBrightnessDim));
+
+        int screenBrightnessMinimum = Math.min(resources.getInteger(
+                com.android.internal.R.integer.config_screenBrightnessSettingMinimum),
+                mScreenBrightnessDimConfig);
+
+        mUseSoftwareAutoBrightnessConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_automatic_brightness_available);
+        if (mUseSoftwareAutoBrightnessConfig) {
+            int[] lux = resources.getIntArray(
+                    com.android.internal.R.array.config_autoBrightnessLevels);
+            int[] screenBrightness = resources.getIntArray(
+                    com.android.internal.R.array.config_autoBrightnessLcdBacklightValues);
+
+            mScreenAutoBrightnessSpline = createAutoBrightnessSpline(lux, screenBrightness);
+            if (mScreenAutoBrightnessSpline == null) {
+                Slog.e(TAG, "Error in config.xml.  config_autoBrightnessLcdBacklightValues "
+                        + "(size " + screenBrightness.length + ") "
+                        + "must be monotic and have exactly one more entry than "
+                        + "config_autoBrightnessLevels (size " + lux.length + ") "
+                        + "which must be strictly increasing.  "
+                        + "Auto-brightness will be disabled.");
+                mUseSoftwareAutoBrightnessConfig = false;
+            } else {
+                if (screenBrightness[0] < screenBrightnessMinimum) {
+                    screenBrightnessMinimum = screenBrightness[0];
+                }
+            }
+
+            mLightSensorWarmUpTimeConfig = resources.getInteger(
+                    com.android.internal.R.integer.config_lightSensorWarmupTime);
+        }
+
+        mScreenBrightnessRangeMinimum = clampAbsoluteBrightness(screenBrightnessMinimum);
+        mScreenBrightnessRangeMaximum = PowerManager.BRIGHTNESS_ON;
+
+        mElectronBeamFadesConfig = resources.getBoolean(
+                com.android.internal.R.bool.config_animateScreenLights);
+
+        if (!DEBUG_PRETEND_PROXIMITY_SENSOR_ABSENT) {
+            mProximitySensor = mSensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+            if (mProximitySensor != null) {
+                mProximityThreshold = Math.min(mProximitySensor.getMaximumRange(),
+                        TYPICAL_PROXIMITY_THRESHOLD);
+            }
+        }
+
+        if (mUseSoftwareAutoBrightnessConfig
+                && !DEBUG_PRETEND_LIGHT_SENSOR_ABSENT) {
+            mLightSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+        }
+
+        if (mUseSoftwareAutoBrightnessConfig && USE_TWILIGHT_ADJUSTMENT) {
+            mTwilight.registerListener(mTwilightListener, mHandler);
+        }
+!!!8651020.java!!!	createAutoBrightnessSpline(inout lux : int, inout brightness : int) : Spline
+        try {
+            final int n = brightness.length;
+            float[] x = new float[n];
+            float[] y = new float[n];
+            y[0] = normalizeAbsoluteBrightness(brightness[0]);
+            for (int i = 1; i < n; i++) {
+                x[i] = lux[i - 1];
+                y[i] = normalizeAbsoluteBrightness(brightness[i]);
+            }
+
+            Spline spline = Spline.createMonotoneCubicSpline(x, y);
+            if (DEBUG) {
+                Slog.d(TAG, "Auto-brightness spline: " + spline);
+                for (float v = 1f; v < lux[lux.length - 1] * 1.25f; v *= 1.25f) {
+                    Slog.d(TAG, String.format("  %7.1f: %7.1f", v, spline.interpolate(v)));
+                }
+            }
+            return spline;
+        } catch (IllegalArgumentException ex) {
+            Slog.e(TAG, "Could not create auto-brightness spline.", ex);
+            return null;
+        }
+!!!8651148.java!!!	isProximitySensorAvailable() : boolean
+        return mProximitySensor != null;
+!!!8651276.java!!!	requestPowerState(inout request : DisplayPowerRequest, inout waitForNegativeProximity : boolean) : boolean
+        if (DEBUG) {
+            Slog.d(TAG, "requestPowerState: "
+                    + request + ", waitForNegativeProximity=" + waitForNegativeProximity);
+        }
+
+        synchronized (mLock) {
+            boolean changed = false;
+
+            if (waitForNegativeProximity
+                    && !mPendingWaitForNegativeProximityLocked) {
+                mPendingWaitForNegativeProximityLocked = true;
+                changed = true;
+            }
+
+            if (mPendingRequestLocked == null) {
+                mPendingRequestLocked = new DisplayPowerRequest(request);
+                changed = true;
+            } else if (!mPendingRequestLocked.equals(request)) {
+                mPendingRequestLocked.copyFrom(request);
+                changed = true;
+            }
+
+            if (changed) {
+                mDisplayReadyLocked = false;
+            }
+
+            if (changed && !mPendingRequestChangedLocked) {
+                mPendingRequestChangedLocked = true;
+                sendUpdatePowerStateLocked();
+            }
+
+            return mDisplayReadyLocked;
+        }
+!!!8651404.java!!!	sendUpdatePowerState() : void
+        synchronized (mLock) {
+            sendUpdatePowerStateLocked();
+        }
+!!!8651532.java!!!	sendUpdatePowerStateLocked() : void
+        if (!mPendingUpdatePowerStateLocked) {
+            mPendingUpdatePowerStateLocked = true;
+            Message msg = mHandler.obtainMessage(MSG_UPDATE_POWER_STATE);
+            msg.setAsynchronous(true);
+            mHandler.sendMessage(msg);
+        }
+!!!8651660.java!!!	initialize() : void
+        mPowerState = new DisplayPowerState(
+                new ElectronBeam(mDisplayManager), mDisplayBlanker,
+                mLights.getLight(LightsService.LIGHT_ID_BACKLIGHT));
+
+        mElectronBeamOnAnimator = ObjectAnimator.ofFloat(
+                mPowerState, DisplayPowerState.ELECTRON_BEAM_LEVEL, 0.0f, 1.0f);
+        mElectronBeamOnAnimator.setDuration(ELECTRON_BEAM_ON_ANIMATION_DURATION_MILLIS);
+        mElectronBeamOnAnimator.addListener(mAnimatorListener);
+
+        mElectronBeamOffAnimator = ObjectAnimator.ofFloat(
+                mPowerState, DisplayPowerState.ELECTRON_BEAM_LEVEL, 1.0f, 0.0f);
+        mElectronBeamOffAnimator.setDuration(ELECTRON_BEAM_OFF_ANIMATION_DURATION_MILLIS);
+        mElectronBeamOffAnimator.addListener(mAnimatorListener);
+
+        mScreenBrightnessRampAnimator = new RampAnimator<DisplayPowerState>(
+                mPowerState, DisplayPowerState.SCREEN_BRIGHTNESS);
+!!!8651788.java!!!	updatePowerState() : void
+        // Update the power state request.
+        final boolean mustNotify;
+        boolean mustInitialize = false;
+        boolean updateAutoBrightness = mTwilightChanged;
+        boolean wasDim = false;
+        mTwilightChanged = false;
+
+        synchronized (mLock) {
+            mPendingUpdatePowerStateLocked = false;
+            if (mPendingRequestLocked == null) {
+                return; // wait until first actual power request
+            }
+
+            if (mPowerRequest == null) {
+                mPowerRequest = new DisplayPowerRequest(mPendingRequestLocked);
+                mWaitingForNegativeProximity = mPendingWaitForNegativeProximityLocked;
+                mPendingWaitForNegativeProximityLocked = false;
+                mPendingRequestChangedLocked = false;
+                mustInitialize = true;
+            } else if (mPendingRequestChangedLocked) {
+                if (mPowerRequest.screenAutoBrightnessAdjustment
+                        != mPendingRequestLocked.screenAutoBrightnessAdjustment) {
+                    updateAutoBrightness = true;
+                }
+                wasDim = (mPowerRequest.screenState == DisplayPowerRequest.SCREEN_STATE_DIM);
+                mPowerRequest.copyFrom(mPendingRequestLocked);
+                mWaitingForNegativeProximity |= mPendingWaitForNegativeProximityLocked;
+                mPendingWaitForNegativeProximityLocked = false;
+                mPendingRequestChangedLocked = false;
+                mDisplayReadyLocked = false;
+            }
+
+            mustNotify = !mDisplayReadyLocked;
+        }
+
+        // Initialize things the first time the power state is changed.
+        if (mustInitialize) {
+            initialize();
+        }
+
+        // Apply the proximity sensor.
+        if (mProximitySensor != null) {
+            if (mPowerRequest.useProximitySensor
+                    && mPowerRequest.screenState != DisplayPowerRequest.SCREEN_STATE_OFF) {
+                setProximitySensorEnabled(true);
+                if (!mScreenOffBecauseOfProximity
+                        && mProximity == PROXIMITY_POSITIVE) {
+                    mScreenOffBecauseOfProximity = true;
+                    sendOnProximityPositive();
+                    setScreenOn(false);
+                }
+            } else if (mWaitingForNegativeProximity
+                    && mScreenOffBecauseOfProximity
+                    && mProximity == PROXIMITY_POSITIVE
+                    && mPowerRequest.screenState != DisplayPowerRequest.SCREEN_STATE_OFF) {
+                setProximitySensorEnabled(true);
+            } else {
+                setProximitySensorEnabled(false);
+                mWaitingForNegativeProximity = false;
+            }
+            if (mScreenOffBecauseOfProximity
+                    && mProximity != PROXIMITY_POSITIVE) {
+                mScreenOffBecauseOfProximity = false;
+                sendOnProximityNegative();
+            }
+        } else {
+            mWaitingForNegativeProximity = false;
+        }
+
+        // Turn on the light sensor if needed.
+        if (mLightSensor != null) {
+            setLightSensorEnabled(mPowerRequest.useAutoBrightness
+                    && wantScreenOn(mPowerRequest.screenState), updateAutoBrightness);
+        }
+
+        // Set the screen brightness.
+        if (wantScreenOn(mPowerRequest.screenState)) {
+            int target;
+            boolean slow;
+            if (mScreenAutoBrightness >= 0 && mLightSensorEnabled) {
+                // Use current auto-brightness value.
+                target = mScreenAutoBrightness;
+                slow = mUsingScreenAutoBrightness;
+                mUsingScreenAutoBrightness = true;
+            } else {
+                // Light sensor is disabled or not ready yet.
+                // Use the current brightness setting from the request, which is expected
+                // provide a nominal default value for the case where auto-brightness
+                // is not ready yet.
+                target = mPowerRequest.screenBrightness;
+                slow = false;
+                mUsingScreenAutoBrightness = false;
+            }
+            if (mPowerRequest.screenState == DisplayPowerRequest.SCREEN_STATE_DIM) {
+                // Dim quickly by at least some minimum amount.
+                target = Math.min(target - SCREEN_DIM_MINIMUM_REDUCTION,
+                        mScreenBrightnessDimConfig);
+                slow = false;
+            } else if (wasDim) {
+                // Brighten quickly.
+                slow = false;
+            }
+            animateScreenBrightness(clampScreenBrightness(target),
+                    slow ? BRIGHTNESS_RAMP_RATE_SLOW : BRIGHTNESS_RAMP_RATE_FAST);
+        } else {
+            // Screen is off.  Don't bother changing the brightness.
+            mUsingScreenAutoBrightness = false;
+        }
+
+        // Animate the screen on or off.
+        if (!mScreenOffBecauseOfProximity) {
+            if (wantScreenOn(mPowerRequest.screenState)) {
+                // Want screen on.
+                // Wait for previous off animation to complete beforehand.
+                // It is relatively short but if we cancel it and switch to the
+                // on animation immediately then the results are pretty ugly.
+                if (!mElectronBeamOffAnimator.isStarted()) {
+                    // Turn the screen on.  The contents of the screen may not yet
+                    // be visible if the electron beam has not been dismissed because
+                    // its last frame of animation is solid black.
+                    setScreenOn(true);
+
+                    if (mPowerRequest.blockScreenOn
+                            && mPowerState.getElectronBeamLevel() == 0.0f) {
+                        blockScreenOn();
+                    } else {
+                        unblockScreenOn();
+                        if (USE_ELECTRON_BEAM_ON_ANIMATION) {
+                            if (!mElectronBeamOnAnimator.isStarted()) {
+                                if (mPowerState.getElectronBeamLevel() == 1.0f) {
+                                    mPowerState.dismissElectronBeam();
+                                } else if (mPowerState.prepareElectronBeam(
+                                        mElectronBeamFadesConfig ?
+                                                ElectronBeam.MODE_FADE :
+                                                        ElectronBeam.MODE_WARM_UP)) {
+                                    mElectronBeamOnAnimator.start();
+                                } else {
+                                    mElectronBeamOnAnimator.end();
+                                }
+                            }
+                        } else {
+                            mPowerState.setElectronBeamLevel(1.0f);
+                            mPowerState.dismissElectronBeam();
+                        }
+                    }
+                }
+            } else {
+                // Want screen off.
+                // Wait for previous on animation to complete beforehand.
+                if (!mElectronBeamOnAnimator.isStarted()) {
+                    if (!mElectronBeamOffAnimator.isStarted()) {
+                        if (mPowerState.getElectronBeamLevel() == 0.0f) {
+                            setScreenOn(false);
+                        } else if (mPowerState.prepareElectronBeam(
+                                mElectronBeamFadesConfig ?
+                                        ElectronBeam.MODE_FADE :
+                                                ElectronBeam.MODE_COOL_DOWN)
+                                && mPowerState.isScreenOn()) {
+                            mElectronBeamOffAnimator.start();
+                        } else {
+                            mElectronBeamOffAnimator.end();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Report whether the display is ready for use.
+        // We mostly care about the screen state here, ignoring brightness changes
+        // which will be handled asynchronously.
+        if (mustNotify
+                && !mScreenOnWasBlocked
+                && !mElectronBeamOnAnimator.isStarted()
+                && !mElectronBeamOffAnimator.isStarted()
+                && mPowerState.waitUntilClean(mCleanListener)) {
+            synchronized (mLock) {
+                if (!mPendingRequestChangedLocked) {
+                    mDisplayReadyLocked = true;
+
+                    if (DEBUG) {
+                        Slog.d(TAG, "Display ready!");
+                    }
+                }
+            }
+            sendOnStateChanged();
+        }
+!!!8651916.java!!!	blockScreenOn() : void
+        if (!mScreenOnWasBlocked) {
+            mScreenOnWasBlocked = true;
+            if (DEBUG) {
+                Slog.d(TAG, "Blocked screen on.");
+                mScreenOnBlockStartRealTime = SystemClock.elapsedRealtime();
+            }
+        }
+!!!8652044.java!!!	unblockScreenOn() : void
+        if (mScreenOnWasBlocked) {
+            mScreenOnWasBlocked = false;
+            if (DEBUG) {
+                Slog.d(TAG, "Unblocked screen on after " +
+                        (SystemClock.elapsedRealtime() - mScreenOnBlockStartRealTime) + " ms");
+            }
+        }
+!!!8652172.java!!!	setScreenOn(inout on : boolean) : void
+        if (!mPowerState.isScreenOn() == on) {
+            mPowerState.setScreenOn(on);
+            if (on) {
+                mNotifier.onScreenOn();
+            } else {
+                mNotifier.onScreenOff();
+            }
+        }
+!!!8652300.java!!!	clampScreenBrightness(in value : int) : int
+        return clamp(value, mScreenBrightnessRangeMinimum, mScreenBrightnessRangeMaximum);
+!!!8652428.java!!!	clampAbsoluteBrightness(in value : int) : int
+        return clamp(value, PowerManager.BRIGHTNESS_OFF, PowerManager.BRIGHTNESS_ON);
+!!!8652556.java!!!	clamp(in value : int, in min : int, in max : int) : int
+        if (value <= min) {
+            return min;
+        }
+        if (value >= max) {
+            return max;
+        }
+        return value;
+!!!8652684.java!!!	normalizeAbsoluteBrightness(in value : int) : float
+        return (float)clampAbsoluteBrightness(value) / PowerManager.BRIGHTNESS_ON;
+!!!8652812.java!!!	animateScreenBrightness(in target : int, in rate : int) : void
+        if (mScreenBrightnessRampAnimator.animateTo(target, rate)) {
+            mNotifier.onScreenBrightness(target);
+        }
+!!!8652940.java!!!	setProximitySensorEnabled(inout enable : boolean) : void
+        if (enable) {
+            if (!mProximitySensorEnabled) {
+                mProximitySensorEnabled = true;
+                mPendingProximity = PROXIMITY_UNKNOWN;
+                mSensorManager.registerListener(mProximitySensorListener, mProximitySensor,
+                        SensorManager.SENSOR_DELAY_NORMAL, mHandler);
+            }
+        } else {
+            if (mProximitySensorEnabled) {
+                mProximitySensorEnabled = false;
+                mProximity = PROXIMITY_UNKNOWN;
+                mHandler.removeMessages(MSG_PROXIMITY_SENSOR_DEBOUNCED);
+                mSensorManager.unregisterListener(mProximitySensorListener);
+            }
+        }
+!!!8653068.java!!!	handleProximitySensorEvent(in time : long, inout positive : boolean) : void
+        if (mPendingProximity == PROXIMITY_NEGATIVE && !positive) {
+            return; // no change
+        }
+        if (mPendingProximity == PROXIMITY_POSITIVE && positive) {
+            return; // no change
+        }
+
+        // Only accept a proximity sensor reading if it remains
+        // stable for the entire debounce delay.
+        mHandler.removeMessages(MSG_PROXIMITY_SENSOR_DEBOUNCED);
+        if (positive) {
+            mPendingProximity = PROXIMITY_POSITIVE;
+            mPendingProximityDebounceTime = time + PROXIMITY_SENSOR_POSITIVE_DEBOUNCE_DELAY;
+        } else {
+            mPendingProximity = PROXIMITY_NEGATIVE;
+            mPendingProximityDebounceTime = time + PROXIMITY_SENSOR_NEGATIVE_DEBOUNCE_DELAY;
+        }
+        debounceProximitySensor();
+!!!8653196.java!!!	debounceProximitySensor() : void
+        if (mPendingProximity != PROXIMITY_UNKNOWN) {
+            final long now = SystemClock.uptimeMillis();
+            if (mPendingProximityDebounceTime <= now) {
+                mProximity = mPendingProximity;
+                sendUpdatePowerState();
+            } else {
+                Message msg = mHandler.obtainMessage(MSG_PROXIMITY_SENSOR_DEBOUNCED);
+                msg.setAsynchronous(true);
+                mHandler.sendMessageAtTime(msg, mPendingProximityDebounceTime);
+            }
+        }
+!!!8653324.java!!!	setLightSensorEnabled(inout enable : boolean, inout updateAutoBrightness : boolean) : void
+        if (enable) {
+            if (!mLightSensorEnabled) {
+                updateAutoBrightness = true;
+                mLightSensorEnabled = true;
+                mLightSensorEnableTime = SystemClock.uptimeMillis();
+                mSensorManager.registerListener(mLightSensorListener, mLightSensor,
+                        LIGHT_SENSOR_RATE_MILLIS * 1000, mHandler);
+            }
+        } else {
+            if (mLightSensorEnabled) {
+                mLightSensorEnabled = false;
+                mAmbientLuxValid = false;
+                mRecentLightSamples = 0;
+                mHandler.removeMessages(MSG_LIGHT_SENSOR_DEBOUNCED);
+                mSensorManager.unregisterListener(mLightSensorListener);
+            }
+        }
+        if (updateAutoBrightness) {
+            updateAutoBrightness(false);
+        }
+!!!8653452.java!!!	handleLightSensorEvent(in time : long, in lux : float) : void
+        mHandler.removeMessages(MSG_LIGHT_SENSOR_DEBOUNCED);
+
+        applyLightSensorMeasurement(time, lux);
+        updateAmbientLux(time);
+!!!8653580.java!!!	applyLightSensorMeasurement(in time : long, in lux : float) : void
+        // Update our filters.
+        mRecentLightSamples += 1;
+        if (mRecentLightSamples == 1) {
+            mRecentShortTermAverageLux = lux;
+            mRecentLongTermAverageLux = lux;
+        } else {
+            final long timeDelta = time - mLastObservedLuxTime;
+            mRecentShortTermAverageLux += (lux - mRecentShortTermAverageLux)
+                    * timeDelta / (SHORT_TERM_AVERAGE_LIGHT_TIME_CONSTANT + timeDelta);
+            mRecentLongTermAverageLux += (lux - mRecentLongTermAverageLux)
+                    * timeDelta / (LONG_TERM_AVERAGE_LIGHT_TIME_CONSTANT + timeDelta);
+        }
+
+        // Remember this sample value.
+        mLastObservedLux = lux;
+        mLastObservedLuxTime = time;
+!!!8653708.java!!!	updateAmbientLux(in time : long) : void
+        // If the light sensor was just turned on then immediately update our initial
+        // estimate of the current ambient light level.
+        if (!mAmbientLuxValid
+                || (time - mLightSensorEnableTime) < mLightSensorWarmUpTimeConfig) {
+            mAmbientLux = mRecentShortTermAverageLux;
+            mAmbientLuxValid = true;
+            mDebounceLuxDirection = 0;
+            mDebounceLuxTime = time;
+            if (DEBUG) {
+                Slog.d(TAG, "updateAmbientLux: Initializing: "
+                        + ", mRecentShortTermAverageLux=" + mRecentShortTermAverageLux
+                        + ", mRecentLongTermAverageLux=" + mRecentLongTermAverageLux
+                        + ", mAmbientLux=" + mAmbientLux);
+            }
+            updateAutoBrightness(true);
+            return;
+        }
+
+        // Determine whether the ambient environment appears to be brightening.
+        float brighteningLuxThreshold = mAmbientLux * (1.0f + BRIGHTENING_LIGHT_HYSTERESIS);
+        if (mRecentShortTermAverageLux > brighteningLuxThreshold
+                && mRecentLongTermAverageLux > brighteningLuxThreshold) {
+            if (mDebounceLuxDirection <= 0) {
+                mDebounceLuxDirection = 1;
+                mDebounceLuxTime = time;
+                if (DEBUG) {
+                    Slog.d(TAG, "updateAmbientLux: Possibly brightened, waiting for "
+                            + BRIGHTENING_LIGHT_DEBOUNCE + " ms: "
+                            + "brighteningLuxThreshold=" + brighteningLuxThreshold
+                            + ", mRecentShortTermAverageLux=" + mRecentShortTermAverageLux
+                            + ", mRecentLongTermAverageLux=" + mRecentLongTermAverageLux
+                            + ", mAmbientLux=" + mAmbientLux);
+                }
+            }
+            long debounceTime = mDebounceLuxTime + BRIGHTENING_LIGHT_DEBOUNCE;
+            if (time >= debounceTime) {
+                mAmbientLux = mRecentShortTermAverageLux;
+                if (DEBUG) {
+                    Slog.d(TAG, "updateAmbientLux: Brightened: "
+                            + "brighteningLuxThreshold=" + brighteningLuxThreshold
+                            + ", mRecentShortTermAverageLux=" + mRecentShortTermAverageLux
+                            + ", mRecentLongTermAverageLux=" + mRecentLongTermAverageLux
+                            + ", mAmbientLux=" + mAmbientLux);
+                }
+                updateAutoBrightness(true);
+            } else {
+                mHandler.sendEmptyMessageAtTime(MSG_LIGHT_SENSOR_DEBOUNCED, debounceTime);
+            }
+            return;
+        }
+
+        // Determine whether the ambient environment appears to be darkening.
+        float darkeningLuxThreshold = mAmbientLux * (1.0f - DARKENING_LIGHT_HYSTERESIS);
+        if (mRecentShortTermAverageLux < darkeningLuxThreshold
+                && mRecentLongTermAverageLux < darkeningLuxThreshold) {
+            if (mDebounceLuxDirection >= 0) {
+                mDebounceLuxDirection = -1;
+                mDebounceLuxTime = time;
+                if (DEBUG) {
+                    Slog.d(TAG, "updateAmbientLux: Possibly darkened, waiting for "
+                            + DARKENING_LIGHT_DEBOUNCE + " ms: "
+                            + "darkeningLuxThreshold=" + darkeningLuxThreshold
+                            + ", mRecentShortTermAverageLux=" + mRecentShortTermAverageLux
+                            + ", mRecentLongTermAverageLux=" + mRecentLongTermAverageLux
+                            + ", mAmbientLux=" + mAmbientLux);
+                }
+            }
+            long debounceTime = mDebounceLuxTime + DARKENING_LIGHT_DEBOUNCE;
+            if (time >= debounceTime) {
+                // Be conservative about reducing the brightness, only reduce it a little bit
+                // at a time to avoid having to bump it up again soon.
+                mAmbientLux = Math.max(mRecentShortTermAverageLux, mRecentLongTermAverageLux);
+                if (DEBUG) {
+                    Slog.d(TAG, "updateAmbientLux: Darkened: "
+                            + "darkeningLuxThreshold=" + darkeningLuxThreshold
+                            + ", mRecentShortTermAverageLux=" + mRecentShortTermAverageLux
+                            + ", mRecentLongTermAverageLux=" + mRecentLongTermAverageLux
+                            + ", mAmbientLux=" + mAmbientLux);
+                }
+                updateAutoBrightness(true);
+            } else {
+                mHandler.sendEmptyMessageAtTime(MSG_LIGHT_SENSOR_DEBOUNCED, debounceTime);
+            }
+            return;
+        }
+
+        // No change or change is within the hysteresis thresholds.
+        if (mDebounceLuxDirection != 0) {
+            mDebounceLuxDirection = 0;
+            mDebounceLuxTime = time;
+            if (DEBUG) {
+                Slog.d(TAG, "updateAmbientLux: Canceled debounce: "
+                        + "brighteningLuxThreshold=" + brighteningLuxThreshold
+                        + ", darkeningLuxThreshold=" + darkeningLuxThreshold
+                        + ", mRecentShortTermAverageLux=" + mRecentShortTermAverageLux
+                        + ", mRecentLongTermAverageLux=" + mRecentLongTermAverageLux
+                        + ", mAmbientLux=" + mAmbientLux);
+            }
+        }
+
+        // If the light level does not change, then the sensor may not report
+        // a new value.  This can cause problems for the auto-brightness algorithm
+        // because the filters might not be updated.  To work around it, we want to
+        // make sure to update the filters whenever the observed light level could
+        // possibly exceed one of the hysteresis thresholds.
+        if (mLastObservedLux > brighteningLuxThreshold
+                || mLastObservedLux < darkeningLuxThreshold) {
+            mHandler.sendEmptyMessageAtTime(MSG_LIGHT_SENSOR_DEBOUNCED,
+                    time + SYNTHETIC_LIGHT_SENSOR_RATE_MILLIS);
+        }
+!!!8653836.java!!!	debounceLightSensor() : void
+        if (mLightSensorEnabled) {
+            long time = SystemClock.uptimeMillis();
+            if (time >= mLastObservedLuxTime + SYNTHETIC_LIGHT_SENSOR_RATE_MILLIS) {
+                if (DEBUG) {
+                    Slog.d(TAG, "debounceLightSensor: Synthesizing light sensor measurement "
+                            + "after " + (time - mLastObservedLuxTime) + " ms.");
+                }
+                applyLightSensorMeasurement(time, mLastObservedLux);
+            }
+            updateAmbientLux(time);
+        }
+!!!8653964.java!!!	updateAutoBrightness(inout sendUpdate : boolean) : void
+        if (!mAmbientLuxValid) {
+            return;
+        }
+
+        float value = mScreenAutoBrightnessSpline.interpolate(mAmbientLux);
+        float gamma = 1.0f;
+
+        if (USE_SCREEN_AUTO_BRIGHTNESS_ADJUSTMENT
+                && mPowerRequest.screenAutoBrightnessAdjustment != 0.0f) {
+            final float adjGamma = FloatMath.pow(SCREEN_AUTO_BRIGHTNESS_ADJUSTMENT_MAX_GAMMA,
+                    Math.min(1.0f, Math.max(-1.0f,
+                            -mPowerRequest.screenAutoBrightnessAdjustment)));
+            gamma *= adjGamma;
+            if (DEBUG) {
+                Slog.d(TAG, "updateAutoBrightness: adjGamma=" + adjGamma);
+            }
+        }
+
+        if (USE_TWILIGHT_ADJUSTMENT) {
+            TwilightState state = mTwilight.getCurrentState();
+            if (state != null && state.isNight()) {
+                final long now = System.currentTimeMillis();
+                final float earlyGamma =
+                        getTwilightGamma(now, state.getYesterdaySunset(), state.getTodaySunrise());
+                final float lateGamma =
+                        getTwilightGamma(now, state.getTodaySunset(), state.getTomorrowSunrise());
+                gamma *= earlyGamma * lateGamma;
+                if (DEBUG) {
+                    Slog.d(TAG, "updateAutoBrightness: earlyGamma=" + earlyGamma
+                            + ", lateGamma=" + lateGamma);
+                }
+            }
+        }
+
+        if (gamma != 1.0f) {
+            final float in = value;
+            value = FloatMath.pow(value, gamma);
+            if (DEBUG) {
+                Slog.d(TAG, "updateAutoBrightness: gamma=" + gamma
+                        + ", in=" + in + ", out=" + value);
+            }
+        }
+
+        int newScreenAutoBrightness = clampScreenBrightness(
+                Math.round(value * PowerManager.BRIGHTNESS_ON));
+        if (mScreenAutoBrightness != newScreenAutoBrightness) {
+            if (DEBUG) {
+                Slog.d(TAG, "updateAutoBrightness: mScreenAutoBrightness="
+                        + mScreenAutoBrightness + ", newScreenAutoBrightness="
+                        + newScreenAutoBrightness);
+            }
+
+            mScreenAutoBrightness = newScreenAutoBrightness;
+            mLastScreenAutoBrightnessGamma = gamma;
+            if (sendUpdate) {
+                sendUpdatePowerState();
+            }
+        }
+!!!8654092.java!!!	getTwilightGamma(in now : long, in lastSunset : long, in nextSunrise : long) : float
+        if (lastSunset < 0 || nextSunrise < 0
+                || now < lastSunset || now > nextSunrise) {
+            return 1.0f;
+        }
+
+        if (now < lastSunset + TWILIGHT_ADJUSTMENT_TIME) {
+            return lerp(1.0f, TWILIGHT_ADJUSTMENT_MAX_GAMMA,
+                    (float)(now - lastSunset) / TWILIGHT_ADJUSTMENT_TIME);
+        }
+
+        if (now > nextSunrise - TWILIGHT_ADJUSTMENT_TIME) {
+            return lerp(1.0f, TWILIGHT_ADJUSTMENT_MAX_GAMMA,
+                    (float)(nextSunrise - now) / TWILIGHT_ADJUSTMENT_TIME);
+        }
+
+        return TWILIGHT_ADJUSTMENT_MAX_GAMMA;
+!!!8654220.java!!!	lerp(in x : float, in y : float, in alpha : float) : float
+        return x + (y - x) * alpha;
+!!!8654348.java!!!	sendOnStateChanged() : void
+        mCallbackHandler.post(mOnStateChangedRunnable);
+!!!8654476.java!!!	sendOnProximityPositive() : void
+        mCallbackHandler.post(mOnProximityPositiveRunnable);
+!!!8654604.java!!!	sendOnProximityNegative() : void
+        mCallbackHandler.post(mOnProximityNegativeRunnable);
+!!!8654732.java!!!	dump(in pw : PrintWriter) : void
+        synchronized (mLock) {
+            pw.println();
+            pw.println("Display Controller Locked State:");
+            pw.println("  mDisplayReadyLocked=" + mDisplayReadyLocked);
+            pw.println("  mPendingRequestLocked=" + mPendingRequestLocked);
+            pw.println("  mPendingRequestChangedLocked=" + mPendingRequestChangedLocked);
+            pw.println("  mPendingWaitForNegativeProximityLocked="
+                    + mPendingWaitForNegativeProximityLocked);
+            pw.println("  mPendingUpdatePowerStateLocked=" + mPendingUpdatePowerStateLocked);
+        }
+
+        pw.println();
+        pw.println("Display Controller Configuration:");
+        pw.println("  mScreenBrightnessDimConfig=" + mScreenBrightnessDimConfig);
+        pw.println("  mScreenBrightnessRangeMinimum=" + mScreenBrightnessRangeMinimum);
+        pw.println("  mScreenBrightnessRangeMaximum=" + mScreenBrightnessRangeMaximum);
+        pw.println("  mUseSoftwareAutoBrightnessConfig="
+                + mUseSoftwareAutoBrightnessConfig);
+        pw.println("  mScreenAutoBrightnessSpline=" + mScreenAutoBrightnessSpline);
+        pw.println("  mLightSensorWarmUpTimeConfig=" + mLightSensorWarmUpTimeConfig);
+
+        mHandler.runWithScissors(new Runnable() {
+            @Override
+            public void run() {
+                dumpLocal(pw);
+            }
+        }, 1000);
+!!!8654860.java!!!	dumpLocal(inout pw : PrintWriter) : void
+        pw.println();
+        pw.println("Display Controller Thread State:");
+        pw.println("  mPowerRequest=" + mPowerRequest);
+        pw.println("  mWaitingForNegativeProximity=" + mWaitingForNegativeProximity);
+
+        pw.println("  mProximitySensor=" + mProximitySensor);
+        pw.println("  mProximitySensorEnabled=" + mProximitySensorEnabled);
+        pw.println("  mProximityThreshold=" + mProximityThreshold);
+        pw.println("  mProximity=" + proximityToString(mProximity));
+        pw.println("  mPendingProximity=" + proximityToString(mPendingProximity));
+        pw.println("  mPendingProximityDebounceTime="
+                + TimeUtils.formatUptime(mPendingProximityDebounceTime));
+        pw.println("  mScreenOffBecauseOfProximity=" + mScreenOffBecauseOfProximity);
+
+        pw.println("  mLightSensor=" + mLightSensor);
+        pw.println("  mLightSensorEnabled=" + mLightSensorEnabled);
+        pw.println("  mLightSensorEnableTime="
+                + TimeUtils.formatUptime(mLightSensorEnableTime));
+        pw.println("  mAmbientLux=" + mAmbientLux);
+        pw.println("  mAmbientLuxValid=" + mAmbientLuxValid);
+        pw.println("  mLastObservedLux=" + mLastObservedLux);
+        pw.println("  mLastObservedLuxTime="
+                + TimeUtils.formatUptime(mLastObservedLuxTime));
+        pw.println("  mRecentLightSamples=" + mRecentLightSamples);
+        pw.println("  mRecentShortTermAverageLux=" + mRecentShortTermAverageLux);
+        pw.println("  mRecentLongTermAverageLux=" + mRecentLongTermAverageLux);
+        pw.println("  mDebounceLuxDirection=" + mDebounceLuxDirection);
+        pw.println("  mDebounceLuxTime=" + TimeUtils.formatUptime(mDebounceLuxTime));
+        pw.println("  mScreenAutoBrightness=" + mScreenAutoBrightness);
+        pw.println("  mUsingScreenAutoBrightness=" + mUsingScreenAutoBrightness);
+        pw.println("  mLastScreenAutoBrightnessGamma=" + mLastScreenAutoBrightnessGamma);
+        pw.println("  mTwilight.getCurrentState()=" + mTwilight.getCurrentState());
+
+        if (mElectronBeamOnAnimator != null) {
+            pw.println("  mElectronBeamOnAnimator.isStarted()=" +
+                    mElectronBeamOnAnimator.isStarted());
+        }
+        if (mElectronBeamOffAnimator != null) {
+            pw.println("  mElectronBeamOffAnimator.isStarted()=" +
+                    mElectronBeamOffAnimator.isStarted());
+        }
+
+        if (mPowerState != null) {
+            mPowerState.dump(pw);
+        }
+!!!8654988.java!!!	proximityToString(in state : int) : String
+        switch (state) {
+            case PROXIMITY_UNKNOWN:
+                return "Unknown";
+            case PROXIMITY_NEGATIVE:
+                return "Negative";
+            case PROXIMITY_POSITIVE:
+                return "Positive";
+            default:
+                return Integer.toString(state);
+        }
+!!!8655116.java!!!	wantScreenOn(in state : int) : boolean
+        switch (state) {
+            case DisplayPowerRequest.SCREEN_STATE_BRIGHT:
+            case DisplayPowerRequest.SCREEN_STATE_DIM:
+                return true;
+        }
+        return false;

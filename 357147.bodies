@@ -1,0 +1,187 @@
+class Impl
+!!!2357915.java!!!	Impl(inout directory : File)
+            boolean exists = directory.exists();
+            if (exists && !directory.isDirectory()) {
+                throw new IOException(directory + " exists but is not a directory.");
+            }
+
+            if (exists) {
+                // Read and sort initial list of files. We defer adding
+                // information about these files to accessOrder until necessary
+                // (see indexFiles()). Sorting the list enables us to detect
+                // cache misses in getSessionData().
+                // Note: Sorting an array here was faster than creating a
+                // HashSet on Dalvik.
+                initialFiles = directory.list();
+                if (initialFiles == null) {
+                    // File.list() will return null in error cases without throwing IOException
+                    // http://b/3363561
+                    throw new IOException(directory + " exists but cannot list contents.");
+                }
+                Arrays.sort(initialFiles);
+                size = initialFiles.length;
+            } else {
+                // Create directory.
+                if (!directory.mkdirs()) {
+                    throw new IOException("Creation of " + directory + " directory failed.");
+                }
+                size = 0;
+            }
+
+            this.directory = directory;
+!!!2358043.java!!!	newAccessOrder() : Map
+            return new LinkedHashMap<String, File>(
+                    MAX_SIZE, 0.75f, true /* access order */);
+!!!2358171.java!!!	fileName(inout host : String, in port : int) : String
+            if (host == null) {
+                throw new NullPointerException("host == null");
+            }
+            return host + "." + port;
+!!!2358299.java!!!	getSessionData(inout host : String, in port : int) : byte
+            /*
+             * Note: This method is only called when the in-memory cache
+             * in SSLSessionContext misses, so it would be unnecessarily
+             * redundant for this cache to store data in memory.
+             */
+
+            String name = fileName(host, port);
+            File file = accessOrder.get(name);
+
+            if (file == null) {
+                // File wasn't in access order. Check initialFiles...
+                if (initialFiles == null) {
+                    // All files are in accessOrder, so it doesn't exist.
+                    return null;
+                }
+
+                // Look in initialFiles.
+                if (Arrays.binarySearch(initialFiles, name) < 0) {
+                    // Not found.
+                    return null;
+                }
+
+                // The file is on disk but not in accessOrder yet.
+                file = new File(directory, name);
+                accessOrder.put(name, file);
+            }
+
+            FileInputStream in;
+            try {
+                in = new FileInputStream(file);
+            } catch (FileNotFoundException e) {
+                logReadError(host, file, e);
+                return null;
+            }
+            try {
+                int size = (int) file.length();
+                byte[] data = new byte[size];
+                new DataInputStream(in).readFully(data);
+                return data;
+            } catch (IOException e) {
+                logReadError(host, file, e);
+                return null;
+            } finally {
+                IoUtils.closeQuietly(in);
+            }
+!!!2358427.java!!!	logReadError(inout host : String, inout file : File, inout t : Throwable) : void
+            System.logW("Error reading session data for " + host + " from " + file + ".", t);
+!!!2358555.java!!!	putSessionData(inout session : SSLSession, inout sessionData : byte) : void
+            String host = session.getPeerHost();
+            if (sessionData == null) {
+                throw new NullPointerException("sessionData == null");
+            }
+
+            String name = fileName(host, session.getPeerPort());
+            File file = new File(directory, name);
+
+            // Used to keep track of whether or not we're expanding the cache.
+            boolean existedBefore = file.exists();
+
+            FileOutputStream out;
+            try {
+                out = new FileOutputStream(file);
+            } catch (FileNotFoundException e) {
+                // We can't write to the file.
+                logWriteError(host, file, e);
+                return;
+            }
+
+            // If we expanded the cache (by creating a new file)...
+            if (!existedBefore) {
+                size++;
+
+                // Delete an old file if necessary.
+                makeRoom();
+            }
+
+            boolean writeSuccessful = false;
+            try {
+                out.write(sessionData);
+                writeSuccessful = true;
+            } catch (IOException e) {
+                logWriteError(host, file, e);
+            } finally {
+                boolean closeSuccessful = false;
+                try {
+                    out.close();
+                    closeSuccessful = true;
+                } catch (IOException e) {
+                    logWriteError(host, file, e);
+                } finally {
+                    if (!writeSuccessful || !closeSuccessful) {
+                        // Storage failed. Clean up.
+                        delete(file);
+                    } else {
+                        // Success!
+                        accessOrder.put(name, file);
+                    }
+                }
+            }
+!!!2358683.java!!!	makeRoom() : void
+            if (size <= MAX_SIZE) {
+                return;
+            }
+
+            indexFiles();
+
+            // Delete LRUed files.
+            int removals = size - MAX_SIZE;
+            Iterator<File> i = accessOrder.values().iterator();
+            do {
+                delete(i.next());
+                i.remove();
+            } while (--removals > 0);
+!!!2358811.java!!!	indexFiles() : void
+            String[] initialFiles = this.initialFiles;
+            if (initialFiles != null) {
+                this.initialFiles = null;
+
+                // Files on disk only, sorted by last modified time.
+                // TODO: Use last access time.
+                Set<CacheFile> diskOnly = new TreeSet<CacheFile>();
+                for (String name : initialFiles) {
+                    // If the file hasn't been accessed in this process...
+                    if (!accessOrder.containsKey(name)) {
+                        diskOnly.add(new CacheFile(directory, name));
+                    }
+                }
+
+                if (!diskOnly.isEmpty()) {
+                    // Add files not accessed in this process to the beginning
+                    // of accessOrder.
+                    Map<String, File> newOrder = newAccessOrder();
+                    for (CacheFile cacheFile : diskOnly) {
+                        newOrder.put(cacheFile.name, cacheFile);
+                    }
+                    newOrder.putAll(accessOrder);
+
+                    this.accessOrder = newOrder;
+                }
+            }
+!!!2358939.java!!!	delete(inout file : File) : void
+            if (!file.delete()) {
+                System.logW("Failed to delete " + file + ".", new IOException());
+            }
+            size--;
+!!!2359067.java!!!	logWriteError(inout host : String, inout file : File, inout t : Throwable) : void
+            System.logW("Error writing session data for " + host + " to " + file + ".", t);

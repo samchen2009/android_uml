@@ -1,0 +1,255 @@
+class _FileAsset
+!!!966540.cpp!!!	~_FileAsset(in  : void)
+    close();
+!!!966668.cpp!!!	openChunk(in fileName : char, in fd : int, in offset : off64_t, in length : size_t) : status_t
+    assert(mFp == NULL);    // no reopen
+    assert(mMap == NULL);
+    assert(fd >= 0);
+    assert(offset >= 0);
+
+    /*
+     * Seek to end to get file length.
+     */
+    off64_t fileLength;
+    fileLength = lseek64(fd, 0, SEEK_END);
+    if (fileLength == (off64_t) -1) {
+        // probably a bad file descriptor
+        ALOGD("failed lseek (errno=%d)\n", errno);
+        return UNKNOWN_ERROR;
+    }
+
+    if ((off64_t) (offset + length) > fileLength) {
+        ALOGD("start (%ld) + len (%ld) > end (%ld)\n",
+            (long) offset, (long) length, (long) fileLength);
+        return BAD_INDEX;
+    }
+
+    /* after fdopen, the fd will be closed on fclose() */
+    mFp = fdopen(fd, "rb");
+    if (mFp == NULL)
+        return UNKNOWN_ERROR;
+
+    mStart = offset;
+    mLength = length;
+    assert(mOffset == 0);
+
+    /* seek the FILE* to the start of chunk */
+    if (fseek(mFp, mStart, SEEK_SET) != 0) {
+        assert(false);
+    }
+
+    mFileName = fileName != NULL ? strdup(fileName) : NULL;
+    
+    return NO_ERROR;
+!!!966796.cpp!!!	openChunk(inout dataMap : FileMap) : status_t
+    assert(mFp == NULL);    // no reopen
+    assert(mMap == NULL);
+    assert(dataMap != NULL);
+
+    mMap = dataMap;
+    mStart = -1;            // not used
+    mLength = dataMap->getDataLength();
+    assert(mOffset == 0);
+
+    return NO_ERROR;
+!!!966924.cpp!!!	read(inout buf : void, in count : size_t) : ssize_t
+    size_t maxLen;
+    size_t actual;
+
+    assert(mOffset >= 0 && mOffset <= mLength);
+
+    if (getAccessMode() == ACCESS_BUFFER) {
+        /*
+         * On first access, read or map the entire file.  The caller has
+         * requested buffer access, either because they're going to be
+         * using the buffer or because what they're doing has appropriate
+         * performance needs and access patterns.
+         */
+        if (mBuf == NULL)
+            getBuffer(false);
+    }
+
+    /* adjust count if we're near EOF */
+    maxLen = mLength - mOffset;
+    if (count > maxLen)
+        count = maxLen;
+
+    if (!count)
+        return 0;
+
+    if (mMap != NULL) {
+        /* copy from mapped area */
+        //printf("map read\n");
+        memcpy(buf, (char*)mMap->getDataPtr() + mOffset, count);
+        actual = count;
+    } else if (mBuf != NULL) {
+        /* copy from buffer */
+        //printf("buf read\n");
+        memcpy(buf, (char*)mBuf + mOffset, count);
+        actual = count;
+    } else {
+        /* read from the file */
+        //printf("file read\n");
+        if (ftell(mFp) != mStart + mOffset) {
+            ALOGE("Hosed: %ld != %ld+%ld\n",
+                ftell(mFp), (long) mStart, (long) mOffset);
+            assert(false);
+        }
+
+        /*
+         * This returns 0 on error or eof.  We need to use ferror() or feof()
+         * to tell the difference, but we don't currently have those on the
+         * device.  However, we know how much data is *supposed* to be in the
+         * file, so if we don't read the full amount we know something is
+         * hosed.
+         */
+        actual = fread(buf, 1, count, mFp);
+        if (actual == 0)        // something failed -- I/O error?
+            return -1;
+
+        assert(actual == count);
+    }
+
+    mOffset += actual;
+    return actual;
+!!!967052.cpp!!!	seek(in offset : off64_t, in whence : int) : off64_t
+    off64_t newPosn;
+    off64_t actualOffset;
+
+    // compute new position within chunk
+    newPosn = handleSeek(offset, whence, mOffset, mLength);
+    if (newPosn == (off64_t) -1)
+        return newPosn;
+
+    actualOffset = mStart + newPosn;
+
+    if (mFp != NULL) {
+        if (fseek(mFp, (long) actualOffset, SEEK_SET) != 0)
+            return (off64_t) -1;
+    }
+
+    mOffset = actualOffset - mStart;
+    return mOffset;
+!!!967180.cpp!!!	close(in  : void) : void
+    if (mMap != NULL) {
+        mMap->release();
+        mMap = NULL;
+    }
+    if (mBuf != NULL) {
+        delete[] mBuf;
+        mBuf = NULL;
+    }
+
+    if (mFileName != NULL) {
+        free(mFileName);
+        mFileName = NULL;
+    }
+    
+    if (mFp != NULL) {
+        // can only be NULL when called from destructor
+        // (otherwise we would never return this object)
+        fclose(mFp);
+        mFp = NULL;
+    }
+!!!967308.cpp!!!	getBuffer(in wordAligned : bool) : void
+    /* subsequent requests just use what we did previously */
+    if (mBuf != NULL)
+        return mBuf;
+    if (mMap != NULL) {
+        if (!wordAligned) {
+            return  mMap->getDataPtr();
+        }
+        return ensureAlignment(mMap);
+    }
+
+    assert(mFp != NULL);
+
+    if (mLength < kReadVsMapThreshold) {
+        unsigned char* buf;
+        long allocLen;
+
+        /* zero-length files are allowed; not sure about zero-len allocs */
+        /* (works fine with gcc + x86linux) */
+        allocLen = mLength;
+        if (mLength == 0)
+            allocLen = 1;
+
+        buf = new unsigned char[allocLen];
+        if (buf == NULL) {
+            ALOGE("alloc of %ld bytes failed\n", (long) allocLen);
+            return NULL;
+        }
+
+        ALOGV("Asset %p allocating buffer size %d (smaller than threshold)", this, (int)allocLen);
+        if (mLength > 0) {
+            long oldPosn = ftell(mFp);
+            fseek(mFp, mStart, SEEK_SET);
+            if (fread(buf, 1, mLength, mFp) != (size_t) mLength) {
+                ALOGE("failed reading %ld bytes\n", (long) mLength);
+                delete[] buf;
+                return NULL;
+            }
+            fseek(mFp, oldPosn, SEEK_SET);
+        }
+
+        ALOGV(" getBuffer: loaded into buffer\n");
+
+        mBuf = buf;
+        return mBuf;
+    } else {
+        FileMap* map;
+
+        map = new FileMap;
+        if (!map->create(NULL, fileno(mFp), mStart, mLength, true)) {
+            map->release();
+            return NULL;
+        }
+
+        ALOGV(" getBuffer: mapped\n");
+
+        mMap = map;
+        if (!wordAligned) {
+            return  mMap->getDataPtr();
+        }
+        return ensureAlignment(mMap);
+    }
+!!!967692.cpp!!!	openFileDescriptor(inout outStart : off64_t, inout outLength : off64_t) : int
+    if (mMap != NULL) {
+        const char* fname = mMap->getFileName();
+        if (fname == NULL) {
+            fname = mFileName;
+        }
+        if (fname == NULL) {
+            return -1;
+        }
+        *outStart = mMap->getDataOffset();
+        *outLength = mMap->getDataLength();
+        return open(fname, O_RDONLY | O_BINARY);
+    }
+    if (mFileName == NULL) {
+        return -1;
+    }
+    *outStart = mStart;
+    *outLength = mLength;
+    return open(mFileName, O_RDONLY | O_BINARY);
+!!!967948.cpp!!!	ensureAlignment(inout map : FileMap) : void
+    void* data = map->getDataPtr();
+    if ((((size_t)data)&0x3) == 0) {
+        // We can return this directly if it is aligned on a word
+        // boundary.
+        ALOGV("Returning aligned FileAsset %p (%s).", this,
+                getAssetSource());
+        return data;
+    }
+    // If not aligned on a word boundary, then we need to copy it into
+    // our own buffer.
+    ALOGV("Copying FileAsset %p (%s) to buffer size %d to make it aligned.", this,
+            getAssetSource(), (int)mLength);
+    unsigned char* buf = new unsigned char[mLength];
+    if (buf == NULL) {
+        ALOGE("alloc of %ld bytes failed\n", (long) mLength);
+        return NULL;
+    }
+    memcpy(buf, data, mLength);
+    mBuf = buf;
+    return buf;

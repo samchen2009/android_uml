@@ -1,0 +1,350 @@
+class LinkedTransferQueue
+!!!1577371.java!!!	casTail(inout cmp : Node, inout val : Node) : boolean
+        return UNSAFE.compareAndSwapObject(this, tailOffset, cmp, val);
+!!!1577499.java!!!	casHead(inout cmp : Node, inout val : Node) : boolean
+        return UNSAFE.compareAndSwapObject(this, headOffset, cmp, val);
+!!!1577627.java!!!	casSweepVotes(in cmp : int, in val : int) : boolean
+        return UNSAFE.compareAndSwapInt(this, sweepVotesOffset, cmp, val);
+!!!1577755.java!!!	cast(inout item : Object) : E
+        // assert item == null || item.getClass() != Node.class;
+        return (E) item;
+!!!1577883.java!!!	xfer(inout e : E, inout haveData : boolean, in how : int, in nanos : long) : E
+        if (haveData && (e == null))
+            throw new NullPointerException();
+        Node s = null;                        // the node to append, if needed
+
+        retry:
+        for (;;) {                            // restart on append race
+
+            for (Node h = head, p = h; p != null;) { // find & match first node
+                boolean isData = p.isData;
+                Object item = p.item;
+                if (item != p && (item != null) == isData) { // unmatched
+                    if (isData == haveData)   // can't match
+                        break;
+                    if (p.casItem(item, e)) { // match
+                        for (Node q = p; q != h;) {
+                            Node n = q.next;  // update by 2 unless singleton
+                            if (head == h && casHead(h, n == null ? q : n)) {
+                                h.forgetNext();
+                                break;
+                            }                 // advance and retry
+                            if ((h = head)   == null ||
+                                (q = h.next) == null || !q.isMatched())
+                                break;        // unless slack < 2
+                        }
+                        LockSupport.unpark(p.waiter);
+                        return LinkedTransferQueue.<E>cast(item);
+                    }
+                }
+                Node n = p.next;
+                p = (p != n) ? n : (h = head); // Use head if p offlist
+            }
+
+            if (how != NOW) {                 // No matches available
+                if (s == null)
+                    s = new Node(e, haveData);
+                Node pred = tryAppend(s, haveData);
+                if (pred == null)
+                    continue retry;           // lost race vs opposite mode
+                if (how != ASYNC)
+                    return awaitMatch(s, pred, e, (how == TIMED), nanos);
+            }
+            return e; // not waiting
+        }
+!!!1578011.java!!!	tryAppend(inout s : Node, inout haveData : boolean) : Node
+        for (Node t = tail, p = t;;) {        // move p to last node and append
+            Node n, u;                        // temps for reads of next & tail
+            if (p == null && (p = head) == null) {
+                if (casHead(null, s))
+                    return s;                 // initialize
+            }
+            else if (p.cannotPrecede(haveData))
+                return null;                  // lost race vs opposite mode
+            else if ((n = p.next) != null)    // not last; keep traversing
+                p = p != t && t != (u = tail) ? (t = u) : // stale tail
+                    (p != n) ? n : null;      // restart if off list
+            else if (!p.casNext(null, s))
+                p = p.next;                   // re-read on CAS failure
+            else {
+                if (p != t) {                 // update if slack now >= 2
+                    while ((tail != t || !casTail(t, s)) &&
+                           (t = tail)   != null &&
+                           (s = t.next) != null && // advance and retry
+                           (s = s.next) != null && s != t);
+                }
+                return p;
+            }
+        }
+!!!1578139.java!!!	awaitMatch(inout s : Node, inout pred : Node, inout e : E, inout timed : boolean, in nanos : long) : E
+        long lastTime = timed ? System.nanoTime() : 0L;
+        Thread w = Thread.currentThread();
+        int spins = -1; // initialized after first item and cancel checks
+        ThreadLocalRandom randomYields = null; // bound if needed
+
+        for (;;) {
+            Object item = s.item;
+            if (item != e) {                  // matched
+                // assert item != s;
+                s.forgetContents();           // avoid garbage
+                return LinkedTransferQueue.<E>cast(item);
+            }
+            if ((w.isInterrupted() || (timed && nanos <= 0)) &&
+                    s.casItem(e, s)) {        // cancel
+                unsplice(pred, s);
+                return e;
+            }
+
+            if (spins < 0) {                  // establish spins at/near front
+                if ((spins = spinsFor(pred, s.isData)) > 0)
+                    randomYields = ThreadLocalRandom.current();
+            }
+            else if (spins > 0) {             // spin
+                --spins;
+                if (randomYields.nextInt(CHAINED_SPINS) == 0)
+                    Thread.yield();           // occasionally yield
+            }
+            else if (s.waiter == null) {
+                s.waiter = w;                 // request unpark then recheck
+            }
+            else if (timed) {
+                long now = System.nanoTime();
+                if ((nanos -= now - lastTime) > 0)
+                    LockSupport.parkNanos(this, nanos);
+                lastTime = now;
+            }
+            else {
+                LockSupport.park(this);
+            }
+        }
+!!!1578267.java!!!	spinsFor(inout pred : Node, inout haveData : boolean) : int
+        if (MP && pred != null) {
+            if (pred.isData != haveData)      // phase change
+                return FRONT_SPINS + CHAINED_SPINS;
+            if (pred.isMatched())             // probably at front
+                return FRONT_SPINS;
+            if (pred.waiter == null)          // pred apparently spinning
+                return CHAINED_SPINS;
+        }
+        return 0;
+!!!1578395.java!!!	succ(inout p : Node) : Node
+        Node next = p.next;
+        return (p == next) ? head : next;
+!!!1578523.java!!!	firstOfMode(inout isData : boolean) : Node
+        for (Node p = head; p != null; p = succ(p)) {
+            if (!p.isMatched())
+                return (p.isData == isData) ? p : null;
+        }
+        return null;
+!!!1578651.java!!!	firstDataItem() : E
+        for (Node p = head; p != null; p = succ(p)) {
+            Object item = p.item;
+            if (p.isData) {
+                if (item != null && item != p)
+                    return LinkedTransferQueue.<E>cast(item);
+            }
+            else if (item == null)
+                return null;
+        }
+        return null;
+!!!1578779.java!!!	countOfMode(inout data : boolean) : int
+        int count = 0;
+        for (Node p = head; p != null; ) {
+            if (!p.isMatched()) {
+                if (p.isData != data)
+                    return 0;
+                if (++count == Integer.MAX_VALUE) // saturated
+                    break;
+            }
+            Node n = p.next;
+            if (n != p)
+                p = n;
+            else {
+                count = 0;
+                p = head;
+            }
+        }
+        return count;
+!!!1579547.java!!!	unsplice(inout pred : Node, inout s : Node) : void
+        s.forgetContents(); // forget unneeded fields
+        /*
+         * See above for rationale. Briefly: if pred still points to
+         * s, try to unlink s.  If s cannot be unlinked, because it is
+         * trailing node or pred might be unlinked, and neither pred
+         * nor s are head or offlist, add to sweepVotes, and if enough
+         * votes have accumulated, sweep.
+         */
+        if (pred != null && pred != s && pred.next == s) {
+            Node n = s.next;
+            if (n == null ||
+                (n != s && pred.casNext(s, n) && pred.isMatched())) {
+                for (;;) {               // check if at, or could be, head
+                    Node h = head;
+                    if (h == pred || h == s || h == null)
+                        return;          // at head or list empty
+                    if (!h.isMatched())
+                        break;
+                    Node hn = h.next;
+                    if (hn == null)
+                        return;          // now empty
+                    if (hn != h && casHead(h, hn))
+                        h.forgetNext();  // advance head
+                }
+                if (pred.next != pred && s.next != s) { // recheck if offlist
+                    for (;;) {           // sweep now if enough votes
+                        int v = sweepVotes;
+                        if (v < SWEEP_THRESHOLD) {
+                            if (casSweepVotes(v, v + 1))
+                                break;
+                        }
+                        else if (casSweepVotes(v, 0)) {
+                            sweep();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+!!!1579675.java!!!	sweep() : void
+        for (Node p = head, s, n; p != null && (s = p.next) != null; ) {
+            if (!s.isMatched())
+                // Unmatched nodes are never self-linked
+                p = s;
+            else if ((n = s.next) == null) // trailing node is pinned
+                break;
+            else if (s == n)    // stale
+                // No need to also check for p == s, since that implies s == n
+                p = head;
+            else
+                p.casNext(s, n);
+        }
+!!!1579803.java!!!	findAndRemove(inout e : Object) : boolean
+        if (e != null) {
+            for (Node pred = null, p = head; p != null; ) {
+                Object item = p.item;
+                if (p.isData) {
+                    if (item != null && item != p && e.equals(item) &&
+                        p.tryMatchData()) {
+                        unsplice(pred, p);
+                        return true;
+                    }
+                }
+                else if (item == null)
+                    break;
+                pred = p;
+                if ((p = p.next) == pred) { // stale
+                    pred = null;
+                    p = head;
+                }
+            }
+        }
+        return false;
+!!!1580059.java!!!	LinkedTransferQueue(inout c : Collection)
+        this();
+        addAll(c);
+!!!1580187.java!!!	put(inout e : E) : void
+        xfer(e, true, ASYNC, 0);
+!!!1580315.java!!!	offer(inout e : E, in timeout : long, inout unit : TimeUnit) : boolean
+        xfer(e, true, ASYNC, 0);
+        return true;
+!!!1580443.java!!!	offer(inout e : E) : boolean
+        xfer(e, true, ASYNC, 0);
+        return true;
+!!!1580571.java!!!	add(inout e : E) : boolean
+        xfer(e, true, ASYNC, 0);
+        return true;
+!!!1580699.java!!!	tryTransfer(inout e : E) : boolean
+        return xfer(e, true, NOW, 0) == null;
+!!!1580827.java!!!	transfer(inout e : E) : void
+        if (xfer(e, true, SYNC, 0) != null) {
+            Thread.interrupted(); // failure possible only due to interrupt
+            throw new InterruptedException();
+        }
+!!!1580955.java!!!	tryTransfer(inout e : E, in timeout : long, inout unit : TimeUnit) : boolean
+        if (xfer(e, true, TIMED, unit.toNanos(timeout)) == null)
+            return true;
+        if (!Thread.interrupted())
+            return false;
+        throw new InterruptedException();
+!!!1581083.java!!!	take() : E
+        E e = xfer(null, false, SYNC, 0);
+        if (e != null)
+            return e;
+        Thread.interrupted();
+        throw new InterruptedException();
+!!!1581211.java!!!	poll(in timeout : long, inout unit : TimeUnit) : E
+        E e = xfer(null, false, TIMED, unit.toNanos(timeout));
+        if (e != null || !Thread.interrupted())
+            return e;
+        throw new InterruptedException();
+!!!1581339.java!!!	poll() : E
+        return xfer(null, false, NOW, 0);
+!!!1581467.java!!!	drainTo(inout c : Collection) : int
+        if (c == null)
+            throw new NullPointerException();
+        if (c == this)
+            throw new IllegalArgumentException();
+        int n = 0;
+        for (E e; (e = poll()) != null;) {
+            c.add(e);
+            ++n;
+        }
+        return n;
+!!!1581595.java!!!	drainTo(inout c : Collection, in maxElements : int) : int
+        if (c == null)
+            throw new NullPointerException();
+        if (c == this)
+            throw new IllegalArgumentException();
+        int n = 0;
+        for (E e; n < maxElements && (e = poll()) != null;) {
+            c.add(e);
+            ++n;
+        }
+        return n;
+!!!1581723.java!!!	iterator() : Iterator
+        return new Itr();
+!!!1581851.java!!!	peek() : E
+        return firstDataItem();
+!!!1581979.java!!!	isEmpty() : boolean
+        for (Node p = head; p != null; p = succ(p)) {
+            if (!p.isMatched())
+                return !p.isData;
+        }
+        return true;
+!!!1582107.java!!!	hasWaitingConsumer() : boolean
+        return firstOfMode(false) != null;
+!!!1582235.java!!!	size() : int
+        return countOfMode(true);
+!!!1582363.java!!!	getWaitingConsumerCount() : int
+        return countOfMode(false);
+!!!1582491.java!!!	remove(inout o : Object) : boolean
+        return findAndRemove(o);
+!!!1582619.java!!!	contains(inout o : Object) : boolean
+        if (o == null) return false;
+        for (Node p = head; p != null; p = succ(p)) {
+            Object item = p.item;
+            if (p.isData) {
+                if (item != null && item != p && o.equals(item))
+                    return true;
+            }
+            else if (item == null)
+                break;
+        }
+        return false;
+!!!1582747.java!!!	remainingCapacity() : int
+        return Integer.MAX_VALUE;
+!!!1582875.java!!!	writeObject(inout s : ObjectOutputStream) : void
+        s.defaultWriteObject();
+        for (E e : this)
+            s.writeObject(e);
+        // Use trailing null as sentinel
+        s.writeObject(null);
+!!!1583003.java!!!	readObject(inout s : ObjectInputStream) : void
+        s.defaultReadObject();
+        for (;;) {
+            @SuppressWarnings("unchecked") E item = (E) s.readObject();
+            if (item == null)
+                break;
+            else
+                offer(item);
+        }

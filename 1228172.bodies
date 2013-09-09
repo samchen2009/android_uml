@@ -1,0 +1,245 @@
+class FilterGraph
+!!!6992524.java!!!	FilterGraph()
+        mLogVerbose = Log.isLoggable(TAG, Log.VERBOSE);
+!!!6992652.java!!!	addFilter(inout filter : Filter) : boolean
+        if (!containsFilter(filter)) {
+            mFilters.add(filter);
+            mNameMap.put(filter.getName(), filter);
+            return true;
+        }
+        return false;
+!!!6992780.java!!!	containsFilter(inout filter : Filter) : boolean
+        return mFilters.contains(filter);
+!!!6992908.java!!!	getFilter(in name : String) : Filter
+        return mNameMap.get(name);
+!!!6993036.java!!!	connect(inout source : Filter, in outputName : String, inout target : Filter, in inputName : String) : void
+        if (source == null || target == null) {
+            throw new IllegalArgumentException("Passing null Filter in connect()!");
+        } else if (!containsFilter(source) || !containsFilter(target)) {
+            throw new RuntimeException("Attempting to connect filter not in graph!");
+        }
+
+        OutputPort outPort = source.getOutputPort(outputName);
+        InputPort inPort = target.getInputPort(inputName);
+        if (outPort == null) {
+            throw new RuntimeException("Unknown output port '" + outputName + "' on Filter " +
+                                       source + "!");
+        } else if (inPort == null) {
+            throw new RuntimeException("Unknown input port '" + inputName + "' on Filter " +
+                                       target + "!");
+        }
+
+        preconnect(outPort, inPort);
+!!!6993164.java!!!	connect(in sourceName : String, in outputName : String, in targetName : String, in inputName : String) : void
+        Filter source = getFilter(sourceName);
+        Filter target = getFilter(targetName);
+        if (source == null) {
+            throw new RuntimeException(
+                "Attempting to connect unknown source filter '" + sourceName + "'!");
+        } else if (target == null) {
+            throw new RuntimeException(
+                "Attempting to connect unknown target filter '" + targetName + "'!");
+        }
+        connect(source, outputName, target, inputName);
+!!!6993292.java!!!	getFilters() : Filter
+        return mFilters;
+!!!6993420.java!!!	beginProcessing() : void
+        if (mLogVerbose) Log.v(TAG, "Opening all filter connections...");
+        for (Filter filter : mFilters) {
+            filter.openOutputs();
+        }
+        mIsReady = true;
+!!!6993548.java!!!	flushFrames() : void
+        for (Filter filter : mFilters) {
+            filter.clearOutputs();
+        }
+!!!6993676.java!!!	closeFilters(inout context : FilterContext) : void
+        if (mLogVerbose) Log.v(TAG, "Closing all filters...");
+        for (Filter filter : mFilters) {
+            filter.performClose(context);
+        }
+        mIsReady = false;
+!!!6993804.java!!!	isReady() : boolean
+        return mIsReady;
+!!!6993932.java!!!	setAutoBranchMode(in autoBranchMode : int) : void
+        mAutoBranchMode = autoBranchMode;
+!!!6994060.java!!!	setDiscardUnconnectedOutputs(inout discard : boolean) : void
+        mDiscardUnconnectedOutputs = discard;
+!!!6994188.java!!!	setTypeCheckMode(in typeCheckMode : int) : void
+        mTypeCheckMode = typeCheckMode;
+!!!6994316.java!!!	tearDown(inout context : FilterContext) : void
+        if (!mFilters.isEmpty()) {
+            flushFrames();
+            for (Filter filter : mFilters) {
+                filter.performTearDown(context);
+            }
+            mFilters.clear();
+            mNameMap.clear();
+            mIsReady = false;
+        }
+!!!6994444.java!!!	readyForProcessing(inout filter : Filter, inout processed : Set<Filter>) : boolean
+        // Check if this has been already processed
+        if (processed.contains(filter)) {
+            return false;
+        }
+
+        // Check if all dependencies have been processed
+        for (InputPort port : filter.getInputPorts()) {
+            Filter dependency = port.getSourceFilter();
+            if (dependency != null && !processed.contains(dependency)) {
+                return false;
+            }
+        }
+        return true;
+!!!6994572.java!!!	runTypeCheck() : void
+        Stack<Filter> filterStack = new Stack<Filter>();
+        Set<Filter> processedFilters = new HashSet<Filter>();
+        filterStack.addAll(getSourceFilters());
+
+        while (!filterStack.empty()) {
+            // Get current filter and mark as processed
+            Filter filter = filterStack.pop();
+            processedFilters.add(filter);
+
+            // Anchor output formats
+            updateOutputs(filter);
+
+            // Perform type check
+            if (mLogVerbose) Log.v(TAG, "Running type check on " + filter + "...");
+            runTypeCheckOn(filter);
+
+            // Push connected filters onto stack
+            for (OutputPort port : filter.getOutputPorts()) {
+                Filter target = port.getTargetFilter();
+                if (target != null && readyForProcessing(target, processedFilters)) {
+                    filterStack.push(target);
+                }
+            }
+        }
+
+        // Make sure all ports were setup
+        if (processedFilters.size() != getFilters().size()) {
+            throw new RuntimeException("Could not schedule all filters! Is your graph malformed?");
+        }
+!!!6994700.java!!!	updateOutputs(inout filter : Filter) : void
+        for (OutputPort outputPort : filter.getOutputPorts()) {
+            InputPort inputPort = outputPort.getBasePort();
+            if (inputPort != null) {
+                FrameFormat inputFormat = inputPort.getSourceFormat();
+                FrameFormat outputFormat = filter.getOutputFormat(outputPort.getName(),
+                                                                  inputFormat);
+                if (outputFormat == null) {
+                    throw new RuntimeException("Filter did not return an output format for "
+                        + outputPort + "!");
+                }
+                outputPort.setPortFormat(outputFormat);
+            }
+        }
+!!!6994828.java!!!	runTypeCheckOn(inout filter : Filter) : void
+        for (InputPort inputPort : filter.getInputPorts()) {
+            if (mLogVerbose) Log.v(TAG, "Type checking port " + inputPort);
+            FrameFormat sourceFormat = inputPort.getSourceFormat();
+            FrameFormat targetFormat = inputPort.getPortFormat();
+            if (sourceFormat != null && targetFormat != null) {
+                if (mLogVerbose) Log.v(TAG, "Checking " + sourceFormat + " against " + targetFormat + ".");
+
+                boolean compatible = true;
+                switch (mTypeCheckMode) {
+                    case TYPECHECK_OFF:
+                        inputPort.setChecksType(false);
+                        break;
+                    case TYPECHECK_DYNAMIC:
+                        compatible = sourceFormat.mayBeCompatibleWith(targetFormat);
+                        inputPort.setChecksType(true);
+                        break;
+                    case TYPECHECK_STRICT:
+                        compatible = sourceFormat.isCompatibleWith(targetFormat);
+                        inputPort.setChecksType(false);
+                        break;
+                }
+
+                if (!compatible) {
+                    throw new RuntimeException("Type mismatch: Filter " + filter + " expects a "
+                        + "format of type " + targetFormat + " but got a format of type "
+                        + sourceFormat + "!");
+                }
+            }
+        }
+!!!6994956.java!!!	checkConnections() : void
+        // TODO
+!!!6995084.java!!!	discardUnconnectedOutputs() : void
+        // Connect unconnected ports to Null filters
+        LinkedList<Filter> addedFilters = new LinkedList<Filter>();
+        for (Filter filter : mFilters) {
+            int id = 0;
+            for (OutputPort port : filter.getOutputPorts()) {
+                if (!port.isConnected()) {
+                    if (mLogVerbose) Log.v(TAG, "Autoconnecting unconnected " + port + " to Null filter.");
+                    NullFilter nullFilter = new NullFilter(filter.getName() + "ToNull" + id);
+                    nullFilter.init();
+                    addedFilters.add(nullFilter);
+                    port.connectTo(nullFilter.getInputPort("frame"));
+                    ++id;
+                }
+            }
+        }
+        // Add all added filters to this graph
+        for (Filter filter : addedFilters) {
+            addFilter(filter);
+        }
+!!!6995212.java!!!	removeFilter(inout filter : Filter) : void
+        mFilters.remove(filter);
+        mNameMap.remove(filter.getName());
+!!!6995340.java!!!	preconnect(inout outPort : OutputPort, inout inPort : InputPort) : void
+        LinkedList<InputPort> targets;
+        targets = mPreconnections.get(outPort);
+        if (targets == null) {
+            targets = new LinkedList<InputPort>();
+            mPreconnections.put(outPort, targets);
+        }
+        targets.add(inPort);
+!!!6995468.java!!!	connectPorts() : void
+        int branchId = 1;
+        for (Entry<OutputPort, LinkedList<InputPort>> connection : mPreconnections.entrySet()) {
+            OutputPort outputPort = connection.getKey();
+            LinkedList<InputPort> inputPorts = connection.getValue();
+            if (inputPorts.size() == 1) {
+                outputPort.connectTo(inputPorts.get(0));
+            } else if (mAutoBranchMode == AUTOBRANCH_OFF) {
+                throw new RuntimeException("Attempting to connect " + outputPort + " to multiple "
+                                         + "filter ports! Enable auto-branching to allow this.");
+            } else {
+                if (mLogVerbose) Log.v(TAG, "Creating branch for " + outputPort + "!");
+                FrameBranch branch = null;
+                if (mAutoBranchMode == AUTOBRANCH_SYNCED) {
+                    branch = new FrameBranch("branch" + branchId++);
+                } else {
+                    throw new RuntimeException("TODO: Unsynced branches not implemented yet!");
+                }
+                KeyValueMap branchParams = new KeyValueMap();
+                branch.initWithAssignmentList("outputs", inputPorts.size());
+                addFilter(branch);
+                outputPort.connectTo(branch.getInputPort("in"));
+                Iterator<InputPort> inputPortIter = inputPorts.iterator();
+                for (OutputPort branchOutPort : ((Filter)branch).getOutputPorts()) {
+                    branchOutPort.connectTo(inputPortIter.next());
+                }
+            }
+        }
+        mPreconnections.clear();
+!!!6995596.java!!!	getSourceFilters() : Filter
+        HashSet<Filter> sourceFilters = new HashSet<Filter>();
+        for (Filter filter : getFilters()) {
+            if (filter.getNumberOfConnectedInputs() == 0) {
+                if (mLogVerbose) Log.v(TAG, "Found source filter: " + filter);
+                sourceFilters.add(filter);
+            }
+        }
+        return sourceFilters;
+!!!6995724.java!!!	setupFilters() : void
+        if (mDiscardUnconnectedOutputs) {
+            discardUnconnectedOutputs();
+        }
+        connectPorts();
+        checkConnections();
+        runTypeCheck();

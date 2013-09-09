@@ -1,0 +1,469 @@
+class OverscanCalibrator
+!!!11001228.cpp!!!	initialize() : bool
+    if (initialized_) {
+        return true;
+    }
+
+    getDisplayMode(&display_mode_);
+    getUIRectangle(&ui_rect_);
+
+    HRESULT ret = MV_OSAL_Init();
+    if (ret) {
+        ALOGE("MV_OSAL_INIT faild, ret=0x%x\n", ret);
+        return false;
+    }
+
+    ret = AMP_Initialize(2, gClientArgv, NULL);
+    if (ret) {
+        ALOGE("AMP_Initialize error, ret=0x%x\n", ret);
+        MV_OSAL_Exit();
+        return false;
+    }
+
+    if ((ret = MV_GFX_2D_Open((const UINT8 *)"Overscan Calibrator", &gfx_handle_)) != S_OK) {
+        ALOGE("Open graphics instance failed.\n");
+        MV_OSAL_Exit();
+        return false;
+    }
+
+    AMP_DISP display;
+    if ((ret = MV_GFX_2D_GetDisp(gfx_handle_, &display)) != S_OK) {
+        MV_GFX_2D_Close(gfx_handle_);
+        MV_OSAL_Exit();
+        return false;
+    }
+
+    AMP_DISP_ZORDER disp_zorder;
+    AMP_RPC(ret, AMP_DISP_GetPlaneZOrder, display, 0, &disp_zorder);
+    zorder_overscan_ = disp_zorder.iGfx2;
+    zorder_ui_ = disp_zorder.iGfx0;
+    if (zorder_overscan_ < zorder_ui_) {
+        // If the plane we're going to use for the calibrator is below the UI plane,
+        // change the Z-order.
+        disp_zorder.iGfx0 = zorder_ui_;
+        disp_zorder.iGfx2 = zorder_overscan_;
+        AMP_RPC(ret, AMP_DISP_SetPlaneZOrder, display, 0, &disp_zorder);
+    }
+
+    // Save the previous scaling parameters.
+    AMP_RPC(ret, AMP_DISP_GetScale, display, eVideoPlaneOverscan, &old_crop_rect_,
+            &old_dest_rect_);
+
+    // The dimension of the overscan plane should exactly match the display
+    // resolution.
+    AMP_DISP_WIN src_win, dst_win;
+    src_win.iX = 0;
+    src_win.iY = 0;
+    src_win.iWidth = ui_rect_.width();
+    src_win.iHeight = ui_rect_.height();
+    dst_win.iX = 0;
+    dst_win.iY = 0;
+    dst_win.iWidth = display_mode_.width;
+    dst_win.iHeight = display_mode_.height;
+    AMP_RPC(ret, AMP_DISP_SetScale, display, eVideoPlaneOverscan, &src_win, &dst_win);
+
+    int i = 0;
+    MV_GFX_2D_CelInfo celInfo;
+    MV_GFX_2D_Init_CelInfo(&celInfo);
+    celInfo.uiWidth = ui_rect_.width();
+    celInfo.uiHeight = ui_rect_.height();
+    celInfo.ePixelFormat = MV_GFX_2D_PIX_A4R4G4B4;
+    for (; i < MAX_OVERSACN_CELL_NUMBER; i++) {
+        if ((ret = MV_GFX_2D_CreateCel(gfx_handle_, &celInfo, &cel_handle_[i])) != S_OK) {
+            MV_GFX_2D_Close(gfx_handle_);
+            MV_OSAL_Exit();
+            return false;
+        }
+    }
+    current_cell_index_ = 0;
+
+    initialized_ = true;
+
+    return true;
+!!!11001356.cpp!!!	cleanup() : void
+    if (!initialized_) {
+        return;
+    }
+
+    HRESULT ret = 0;
+    AMP_DISP display;
+    MV_CHECK(MV_GFX_2D_GetDisp(gfx_handle_, &display));
+
+    MV_GFX_2D_DisplayCel(gfx_handle_, NULL, NULL, NULL, (MV_GFX_2D_CHANNEL)eVideoPlaneOverscan);
+    MV_GFX_2D_WaitCelFree(gfx_handle_, cel_handle_[current_cell_index_]);
+
+    // Restore scaling.
+    AMP_RPC(ret, AMP_DISP_SetScale, display, eVideoPlaneOverscan, &old_crop_rect_,
+            &old_dest_rect_);
+
+    // Restore zorder.
+    if (zorder_overscan_ < zorder_ui_) {
+        AMP_DISP_ZORDER disp_zorder;
+        AMP_RPC(ret, AMP_DISP_GetPlaneZOrder, display, 0, &disp_zorder);
+        disp_zorder.iGfx0 = zorder_overscan_;
+        disp_zorder.iGfx2 = zorder_ui_;
+        AMP_RPC(ret, AMP_DISP_SetPlaneZOrder, display, 0, &disp_zorder);
+    }
+
+bailout:
+    // Cells are also released here.
+    MV_GFX_2D_Close(gfx_handle_);
+    MV_OSAL_Exit();
+    initialized_ = false;
+!!!11001484.cpp!!!	drawCalibrationRect(in x : int, in y : int, in width : int, in height : int) : bool
+    if (!initialized_) {
+        this->initialize();
+    }
+
+    current_cell_index_ = (current_cell_index_ + 1) % MAX_OVERSACN_CELL_NUMBER;
+    MV_GFX_2D_WaitCelFree(gfx_handle_, cel_handle_[current_cell_index_]);
+
+    MV_GFX_2D_RECT rect = {x, y, width, height};
+    MV_CHECK(MV_GFX_2D_FillCel(gfx_handle_, cel_handle_[current_cell_index_],
+                              color_, NULL, NULL));
+    MV_CHECK(MV_GFX_2D_FillCel(gfx_handle_, cel_handle_[current_cell_index_],
+                              COLOR_FOREGROUND, &rect, NULL));
+    MV_CHECK(MV_GFX_2D_Sync(gfx_handle_, 0));
+    MV_CHECK(MV_GFX_2D_DisplayCel(gfx_handle_, cel_handle_[current_cell_index_],
+                                 NULL, NULL, (MV_GFX_2D_CHANNEL)eVideoPlaneOverscan));
+    return true;
+
+bailout:
+    return false;
+!!!11001612.cpp!!!	getOutputSize(inout width : int, inout height : int) : status_t
+    *width = ui_rect_.width();
+    *height = ui_rect_.height();
+    ALOGI("getOutputSize: %d, %d", *width, *height);
+    return NO_ERROR;
+!!!11001740.cpp!!!	setRectColor(in color : int) : bool
+    color_ = 0xff000000 | color;
+    return true;
+!!!11001868.cpp!!!	getRectColor() : int
+    return color_;
+!!!11001996.cpp!!!	setOverscanRectangle(in x : int, in y : int, in width : int, in height : int) : status_t
+    // If this particular product disallows overscan, return an error.  Products
+    // which disallow overscan should fail attempts to set the setting.
+    if (!overscan_enabled_) {
+        return android::UNKNOWN_ERROR;
+    }
+
+    if (av_settings_ == NULL) {
+        return android::UNKNOWN_ERROR;
+    }
+
+    DisplayMode display_mode;
+    status_t ret = getDisplayMode(&display_mode);
+    if (android::OK != ret) {
+        return ret;
+    }
+
+    double scale_factor_x, scale_factor_y;
+    getVideoScaleFactor(&scale_factor_x, &scale_factor_y);
+    display_mode.width /= scale_factor_x;
+    display_mode.height /= scale_factor_y;
+
+    char buf[1024];
+    if (!display_mode.ToString(buf, sizeof(buf))) {
+        return android::UNKNOWN_ERROR;
+    }
+
+    AVSettingValue value;
+    value.setString(android::String8(buf));
+    av_settings_->WriteSetting(internal_overscan_display_mode_, value, false);
+
+    android::Rect overscan_rect(x, y, x + width, y + height);
+    value.setRect(overscan_rect);
+    ALOGD("setOverscanRectangle, overscan_rect %d %d %d %d",
+           overscan_rect.left,
+           overscan_rect.top,
+           overscan_rect.right,
+           overscan_rect.bottom);
+    av_settings_->WriteSetting(internal_overscan_rect_, value, true);
+
+    return android::OK;
+!!!11002124.cpp!!!	getOverscanRectangle(inout x : int, inout y : int, inout width : int, inout height : int) : status_t
+    if (x == NULL ||  y == NULL || width == NULL || height == NULL) {
+        ALOGD("getOverscanRectangle gets wrong parapmeters");
+        return android::BAD_VALUE;
+    }
+    android::Rect overscan_rect;
+    if (OK != computeOverscanRectangle(&overscan_rect)) {
+        ALOGD("fail to computeOverscanRectangle");
+        return android::BAD_VALUE;
+    }
+    *x = overscan_rect.left;
+    *y = overscan_rect.top;
+    *width = overscan_rect.right - overscan_rect.left;
+    *height = overscan_rect.bottom - overscan_rect.top;
+    ALOGD("getOverscanRectangle (%dx%d @ (%d,%d))", *width, *height, *x, *y);
+    return android::OK;
+!!!11002252.cpp!!!	computeOverscanRectangle(inout overscan_rect : android::Rect) : status_t
+    android::Rect    db_overscan_rect, ui_rect;
+    android::String8 db_overscan_display_mode_string;
+    DisplayMode   db_overscan_display_mode;
+    status_t ret_val = OK;
+    AVSettingValue uiRectangleValue;
+    DisplayMode display_mode;
+    char key[MAX_KEY_LEN];
+
+    if (getDisplayMode(&display_mode) != android::OK) {
+        ALOGD("fail to getDisplayMode");
+        return android::BAD_VALUE;
+    }
+    ALOGD("computeOverscanRectangle, display_mode %s",
+            display_mode.ToString().string());
+
+    // If this particular product disallows overscan, go ahead and return the
+    // defaults.
+    if (!overscan_enabled_) {
+        ALOGD("overscan is disabled");
+        ret_val = getDefaultOverscanRectangle(overscan_rect);
+        if (android::OK == ret_val) {
+            fixupOverscanForInterlaced(overscan_rect, display_mode);
+        }
+        return ret_val;
+    }
+
+    // Fetch the overscan rectangle as well as the display mode which was in
+    // effect when the overscan rectangle was last set from the DB.  If either of
+    // these settings is missing or appears to be corrupt, clear them out and
+    // return to defaults.
+    ret_val = av_settings_->ReadRectSetting(internal_overscan_rect_,
+                                           &db_overscan_rect);
+    if (android::OK != ret_val) {
+        ALOGI("GetOverscanRectangle: %s is missing from the DB; will fall back on"
+             " defaults.", internal_overscan_rect_);
+        goto bailout;
+    }
+
+    ALOGD("computeOverscanRectangle, db_overscan_rect %d %d %d %d",
+           db_overscan_rect.left,
+           db_overscan_rect.top,
+           db_overscan_rect.right,
+           db_overscan_rect.bottom);
+
+    ret_val = av_settings_->ReadString8Setting(internal_overscan_display_mode_,
+                                              &db_overscan_display_mode_string);
+    if (android::OK != ret_val) {
+        ALOGI("GetOverscanRectangle: %s is missing from the DB; will fall back on"
+             " defaults.", internal_overscan_display_mode_);
+        goto bailout;
+    }
+
+    if (!DisplayMode::FromString(db_overscan_display_mode_string.string(),
+                                  &db_overscan_display_mode)) {
+        ALOGW("GetOverscanRectangle: failed to parse display mode string %s; will"
+             " fall back on defaults.", db_overscan_display_mode_string.string());
+        ret_val = android::UNKNOWN_ERROR;
+        goto bailout;
+    }
+
+
+    ALOGD("computeOverscanRectangle, db_overscan_display_mode %s",
+            db_overscan_display_mode.ToString().string());
+
+    if ((db_overscan_display_mode.width  < 640)  ||
+        (db_overscan_display_mode.width  > 1920) ||
+        (db_overscan_display_mode.height < 480)  ||
+        (db_overscan_display_mode.height > 1080)) {
+        ALOGW("GetOverscanRectangle: overscan display mode %s appears corrupt; will"
+             " fall back on defaults.", db_overscan_display_mode_string.string());
+        ret_val = android::UNKNOWN_ERROR;
+        goto bailout;
+    }
+
+    // OK - we have a starting point.  Go ahead and set it now.
+    *overscan_rect = db_overscan_rect;
+
+    getUIRectangle(&ui_rect);
+    ALOGV("computeOverscanRectangle, ui_rect %d %d %d %d",
+           ui_rect.left,
+           ui_rect.top,
+           ui_rect.right,
+           ui_rect.bottom);
+
+    // If the current ui resolution is different from the resolution (ui) which
+    // was in effect when we performed overscan calibration previously, attempt to
+    // re-normalize the coordinates.
+    // If no reboot after resolution changed, we still get the same ui
+    // resolution (frame buffer size)
+    // And if fixed ui resolution is set, we can just ingore this
+    char property[PROPERTY_VALUE_MAX];
+    int32_t fix_ui_xres, fix_ui_yres;
+    property_get("ro.sf.ui_xres", property, "0");
+    fix_ui_xres = atoi(property);
+    property_get("ro.sf.ui_yres", property, "0");
+    fix_ui_yres = atoi(property);
+    if (fix_ui_xres && fix_ui_yres) {
+        ALOGD("Fixed ui resolution %d %d, no scale for overscan rect",
+                fix_ui_xres, fix_ui_yres);
+        // Do nothing
+    } else if ((ui_rect.width()  != db_overscan_display_mode.width) ||
+            (ui_rect.height() != db_overscan_display_mode.height)) {
+        ALOGD("computeOverscanRectangle, do scale");
+        // Rescale rounding down.
+        overscan_rect->left   = (overscan_rect->left * ui_rect.width())
+                                / db_overscan_display_mode.width;
+        overscan_rect->top    = (overscan_rect->top * ui_rect.height())
+                                / db_overscan_display_mode.height;
+
+        // Rescale rounding up.
+        overscan_rect->right  = ((overscan_rect->right * ui_rect.width())
+                                + db_overscan_display_mode.width - 1)
+                                / db_overscan_display_mode.width;
+        overscan_rect->bottom = ((overscan_rect->bottom * ui_rect.height())
+                                + db_overscan_display_mode.height - 1)
+                                / db_overscan_display_mode.height;
+    }
+
+    ALOGD("computeOverscanRectangle, overscan_rect %d %d %d %d",
+           overscan_rect->left,
+           overscan_rect->top,
+           overscan_rect->right,
+           overscan_rect->bottom);
+
+    // OK - now sanity check everything.  First check to see if any of the
+    // overscan bounds could possibly be offscreen.
+    if ((overscan_rect->left    < 0)                                    ||
+        (overscan_rect->top     < 0)                                    ||
+        (overscan_rect->right   > ui_rect.width()) ||
+        (overscan_rect->bottom  > ui_rect.height())) {
+        ALOGW("GetOverscanRectangle: overscan rectangle (%dx%d @ %d,%d) appears"
+             " corrupt (partially offscreen); will fall back on defaults.",
+             overscan_rect->width(),
+             overscan_rect->height(),
+             overscan_rect->left,
+             overscan_rect->top);
+        ret_val = android::UNKNOWN_ERROR;
+        goto bailout;
+    }
+
+    // Now check for a rectangle which may be too small.  If the overscan
+    // rectangle is less than 70% of the current display mode in either dimension,
+    // consider it to be corrupt and reset it.
+    if ((((overscan_rect->width()  * 1000) / ui_rect.width())  < 700) ||
+        (((overscan_rect->height() * 1000) / ui_rect.height()) < 700)) {
+        ALOGW("GetOverscanRectangle: overscan rectangle (%dx%d @ %d,%d) appears"
+             " corrupt (too small); will fall back on defaults.",
+             overscan_rect->width(),
+             overscan_rect->height(),
+             overscan_rect->left,
+             overscan_rect->top);
+        ret_val = android::UNKNOWN_ERROR;
+        goto bailout;
+    }
+
+    // Finally, do any required fixup on the final overscan region to make certain
+    // we obey all of the requirement WRT the position of planes in an interlaced
+    // output mode.
+    fixupOverscanForInterlaced(overscan_rect, display_mode);
+    ALOGV("computeOverscanRectangle, interlaced fixed overscan_rect %d %d %d %d",
+           overscan_rect->left,
+           overscan_rect->top,
+           overscan_rect->right,
+           overscan_rect->bottom);
+    ret_val = android::OK;
+
+bailout:
+    if (android::OK != ret_val) {
+        ALOGW("resetInternalOverscanRectangle");
+        resetInternalOverscanRectangle();
+        ret_val = getDefaultOverscanRectangle(overscan_rect);
+        if (android::OK == ret_val) {
+            fixupOverscanForInterlaced(overscan_rect, display_mode);
+        }
+        ALOGI("getDefaultOverscanRectangle: ret_val=%d", ret_val);
+        return ret_val;
+    }
+
+    return ret_val;
+!!!11002380.cpp!!!	fixupOverscanForInterlaced(inout overscan_rect : android::Rect, in display_mode : DisplayMode) : void
+    if (NULL == overscan_rect) {
+        return;
+    }
+
+    // Adjust for half width and half height mode.
+    if (display_mode.stereo_mode == marvell::kStereoSBS) {
+        overscan_rect->left >>= 1;
+        overscan_rect->right >>= 1;
+    } else if (display_mode.stereo_mode == marvell::kStereoTB) {
+        overscan_rect->top >>= 1;
+        overscan_rect->bottom >>= 1;
+    }
+
+    // Always align overscan rect on even boundaries regardless of display mode.
+    overscan_rect->top &= ~1;
+    overscan_rect->left &= ~1;
+    overscan_rect->bottom = (overscan_rect->bottom + 1) & ~1;
+    overscan_rect->right = (overscan_rect->right + 1) & ~1;
+
+    // These could only happen if the display mode had odd width/height.
+    assert(overscan_rect->bottom <= display_mode.height);
+    assert(overscan_rect->right <= display_mode.width);
+!!!11002508.cpp!!!	getDefaultOverscanRectangle(inout overscan_rect : android::Rect) : status_t
+    if (NULL == overscan_rect) {
+        return android::BAD_VALUE;
+    }
+
+    android::Rect ui_rect;
+    getUIRectangle(&ui_rect);
+
+    // If we get to this point, it is because there was no setting in the DB, or a
+    // corrupt setting in the DB.  In this case, report an overscan rectangle
+    // which is the default percentage of the full display size and centered in
+    // the display output.
+    int effectiveWidth  = (ui_rect.width()  * default_overscan_percentage_) / 100;
+    int effectiveHeight = (ui_rect.height() * default_overscan_percentage_) / 100;
+
+    overscan_rect->left   = (ui_rect.width()  - effectiveWidth)  >> 1;
+    overscan_rect->top    = (ui_rect.height() - effectiveHeight) >> 1;
+    overscan_rect->right  = overscan_rect->left + effectiveWidth;
+    overscan_rect->bottom = overscan_rect->top  + effectiveHeight;
+    return android::OK;
+!!!11002636.cpp!!!	resetInternalOverscanRectangle() : void
+    if (av_settings_ != NULL) {
+        AVSettingValue value;
+        value.setNoValue();
+        av_settings_->WriteSetting(internal_overscan_display_mode_, value, false);
+        av_settings_->WriteSetting(internal_overscan_rect_, value, false);
+    }
+!!!11002764.cpp!!!	getDisplayMode(inout display_mode : DisplayMode) : status_t
+    AVSettingValue displayModeValue;
+    char key[MAX_KEY_LEN];
+    snprintf(key, MAX_KEY_LEN, "%s.%s", kVideoOutputSettingsPrefix, kHDMIDisplayMode);
+    status_t status = output_settings_->GetHandler()->ReadSetting(key, &displayModeValue);
+    if (status != OK) {
+        return status;
+    }
+    if (!DisplayMode::FromString(displayModeValue.getString(), display_mode)) {
+        return android::BAD_VALUE;
+    }
+    return android::OK;
+!!!11002892.cpp!!!	getUIRectangle(inout ui_rect : android::Rect) : status_t
+    Parcel reply;
+    status_t status = output_settings_->getService()->getParameter(GET_UI_REC, &reply);
+    if (status != android::OK) {
+        return status;
+    }
+    reply.setDataPosition(0);
+    ui_rect->left = reply.readInt32();
+    ui_rect->top = reply.readInt32();
+    ui_rect->right = reply.readInt32();
+    ui_rect->bottom = reply.readInt32();
+    ALOGD("ui rectangle (%d,%d,%d,%d)", ui_rect->left, ui_rect->top,
+         ui_rect->right, ui_rect->bottom);
+
+    return status;
+!!!11003020.cpp!!!	getVideoScaleFactor(inout scale_factor_x : double, inout scale_factor_y : double) : status_t
+    Parcel reply;
+    status_t status = output_settings_->getService()->getParameter(GET_VIDEO_SCALE_FACTOR,
+                                                                  &reply);
+    if (status != android::OK) {
+        return status;
+    }
+    reply.setDataPosition(0);
+    *scale_factor_x = reply.readDouble();
+    *scale_factor_y = reply.readDouble();
+
+    return status;
+

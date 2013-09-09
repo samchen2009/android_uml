@@ -1,0 +1,393 @@
+class BerlinOutputHandler
+!!!10939532.cpp!!!	BerlinOutputHandler()
+    ALOGD("construct");
+!!!10939788.cpp!!!	Init(in av_settings : sp<AVSettings>) : bool
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    status_t status = android::OK;
+    // AMP init
+    MV_OSAL_Init();
+    ALOGD("AMP init");
+    CHECK(AMP_Initialize(2, client_argv, &factory_handle_) == SUCCESS);
+    CHECK(AMP_GetFactory(&factory_handle_) == SUCCESS);
+    // TODO: HDCP enable
+
+    // Create display service and video output
+    AMP_RPC(ret, AMP_FACTORY_CreateDisplayService, factory_handle_, &disp_handle_);
+    AVS_CHECK(ret, "AMP_FACTORY_CreateDisplayService");
+    vout_ = new BerlinVideoOutput(disp_handle_, av_settings);
+    CHECK(vout_ != 0);
+
+    // Create sound service and audio output
+    AMP_RPC(ret, AMP_FACTORY_CreateSoundService, factory_handle_, &snd_handle_);
+    AVS_CHECK(ret, "AMP_FACTORY_CreateSoundService");
+    aout_ = new BerlinAudioOutput(snd_handle_, av_settings);
+    CHECK(aout_ != 0);
+
+    // Register avsettings observer
+    status = av_settings->RegisterObserver(
+            MRVL_AVSETTINGS_OUTPUT_PREFIX,
+            sp<IAVSettingObserver>(this));
+    if (android::OK != status) {
+        ALOGE("Failed to register observer for prefix %s"
+             " (status = %d)", kVideoOutputSettingsPrefix, status);
+        return false;
+    }
+    // Create hotplug handler
+    hotplug_handler_ = new BerlinHotplugHandler();
+    CHECK(hotplug_handler_ != 0);
+    if (!hotplug_handler_->Init(av_settings, this, factory_handle_)) {
+        ALOGE("Failed to init HotplugHandler");
+        return false;
+    }
+
+    if (!hotplug_handler_->StartWorkThread()) {
+        ALOGE("Failed to start work thread of HotplugHandler");
+        return false;
+    }
+
+    av_settings_handle_ = (BerlinAVSettings*)av_settings.get();
+    pq_setting_ = av_settings_handle_->GetVideoSetting();
+    aq_setting_ = av_settings_handle_->GetAudioSetting();
+    fac_setting_ = av_settings_handle_->GetFactorySetting();
+
+    AVS_FUNC_LEAVE
+    return true;
+
+bailout:
+    ALOGE("Init fail");
+    return false;
+!!!10939916.cpp!!!	Destroy() : void
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    av_settings_handle_->RemoveObserver(sp<IAVSettingObserver>(this));
+    hotplug_handler_->Destroy();
+
+    delete hotplug_handler_;
+    delete aout_;
+    delete vout_;
+    factory_handle_ = NULL;
+
+    MV_OSAL_Exit();
+    AVS_FUNC_LEAVE
+!!!10940300.cpp!!!	ApplySetting(in name : char, in value : AVSettingValue, in persisted : bool) : status_t
+    ALOGV("ApplySetting, (%s, %s, %d)",
+            name, value.getFormattedValue().string(), persisted);
+
+    char subkey[MAX_KEY_LEN];
+    ApplyStatus status = persisted ? NEED_WRITE : SKIP_WRITE;
+    if (strstr(name, kVideoOutputSettingsPrefix)) {
+        // VideoOutput Related
+        AVSettingsHelper::ParseKey(
+                name, kVideoOutputSettingsPrefix, subkey);
+        ALOGV("ApplySetting, [vout] key: %s", subkey);
+        if (!strcmp(subkey, kHDMIDisplayMode)) {
+            DisplayMode target;
+            DisplayMode::FromString(value.getString().string(), &target);
+            vout_->SetDisplayMode(VIDEO_OUTPUT_HDMI, target, false);
+            status = SKIP_WRITE;
+        } else if (!strcmp(subkey, kHDMIPrefDisplayMode)) {
+            status = SKIP_WRITE;
+        } else if (!strcmp(subkey, kDeepColor)) {
+            status =  SKIP_WRITE;
+        } else if (!strcmp(subkey, kHDMIPixelFormat)) {
+            VideoOutputPixelFormat pixel_format;
+            AVSettingsHelper::ParsePixelFormat(value.getString().string(), &pixel_format);
+            vout_->SetPixelFormat(VIDEO_OUTPUT_HDMI, pixel_format);
+            status = SKIP_WRITE;
+        } else if (!strcmp(subkey, kOverscanDisplayMode)) {
+            status = SKIP_WRITE;
+        } else if (!strcmp(subkey, kOverscanRect)) {
+            status = SKIP_WRITE;
+        } else if (strstr(subkey, kAVMute)) {
+            status = marvell::SKIP_WRITE;
+        } else {
+            ALOGE("ApplySetting, unknown [vout] key: %s", subkey);
+            status = marvell::BAD_VALUE;
+        }
+    } else if (strstr(name, kAudioOutputSettingsPrefix)) {
+        // AudioOutput related
+        AVSettingsHelper::ParseKey(
+                name, kAudioOutputSettingsPrefix, subkey);
+        ALOGV("ApplySetting, [aout] key: %s", subkey);
+        if (!strcmp(subkey, kOutputMode)) {
+            status = SKIP_WRITE;
+        } else if (!strcmp(subkey, kDrcMode)) {
+            status = SKIP_WRITE;
+        } else if (!strcmp(subkey, kMasterVolume)) {
+            int32_t vol = value.getFloat() * 100;
+            if (NEED_WRITE == status) {
+                ALOGD("Set value to database, key %s", name);
+                aq_setting_->SetAudioProperty(TV_SourceInvalid,
+                    TV_SourceInvalid, TV_AUDIO_Volume, vol);
+            }
+            aout_->SetAudioProperty(TV_SourceInvalid, TV_AUDIO_Volume, vol);
+            return android::OK;
+        } else {
+            ALOGE("ApplySetting, unknown [aout] key: %s", subkey);
+            status = marvell::BAD_VALUE;
+        }
+    } else if (strstr(name, MRVL_AVSETTINGS_SOURCE_PREFIX)) {
+        int32_t source_id, sub_source, prop_id, format;
+        if (strstr(name, kVideoProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kVideoProperty, &prop_id)) {
+                sub_source = getSubSource(source_id);
+                if (NEED_WRITE == status) {
+                    ALOGD("Set value to database, key %s", name);
+                    format = vout_->GetSourceFormat(sub_source);
+                    pq_setting_->SetVideoProperty(sub_source, format, prop_id, value.getInt());
+                }
+                vout_->SetVideoProperty(sub_source, prop_id, value.getInt());
+            }
+        } else if (strstr(name, kAudioProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kAudioProperty, &prop_id)) {
+                sub_source = getSubSource(source_id);
+                format = aout_->GetAQSrcType(sub_source);
+                if (NEED_WRITE == status) {
+                    ALOGD("Set value to database, key %s", name);
+                    aq_setting_->SetAudioProperty(sub_source, format, prop_id, value.getInt());
+                }
+                aout_->SetAudioProperty(sub_source, prop_id, value.getInt());
+            }
+        } else if (strstr(name, kFactoryProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kFactoryProperty, &prop_id)) {
+                sub_source = getSubSource(source_id);
+                if (NEED_WRITE == status) {
+                    ALOGD("Set value to database, key %s", name);
+                    format = vout_->GetSourceFormat(sub_source);
+                    fac_setting_->SetFactoryProperty(sub_source, format, prop_id, value.getInt());
+                }
+            }
+        /*} else if(strstr(name, kGenericProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kGenericProperty, &prop_id)) {
+                setGenericProperty(source_id, prop_id, value.getInt());
+            }*/
+        } else {
+            ALOGE("ApplySetting, unknown key: %s", subkey);
+            status = marvell::BAD_VALUE;
+        }
+    } else {
+        ALOGE("ApplySetting, unknown output subkey: %s", name);
+        // TODO: use NEED_WRITE for test purpose
+        // Change it to BAD_VALUE once dummy handler is ready
+        status = marvell::NEED_WRITE;
+    }
+
+    ALOGV("ApplySetting, status %d", status);
+
+    // For deletion, always remove from DB regardless of what the handler says.
+    if (APPLY_FAILED == status)
+        return android::UNKNOWN_ERROR;
+
+    return android::OK;
+!!!10940428.cpp!!!	ReadSetting(in name : char, inout value : AVSettingValue, in persisted : bool) : status_t
+    ALOGV("ReadSetting, (%s)", name);
+
+    char subkey[MAX_KEY_LEN];
+    if (strstr(name, kVideoOutputSettingsPrefix)) {
+        // VideoOutput Related
+        AVSettingsHelper::ParseKey(
+                name, kVideoOutputSettingsPrefix, subkey);
+        ALOGV("ReadSetting, [vout] key: %s", subkey);
+        if (!strcmp(subkey, kHDMIDisplayMode)) {
+            DisplayMode curMode;
+            if (android::OK == vout_->GetDisplayMode(&curMode)) {
+                value->setString(curMode.ToString());
+                return android::OK;
+            } else {
+                return android::UNKNOWN_ERROR;
+            }
+        } else if (!strcmp(subkey, kHDMIPrefDisplayMode)) {
+            // If no entry in DB, return no value as 'Auto'
+            value->setType(AVSettingValue::TYPE_NO_VALUE);
+            return android::OK;
+        } else if (!strcmp(subkey, kHDMIPixelFormat)) {
+            // If no entry in DB, return default 'rgb'
+            value->setString(String8(vHDMIPixelFormatRGB));
+            return android::OK;
+        } else if (!strcmp(subkey, kDeepColor)) {
+            // If no entry in DB, return default '8bit'
+            value->setString(String8(vDeepColorFixed8Bit));
+            return android::OK;
+        } else if (!strcmp(subkey, kHDMITvSupportedModes)) {
+            value->setType(AVSettingValue::TYPE_NO_VALUE);
+            return android::OK;
+        } else if (!strcmp(subkey, kHDMIPlugStatus)) {
+            value->setBool(true);
+            return android::OK;
+        } else if (!strcmp(subkey, kOverscanRect)) {
+            value->setType(AVSettingValue::TYPE_NO_VALUE);
+            return android::BAD_VALUE;
+        } else if (!strcmp(subkey, kOverscanDisplayMode)) {
+            value->setType(AVSettingValue::TYPE_NO_VALUE);
+            return android::BAD_VALUE;
+        } else {
+            ALOGE("ReadSetting, unknown [vout] key: %s", subkey);
+            return android::UNKNOWN_ERROR;
+        }
+    } else if (strstr(name, kAudioOutputSettingsPrefix)) {
+        // AudioOutput related
+        AVSettingsHelper::ParseKey(
+                name, kAudioOutputSettingsPrefix, subkey);
+        ALOGV("ReadSetting, [aout] key: %s", subkey);
+        if (!strcmp(subkey, kOutputMode)) {
+            // If no entry in DB, return default 'pcm'
+            value->setString(String8(vAOutputModePCM));
+            return android::OK;
+        } else if (!strcmp(subkey, kDrcMode)) {
+            // If no entry in DB, return default 'on'
+            value->setString(String8(vDrcModeOn));
+            return android::OK;
+        } else if (!strcmp(subkey, kMasterVolume)) {
+            int32_t vol;
+            aq_setting_->GetAudioProperty(TV_SourceInvalid,
+                    TV_SourceInvalid, TV_AUDIO_Volume, &vol);
+            value->setFloat(vol/100.0);
+            return android::OK;
+        } else {
+            ALOGE("ReadSetting, unknown [aout] key: %s", subkey);
+            return android::UNKNOWN_ERROR;
+        }
+    } else if (strstr(name, MRVL_AVSETTINGS_SOURCE_PREFIX)) {
+        int32_t source_id, sub_source, prop_id, format, val;
+        if (strstr(name, kVideoProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kVideoProperty, &prop_id)) {
+                sub_source = getSubSource(source_id);
+                format = vout_->GetSourceFormat(sub_source);
+                if(android::OK != pq_setting_->GetVideoProperty(sub_source, format, prop_id, &val))
+                    vout_->GetVideoProperty(sub_source, prop_id, &val);
+                value->setInt(val);
+            }
+        } else if(strstr(name, kAudioProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kAudioProperty, &prop_id)) {
+                sub_source = getSubSource(source_id);
+                format = aout_->GetAQSrcType(sub_source);
+                if(android::OK != aq_setting_->GetAudioProperty(sub_source, format, prop_id, &val))
+                    aout_->GetAudioProperty(sub_source, prop_id, &val);
+                value->setInt(val);
+            }
+        } else if(strstr(name, kFactoryProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kFactoryProperty, &prop_id)) {
+                sub_source = getSubSource(source_id);
+                format = vout_->GetSourceFormat(sub_source);
+                fac_setting_->GetFactoryProperty(sub_source, format, prop_id, &val);
+                value->setInt(val);
+            }
+        /*} else if(strstr(name, kGenericProperty)) {
+            if(AVSettingsHelper::ParsePropertyKey(name,
+                MRVL_AVSETTINGS_SOURCE_PREFIX, &source_id, kGenericProperty, &prop_id)) {
+                getGenericProperty(source_id, prop_id, &val);
+                value->setInt(val);
+            }*/
+        } else {
+             ALOGE("ReadSetting, unknown output subkey: %s", name);
+             return android::UNKNOWN_ERROR;
+        }
+    } else {
+        ALOGE("ReadSetting, unknown output subkey: %s", name);
+        return android::UNKNOWN_ERROR;
+    }
+    return android::OK;
+!!!10940556.cpp!!!	OnSettingUpdate(in name : char, in value : AVSettingValue) : void
+    // Behaviors when interested avsettings key changed
+    AVS_FUNC_ENTER
+    CHECK(NULL != name);
+    char subkey[200];
+    ALOGD("OnSettingUpdate, (%s, %s)", name, value.getFormattedValue().string());
+    if (strstr(name, kVideoOutputSettingsPrefix)) {
+        AVSettingsHelper::ParseKey(
+                name, kVideoOutputSettingsPrefix, subkey);
+        ALOGV("OnSettingUpdate, [vout] subkey: %s", subkey);
+    } else if (strstr(name, kAudioOutputSettingsPrefix)) {
+        AVSettingsHelper::ParseKey(
+                name, kAudioOutputSettingsPrefix, subkey);
+        ALOGV("OnSettingUpdate, [aout] subkey: %s", subkey);
+    } else if (strstr(name, MRVL_AVSETTINGS_SOURCE_PREFIX)) {
+
+    } else {
+        ALOGE("OnSettingUpdate, not interested in such key");
+    }
+    AVS_FUNC_LEAVE
+!!!10940940.cpp!!!	getParameter(in key : int32_t, inout reply : Parcel) : status_t
+    if (key == GET_VIDEO_SCALE_FACTOR) {
+        double scale_factor_x, scale_factor_y;
+        getVideoScaleFactor(&scale_factor_x, &scale_factor_y);
+        reply->writeDouble(scale_factor_x);
+        reply->writeDouble(scale_factor_y);
+        return android::OK;
+    }
+
+    return PlatformOutputSettingsHandler::getParameter(key, reply);
+!!!10941068.cpp!!!	setParameter(in key : int32_t, in request : Parcel) : status_t
+    int32_t source_id = request.readInt32();
+    int32_t sub_source = getSubSource(source_id);
+
+    if (key == APPLY_AQ) {
+        AVSLOGD("applyAQ, source %d, sub_source %d", source_id, sub_source);
+        return aout_->ApplyAudioProfile(sub_source);
+    } else if (key == APPLY_PQ) {
+        AVSLOGD("applyPQ, source %d, sub_source %d", source_id, sub_source);
+        return vout_->ApplyVideoProfile(sub_source);
+    }
+
+    return PlatformOutputSettingsHandler::setParameter(key, request);
+!!!10941196.cpp!!!	invoke(in request : Parcel, inout reply : Parcel) : status_t
+    return PlatformOutputSettingsHandler::invoke(request, reply);
+!!!10941324.cpp!!!	getVideoScaleFactor(inout scale_factor_x : double, inout scale_factor_y : double) : status_t
+    DisplayMode curMode;
+    status_t status = vout_->GetDisplayMode(&curMode);
+    if (status != android::OK) {
+        return status;
+    }
+
+    int32_t left, right, top, bottom;
+    PlatformOutputSettingsHandler::getUIRectangle(&left, &right, &top, &bottom);
+    ALOGD("getVideoScaleFactor, ui rect %d %d %d %d",
+            left, top, right, bottom);
+    ALOGD("getVideoScaleFactor, video rect %d %d",
+            curMode.width, curMode.height);
+    *scale_factor_x = (double)curMode.width / (double)(right - left);
+    *scale_factor_y = (double)curMode.height / (double)(bottom - top);
+    return android::OK;
+!!!10941452.cpp!!!	updateRxEDID(in sink_connected : bool) : status_t
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    AMP_AVIN hAvinComp;
+    AMP_COMPONENT_CONFIG config;
+    BerlinHPDHandler hpd_handler;
+
+    // Create avin component
+    AMP_RPC(ret, AMP_FACTORY_CreateComponent,
+            hFactory, AMP_COMPONENT_AVIN, 0, &hAvinComp);
+    AVS_CHECK(ret, "AMP_FACTORY_CreateComponent");
+    memset(&config, 0, sizeof(config));
+    config._d = AMP_COMPONENT_AVIN;
+    AMP_RPC(ret, AMP_AVIN_Open, hAvinComp, &config);
+    AVS_CHECK(ret, "AMP_AVIN_Open");
+
+    // Update EDID by HPD handler
+    hpd_handler.Init(hDisplay, hAvinComp);
+    hpd_handler.UpdateEDIDBySinkHPD(sink_connected);
+    hpd_handler.Destroy();
+
+    // Destory avin component
+    AMP_RPC(ret, AMP_AVIN_Close, hAvinComp);
+    AVS_CHECK(ret, "AMP_AVIN_Close");
+    AMP_RPC(ret, AMP_AVIN_Destroy, hAvinComp);
+    AVS_CHECK(ret, "AMP_AVIN_Destroy");
+    AMP_FACTORY_Release(hAvinComp);
+    hAvinComp = NULL;
+
+    AVS_FUNC_LEAVE
+    return android::OK;;
+
+bailout:
+    ALOGE("updateRxEDID fail");
+    return android::UNKNOWN_ERROR;

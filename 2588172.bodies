@@ -1,0 +1,161 @@
+class BerlinHotplugHandler
+!!!10936844.cpp!!!	BerlinHotplugHandler()
+
+!!!10937100.cpp!!!	Destroy() : void
+    AVS_FUNC_ENTER
+    ShutdownWorkThread();
+    Cleanup();
+    AVS_FUNC_LEAVE
+!!!10937228.cpp!!!	Init(in av_settings : sp<IAVSettings>, inout output_handler : BerlinOutputHandler, in amp_factory : AMP_FACTORY) : bool
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    gAVSettings = (BerlinAVSettings*)(av_settings.get());
+    CHECK(gAVSettings != NULL);
+    output_handler_ = output_handler;
+    CHECK(output_handler_ != NULL);
+    amp_factory_ = amp_factory;
+    CHECK(amp_factory_ != NULL);
+
+    // Register amp events
+    amp_event_listener_ = AMP_Event_CreateListener(16, 0);
+    CHECK(amp_event_listener_ != NULL);
+    // Need to pass output handler pointer since callback in another process
+    ret = AMP_Event_RegisterCallback(amp_event_listener_,
+                                    AMP_EVENT_API_DISP_CALLBACK_HDMI,
+                                    staticHDMIEventHandler,
+                                    this);
+    AVS_CHECK(ret, "AMP_Event_RegisterCallback");
+
+    // TODO: hotplug handler need to observe some avsettings value changed
+
+    // Select a video mode and turn it on.
+    // Use sink caps result to initialize hdmi plug status and notify it
+    // Select a target display mode
+    DisplayMode target;
+    output_handler_->GetVideoOutput()->GetDisplayMode(&target);
+    output_handler_->GetVideoOutput()->SetDisplayMode(
+            marvell::VIDEO_OUTPUT_HDMI, target);
+
+    // Write the screen density on first boot only
+    double density;
+    char property[PROPERTY_VALUE_MAX];
+    if (property_get("ro.sf.ui_xres", property, NULL) > 0) {
+        density = (atoi(property) * 320.0f) / 1920.0f;
+    } else {
+        density = (target.width * 320.0f) / 1920.0f;
+    }
+    snprintf(property, sizeof(property), "%f", density);
+    property_set("qemu.sf.lcd_density", property);
+    property_set("ro.sf.lcd_density", property);
+
+    // TODO: setup of audio output
+
+bailout:
+    if (SUCCESS != ret)
+        Cleanup();
+    AVS_FUNC_LEAVE
+    return ret == SUCCESS;
+!!!10937356.cpp!!!	Cleanup() : void
+    AVS_FUNC_ENTER
+    HRESULT ret = SUCCESS;
+    ret = AMP_Event_UnregisterCallback(amp_event_listener_,
+                                      AMP_EVENT_API_DISP_CALLBACK_HDMI,
+                                      staticHDMIEventHandler);
+    AVS_FUNC_LEAVE
+!!!10937484.cpp!!!	StartWorkThread() : bool
+    AVS_FUNC_ENTER
+    android::AutoMutex lock(work_thread_lock_);
+
+    if (kInvalidThreadID == work_thread_id_) {
+        CHECK(!quit_work_thread_);
+        ALOGD("create work thread begin");
+        int ret = pthread_create(&work_thread_id_,
+                                 NULL,
+                                 staticWorkThreadEntry,
+                                 this);
+        if (ret != 0) {
+            ALOGE("Failed to create pthread while starting work thread! "
+                 "(err = %d)", ret);
+            return false;
+        }
+        ALOGD("create work thread end");
+    }
+
+    AVS_FUNC_LEAVE
+    return true;
+!!!10937612.cpp!!!	ShutdownWorkThread() : void
+    work_thread_lock_.lock();
+
+    if (kInvalidThreadID != work_thread_id_) {
+        void* junk;
+        quit_work_thread_ = true;
+        WakeupWorkThread();
+
+        work_thread_lock_.unlock();
+        pthread_join(work_thread_id_, &junk);
+        work_thread_lock_.lock();
+    }
+
+    quit_work_thread_ = false;
+    work_thread_lock_.unlock();
+!!!10937868.cpp!!!	WorkThread() : void
+    work_thread_lock_.lock();
+
+    while (!quit_work_thread_) {
+        AVSLOGD("Wait on work thread lock");
+        hotplug_cond_.wait(work_thread_lock_);
+        AVSLOGD("Wake up from work thread");
+
+        if (quit_work_thread_)
+            break;
+        ALOGD("Dirty hotplug status; current status is %s.",
+                hdmi_connected_ ? "plugged in" : "unplugged");
+        // Update HDMI sink caps for every hotplug event
+        if (hdmi_connected_) {
+            DisplayMode target;
+            output_handler_->GetVideoOutput()->GetDisplayMode(&target);
+            output_handler_->GetVideoOutput()->SetDisplayMode(
+                    marvell::VIDEO_OUTPUT_HDMI, target);
+            // TODO: use switch driver to notify hotplug event
+        }
+    }
+
+  work_thread_lock_.unlock();
+  return NULL;
+!!!10937996.cpp!!!	staticWorkThreadEntry(inout thiz : void) : void
+    CHECK(NULL != thiz);
+    return reinterpret_cast<BerlinHotplugHandler*>(thiz)->WorkThread();
+!!!10938124.cpp!!!	HDMIEventHandler(inout thisp : BerlinHotplugHandler, in event : UINT32) : void
+    android::AutoMutex lock(work_thread_lock_);
+    ALOGD("HDMI hotplug event %d", event);
+    HRESULT ret = SUCCESS;
+    switch (event) {
+        case AMP_DISP_EVENT_HDMI_SINK_CONNECTED:
+        case AMP_DISP_EVENT_HDMI_SINK_DISCONNECTED:
+            thisp->hdmi_connected_ = event == AMP_DISP_EVENT_HDMI_SINK_CONNECTED;
+            thisp->WakeupWorkThread();
+            break;
+        case AMP_DISP_VPP_EVENT_HDMI_RESUME:
+            // Resume
+            // Reload/Enable HDCP is not required here, which is handled by native now
+            break;
+        default:
+            ALOGD("Unexpected AMP_EVENT_API_DISP_CALLBACK_HDMI (%d)", event);
+            break;
+    }
+!!!10938252.cpp!!!	staticHDMIEventHandler(in hListener : HANDLE, inout pEvent : AMP_EVENT, inout pUserData : VOID) : HRESULT
+  CHECK(NULL != pUserData);
+  UINT32 *pPayLoad = (UINT32*)AMP_EVENT_PAYLOAD_PTR(pEvent);
+  UINT32 code = AMP_EVENT_GETCODE (*pEvent);
+  if (AMP_EVENT_API_DISP_CALLBACK_HDMI == code) {
+    UINT32 hotplug_event = pPayLoad[0];
+    BerlinHotplugHandler* thisp = reinterpret_cast<BerlinHotplugHandler*>(pUserData);
+    thisp->HDMIEventHandler(thisp, hotplug_event);
+  }
+  return S_OK;
+!!!10938380.cpp!!!	NotifyHDMIPlugStatus() : void
+    // Notify hotplug state observers
+    AVSettingValue value;
+    value.setBool(hdmi_connected_);
+    ALOGD("Notifying HDMI plug status (%d)", hdmi_connected_);
+    gAVSettings->NotifyValue(hotplug_status_key_.string(), value);

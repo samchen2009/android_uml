@@ -1,0 +1,247 @@
+class SSLRecordProtocol
+!!!2498715.java!!!	SSLRecordProtocol(inout handshakeProtocol : HandshakeProtocol, inout alertProtocol : AlertProtocol, inout in : SSLInputStream, inout appData : Appendable)
+        this.handshakeProtocol = handshakeProtocol;
+        this.handshakeProtocol.setRecordProtocol(this);
+        this.alertProtocol = alertProtocol;
+        this.alertProtocol.setRecordProtocol(this);
+        this.in = in;
+        this.appData = appData;
+!!!2498843.java!!!	getSession() : SSLSessionImpl
+        return session;
+!!!2498971.java!!!	getMinRecordSize() : int
+        return (activeReadState == null)
+            ? 6 // type + version + length + 1 byte of data
+            : 5 + activeReadState.getMinFragmentSize();
+!!!2499099.java!!!	getRecordSize(in data_size : int) : int
+        if (activeWriteState == null) {
+            return 5+data_size; // type + version + length + data_size
+        } else {
+            int res = 5 + activeWriteState.getFragmentSize(data_size);
+            return (res > MAX_CIPHERED_DATA_LENGTH)
+                ? MAX_CIPHERED_DATA_LENGTH // so the source data should be
+                                           // split into several packets
+                : res;
+        }
+!!!2499227.java!!!	getDataSize(in record_size : int) : int
+        record_size -= 5; // - (type + version + length + data_size)
+        if (record_size > MAX_CIPHERED_DATA_LENGTH) {
+            // the data of such size consists of the several packets
+            return MAX_DATA_LENGTH;
+        }
+        if (activeReadState == null) {
+            return record_size;
+        }
+        return activeReadState.getContentSize(record_size);
+!!!2499355.java!!!	wrap(in content_type : byte, inout dataStream : DataStream) : byte
+        byte[] fragment = dataStream.getData(MAX_DATA_LENGTH);
+        return wrap(content_type, fragment, 0, fragment.length);
+!!!2499483.java!!!	wrap(in content_type : byte, inout fragment : byte, in offset : int, in len : int) : byte
+        if (logger != null) {
+            logger.println("SSLRecordProtocol.wrap: TLSPlaintext.fragment["
+                    +len+"]:");
+            logger.print(fragment, offset, len);
+        }
+        if (len > MAX_DATA_LENGTH) {
+            throw new AlertException(
+                AlertProtocol.INTERNAL_ERROR,
+                new SSLProtocolException(
+                    "The provided chunk of data is too big: " + len
+                    + " > MAX_DATA_LENGTH == "+MAX_DATA_LENGTH));
+        }
+        byte[] ciphered_fragment = fragment;
+        if (activeWriteState != null) {
+            ciphered_fragment =
+                activeWriteState.encrypt(content_type, fragment, offset, len);
+            if (ciphered_fragment.length > MAX_CIPHERED_DATA_LENGTH) {
+                throw new AlertException(
+                    AlertProtocol.INTERNAL_ERROR,
+                    new SSLProtocolException(
+                        "The ciphered data increased more than on 1024 bytes"));
+            }
+            if (logger != null) {
+                logger.println("SSLRecordProtocol.wrap: TLSCiphertext.fragment["
+                        +ciphered_fragment.length+"]:");
+                logger.print(ciphered_fragment);
+            }
+        }
+        return packetize(content_type, version, ciphered_fragment);
+!!!2499611.java!!!	packetize(in type : byte, inout version : byte, inout fragment : byte) : byte
+        byte[] buff = new byte[5+fragment.length];
+        buff[0] = type;
+        if (version != null) {
+            buff[1] = version[0];
+            buff[2] = version[1];
+        } else {
+            buff[1] = 3;
+            buff[2] = 1;
+        }
+        buff[3] = (byte) ((0x00FF00 & fragment.length) >> 8);
+        buff[4] = (byte) (0x0000FF & fragment.length);
+        System.arraycopy(fragment, 0, buff, 5, fragment.length);
+        return buff;
+!!!2499739.java!!!	setSession(inout session : SSLSessionImpl) : void
+        if (!sessionWasChanged) {
+            // session was not changed for current handshake process
+            if (logger != null) {
+                logger.println("SSLRecordProtocol.setSession: Set pending session");
+                logger.println("  cipher name: " + session.getCipherSuite());
+            }
+            this.session = session;
+            // create new connection state
+            pendingConnectionState = ((version == null) || (version[1] == 1))
+                ? (ConnectionState) new ConnectionStateTLS(getSession())
+                : (ConnectionState) new ConnectionStateSSLv3(getSession());
+            sessionWasChanged = true;
+        } else {
+            // wait for rehandshaking's session
+            sessionWasChanged = false;
+        }
+!!!2499867.java!!!	getChangeCipherSpecMesage(inout session : SSLSessionImpl) : byte
+        // make change_cipher_spec_message:
+        byte[] change_cipher_spec_message;
+        if (activeWriteState == null) {
+            change_cipher_spec_message = new byte[] {
+                    ContentType.CHANGE_CIPHER_SPEC, version[0],
+                        version[1], 0, 1, 1
+                };
+        } else {
+            change_cipher_spec_message =
+                packetize(ContentType.CHANGE_CIPHER_SPEC, version,
+                        activeWriteState.encrypt(ContentType.CHANGE_CIPHER_SPEC,
+                            change_cipher_spec_byte, 0, 1));
+        }
+        setSession(session);
+        activeWriteState = pendingConnectionState;
+        if (logger != null) {
+            logger.println("SSLRecordProtocol.getChangeCipherSpecMesage");
+            logger.println("activeWriteState = pendingConnectionState");
+            logger.print(change_cipher_spec_message);
+        }
+        return change_cipher_spec_message;
+!!!2499995.java!!!	unwrap() : int
+        if (logger != null) {
+            logger.println("SSLRecordProtocol.unwrap: BEGIN [");
+        }
+        int type = in.readUint8();
+        if ((type < ContentType.CHANGE_CIPHER_SPEC)
+                || (type > ContentType.APPLICATION_DATA)) {
+            if (logger != null) {
+                logger.println("Non v3.1 message type:" + type);
+            }
+            if (type >= 0x80) {
+                // it is probably SSL v2 client_hello message
+                // (see SSL v2 spec at:
+                // http://wp.netscape.com/eng/security/SSL_2.html)
+                int length = (type & 0x7f) << 8 | in.read();
+                byte[] fragment = in.read(length);
+                handshakeProtocol.unwrapSSLv2(fragment);
+                if (logger != null) {
+                    logger.println(
+                            "SSLRecordProtocol:unwrap ] END, SSLv2 type");
+                }
+                return ContentType.HANDSHAKE;
+            }
+            throw new AlertException(AlertProtocol.UNEXPECTED_MESSAGE,
+                    new SSLProtocolException(
+                        "Unexpected message type has been received: "+type));
+        }
+        if (logger != null) {
+            logger.println("Got the message of type: " + type);
+        }
+        if (version != null) {
+            if ((in.read() != version[0])
+                    || (in.read() != version[1])) {
+                throw new AlertException(AlertProtocol.UNEXPECTED_MESSAGE,
+                        new SSLProtocolException(
+                            "Unexpected message type has been received: " +
+                            type));
+            }
+        } else {
+            in.skip(2); // just skip the version number
+        }
+        int length = in.readUint16();
+        if (logger != null) {
+            logger.println("TLSCiphertext.fragment["+length+"]: ...");
+        }
+        if (length > MAX_CIPHERED_DATA_LENGTH) {
+            throw new AlertException(AlertProtocol.RECORD_OVERFLOW,
+                    new SSLProtocolException(
+                        "Received message is too big."));
+        }
+        byte[] fragment = in.read(length);
+        if (logger != null) {
+            logger.print(fragment);
+        }
+        if (activeReadState != null) {
+            fragment = activeReadState.decrypt((byte) type, fragment);
+            if (logger != null) {
+                logger.println("TLSPlaintext.fragment:");
+                logger.print(fragment);
+            }
+        }
+        if (fragment.length > MAX_DATA_LENGTH) {
+            throw new AlertException(AlertProtocol.DECOMPRESSION_FAILURE,
+                    new SSLProtocolException(
+                        "Decompressed plain data is too big."));
+        }
+        switch (type) {
+            case ContentType.CHANGE_CIPHER_SPEC:
+                // notify handshake protocol:
+                handshakeProtocol.receiveChangeCipherSpec();
+                setSession(handshakeProtocol.getSession());
+                // change cipher spec message has been received, so:
+                if (logger != null) {
+                    logger.println("activeReadState = pendingConnectionState");
+                }
+                activeReadState = pendingConnectionState;
+                break;
+            case ContentType.ALERT:
+                alert(fragment[0], fragment[1]);
+                break;
+            case ContentType.HANDSHAKE:
+                handshakeProtocol.unwrap(fragment);
+                break;
+            case ContentType.APPLICATION_DATA:
+                if (logger != null) {
+                    logger.println(
+                            "TLSCiphertext.unwrap: APP DATA["+length+"]:");
+                    logger.println(new String(fragment));
+                }
+                appData.append(fragment);
+                break;
+            default:
+                throw new AlertException(AlertProtocol.UNEXPECTED_MESSAGE,
+                        new SSLProtocolException(
+                            "Unexpected message type has been received: " +
+                            type));
+        }
+        if (logger != null) {
+            logger.println("SSLRecordProtocol:unwrap ] END, type: " + type);
+        }
+        return type;
+!!!2500123.java!!!	alert(in level : byte, in description : byte) : void
+        if (logger != null) {
+            logger.println("SSLRecordProtocol.allert: "+level+" "+description);
+        }
+        alertProtocol.alert(level, description);
+!!!2500251.java!!!	setVersion(inout ver : byte) : void
+        this.version = ver;
+!!!2500379.java!!!	shutdown() : void
+        session = null;
+        version = null;
+        in = null;
+        handshakeProtocol = null;
+        alertProtocol = null;
+        appData = null;
+        if (pendingConnectionState != null) {
+            pendingConnectionState.shutdown();
+        }
+        pendingConnectionState = null;
+        if (activeReadState != null) {
+            activeReadState.shutdown();
+        }
+        activeReadState = null;
+        if (activeReadState != null) {
+            activeReadState.shutdown();
+        }
+        activeWriteState = null;

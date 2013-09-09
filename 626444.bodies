@@ -1,0 +1,343 @@
+class ANetworkSession::Session
+!!!1906956.cpp!!!	sessionID() : int32_t
+    return mSessionID;
+!!!1907084.cpp!!!	socket() : int
+    return mSocket;
+!!!1907212.cpp!!!	getNotificationMessage() : sp<AMessage>
+    return mNotify;
+!!!1907340.cpp!!!	isRTSPServer() : bool
+    return mState == LISTENING_RTSP;
+!!!1907468.cpp!!!	isTCPDatagramServer() : bool
+    return mState == LISTENING_TCP_DGRAMS;
+!!!1907596.cpp!!!	wantsToRead() : bool
+    return !mSawReceiveFailure && mState != CONNECTING;
+!!!1907724.cpp!!!	wantsToWrite() : bool
+    return !mSawSendFailure
+        && (mState == CONNECTING
+            || (mState == CONNECTED && !mOutBuffer.empty())
+            || (mState == DATAGRAM && !mOutDatagrams.empty()));
+!!!1907852.cpp!!!	readMore() : status_t
+    if (mState == DATAGRAM) {
+        status_t err;
+        do {
+            sp<ABuffer> buf = new ABuffer(kMaxUDPSize);
+
+            struct sockaddr_in remoteAddr;
+            socklen_t remoteAddrLen = sizeof(remoteAddr);
+
+            ssize_t n;
+            do {
+                n = recvfrom(
+                        mSocket, buf->data(), buf->capacity(), 0,
+                        (struct sockaddr *)&remoteAddr, &remoteAddrLen);
+            } while (n < 0 && errno == EINTR);
+
+            err = OK;
+            if (n < 0) {
+                err = -errno;
+            } else if (n == 0) {
+                err = -ECONNRESET;
+            } else {
+                buf->setRange(0, n);
+
+                int64_t nowUs = ALooper::GetNowUs();
+                buf->meta()->setInt64("arrivalTimeUs", nowUs);
+
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("sessionID", mSessionID);
+                notify->setInt32("reason", kWhatDatagram);
+
+                uint32_t ip = ntohl(remoteAddr.sin_addr.s_addr);
+                notify->setString(
+                        "fromAddr",
+                        StringPrintf(
+                            "%u.%u.%u.%u",
+                            ip >> 24,
+                            (ip >> 16) & 0xff,
+                            (ip >> 8) & 0xff,
+                            ip & 0xff).c_str());
+
+                notify->setInt32("fromPort", ntohs(remoteAddr.sin_port));
+
+                notify->setBuffer("data", buf);
+                notify->post();
+            }
+        } while (err == OK);
+
+        if (err == -EAGAIN) {
+            err = OK;
+        }
+
+        if (err != OK) {
+            notifyError(false /* send */, err, "Recvfrom failed.");
+            mSawReceiveFailure = true;
+        }
+
+        return err;
+    }
+
+    char tmp[512];
+    ssize_t n;
+    do {
+        n = recv(mSocket, tmp, sizeof(tmp), 0);
+    } while (n < 0 && errno == EINTR);
+
+    status_t err = OK;
+
+    if (n > 0) {
+        mInBuffer.append(tmp, n);
+
+#if 0
+        ALOGI("in:");
+        hexdump(tmp, n);
+#endif
+    } else if (n < 0) {
+        err = -errno;
+    } else {
+        err = -ECONNRESET;
+    }
+
+    if (!mIsRTSPConnection) {
+        // TCP stream carrying 16-bit length-prefixed datagrams.
+
+        while (mInBuffer.size() >= 2) {
+            size_t packetSize = U16_AT((const uint8_t *)mInBuffer.c_str());
+
+            if (mInBuffer.size() < packetSize + 2) {
+                break;
+            }
+
+            sp<ABuffer> packet = new ABuffer(packetSize);
+            memcpy(packet->data(), mInBuffer.c_str() + 2, packetSize);
+
+            sp<AMessage> notify = mNotify->dup();
+            notify->setInt32("sessionID", mSessionID);
+            notify->setInt32("reason", kWhatDatagram);
+            notify->setBuffer("data", packet);
+            notify->post();
+
+            mInBuffer.erase(0, packetSize + 2);
+        }
+    } else {
+        for (;;) {
+            size_t length;
+
+            if (mInBuffer.size() > 0 && mInBuffer.c_str()[0] == '$') {
+                if (mInBuffer.size() < 4) {
+                    break;
+                }
+
+                length = U16_AT((const uint8_t *)mInBuffer.c_str() + 2);
+
+                if (mInBuffer.size() < 4 + length) {
+                    break;
+                }
+
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("sessionID", mSessionID);
+                notify->setInt32("reason", kWhatBinaryData);
+                notify->setInt32("channel", mInBuffer.c_str()[1]);
+
+                sp<ABuffer> data = new ABuffer(length);
+                memcpy(data->data(), mInBuffer.c_str() + 4, length);
+
+                int64_t nowUs = ALooper::GetNowUs();
+                data->meta()->setInt64("arrivalTimeUs", nowUs);
+
+                notify->setBuffer("data", data);
+                notify->post();
+
+                mInBuffer.erase(0, 4 + length);
+                continue;
+            }
+
+            sp<ParsedMessage> msg =
+                ParsedMessage::Parse(
+                        mInBuffer.c_str(), mInBuffer.size(), err != OK, &length);
+
+            if (msg == NULL) {
+                break;
+            }
+
+            sp<AMessage> notify = mNotify->dup();
+            notify->setInt32("sessionID", mSessionID);
+            notify->setInt32("reason", kWhatData);
+            notify->setObject("data", msg);
+            notify->post();
+
+#if 1
+            // XXX The (old) dongle sends the wrong content length header on a
+            // SET_PARAMETER request that signals a "wfd_idr_request".
+            // (17 instead of 19).
+            const char *content = msg->getContent();
+            if (content
+                    && !memcmp(content, "wfd_idr_request\r\n", 17)
+                    && length >= 19
+                    && mInBuffer.c_str()[length] == '\r'
+                    && mInBuffer.c_str()[length + 1] == '\n') {
+                length += 2;
+            }
+#endif
+
+            mInBuffer.erase(0, length);
+
+            if (err != OK) {
+                break;
+            }
+        }
+    }
+
+    if (err != OK) {
+        notifyError(false /* send */, err, "Recv failed.");
+        mSawReceiveFailure = true;
+    }
+
+    return err;
+!!!1907980.cpp!!!	writeMore() : status_t
+    if (mState == DATAGRAM) {
+        CHECK(!mOutDatagrams.empty());
+
+        status_t err;
+        do {
+            const sp<ABuffer> &datagram = *mOutDatagrams.begin();
+
+            uint8_t *data = datagram->data();
+            if (data[0] == 0x80 && (data[1] & 0x7f) == 33) {
+                int64_t nowUs = ALooper::GetNowUs();
+
+                uint32_t prevRtpTime = U32_AT(&data[4]);
+
+                // 90kHz time scale
+                uint32_t rtpTime = (nowUs * 9ll) / 100ll;
+                int32_t diffTime = (int32_t)rtpTime - (int32_t)prevRtpTime;
+
+                ALOGV("correcting rtpTime by %.0f ms", diffTime / 90.0);
+
+                data[4] = rtpTime >> 24;
+                data[5] = (rtpTime >> 16) & 0xff;
+                data[6] = (rtpTime >> 8) & 0xff;
+                data[7] = rtpTime & 0xff;
+            }
+
+            int n;
+            do {
+                n = send(mSocket, datagram->data(), datagram->size(), 0);
+            } while (n < 0 && errno == EINTR);
+
+            err = OK;
+
+            if (n > 0) {
+                mOutDatagrams.erase(mOutDatagrams.begin());
+            } else if (n < 0) {
+                err = -errno;
+            } else if (n == 0) {
+                err = -ECONNRESET;
+            }
+        } while (err == OK && !mOutDatagrams.empty());
+
+        if (err == -EAGAIN) {
+            if (!mOutDatagrams.empty()) {
+                ALOGI("%d datagrams remain queued.", mOutDatagrams.size());
+            }
+            err = OK;
+        }
+
+        if (err != OK) {
+            notifyError(true /* send */, err, "Send datagram failed.");
+            mSawSendFailure = true;
+        }
+
+        return err;
+    }
+
+    if (mState == CONNECTING) {
+        int err;
+        socklen_t optionLen = sizeof(err);
+        CHECK_EQ(getsockopt(mSocket, SOL_SOCKET, SO_ERROR, &err, &optionLen), 0);
+        CHECK_EQ(optionLen, (socklen_t)sizeof(err));
+
+        if (err != 0) {
+            notifyError(kWhatError, -err, "Connection failed");
+            mSawSendFailure = true;
+
+            return -err;
+        }
+
+        mState = CONNECTED;
+        notify(kWhatConnected);
+
+        return OK;
+    }
+
+    CHECK_EQ(mState, CONNECTED);
+    CHECK(!mOutBuffer.empty());
+
+    ssize_t n;
+    do {
+        n = send(mSocket, mOutBuffer.c_str(), mOutBuffer.size(), 0);
+    } while (n < 0 && errno == EINTR);
+
+    status_t err = OK;
+
+    if (n > 0) {
+#if 0
+        ALOGI("out:");
+        hexdump(mOutBuffer.c_str(), n);
+#endif
+
+        mOutBuffer.erase(0, n);
+    } else if (n < 0) {
+        err = -errno;
+    } else if (n == 0) {
+        err = -ECONNRESET;
+    }
+
+    if (err != OK) {
+        notifyError(true /* send */, err, "Send failed.");
+        mSawSendFailure = true;
+    }
+
+    return err;
+!!!1908108.cpp!!!	sendRequest(in data : void, in size : ssize_t) : status_t
+    CHECK(mState == CONNECTED || mState == DATAGRAM);
+
+    if (mState == DATAGRAM) {
+        CHECK_GE(size, 0);
+
+        sp<ABuffer> datagram = new ABuffer(size);
+        memcpy(datagram->data(), data, size);
+
+        mOutDatagrams.push_back(datagram);
+        return OK;
+    }
+
+    if (mState == CONNECTED && !mIsRTSPConnection) {
+        CHECK_LE(size, 65535);
+
+        uint8_t prefix[2];
+        prefix[0] = size >> 8;
+        prefix[1] = size & 0xff;
+
+        mOutBuffer.append((const char *)prefix, sizeof(prefix));
+    }
+
+    mOutBuffer.append(
+            (const char *)data,
+            (size >= 0) ? size : strlen((const char *)data));
+
+    return OK;
+!!!1908236.cpp!!!	setIsRTSPConnection(in yesno : bool) : void
+    mIsRTSPConnection = yesno;
+!!!1908364.cpp!!!	notifyError(in send : bool, in err : status_t, in detail : char) : void
+    sp<AMessage> msg = mNotify->dup();
+    msg->setInt32("sessionID", mSessionID);
+    msg->setInt32("reason", kWhatError);
+    msg->setInt32("send", send);
+    msg->setInt32("err", err);
+    msg->setString("detail", detail);
+    msg->post();
+!!!1908492.cpp!!!	notify(in reason : NotificationReason) : void
+    sp<AMessage> msg = mNotify->dup();
+    msg->setInt32("sessionID", mSessionID);
+    msg->setInt32("reason", reason);
+    msg->post();

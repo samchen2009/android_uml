@@ -1,0 +1,131 @@
+class UsbHostManager
+!!!8696204.java!!!	UsbHostManager(inout context : Context)
+        mContext = context;
+        mHostBlacklist = context.getResources().getStringArray(
+                com.android.internal.R.array.config_usbHostBlacklist);
+!!!8696332.java!!!	setCurrentSettings(inout settings : UsbSettingsManager) : void
+        synchronized (mLock) {
+            mCurrentSettings = settings;
+        }
+!!!8696460.java!!!	getCurrentSettings() : UsbSettingsManager
+        synchronized (mLock) {
+            return mCurrentSettings;
+        }
+!!!8696588.java!!!	isBlackListed(in deviceName : String) : boolean
+        int count = mHostBlacklist.length;
+        for (int i = 0; i < count; i++) {
+            if (deviceName.startsWith(mHostBlacklist[i])) {
+                return true;
+            }
+        }
+        return false;
+!!!8696716.java!!!	isBlackListed(in clazz : int, in subClass : int, in protocol : int) : boolean
+        // blacklist hubs
+        if (clazz == UsbConstants.USB_CLASS_HUB) return true;
+
+        // blacklist HID boot devices (mouse and keyboard)
+        if (clazz == UsbConstants.USB_CLASS_HID &&
+                subClass == UsbConstants.USB_INTERFACE_SUBCLASS_BOOT) {
+            return true;
+        }
+
+        return false;
+!!!8696844.java!!!	usbDeviceAdded(in deviceName : String, in vendorID : int, in productID : int, in deviceClass : int, in deviceSubclass : int, in deviceProtocol : int, inout interfaceValues : int, inout endpointValues : int) : void
+
+        if (isBlackListed(deviceName) ||
+                isBlackListed(deviceClass, deviceSubclass, deviceProtocol)) {
+            return;
+        }
+
+        synchronized (mLock) {
+            if (mDevices.get(deviceName) != null) {
+                Slog.w(TAG, "device already on mDevices list: " + deviceName);
+                return;
+            }
+
+            int numInterfaces = interfaceValues.length / 5;
+            Parcelable[] interfaces = new UsbInterface[numInterfaces];
+            try {
+                // repackage interfaceValues as an array of UsbInterface
+                int intf, endp, ival = 0, eval = 0;
+                for (intf = 0; intf < numInterfaces; intf++) {
+                    int interfaceId = interfaceValues[ival++];
+                    int interfaceClass = interfaceValues[ival++];
+                    int interfaceSubclass = interfaceValues[ival++];
+                    int interfaceProtocol = interfaceValues[ival++];
+                    int numEndpoints = interfaceValues[ival++];
+
+                    Parcelable[] endpoints = new UsbEndpoint[numEndpoints];
+                    for (endp = 0; endp < numEndpoints; endp++) {
+                        int address = endpointValues[eval++];
+                        int attributes = endpointValues[eval++];
+                        int maxPacketSize = endpointValues[eval++];
+                        int interval = endpointValues[eval++];
+                        endpoints[endp] = new UsbEndpoint(address, attributes,
+                                maxPacketSize, interval);
+                    }
+
+                    // don't allow if any interfaces are blacklisted
+                    if (isBlackListed(interfaceClass, interfaceSubclass, interfaceProtocol)) {
+                        return;
+                    }
+                    interfaces[intf] = new UsbInterface(interfaceId, interfaceClass,
+                            interfaceSubclass, interfaceProtocol, endpoints);
+                }
+            } catch (Exception e) {
+                // beware of index out of bound exceptions, which might happen if
+                // a device does not set bNumEndpoints correctly
+                Slog.e(TAG, "error parsing USB descriptors", e);
+                return;
+            }
+
+            UsbDevice device = new UsbDevice(deviceName, vendorID, productID,
+                    deviceClass, deviceSubclass, deviceProtocol, interfaces);
+            mDevices.put(deviceName, device);
+            getCurrentSettings().deviceAttached(device);
+        }
+!!!8696972.java!!!	usbDeviceRemoved(in deviceName : String) : void
+        synchronized (mLock) {
+            UsbDevice device = mDevices.remove(deviceName);
+            if (device != null) {
+                getCurrentSettings().deviceDetached(device);
+            }
+        }
+!!!8697100.java!!!	systemReady() : void
+        synchronized (mLock) {
+            // Create a thread to call into native code to wait for USB host events.
+            // This thread will call us back on usbDeviceAdded and usbDeviceRemoved.
+            Runnable runnable = new Runnable() {
+                public void run() {
+                    monitorUsbHostBus();
+                }
+            };
+            new Thread(null, runnable, "UsbService host thread").start();
+        }
+!!!8697228.java!!!	getDeviceList(inout devices : Bundle) : void
+        synchronized (mLock) {
+            for (String name : mDevices.keySet()) {
+                devices.putParcelable(name, mDevices.get(name));
+            }
+        }
+!!!8697356.java!!!	openDevice(in deviceName : String) : ParcelFileDescriptor
+        synchronized (mLock) {
+            if (isBlackListed(deviceName)) {
+                throw new SecurityException("USB device is on a restricted bus");
+            }
+            UsbDevice device = mDevices.get(deviceName);
+            if (device == null) {
+                // if it is not in mDevices, it either does not exist or is blacklisted
+                throw new IllegalArgumentException(
+                        "device " + deviceName + " does not exist or is restricted");
+            }
+            getCurrentSettings().checkPermission(device);
+            return nativeOpenDevice(deviceName);
+        }
+!!!8697484.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter) : void
+        synchronized (mLock) {
+            pw.println("  USB Host State:");
+            for (String name : mDevices.keySet()) {
+                pw.println("    " + name + ": " + mDevices.get(name));
+            }
+        }

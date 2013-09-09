@@ -1,0 +1,222 @@
+class VelocityTracker
+!!!1034764.cpp!!!	VelocityTracker(in strategy : char = NULL)
+    char value[PROPERTY_VALUE_MAX];
+
+    // Allow the default strategy to be overridden using a system property for debugging.
+    if (!strategy) {
+        int length = property_get("debug.velocitytracker.strategy", value, NULL);
+        if (length > 0) {
+            strategy = value;
+        } else {
+            strategy = DEFAULT_STRATEGY;
+        }
+    }
+
+    // Configure the strategy.
+    if (!configureStrategy(strategy)) {
+        ALOGD("Unrecognized velocity tracker strategy name '%s'.", strategy);
+        if (!configureStrategy(DEFAULT_STRATEGY)) {
+            LOG_ALWAYS_FATAL("Could not create the default velocity tracker strategy '%s'!",
+                    strategy);
+        }
+    }
+!!!1034892.cpp!!!	~VelocityTracker()
+    delete mStrategy;
+!!!1035020.cpp!!!	clear() : void
+    mCurrentPointerIdBits.clear();
+    mActivePointerId = -1;
+
+    mStrategy->clear();
+!!!1035148.cpp!!!	clearPointers(in idBits : BitSet32) : void
+    BitSet32 remainingIdBits(mCurrentPointerIdBits.value & ~idBits.value);
+    mCurrentPointerIdBits = remainingIdBits;
+
+    if (mActivePointerId >= 0 && idBits.hasBit(mActivePointerId)) {
+        mActivePointerId = !remainingIdBits.isEmpty() ? remainingIdBits.firstMarkedBit() : -1;
+    }
+
+    mStrategy->clearPointers(idBits);
+!!!1035276.cpp!!!	addMovement(in eventTime : nsecs_t, in idBits : BitSet32, in positions : Position) : void
+    while (idBits.count() > MAX_POINTERS) {
+        idBits.clearLastMarkedBit();
+    }
+
+    if ((mCurrentPointerIdBits.value & idBits.value)
+            && eventTime >= mLastEventTime + ASSUME_POINTER_STOPPED_TIME) {
+#if DEBUG_VELOCITY
+        ALOGD("VelocityTracker: stopped for %0.3f ms, clearing state.",
+                (eventTime - mLastEventTime) * 0.000001f);
+#endif
+        // We have not received any movements for too long.  Assume that all pointers
+        // have stopped.
+        mStrategy->clear();
+    }
+    mLastEventTime = eventTime;
+
+    mCurrentPointerIdBits = idBits;
+    if (mActivePointerId < 0 || !idBits.hasBit(mActivePointerId)) {
+        mActivePointerId = idBits.isEmpty() ? -1 : idBits.firstMarkedBit();
+    }
+
+    mStrategy->addMovement(eventTime, idBits, positions);
+
+#if DEBUG_VELOCITY
+    ALOGD("VelocityTracker: addMovement eventTime=%lld, idBits=0x%08x, activePointerId=%d",
+            eventTime, idBits.value, mActivePointerId);
+    for (BitSet32 iterBits(idBits); !iterBits.isEmpty(); ) {
+        uint32_t id = iterBits.firstMarkedBit();
+        uint32_t index = idBits.getIndexOfBit(id);
+        iterBits.clearBit(id);
+        Estimator estimator;
+        getEstimator(id, &estimator);
+        ALOGD("  %d: position (%0.3f, %0.3f), "
+                "estimator (degree=%d, xCoeff=%s, yCoeff=%s, confidence=%f)",
+                id, positions[index].x, positions[index].y,
+                int(estimator.degree),
+                vectorToString(estimator.xCoeff, estimator.degree + 1).string(),
+                vectorToString(estimator.yCoeff, estimator.degree + 1).string(),
+                estimator.confidence);
+    }
+#endif
+!!!1035404.cpp!!!	addMovement(in event : MotionEvent) : void
+    int32_t actionMasked = event->getActionMasked();
+
+    switch (actionMasked) {
+    case AMOTION_EVENT_ACTION_DOWN:
+    case AMOTION_EVENT_ACTION_HOVER_ENTER:
+        // Clear all pointers on down before adding the new movement.
+        clear();
+        break;
+    case AMOTION_EVENT_ACTION_POINTER_DOWN: {
+        // Start a new movement trace for a pointer that just went down.
+        // We do this on down instead of on up because the client may want to query the
+        // final velocity for a pointer that just went up.
+        BitSet32 downIdBits;
+        downIdBits.markBit(event->getPointerId(event->getActionIndex()));
+        clearPointers(downIdBits);
+        break;
+    }
+    case AMOTION_EVENT_ACTION_MOVE:
+    case AMOTION_EVENT_ACTION_HOVER_MOVE:
+        break;
+    default:
+        // Ignore all other actions because they do not convey any new information about
+        // pointer movement.  We also want to preserve the last known velocity of the pointers.
+        // Note that ACTION_UP and ACTION_POINTER_UP always report the last known position
+        // of the pointers that went up.  ACTION_POINTER_UP does include the new position of
+        // pointers that remained down but we will also receive an ACTION_MOVE with this
+        // information if any of them actually moved.  Since we don't know how many pointers
+        // will be going up at once it makes sense to just wait for the following ACTION_MOVE
+        // before adding the movement.
+        return;
+    }
+
+    size_t pointerCount = event->getPointerCount();
+    if (pointerCount > MAX_POINTERS) {
+        pointerCount = MAX_POINTERS;
+    }
+
+    BitSet32 idBits;
+    for (size_t i = 0; i < pointerCount; i++) {
+        idBits.markBit(event->getPointerId(i));
+    }
+
+    uint32_t pointerIndex[MAX_POINTERS];
+    for (size_t i = 0; i < pointerCount; i++) {
+        pointerIndex[i] = idBits.getIndexOfBit(event->getPointerId(i));
+    }
+
+    nsecs_t eventTime;
+    Position positions[pointerCount];
+
+    size_t historySize = event->getHistorySize();
+    for (size_t h = 0; h < historySize; h++) {
+        eventTime = event->getHistoricalEventTime(h);
+        for (size_t i = 0; i < pointerCount; i++) {
+            uint32_t index = pointerIndex[i];
+            positions[index].x = event->getHistoricalX(i, h);
+            positions[index].y = event->getHistoricalY(i, h);
+        }
+        addMovement(eventTime, idBits, positions);
+    }
+
+    eventTime = event->getEventTime();
+    for (size_t i = 0; i < pointerCount; i++) {
+        uint32_t index = pointerIndex[i];
+        positions[index].x = event->getX(i);
+        positions[index].y = event->getY(i);
+    }
+    addMovement(eventTime, idBits, positions);
+!!!1035532.cpp!!!	getVelocity(in id : uint32_t, inout outVx : float, inout outVy : float) : bool
+    Estimator estimator;
+    if (getEstimator(id, &estimator) && estimator.degree >= 1) {
+        *outVx = estimator.xCoeff[1];
+        *outVy = estimator.yCoeff[1];
+        return true;
+    }
+    *outVx = 0;
+    *outVy = 0;
+    return false;
+!!!1035660.cpp!!!	getEstimator(in id : uint32_t, inout outEstimator : Estimator) : bool
+    return mStrategy->getEstimator(id, outEstimator);
+!!!1036044.cpp!!!	configureStrategy(in strategy : char) : bool
+    mStrategy = createStrategy(strategy);
+    return mStrategy != NULL;
+!!!1036172.cpp!!!	createStrategy(in strategy : char) : VelocityTrackerStrategy
+    if (!strcmp("lsq1", strategy)) {
+        // 1st order least squares.  Quality: POOR.
+        // Frequently underfits the touch data especially when the finger accelerates
+        // or changes direction.  Often underestimates velocity.  The direction
+        // is overly influenced by historical touch points.
+        return new LeastSquaresVelocityTrackerStrategy(1);
+    }
+    if (!strcmp("lsq2", strategy)) {
+        // 2nd order least squares.  Quality: VERY GOOD.
+        // Pretty much ideal, but can be confused by certain kinds of touch data,
+        // particularly if the panel has a tendency to generate delayed,
+        // duplicate or jittery touch coordinates when the finger is released.
+        return new LeastSquaresVelocityTrackerStrategy(2);
+    }
+    if (!strcmp("lsq3", strategy)) {
+        // 3rd order least squares.  Quality: UNUSABLE.
+        // Frequently overfits the touch data yielding wildly divergent estimates
+        // of the velocity when the finger is released.
+        return new LeastSquaresVelocityTrackerStrategy(3);
+    }
+    if (!strcmp("wlsq2-delta", strategy)) {
+        // 2nd order weighted least squares, delta weighting.  Quality: EXPERIMENTAL
+        return new LeastSquaresVelocityTrackerStrategy(2,
+                LeastSquaresVelocityTrackerStrategy::WEIGHTING_DELTA);
+    }
+    if (!strcmp("wlsq2-central", strategy)) {
+        // 2nd order weighted least squares, central weighting.  Quality: EXPERIMENTAL
+        return new LeastSquaresVelocityTrackerStrategy(2,
+                LeastSquaresVelocityTrackerStrategy::WEIGHTING_CENTRAL);
+    }
+    if (!strcmp("wlsq2-recent", strategy)) {
+        // 2nd order weighted least squares, recent weighting.  Quality: EXPERIMENTAL
+        return new LeastSquaresVelocityTrackerStrategy(2,
+                LeastSquaresVelocityTrackerStrategy::WEIGHTING_RECENT);
+    }
+    if (!strcmp("int1", strategy)) {
+        // 1st order integrating filter.  Quality: GOOD.
+        // Not as good as 'lsq2' because it cannot estimate acceleration but it is
+        // more tolerant of errors.  Like 'lsq1', this strategy tends to underestimate
+        // the velocity of a fling but this strategy tends to respond to changes in
+        // direction more quickly and accurately.
+        return new IntegratingVelocityTrackerStrategy(1);
+    }
+    if (!strcmp("int2", strategy)) {
+        // 2nd order integrating filter.  Quality: EXPERIMENTAL.
+        // For comparison purposes only.  Unlike 'int1' this strategy can compensate
+        // for acceleration but it typically overestimates the effect.
+        return new IntegratingVelocityTrackerStrategy(2);
+    }
+    if (!strcmp("legacy", strategy)) {
+        // Legacy velocity tracker algorithm.  Quality: POOR.
+        // For comparison purposes only.  This algorithm is strongly influenced by
+        // old data points, consistently underestimates velocity and takes a very long
+        // time to adjust to changes in direction.
+        return new LegacyVelocityTrackerStrategy();
+    }
+    return NULL;

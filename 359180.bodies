@@ -1,0 +1,219 @@
+class MatroskaExtractor
+!!!677516.cpp!!!	MatroskaExtractor(in source : sp<DataSource>)
+    off64_t size;
+    mIsLiveStreaming =
+        (mDataSource->flags()
+            & (DataSource::kWantsPrefetching
+                | DataSource::kIsCachingDataSource))
+        && mDataSource->getSize(&size) != OK;
+
+    mkvparser::EBMLHeader ebmlHeader;
+    long long pos;
+    if (ebmlHeader.Parse(mReader, pos) < 0) {
+        return;
+    }
+
+    if (ebmlHeader.m_docType && !strcmp("webm", ebmlHeader.m_docType)) {
+        mIsWebm = true;
+    }
+
+    long long ret =
+        mkvparser::Segment::CreateInstance(mReader, pos, mSegment);
+
+    if (ret) {
+        CHECK(mSegment == NULL);
+        return;
+    }
+
+    ret = mSegment->ParseHeaders();
+    CHECK_EQ(ret, 0);
+
+    long len;
+    ret = mSegment->LoadCluster(pos, len);
+    CHECK_EQ(ret, 0);
+
+    if (ret < 0) {
+        delete mSegment;
+        mSegment = NULL;
+        return;
+    }
+
+#if 0
+    const mkvparser::SegmentInfo *info = mSegment->GetInfo();
+    ALOGI("muxing app: %s, writing app: %s",
+         info->GetMuxingAppAsUTF8(),
+         info->GetWritingAppAsUTF8());
+#endif
+
+    addTracks();
+!!!677644.cpp!!!	countTracks() : size_t
+    return mTracks.size();
+!!!677772.cpp!!!	getTrack(in index : size_t) : sp<MediaSource>
+    if (index >= mTracks.size()) {
+        return NULL;
+    }
+
+    return new MatroskaSource(this, index);
+!!!677900.cpp!!!	getTrackMetaData(in index : size_t, in flags : uint32_t) : sp<MetaData>
+    if (index >= mTracks.size()) {
+        return NULL;
+    }
+
+    if ((flags & kIncludeExtensiveMetaData) && !mExtractedThumbnails
+            && !isLiveStreaming()) {
+        findThumbnails();
+        mExtractedThumbnails = true;
+    }
+
+    return mTracks.itemAt(index).mMeta;
+!!!678028.cpp!!!	getMetaData() : sp<MetaData>
+    sp<MetaData> meta = new MetaData;
+
+    meta->setCString(
+            kKeyMIMEType,
+            mIsWebm ? "video/webm" : MEDIA_MIMETYPE_CONTAINER_MATROSKA);
+
+    return meta;
+!!!678156.cpp!!!	flags() : uint32_t
+    uint32_t x = CAN_PAUSE;
+    if (!isLiveStreaming()) {
+        x |= CAN_SEEK_BACKWARD | CAN_SEEK_FORWARD | CAN_SEEK;
+    }
+
+    return x;
+!!!678284.cpp!!!	~MatroskaExtractor()
+    delete mSegment;
+    mSegment = NULL;
+
+    delete mReader;
+    mReader = NULL;
+!!!678412.cpp!!!	addTracks() : void
+    const mkvparser::Tracks *tracks = mSegment->GetTracks();
+
+    for (size_t index = 0; index < tracks->GetTracksCount(); ++index) {
+        const mkvparser::Track *track = tracks->GetTrackByIndex(index);
+
+        if (track == NULL) {
+            // Apparently this is currently valid (if unexpected) behaviour
+            // of the mkv parser lib.
+            continue;
+        }
+
+        const char *const codecID = track->GetCodecId();
+        ALOGV("codec id = %s", codecID);
+        ALOGV("codec name = %s", track->GetCodecNameAsUTF8());
+
+        size_t codecPrivateSize;
+        const unsigned char *codecPrivate =
+            track->GetCodecPrivate(codecPrivateSize);
+
+        enum { VIDEO_TRACK = 1, AUDIO_TRACK = 2 };
+
+        sp<MetaData> meta = new MetaData;
+
+        switch (track->GetType()) {
+            case VIDEO_TRACK:
+            {
+                const mkvparser::VideoTrack *vtrack =
+                    static_cast<const mkvparser::VideoTrack *>(track);
+
+                if (!strcmp("V_MPEG4/ISO/AVC", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_AVC);
+                    meta->setData(kKeyAVCC, 0, codecPrivate, codecPrivateSize);
+                } else if (!strcmp("V_MPEG4/ISO/ASP", codecID)) {
+                    if (codecPrivateSize > 0) {
+                        meta->setCString(
+                                kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_MPEG4);
+                        addESDSFromCodecPrivate(
+                                meta, false, codecPrivate, codecPrivateSize);
+                    } else {
+                        ALOGW("%s is detected, but does not have configuration.",
+                                codecID);
+                        continue;
+                    }
+                } else if (!strcmp("V_VP8", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_VPX);
+                } else {
+                    ALOGW("%s is not supported.", codecID);
+                    continue;
+                }
+
+                meta->setInt32(kKeyWidth, vtrack->GetWidth());
+                meta->setInt32(kKeyHeight, vtrack->GetHeight());
+                break;
+            }
+
+            case AUDIO_TRACK:
+            {
+                const mkvparser::AudioTrack *atrack =
+                    static_cast<const mkvparser::AudioTrack *>(track);
+
+                if (!strcmp("A_AAC", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_AAC);
+                    CHECK(codecPrivateSize >= 2);
+
+                    addESDSFromCodecPrivate(
+                            meta, true, codecPrivate, codecPrivateSize);
+                } else if (!strcmp("A_VORBIS", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_VORBIS);
+
+                    addVorbisCodecInfo(meta, codecPrivate, codecPrivateSize);
+                } else if (!strcmp("A_MPEG/L3", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MPEG);
+                } else {
+                    ALOGW("%s is not supported.", codecID);
+                    continue;
+                }
+
+                meta->setInt32(kKeySampleRate, atrack->GetSamplingRate());
+                meta->setInt32(kKeyChannelCount, atrack->GetChannels());
+                break;
+            }
+
+            default:
+                continue;
+        }
+
+        long long durationNs = mSegment->GetDuration();
+        meta->setInt64(kKeyDuration, (durationNs + 500) / 1000);
+
+        mTracks.push();
+        TrackInfo *trackInfo = &mTracks.editItemAt(mTracks.size() - 1);
+        trackInfo->mTrackNum = track->GetNumber();
+        trackInfo->mMeta = meta;
+    }
+!!!678540.cpp!!!	findThumbnails() : void
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        TrackInfo *info = &mTracks.editItemAt(i);
+
+        const char *mime;
+        CHECK(info->mMeta->findCString(kKeyMIMEType, &mime));
+
+        if (strncasecmp(mime, "video/", 6)) {
+            continue;
+        }
+
+        BlockIterator iter(this, info->mTrackNum);
+        int32_t j = 0;
+        int64_t thumbnailTimeUs = 0;
+        size_t maxBlockSize = 0;
+        while (!iter.eos() && j < 20) {
+            if (iter.block()->IsKey()) {
+                ++j;
+
+                size_t blockSize = 0;
+                for (int k = 0; k < iter.block()->GetFrameCount(); ++k) {
+                    blockSize += iter.block()->GetFrame(k).len;
+                }
+
+                if (blockSize > maxBlockSize) {
+                    maxBlockSize = blockSize;
+                    thumbnailTimeUs = iter.blockTimeUs();
+                }
+            }
+            iter.advance();
+        }
+        info->mMeta->setInt64(kKeyThumbnailTime, thumbnailTimeUs);
+    }
+!!!678668.cpp!!!	isLiveStreaming() : bool
+    return mIsLiveStreaming;

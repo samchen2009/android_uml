@@ -1,0 +1,208 @@
+class MatroskaSource
+!!!1892364.cpp!!!	MatroskaSource(in extractor : sp<MatroskaExtractor>, in index : size_t)
+    sp<MetaData> meta = mExtractor->mTracks.itemAt(index).mMeta;
+
+    const char *mime;
+    CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+    mIsAudio = !strncasecmp("audio/", mime, 6);
+
+    if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)) {
+        mType = AVC;
+
+        uint32_t dummy;
+        const uint8_t *avcc;
+        size_t avccSize;
+        CHECK(meta->findData(
+                    kKeyAVCC, &dummy, (const void **)&avcc, &avccSize));
+
+        CHECK_GE(avccSize, 5u);
+
+        mNALSizeLen = 1 + (avcc[4] & 3);
+        ALOGV("mNALSizeLen = %d", mNALSizeLen);
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
+        mType = AAC;
+    }
+!!!1892492.cpp!!!	start(inout params : MetaData) : status_t
+    mBlockIter.reset();
+
+    return OK;
+!!!1892620.cpp!!!	stop() : status_t
+    clearPendingFrames();
+
+    return OK;
+!!!1892748.cpp!!!	getFormat() : sp<MetaData>
+    return mExtractor->mTracks.itemAt(mTrackIndex).mMeta;
+!!!1892876.cpp!!!	read(inout out : MediaBuffer, in options : ReadOptions) : status_t
+    *out = NULL;
+
+    int64_t targetSampleTimeUs = -1ll;
+
+    int64_t seekTimeUs;
+    ReadOptions::SeekMode mode;
+    if (options && options->getSeekTo(&seekTimeUs, &mode)
+            && !mExtractor->isLiveStreaming()) {
+        clearPendingFrames();
+
+        // The audio we want is located by using the Cues to seek the video
+        // stream to find the target Cluster then iterating to finalize for
+        // audio.
+        int64_t actualFrameTimeUs;
+        mBlockIter.seek(seekTimeUs, mIsAudio, &actualFrameTimeUs);
+
+        if (mode == ReadOptions::SEEK_CLOSEST) {
+            targetSampleTimeUs = actualFrameTimeUs;
+        }
+    }
+
+    while (mPendingFrames.empty()) {
+        status_t err = readBlock();
+
+        if (err != OK) {
+            clearPendingFrames();
+
+            return err;
+        }
+    }
+
+    MediaBuffer *frame = *mPendingFrames.begin();
+    mPendingFrames.erase(mPendingFrames.begin());
+
+    if (mType != AVC) {
+        if (targetSampleTimeUs >= 0ll) {
+            frame->meta_data()->setInt64(
+                    kKeyTargetTime, targetSampleTimeUs);
+        }
+
+        *out = frame;
+
+        return OK;
+    }
+
+    // Each input frame contains one or more NAL fragments, each fragment
+    // is prefixed by mNALSizeLen bytes giving the fragment length,
+    // followed by a corresponding number of bytes containing the fragment.
+    // We output all these fragments into a single large buffer separated
+    // by startcodes (0x00 0x00 0x00 0x01).
+
+    const uint8_t *srcPtr =
+        (const uint8_t *)frame->data() + frame->range_offset();
+
+    size_t srcSize = frame->range_length();
+
+    size_t dstSize = 0;
+    MediaBuffer *buffer = NULL;
+    uint8_t *dstPtr = NULL;
+
+    for (int32_t pass = 0; pass < 2; ++pass) {
+        size_t srcOffset = 0;
+        size_t dstOffset = 0;
+        while (srcOffset + mNALSizeLen <= srcSize) {
+            size_t NALsize;
+            switch (mNALSizeLen) {
+                case 1: NALsize = srcPtr[srcOffset]; break;
+                case 2: NALsize = U16_AT(srcPtr + srcOffset); break;
+                case 3: NALsize = U24_AT(srcPtr + srcOffset); break;
+                case 4: NALsize = U32_AT(srcPtr + srcOffset); break;
+                default:
+                    TRESPASS();
+            }
+
+            if (srcOffset + mNALSizeLen + NALsize > srcSize) {
+                break;
+            }
+
+            if (pass == 1) {
+                memcpy(&dstPtr[dstOffset], "\x00\x00\x00\x01", 4);
+
+                memcpy(&dstPtr[dstOffset + 4],
+                       &srcPtr[srcOffset + mNALSizeLen],
+                       NALsize);
+            }
+
+            dstOffset += 4;  // 0x00 00 00 01
+            dstOffset += NALsize;
+
+            srcOffset += mNALSizeLen + NALsize;
+        }
+
+        if (srcOffset < srcSize) {
+            // There were trailing bytes or not enough data to complete
+            // a fragment.
+
+            frame->release();
+            frame = NULL;
+
+            return ERROR_MALFORMED;
+        }
+
+        if (pass == 0) {
+            dstSize = dstOffset;
+
+            buffer = new MediaBuffer(dstSize);
+
+            int64_t timeUs;
+            CHECK(frame->meta_data()->findInt64(kKeyTime, &timeUs));
+            int32_t isSync;
+            CHECK(frame->meta_data()->findInt32(kKeyIsSyncFrame, &isSync));
+
+            buffer->meta_data()->setInt64(kKeyTime, timeUs);
+            buffer->meta_data()->setInt32(kKeyIsSyncFrame, isSync);
+
+            dstPtr = (uint8_t *)buffer->data();
+        }
+    }
+
+    frame->release();
+    frame = NULL;
+
+    if (targetSampleTimeUs >= 0ll) {
+        buffer->meta_data()->setInt64(
+                kKeyTargetTime, targetSampleTimeUs);
+    }
+
+    *out = buffer;
+
+    return OK;
+!!!1893004.cpp!!!	~MatroskaSource()
+    clearPendingFrames();
+!!!1893260.cpp!!!	readBlock() : status_t
+    CHECK(mPendingFrames.empty());
+
+    if (mBlockIter.eos()) {
+        return ERROR_END_OF_STREAM;
+    }
+
+    const mkvparser::Block *block = mBlockIter.block();
+
+    int64_t timeUs = mBlockIter.blockTimeUs();
+
+    for (int i = 0; i < block->GetFrameCount(); ++i) {
+        const mkvparser::Block::Frame &frame = block->GetFrame(i);
+
+        MediaBuffer *mbuf = new MediaBuffer(frame.len);
+        mbuf->meta_data()->setInt64(kKeyTime, timeUs);
+        mbuf->meta_data()->setInt32(kKeyIsSyncFrame, block->IsKey());
+
+        long n = frame.Read(mExtractor->mReader, (unsigned char *)mbuf->data());
+        if (n != 0) {
+            mPendingFrames.clear();
+
+            mBlockIter.advance();
+            return ERROR_IO;
+        }
+
+        mPendingFrames.push_back(mbuf);
+    }
+
+    mBlockIter.advance();
+
+    return OK;
+!!!1893388.cpp!!!	clearPendingFrames() : void
+    while (!mPendingFrames.empty()) {
+        MediaBuffer *frame = *mPendingFrames.begin();
+        mPendingFrames.erase(mPendingFrames.begin());
+
+        frame->release();
+        frame = NULL;
+    }

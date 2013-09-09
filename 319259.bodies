@@ -1,0 +1,495 @@
+class HttpEngine
+!!!2079259.java!!!	HttpEngine(inout policy : HttpURLConnectionImpl, inout method : String, inout requestHeaders : RawHeaders, inout connection : HttpConnection, inout requestBodyOut : RetryableOutputStream)
+        this.policy = policy;
+        this.method = method;
+        this.connection = connection;
+        this.requestBodyOut = requestBodyOut;
+
+        try {
+            uri = policy.getURL().toURILenient();
+        } catch (URISyntaxException e) {
+            throw new IOException(e);
+        }
+
+        this.requestHeaders = new RequestHeaders(uri, new RawHeaders(requestHeaders));
+!!!2079387.java!!!	getUri() : URI
+        return uri;
+!!!2079515.java!!!	sendRequest() : void
+        if (responseSource != null) {
+            return;
+        }
+
+        prepareRawRequestHeaders();
+        initResponseSource();
+        if (responseCache instanceof ExtendedResponseCache) {
+            ((ExtendedResponseCache) responseCache).trackResponse(responseSource);
+        }
+
+        /*
+         * The raw response source may require the network, but the request
+         * headers may forbid network use. In that case, dispose of the network
+         * response and use a GATEWAY_TIMEOUT response instead, as specified
+         * by http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.4.
+         */
+        if (requestHeaders.isOnlyIfCached() && responseSource.requiresConnection()) {
+            if (responseSource == ResponseSource.CONDITIONAL_CACHE) {
+                IoUtils.closeQuietly(cachedResponseBody);
+            }
+            this.responseSource = ResponseSource.CACHE;
+            this.cacheResponse = GATEWAY_TIMEOUT_RESPONSE;
+            RawHeaders rawResponseHeaders = RawHeaders.fromMultimap(cacheResponse.getHeaders());
+            setResponse(new ResponseHeaders(uri, rawResponseHeaders), cacheResponse.getBody());
+        }
+
+        if (responseSource.requiresConnection()) {
+            sendSocketRequest();
+        } else if (connection != null) {
+            HttpConnectionPool.INSTANCE.recycle(connection);
+            connection = null;
+        }
+!!!2079643.java!!!	initResponseSource() : void
+        responseSource = ResponseSource.NETWORK;
+        if (!policy.getUseCaches() || responseCache == null) {
+            return;
+        }
+
+        CacheResponse candidate = responseCache.get(uri, method,
+                requestHeaders.getHeaders().toMultimap());
+        if (candidate == null) {
+            return;
+        }
+
+        Map<String, List<String>> responseHeadersMap = candidate.getHeaders();
+        cachedResponseBody = candidate.getBody();
+        if (!acceptCacheResponseType(candidate)
+                || responseHeadersMap == null
+                || cachedResponseBody == null) {
+            IoUtils.closeQuietly(cachedResponseBody);
+            return;
+        }
+
+        RawHeaders rawResponseHeaders = RawHeaders.fromMultimap(responseHeadersMap);
+        cachedResponseHeaders = new ResponseHeaders(uri, rawResponseHeaders);
+        long now = System.currentTimeMillis();
+        this.responseSource = cachedResponseHeaders.chooseResponseSource(now, requestHeaders);
+        if (responseSource == ResponseSource.CACHE) {
+            this.cacheResponse = candidate;
+            setResponse(cachedResponseHeaders, cachedResponseBody);
+        } else if (responseSource == ResponseSource.CONDITIONAL_CACHE) {
+            this.cacheResponse = candidate;
+        } else if (responseSource == ResponseSource.NETWORK) {
+            IoUtils.closeQuietly(cachedResponseBody);
+        } else {
+            throw new AssertionError();
+        }
+!!!2079771.java!!!	sendSocketRequest() : void
+        if (connection == null) {
+            connect();
+        }
+
+        if (socketOut != null || requestOut != null || socketIn != null) {
+            throw new IllegalStateException();
+        }
+
+        socketOut = connection.getOutputStream();
+        requestOut = socketOut;
+        socketIn = connection.getInputStream();
+
+        if (hasRequestBody()) {
+            initRequestBodyOut();
+        }
+!!!2079899.java!!!	connect() : void
+        if (connection == null) {
+            connection = openSocketConnection();
+        }
+!!!2080027.java!!!	openSocketConnection() : HttpConnection
+        HttpConnection result = HttpConnection.connect(uri, getSslSocketFactory(),
+                policy.getProxy(), requiresTunnel(), policy.getConnectTimeout());
+        Proxy proxy = result.getAddress().getProxy();
+        if (proxy != null) {
+            policy.setProxy(proxy);
+        }
+        result.setSoTimeout(policy.getReadTimeout());
+        return result;
+!!!2080155.java!!!	initRequestBodyOut() : void
+        int chunkLength = policy.getChunkLength();
+        if (chunkLength > 0 || requestHeaders.isChunked()) {
+            sendChunked = true;
+            if (chunkLength == -1) {
+                chunkLength = DEFAULT_CHUNK_LENGTH;
+            }
+        }
+
+        if (socketOut == null) {
+            throw new IllegalStateException("No socket to write to; was a POST cached?");
+        }
+
+        if (httpMinorVersion == 0) {
+            sendChunked = false;
+        }
+
+        int fixedContentLength = policy.getFixedContentLength();
+        if (requestBodyOut != null) {
+            // request body was already initialized by the predecessor HTTP engine
+        } else if (fixedContentLength != -1) {
+            writeRequestHeaders(fixedContentLength);
+            requestBodyOut = new FixedLengthOutputStream(requestOut, fixedContentLength);
+        } else if (sendChunked) {
+            writeRequestHeaders(-1);
+            requestBodyOut = new ChunkedOutputStream(requestOut, chunkLength);
+        } else if (requestHeaders.getContentLength() != -1) {
+            writeRequestHeaders(requestHeaders.getContentLength());
+            requestBodyOut = new RetryableOutputStream(requestHeaders.getContentLength());
+        } else {
+            requestBodyOut = new RetryableOutputStream();
+        }
+!!!2080283.java!!!	setResponse(inout headers : ResponseHeaders, inout body : InputStream) : void
+        if (this.responseBodyIn != null) {
+            throw new IllegalStateException();
+        }
+        this.responseHeaders = headers;
+        this.httpMinorVersion = responseHeaders.getHeaders().getHttpMinorVersion();
+        if (body != null) {
+            initContentStream(body);
+        }
+!!!2080411.java!!!	hasRequestBody() : boolean
+        return method == POST || method == PUT;
+!!!2080539.java!!!	getRequestBody() : OutputStream
+        if (responseSource == null) {
+            throw new IllegalStateException();
+        }
+        return requestBodyOut;
+!!!2080667.java!!!	hasResponse() : boolean
+        return responseHeaders != null;
+!!!2080795.java!!!	getRequestHeaders() : RequestHeaders
+        return requestHeaders;
+!!!2080923.java!!!	getResponseHeaders() : ResponseHeaders
+        if (responseHeaders == null) {
+            throw new IllegalStateException();
+        }
+        return responseHeaders;
+!!!2081051.java!!!	getResponseCode() : int
+        if (responseHeaders == null) {
+            throw new IllegalStateException();
+        }
+        return responseHeaders.getHeaders().getResponseCode();
+!!!2081179.java!!!	getResponseBody() : InputStream
+        if (responseHeaders == null) {
+            throw new IllegalStateException();
+        }
+        return responseBodyIn;
+!!!2081307.java!!!	getCacheResponse() : CacheResponse
+        return cacheResponse;
+!!!2081435.java!!!	getConnection() : HttpConnection
+        return connection;
+!!!2081563.java!!!	hasRecycledConnection() : boolean
+        return connection != null && connection.isRecycled();
+!!!2081691.java!!!	acceptCacheResponseType(inout cacheResponse : CacheResponse) : boolean
+        return true;
+!!!2081819.java!!!	maybeCache() : void
+        // Never cache responses to proxy CONNECT requests.
+        if (method == CONNECT) {
+            return;
+        }
+
+        // Are we caching at all?
+        if (!policy.getUseCaches() || responseCache == null) {
+            return;
+        }
+
+        // Should we cache this response for this request?
+        if (!responseHeaders.isCacheable(requestHeaders)) {
+            return;
+        }
+
+        // Offer this request to the cache.
+        cacheRequest = responseCache.put(uri, getHttpConnectionToCache());
+!!!2081947.java!!!	getHttpConnectionToCache() : HttpURLConnection
+        return policy;
+!!!2082075.java!!!	automaticallyReleaseConnectionToPool() : void
+        automaticallyReleaseConnectionToPool = true;
+        if (connection != null && connectionReleased) {
+            HttpConnectionPool.INSTANCE.recycle(connection);
+            connection = null;
+        }
+!!!2082203.java!!!	markConnectionAsRecycled() : void
+        if (connection != null) {
+            connection.setRecycled();
+        }
+!!!2082331.java!!!	release(inout reusable : boolean) : void
+        // If the response body comes from the cache, close it.
+        if (responseBodyIn == cachedResponseBody) {
+            IoUtils.closeQuietly(responseBodyIn);
+        }
+
+        if (!connectionReleased && connection != null) {
+            connectionReleased = true;
+
+            // We cannot reuse sockets that have incomplete output.
+            if (requestBodyOut != null && !requestBodyOut.closed) {
+                reusable = false;
+            }
+
+            // If the request specified that the connection shouldn't be reused,
+            // don't reuse it. This advice doesn't apply to CONNECT requests because
+            // the "Connection: close" header goes the origin server, not the proxy.
+            if (requestHeaders.hasConnectionClose() && method != CONNECT) {
+                reusable = false;
+            }
+
+            // If the response specified that the connection shouldn't be reused, don't reuse it.
+            if (responseHeaders != null && responseHeaders.hasConnectionClose()) {
+                reusable = false;
+            }
+
+            if (responseBodyIn instanceof UnknownLengthHttpInputStream) {
+                reusable = false;
+            }
+
+            if (reusable && responseBodyIn != null) {
+                // We must discard the response body before the connection can be reused.
+                try {
+                    Streams.skipAll(responseBodyIn);
+                } catch (IOException e) {
+                    reusable = false;
+                }
+            }
+
+            if (!reusable) {
+                connection.closeSocketAndStreams();
+                connection = null;
+            } else if (automaticallyReleaseConnectionToPool) {
+                HttpConnectionPool.INSTANCE.recycle(connection);
+                connection = null;
+            }
+        }
+!!!2082459.java!!!	initContentStream(inout transferStream : InputStream) : void
+        if (transparentGzip && responseHeaders.isContentEncodingGzip()) {
+            /*
+             * If the response was transparently gzipped, remove the gzip header field
+             * so clients don't double decompress. http://b/3009828
+             *
+             * Also remove the Content-Length in this case because it contains the length
+             * of the gzipped response. This isn't terribly useful and is dangerous because
+             * clients can query the content length, but not the content encoding.
+             */
+            responseHeaders.stripContentEncoding();
+            responseHeaders.stripContentLength();
+            responseBodyIn = new GZIPInputStream(transferStream);
+        } else {
+            responseBodyIn = transferStream;
+        }
+!!!2082587.java!!!	getTransferStream() : InputStream
+        if (!hasResponseBody()) {
+            return new FixedLengthInputStream(socketIn, cacheRequest, this, 0);
+        }
+
+        if (responseHeaders.isChunked()) {
+            return new ChunkedInputStream(socketIn, cacheRequest, this);
+        }
+
+        if (responseHeaders.getContentLength() != -1) {
+            return new FixedLengthInputStream(socketIn, cacheRequest, this,
+                    responseHeaders.getContentLength());
+        }
+
+        /*
+         * Wrap the input stream from the HttpConnection (rather than
+         * just returning "socketIn" directly here), so that we can control
+         * its use after the reference escapes.
+         */
+        return new UnknownLengthHttpInputStream(socketIn, cacheRequest, this);
+!!!2082715.java!!!	readResponseHeaders() : void
+        RawHeaders headers;
+        do {
+            headers = new RawHeaders();
+            headers.setStatusLine(Streams.readAsciiLine(socketIn));
+            readHeaders(headers);
+        } while (headers.getResponseCode() == HTTP_CONTINUE);
+        setResponse(new ResponseHeaders(uri, headers), null);
+!!!2082843.java!!!	hasResponseBody() : boolean
+        int responseCode = responseHeaders.getHeaders().getResponseCode();
+
+        // HEAD requests never yield a body regardless of the response headers.
+        if (method == HEAD) {
+            return false;
+        }
+
+        if (method != CONNECT
+                && (responseCode < HTTP_CONTINUE || responseCode >= 200)
+                && responseCode != HttpURLConnectionImpl.HTTP_NO_CONTENT
+                && responseCode != HttpURLConnectionImpl.HTTP_NOT_MODIFIED) {
+            return true;
+        }
+
+        /*
+         * If the Content-Length or Transfer-Encoding headers disagree with the
+         * response code, the response is malformed. For best compatibility, we
+         * honor the headers.
+         */
+        if (responseHeaders.getContentLength() != -1 || responseHeaders.isChunked()) {
+            return true;
+        }
+
+        return false;
+!!!2082971.java!!!	readTrailers() : void
+        readHeaders(responseHeaders.getHeaders());
+!!!2083099.java!!!	readHeaders(inout headers : RawHeaders) : void
+        // parse the result headers until the first blank line
+        String line;
+        while (!(line = Streams.readAsciiLine(socketIn)).isEmpty()) {
+            headers.addLine(line);
+        }
+
+        CookieHandler cookieHandler = CookieHandler.getDefault();
+        if (cookieHandler != null) {
+            cookieHandler.put(uri, headers.toMultimap());
+        }
+!!!2083227.java!!!	writeRequestHeaders(in contentLength : int) : void
+        if (sentRequestMillis != -1) {
+            throw new IllegalStateException();
+        }
+
+        RawHeaders headersToSend = getNetworkRequestHeaders();
+        byte[] bytes = headersToSend.toHeaderString().getBytes(Charsets.ISO_8859_1);
+
+        if (contentLength != -1 && bytes.length + contentLength <= MAX_REQUEST_BUFFER_LENGTH) {
+            requestOut = new BufferedOutputStream(socketOut, bytes.length + contentLength);
+        }
+
+        sentRequestMillis = System.currentTimeMillis();
+        requestOut.write(bytes);
+!!!2083355.java!!!	getNetworkRequestHeaders() : RawHeaders
+        requestHeaders.getHeaders().setStatusLine(getRequestLine());
+
+        int fixedContentLength = policy.getFixedContentLength();
+        if (fixedContentLength != -1) {
+            requestHeaders.setContentLength(fixedContentLength);
+        } else if (sendChunked) {
+            requestHeaders.setChunked();
+        } else if (requestBodyOut instanceof RetryableOutputStream) {
+            int contentLength = ((RetryableOutputStream) requestBodyOut).contentLength();
+            requestHeaders.setContentLength(contentLength);
+        }
+
+        return requestHeaders.getHeaders();
+!!!2083483.java!!!	prepareRawRequestHeaders() : void
+        requestHeaders.getHeaders().setStatusLine(getRequestLine());
+
+        if (requestHeaders.getUserAgent() == null) {
+            requestHeaders.setUserAgent(getDefaultUserAgent());
+        }
+
+        if (requestHeaders.getHost() == null) {
+            requestHeaders.setHost(getOriginAddress(policy.getURL()));
+        }
+
+        if (httpMinorVersion > 0 && requestHeaders.getConnection() == null) {
+            requestHeaders.setConnection("Keep-Alive");
+        }
+
+        if (requestHeaders.getAcceptEncoding() == null) {
+            transparentGzip = true;
+            requestHeaders.setAcceptEncoding("gzip");
+        }
+
+        if (hasRequestBody() && requestHeaders.getContentType() == null) {
+            requestHeaders.setContentType("application/x-www-form-urlencoded");
+        }
+
+        long ifModifiedSince = policy.getIfModifiedSince();
+        if (ifModifiedSince != 0) {
+            requestHeaders.setIfModifiedSince(new Date(ifModifiedSince));
+        }
+
+        CookieHandler cookieHandler = CookieHandler.getDefault();
+        if (cookieHandler != null) {
+            requestHeaders.addCookies(
+                    cookieHandler.get(uri, requestHeaders.getHeaders().toMultimap()));
+        }
+!!!2083611.java!!!	getRequestLine() : String
+        String protocol = (httpMinorVersion == 0) ? "HTTP/1.0" : "HTTP/1.1";
+        return method + " " + requestString() + " " + protocol;
+!!!2083739.java!!!	requestString() : String
+        URL url = policy.getURL();
+        if (includeAuthorityInRequestLine()) {
+            return url.toString();
+        } else {
+            String fileOnly = url.getFile();
+            if (fileOnly == null) {
+                fileOnly = "/";
+            } else if (!fileOnly.startsWith("/")) {
+                fileOnly = "/" + fileOnly;
+            }
+            return fileOnly;
+        }
+!!!2083867.java!!!	includeAuthorityInRequestLine() : boolean
+        return policy.usingProxy();
+!!!2083995.java!!!	getSslSocketFactory() : SSLSocketFactory
+        return null;
+!!!2084123.java!!!	getDefaultUserAgent() : String
+        String agent = System.getProperty("http.agent");
+        return agent != null ? agent : ("Java" + System.getProperty("java.version"));
+!!!2084251.java!!!	getOriginAddress(inout url : URL) : String
+        int port = url.getPort();
+        String result = url.getHost();
+        if (port > 0 && port != policy.getDefaultPort()) {
+            result = result + ":" + port;
+        }
+        return result;
+!!!2084379.java!!!	requiresTunnel() : boolean
+        return false;
+!!!2084507.java!!!	readResponse() : void
+        if (hasResponse()) {
+            return;
+        }
+
+        if (responseSource == null) {
+            throw new IllegalStateException("readResponse() without sendRequest()");
+        }
+
+        if (!responseSource.requiresConnection()) {
+            return;
+        }
+
+        if (sentRequestMillis == -1) {
+            int contentLength = requestBodyOut instanceof RetryableOutputStream
+                    ? ((RetryableOutputStream) requestBodyOut).contentLength()
+                    : -1;
+            writeRequestHeaders(contentLength);
+        }
+
+        if (requestBodyOut != null) {
+            requestBodyOut.close();
+            if (requestBodyOut instanceof RetryableOutputStream) {
+                ((RetryableOutputStream) requestBodyOut).writeToSocket(requestOut);
+            }
+        }
+
+        requestOut.flush();
+        requestOut = socketOut;
+
+        readResponseHeaders();
+        responseHeaders.setLocalTimestamps(sentRequestMillis, System.currentTimeMillis());
+
+        if (responseSource == ResponseSource.CONDITIONAL_CACHE) {
+            if (cachedResponseHeaders.validate(responseHeaders)) {
+                release(true);
+                ResponseHeaders combinedHeaders = cachedResponseHeaders.combine(responseHeaders);
+                setResponse(combinedHeaders, cachedResponseBody);
+                if (responseCache instanceof ExtendedResponseCache) {
+                    ExtendedResponseCache httpResponseCache = (ExtendedResponseCache) responseCache;
+                    httpResponseCache.trackConditionalCacheHit();
+                    httpResponseCache.update(cacheResponse, getHttpConnectionToCache());
+                }
+                return;
+            } else {
+                IoUtils.closeQuietly(cachedResponseBody);
+            }
+        }
+
+        if (hasResponseBody()) {
+            maybeCache(); // reentrant. this calls into user code which may call back into this!
+        }
+
+        initContentStream(getTransferStream());

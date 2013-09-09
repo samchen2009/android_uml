@@ -1,0 +1,223 @@
+class CodecState
+!!!12161804.java!!!	CodecState(inout converter : MediaTimeConverter, inout extractor : MediaExtractor, in trackIndex : int, inout format : MediaFormat, inout codec : MediaCodec)
+        mConverter = converter;
+        mExtractor = extractor;
+        mTrackIndex = trackIndex;
+        mFormat = format;
+        mSawInputEOS = mSawOutputEOS = false;
+
+        mCodec = codec;
+
+        mCodec.start();
+        mCodecInputBuffers = mCodec.getInputBuffers();
+        mCodecOutputBuffers = mCodec.getOutputBuffers();
+
+        mAvailableInputBufferIndices = new LinkedList();
+        mAvailableOutputBufferIndices = new LinkedList();
+        mAvailableOutputBufferInfos = new LinkedList();
+
+        mLastMediaTimeUs = 0;
+!!!12161932.java!!!	release() : void
+        mCodec.stop();
+        mCodec.release();
+        mCodec = null;
+
+        mCodecInputBuffers = null;
+        mCodecOutputBuffers = null;
+        mOutputFormat = null;
+
+        mAvailableOutputBufferInfos = null;
+        mAvailableOutputBufferIndices = null;
+        mAvailableInputBufferIndices = null;
+
+        if (mAudioTrack != null) {
+            mAudioTrack.release();
+            mAudioTrack = null;
+        }
+!!!12162060.java!!!	start() : void
+        if (mAudioTrack != null) {
+            mAudioTrack.play();
+        }
+!!!12162188.java!!!	pause() : void
+        if (mAudioTrack != null) {
+            mAudioTrack.pause();
+        }
+!!!12162316.java!!!	getCurrentPositionUs() : long
+        return mLastMediaTimeUs;
+!!!12162444.java!!!	flush() : void
+        mAvailableInputBufferIndices.clear();
+        mAvailableOutputBufferIndices.clear();
+        mAvailableOutputBufferInfos.clear();
+
+        mSawInputEOS = false;
+        mSawOutputEOS = false;
+
+        if (mAudioTrack != null
+                && mAudioTrack.getPlayState() == AudioTrack.PLAYSTATE_STOPPED) {
+            mAudioTrack.play();
+        }
+
+        mCodec.flush();
+!!!12162572.java!!!	doSomeWork() : void
+        int index = mCodec.dequeueInputBuffer(0 /* timeoutUs */);
+
+        if (index != MediaCodec.INFO_TRY_AGAIN_LATER) {
+            mAvailableInputBufferIndices.add(new Integer(index));
+        }
+
+        while (feedInputBuffer()) {}
+
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        index = mCodec.dequeueOutputBuffer(info, 0 /* timeoutUs */);
+
+        if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+            mOutputFormat = mCodec.getOutputFormat();
+            onOutputFormatChanged();
+        } else if (index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+            mCodecOutputBuffers = mCodec.getOutputBuffers();
+        } else if (index != MediaCodec.INFO_TRY_AGAIN_LATER) {
+            mAvailableOutputBufferIndices.add(new Integer(index));
+            mAvailableOutputBufferInfos.add(info);
+        }
+
+        while (drainOutputBuffer()) {}
+!!!12162700.java!!!	feedInputBuffer() : boolean
+        if (mSawInputEOS || mAvailableInputBufferIndices.isEmpty()) {
+            return false;
+        }
+
+        int index = mAvailableInputBufferIndices.peekFirst().intValue();
+
+        ByteBuffer codecData = mCodecInputBuffers[index];
+
+        int trackIndex = mExtractor.getSampleTrackIndex();
+
+        if (trackIndex == mTrackIndex) {
+            int sampleSize =
+                mExtractor.readSampleData(codecData, 0 /* offset */);
+
+            long sampleTime = mExtractor.getSampleTime();
+
+            int sampleFlags = mExtractor.getSampleFlags();
+
+            try {
+                if ((sampleFlags & MediaExtractor.SAMPLE_FLAG_ENCRYPTED) != 0) {
+                    MediaCodec.CryptoInfo info = new MediaCodec.CryptoInfo();
+                    mExtractor.getSampleCryptoInfo(info);
+
+                    mCodec.queueSecureInputBuffer(
+                            index, 0 /* offset */, info, sampleTime, 0 /* flags */);
+                } else {
+                    mCodec.queueInputBuffer(
+                            index, 0 /* offset */, sampleSize, sampleTime,
+                            0 /* flags */);
+                }
+
+                mAvailableInputBufferIndices.removeFirst();
+                mExtractor.advance();
+            } catch (MediaCodec.CryptoException e) {
+                Log.d(TAG, "CryptoException w/ errorCode "
+                        + e.getErrorCode() + ", '" + e.getMessage() + "'");
+            }
+
+            return true;
+        } else if (trackIndex < 0) {
+            Log.d(TAG, "saw input EOS on track " + mTrackIndex);
+
+            mSawInputEOS = true;
+
+            try {
+                mCodec.queueInputBuffer(
+                        index, 0 /* offset */, 0 /* sampleSize */,
+                        0 /* sampleTime */, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+
+                mAvailableInputBufferIndices.removeFirst();
+            } catch (MediaCodec.CryptoException e) {
+                Log.d(TAG, "CryptoException w/ errorCode "
+                        + e.getErrorCode() + ", '" + e.getMessage() + "'");
+            }
+        }
+
+        return false;
+!!!12162828.java!!!	onOutputFormatChanged() : void
+        String mime = mOutputFormat.getString(MediaFormat.KEY_MIME);
+
+        if (mime.startsWith("audio/")) {
+            int sampleRate =
+                mOutputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+
+            int channelCount =
+                mOutputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+
+            mAudioTrack = new NonBlockingAudioTrack(sampleRate, channelCount);
+            mAudioTrack.play();
+        }
+!!!12162956.java!!!	drainOutputBuffer() : boolean
+        if (mSawOutputEOS || mAvailableOutputBufferIndices.isEmpty()) {
+            return false;
+        }
+
+        int index = mAvailableOutputBufferIndices.peekFirst().intValue();
+        MediaCodec.BufferInfo info = mAvailableOutputBufferInfos.peekFirst();
+
+        if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+            Log.d(TAG, "saw output EOS on track " + mTrackIndex);
+
+            mSawOutputEOS = true;
+
+            if (mAudioTrack != null) {
+                mAudioTrack.stop();
+            }
+            return false;
+        }
+
+        long realTimeUs =
+            mConverter.getRealTimeUsForMediaTime(info.presentationTimeUs);
+
+        long nowUs = System.currentTimeMillis() * 1000;
+
+        long lateUs = nowUs - realTimeUs;
+
+        if (mAudioTrack != null) {
+            if (lateUs < -10000) {
+                // too early;
+                return false;
+            }
+
+            ByteBuffer buffer = mCodecOutputBuffers[index];
+            buffer.clear();
+            buffer.position(0 /* offset */);
+
+            byte[] audioCopy = new byte[info.size];
+            buffer.get(audioCopy, 0, info.size);
+
+            mAudioTrack.write(audioCopy, info.size);
+
+            mCodec.releaseOutputBuffer(index, false /* render */);
+
+            mLastMediaTimeUs = info.presentationTimeUs;
+
+            mAvailableOutputBufferIndices.removeFirst();
+            mAvailableOutputBufferInfos.removeFirst();
+            return true;
+        } else {
+            // video
+            boolean render = true;
+
+            if (lateUs < -10000) {
+                // too early;
+                return false;
+            } else if (lateUs > 30000) {
+                Log.d(TAG, "video late by " + lateUs + " us.");
+                render = false;
+            } else {
+                render = true;
+                mLastMediaTimeUs = info.presentationTimeUs;
+            }
+
+            mCodec.releaseOutputBuffer(index, render);
+
+            mAvailableOutputBufferIndices.removeFirst();
+            mAvailableOutputBufferInfos.removeFirst();
+            return true;
+        }

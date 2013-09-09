@@ -1,0 +1,258 @@
+class FtpURLConnection
+!!!2118043.java!!!	FtpURLConnection(inout url : URL)
+        super(url);
+        hostName = url.getHost();
+        String parse = url.getUserInfo();
+        if (parse != null) {
+            int split = parse.indexOf(':');
+            if (split >= 0) {
+                username = parse.substring(0, split);
+                password = parse.substring(split + 1);
+            } else {
+                username = parse;
+            }
+        }
+        uri = null;
+        try {
+            uri = url.toURI();
+        } catch (URISyntaxException e) {
+            // do nothing.
+        }
+!!!2118171.java!!!	FtpURLConnection(inout url : URL, inout proxy : Proxy)
+        this(url);
+        this.proxy = proxy;
+!!!2118299.java!!!	cd() : void
+        int idx = url.getFile().lastIndexOf('/');
+
+        if (idx > 0) {
+            String dir = url.getFile().substring(0, idx);
+            write("CWD " + dir + "\r\n");
+            int reply = getReply();
+            if (reply != FTP_FILEOK && dir.length() > 0 && dir.charAt(0) == '/') {
+                write("CWD " + dir.substring(1) + "\r\n");
+                reply = getReply();
+            }
+            if (reply != FTP_FILEOK) {
+                throw new IOException("Unable to change directories");
+            }
+        }
+!!!2118427.java!!!	connect() : void
+        // Use system-wide ProxySelect to select proxy list,
+        // then try to connect via elements in the proxy list.
+        List<Proxy> proxyList = null;
+        if (proxy != null) {
+            proxyList = new ArrayList<Proxy>(1);
+            proxyList.add(proxy);
+        } else {
+            ProxySelector selector = ProxySelector.getDefault();
+            if (selector != null) {
+                proxyList = selector.select(uri);
+            }
+        }
+        if (proxyList == null) {
+            currentProxy = null;
+            connectInternal();
+        } else {
+            ProxySelector selector = ProxySelector.getDefault();
+            Iterator<Proxy> iter = proxyList.iterator();
+            boolean connectOK = false;
+            String failureReason = "";
+            while (iter.hasNext() && !connectOK) {
+                currentProxy = iter.next();
+                try {
+                    connectInternal();
+                    connectOK = true;
+                } catch (IOException ioe) {
+                    failureReason = ioe.getLocalizedMessage();
+                    // If connect failed, callback "connectFailed"
+                    // should be invoked.
+                    if (selector != null && Proxy.NO_PROXY != currentProxy) {
+                        selector.connectFailed(uri, currentProxy.address(), ioe);
+                    }
+                }
+            }
+            if (!connectOK) {
+                throw new IOException("Unable to connect to server: " + failureReason);
+            }
+        }
+!!!2118555.java!!!	connectInternal() : void
+        int port = url.getPort();
+        int connectTimeout = getConnectTimeout();
+        if (port <= 0) {
+            port = FTP_PORT;
+        }
+        if (currentProxy == null || Proxy.Type.HTTP == currentProxy.type()) {
+            controlSocket = new Socket();
+        } else {
+            controlSocket = new Socket(currentProxy);
+        }
+        InetSocketAddress addr = new InetSocketAddress(hostName, port);
+        controlSocket.connect(addr, connectTimeout);
+        connected = true;
+        ctrlOutput = controlSocket.getOutputStream();
+        ctrlInput = controlSocket.getInputStream();
+        login();
+        setType();
+        if (!getDoInput()) {
+            cd();
+        }
+
+        try {
+            acceptSocket = new ServerSocket(0);
+            dataPort = acceptSocket.getLocalPort();
+            /* Cannot set REUSEADDR so we need to send a PORT command */
+            port();
+            if (connectTimeout == 0) {
+                // set timeout rather than zero as before
+                connectTimeout = 3000;
+            }
+            acceptSocket.setSoTimeout(getConnectTimeout());
+            if (getDoInput()) {
+                getFile();
+            } else {
+                sendFile();
+            }
+            dataSocket = acceptSocket.accept();
+            dataSocket.setSoTimeout(getReadTimeout());
+            acceptSocket.close();
+        } catch (InterruptedIOException e) {
+            throw new IOException("Could not establish data connection");
+        }
+        if (getDoInput()) {
+            inputStream = new FtpURLInputStream(
+                    new BufferedInputStream(dataSocket.getInputStream()), controlSocket);
+        }
+!!!2118683.java!!!	getContentType() : String
+        String result = guessContentTypeFromName(url.getFile());
+        if (result == null) {
+            return "content/unknown";
+        }
+        return result;
+!!!2118811.java!!!	getFile() : void
+        int reply;
+        String file = url.getFile();
+        write("RETR " + file + "\r\n");
+        reply = getReply();
+        if (reply == FTP_NOTFOUND && file.length() > 0 && file.charAt(0) == '/') {
+            write("RETR " + file.substring(1) + "\r\n");
+            reply = getReply();
+        }
+        if (!(reply == FTP_OPENDATA || reply == FTP_TRANSFEROK)) {
+            throw new FileNotFoundException("Unable to retrieve file: " + reply);
+        }
+!!!2118939.java!!!	getInputStream() : InputStream
+        if (!connected) {
+            connect();
+        }
+        return inputStream;
+!!!2119067.java!!!	getPermission() : Permission
+        int port = url.getPort();
+        if (port <= 0) {
+            port = FTP_PORT;
+        }
+        return new SocketPermission(hostName + ":" + port, "connect, resolve");
+!!!2119195.java!!!	getOutputStream() : OutputStream
+        if (!connected) {
+            connect();
+        }
+        return dataSocket.getOutputStream();
+!!!2119323.java!!!	getReply() : int
+        byte[] code = new byte[3];
+        for (int i = 0; i < code.length; i++) {
+            final int tmp = ctrlInput.read();
+            if (tmp == -1) {
+                throw new EOFException();
+            }
+            code[i] = (byte) tmp;
+        }
+        replyCode = new String(code, 0, code.length, Charsets.ISO_8859_1);
+
+        boolean multiline = false;
+        if (ctrlInput.read() == '-') {
+            multiline = true;
+        }
+        readLine(); /* Skip the rest of the first line */
+        if (multiline) {
+            while (readMultiLine()) {/* Read all of a multiline reply */
+            }
+        }
+
+        try {
+            return Integer.parseInt(replyCode);
+        } catch (NumberFormatException e) {
+            throw (IOException)(new IOException("reply code is invalid").initCause(e));
+        }
+!!!2119451.java!!!	login() : void
+        int reply;
+        reply = getReply();
+        if (reply == FTP_USERREADY) {
+        } else {
+            throw new IOException("Unable to connect to server: " + url.getHost());
+        }
+        write("USER " + username + "\r\n");
+        reply = getReply();
+        if (reply == FTP_PASWD || reply == FTP_LOGGEDIN) {
+        } else {
+            throw new IOException("Unable to log in to server (USER): " + url.getHost());
+        }
+        if (reply == FTP_PASWD) {
+            write("PASS " + password + "\r\n");
+            reply = getReply();
+            if (!(reply == FTP_OK || reply == FTP_USERREADY || reply == FTP_LOGGEDIN)) {
+                throw new IOException("Unable to log in to server (PASS): " + url.getHost());
+            }
+        }
+!!!2119579.java!!!	port() : void
+        write("PORT "
+                + controlSocket.getLocalAddress().getHostAddress().replace('.',
+                        ',') + ',' + (dataPort >> 8) + ','
+                + (dataPort & 255)
+                + "\r\n");
+        if (getReply() != FTP_OK) {
+            throw new IOException("Unable to configure data port");
+        }
+!!!2119707.java!!!	readLine() : String
+        StringBuilder sb = new StringBuilder();
+        int c;
+        while ((c = ctrlInput.read()) != '\n') {
+            sb.append((char) c);
+        }
+        return sb.toString();
+!!!2119835.java!!!	readMultiLine() : boolean
+        String line = readLine();
+        if (line.length() < 4) {
+            return true;
+        }
+        if (line.substring(0, 3).equals(replyCode)
+                && (line.charAt(3) == (char) 32)) {
+            return false;
+        }
+        return true;
+!!!2119963.java!!!	sendFile() : void
+        int reply;
+        write("STOR "
+                + url.getFile().substring(url.getFile().lastIndexOf('/') + 1,
+                        url.getFile().length()) + "\r\n");
+        reply = getReply();
+        if (!(reply == FTP_OPENDATA || reply == FTP_OK || reply == FTP_DATAOPEN)) {
+            throw new IOException("Unable to store file");
+        }
+!!!2120091.java!!!	setDoInput(inout newValue : boolean) : void
+        if (connected) {
+            throw new IllegalAccessError();
+        }
+        this.doInput = newValue;
+        this.doOutput = !newValue;
+!!!2120219.java!!!	setDoOutput(inout newValue : boolean) : void
+        if (connected) {
+            throw new IllegalAccessError();
+        }
+        this.doOutput = newValue;
+        this.doInput = !newValue;
+!!!2120347.java!!!	setType() : void
+        write("TYPE I\r\n");
+        if (getReply() != FTP_OK) {
+            throw new IOException("Unable to set transfer type");
+        }
+!!!2120475.java!!!	write(inout command : String) : void
+        ctrlOutput.write(command.getBytes(Charsets.ISO_8859_1));

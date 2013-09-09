@@ -1,0 +1,250 @@
+class ChromiumHTTPDataSource
+!!!609164.cpp!!!	ChromiumHTTPDataSource(in flags : uint32_t = 0)
+    mDelegate->setOwner(this);
+!!!609292.cpp!!!	connect(in uri : char, in headers : KeyedVector<String8, String8> = NULL, in offset : off64_t = 0) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    uid_t uid;
+    if (getUID(&uid)) {
+        mDelegate->setUID(uid);
+    }
+
+#if defined(LOG_NDEBUG) && !LOG_NDEBUG
+    LOG_PRI(ANDROID_LOG_VERBOSE, LOG_TAG, "connect on behalf of uid %d", uid);
+#endif
+
+    return connect_l(uri, headers, offset);
+!!!609420.cpp!!!	disconnect() : void
+    Mutex::Autolock autoLock(mLock);
+    disconnect_l();
+!!!609548.cpp!!!	initCheck() : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    return mState == CONNECTED ? OK : NO_INIT;
+!!!609676.cpp!!!	readAt(in offset : off64_t, inout data : void, in size : size_t) : ssize_t
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != CONNECTED) {
+        return INVALID_OPERATION;
+    }
+
+#if 0
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("media.stagefright.disable-net", value, 0)
+            && (!strcasecmp(value, "true") || !strcmp(value, "1"))) {
+        LOG_PRI(ANDROID_LOG_INFO, LOG_TAG, "Simulating that the network is down.");
+        disconnect_l();
+        return ERROR_IO;
+    }
+#endif
+
+    if (offset != mCurrentOffset) {
+        AString tmp = mURI;
+        KeyedVector<String8, String8> tmpHeaders = mHeaders;
+
+        disconnect_l();
+
+        status_t err = connect_l(tmp.c_str(), &tmpHeaders, offset);
+
+        if (err != OK) {
+            return err;
+        }
+    }
+
+    mState = READING;
+
+    int64_t startTimeUs = ALooper::GetNowUs();
+
+    mDelegate->initiateRead(data, size);
+
+    while (mState == READING) {
+        mCondition.wait(mLock);
+    }
+
+    if (mIOResult < OK) {
+        return mIOResult;
+    }
+
+    if (mState == CONNECTED) {
+        int64_t delayUs = ALooper::GetNowUs() - startTimeUs;
+
+        // The read operation was successful, mIOResult contains
+        // the number of bytes read.
+        addBandwidthMeasurement(mIOResult, delayUs);
+
+        mCurrentOffset += mIOResult;
+        return mIOResult;
+    }
+
+    return ERROR_IO;
+!!!609804.cpp!!!	getSize(inout size : off64_t) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    if (mContentSize < 0) {
+        return ERROR_UNSUPPORTED;
+    }
+
+    *size = mContentSize;
+
+    return OK;
+!!!609932.cpp!!!	flags() : uint32_t
+    return kWantsPrefetching | kIsHTTPBasedSource;
+!!!610060.cpp!!!	DrmInitialization(in mime : char) : sp<DecryptHandle>
+    Mutex::Autolock autoLock(mLock);
+
+    if (mDrmManagerClient == NULL) {
+        mDrmManagerClient = new DrmManagerClient();
+    }
+
+    if (mDrmManagerClient == NULL) {
+        return NULL;
+    }
+
+    if (mDecryptHandle == NULL) {
+        /* Note if redirect occurs, mUri is the redirect uri instead of the
+         * original one
+         */
+        mDecryptHandle = mDrmManagerClient->openDecryptSession(
+                String8(mURI.c_str()), mime);
+    }
+
+    if (mDecryptHandle == NULL) {
+        delete mDrmManagerClient;
+        mDrmManagerClient = NULL;
+    }
+
+    return mDecryptHandle;
+!!!610188.cpp!!!	getDrmInfo(inout handle : sp<DecryptHandle>, inout client : DrmManagerClient) : void
+    Mutex::Autolock autoLock(mLock);
+
+    handle = mDecryptHandle;
+    *client = mDrmManagerClient;
+!!!610316.cpp!!!	getUri() : String8
+    Mutex::Autolock autoLock(mLock);
+
+    return String8(mURI.c_str());
+!!!610444.cpp!!!	getMIMEType() : String8
+    Mutex::Autolock autoLock(mLock);
+
+    return mContentType;
+!!!610572.cpp!!!	reconnectAtOffset(in offset : off64_t) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    if (mURI.empty()) {
+        return INVALID_OPERATION;
+    }
+
+    LOG_PRI(ANDROID_LOG_INFO, LOG_TAG, "Reconnecting...");
+    status_t err = connect_l(mURI.c_str(), &mHeaders, offset);
+    if (err != OK) {
+        LOG_PRI(ANDROID_LOG_INFO, LOG_TAG, "Reconnect failed w/ err 0x%08x", err);
+    }
+
+    return err;
+!!!610700.cpp!!!	~ChromiumHTTPDataSource()
+    disconnect();
+
+    delete mDelegate;
+    mDelegate = NULL;
+
+    clearDRMState_l();
+
+    if (mDrmManagerClient != NULL) {
+        delete mDrmManagerClient;
+        mDrmManagerClient = NULL;
+    }
+!!!610828.cpp!!!	disconnect_l() : void
+    if (mState == DISCONNECTED) {
+        return;
+    }
+
+    mState = DISCONNECTING;
+    mIOResult = -EINTR;
+
+    mDelegate->initiateDisconnect();
+
+    while (mState == DISCONNECTING) {
+        mCondition.wait(mLock);
+    }
+
+    CHECK_EQ((int)mState, (int)DISCONNECTED);
+!!!610956.cpp!!!	connect_l(in uri : char, in headers : KeyedVector<String8, String8>, in offset : off64_t) : status_t
+    if (mState != DISCONNECTED) {
+        disconnect_l();
+    }
+
+#if defined(LOG_NDEBUG) && !LOG_NDEBUG
+    LOG_PRI(ANDROID_LOG_VERBOSE, LOG_TAG,
+                "connect to <URL suppressed> @%lld", offset);
+#endif
+
+    mURI = uri;
+    mContentType = String8("application/octet-stream");
+
+    if (headers != NULL) {
+        mHeaders = *headers;
+    } else {
+        mHeaders.clear();
+    }
+
+    mState = CONNECTING;
+    mContentSize = -1;
+    mCurrentOffset = offset;
+
+    mDelegate->initiateConnection(mURI.c_str(), &mHeaders, offset);
+
+    while (mState == CONNECTING || mState == DISCONNECTING) {
+        mCondition.wait(mLock);
+    }
+
+    return mState == CONNECTED ? OK : mIOResult;
+!!!611084.cpp!!!	InitiateRead(inout me : ChromiumHTTPDataSource, inout data : void, in size : size_t) : void
+    me->initiateRead(data, size);
+!!!611212.cpp!!!	initiateRead(inout data : void, in size : size_t) : void
+    mDelegate->initiateRead(data, size);
+!!!611340.cpp!!!	onConnectionEstablished(in contentSize : int64_t, in contentType : char) : void
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != CONNECTING) {
+        // We may have initiated disconnection.
+        CHECK_EQ(mState, DISCONNECTING);
+        return;
+    }
+
+    mState = CONNECTED;
+    mContentSize = (contentSize < 0) ? -1 : contentSize + mCurrentOffset;
+    mContentType = String8(contentType);
+    mCondition.broadcast();
+!!!611468.cpp!!!	onConnectionFailed(in err : status_t) : void
+    Mutex::Autolock autoLock(mLock);
+    mState = DISCONNECTED;
+    mCondition.broadcast();
+
+    // mURI.clear();
+
+    mIOResult = err;
+!!!611596.cpp!!!	onReadCompleted(in size : ssize_t) : void
+    Mutex::Autolock autoLock(mLock);
+
+    mIOResult = size;
+
+    if (mState == READING) {
+        mState = CONNECTED;
+        mCondition.broadcast();
+    }
+!!!611724.cpp!!!	onDisconnectComplete() : void
+    Mutex::Autolock autoLock(mLock);
+    CHECK_EQ((int)mState, (int)DISCONNECTING);
+
+    mState = DISCONNECTED;
+    // mURI.clear();
+    mIOResult = -ENOTCONN;
+
+    mCondition.broadcast();
+!!!611852.cpp!!!	clearDRMState_l() : void
+    if (mDecryptHandle != NULL) {
+        // To release mDecryptHandle
+        CHECK(mDrmManagerClient);
+        mDrmManagerClient->closeDecryptSession(mDecryptHandle);
+        mDecryptHandle = NULL;
+    }

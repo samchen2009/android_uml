@@ -1,0 +1,378 @@
+class OmxAmpClock
+!!!11109260.cpp!!!	OmxAmpClock()
+  initVariables();
+!!!11109388.cpp!!!	OmxAmpClock(in name : OMX_STRING)
+  strncpy(mName, name, OMX_MAX_STRINGNAME_SIZE);
+  initVariables();
+!!!11109516.cpp!!!	~OmxAmpClock()
+  if (mAmpHandle) {
+    HRESULT err = SUCCESS;
+    AMP_RPC(err, AMP_CLK_Destroy, mAmpHandle);
+    AMP_FACTORY_Release(mAmpHandle);
+    mAmpHandle = NULL;
+  }
+  OMX_LOGD("destroyed");
+!!!11109644.cpp!!!	componentDeInit(in hComponent : OMX_HANDLETYPE) : OMX_ERRORTYPE
+  OmxComponent *comp = reinterpret_cast<OmxComponent *>(
+      reinterpret_cast<OMX_COMPONENTTYPE *>(hComponent)->pComponentPrivate);
+  OmxAmpClock *clock = static_cast<OmxAmpClock *>(comp);
+  delete clock;
+  return OMX_ErrorNone;
+!!!11109772.cpp!!!	getConfig(in index : OMX_INDEXTYPE, in config : OMX_PTR) : OMX_ERRORTYPE
+  OMX_ERRORTYPE err = OMX_ErrorNone;
+  OMX_LOGV("index %s, config %p", OmxIndex2String(index), config);
+  switch (index) {
+    case OMX_IndexConfigTimeScale: {
+      OMX_TIME_CONFIG_SCALETYPE *scale =
+          static_cast<OMX_TIME_CONFIG_SCALETYPE *>(config);
+      err = CheckOmxHeader(scale);
+      if (OMX_ErrorNone != err) {
+        break;
+      }
+      scale->xScale = mScale;
+      break;
+    }
+    case OMX_IndexConfigTimeClockState: {
+      OMX_TIME_CONFIG_CLOCKSTATETYPE *state =
+        static_cast<OMX_TIME_CONFIG_CLOCKSTATETYPE *>(config);
+      err = CheckOmxHeader(state);
+      if (OMX_ErrorNone != err) {
+        break;
+      }
+      state->eState = mClockState;
+      state->nStartTime = mStartTime;
+      state->nOffset = mMediaTimeOffset;
+      state->nWaitMask = mWaitMask;
+      break;
+    }
+#ifndef OMX_SPEC_1_2_0_0_SUPPORT
+    case OMX_IndexConfigTimeActiveRefClock:
+      break;
+#endif
+    case OMX_IndexConfigTimeCurrentMediaTime: {
+      OMX_TIME_CONFIG_TIMESTAMPTYPE *mediaTime =
+        static_cast<OMX_TIME_CONFIG_TIMESTAMPTYPE *>(config);
+      err = CheckOmxHeader(mediaTime);
+      if (OMX_ErrorNone != err) {
+        break;
+      }
+      err = getCurrentMediaTime(&mediaTime->nTimestamp);
+      break;
+    }
+    case OMX_IndexConfigTimeCurrentWallTime:
+      break;
+    default:
+      return OmxComponentImpl::getConfig(index, config);
+  }
+  return err;
+!!!11110028.cpp!!!	initVariables() : void
+  mClockState = OMX_TIME_ClockStateStopped;
+  mScale = 0x10000;
+  mMediaTimeOffset = 0;
+  mStartTime = 0;
+  mWaitMask = 0x3;
+  mIsStopping = OMX_FALSE;
+#ifdef OMX_CoreExt_h
+  mShouldExit = OMX_FALSE;
+  mThread = NULL;
+  mThreadAttr = NULL;
+  mFpsTimerLock = NULL;
+  mFpsTimerStarted = OMX_FALSE;
+#endif
+!!!11110156.cpp!!!	initRole() : OMX_ERRORTYPE
+  if (strncmp(mName, kCompNamePrefix, kCompNamePrefixLength)) {
+    return OMX_ErrorInvalidComponentName;
+  }
+  char *role_name = mName + kCompNamePrefixLength;
+  if (!strncmp(role_name, OMX_ROLE_CLOCK_BINARY,
+      strlen(OMX_ROLE_CLOCK_BINARY))) {
+    addRole(OMX_ROLE_CLOCK_BINARY);
+  } else {
+    return OMX_ErrorInvalidComponentName;
+  }
+  return OMX_ErrorNone;
+!!!11110284.cpp!!!	initPort() : OMX_ERRORTYPE
+  OMX_ERRORTYPE err = OMX_ErrorNone;
+  mAudioPort = new OmxAmpClockPort(kClockPortStartNumber, OMX_DirOutput);
+  mVideoPort = new OmxAmpClockPort(kClockPortStartNumber + 1, OMX_DirOutput);
+  addPort(mAudioPort);
+  addPort(mVideoPort);
+  return err;
+!!!11110412.cpp!!!	prepare() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  HRESULT err = SUCCESS;
+  AMP_FACTORY factory;
+  err = AMP_GetFactory(&factory);
+  CHECKAMPERRLOG(err, "Failed to get AMP factory");
+
+  AMP_RPC(err, AMP_FACTORY_CreateComponent, factory, AMP_COMPONENT_CLK,
+      1, &mAmpHandle);
+  CHECKAMPERRLOG(err, "Failed to get clock compoenent");
+
+  AMP_COMPONENT_CONFIG config;
+  kdMemset(&config, 0 ,sizeof(config));
+  config._d = AMP_COMPONENT_CLK;
+  config._u.pCLK.mode = AMP_TUNNEL;
+  config._u.pCLK.uiInputPortNum = 0;
+  // To support passthru mode, need config 4 clock ports
+  // 3 for audio and 1 for video
+  config._u.pCLK.uiOutputPortNum = 4;
+  config._u.pCLK.uiNotifierNum = 0;
+  config._u.pCLK.eClockSource = AMP_CLK_SRC_VPP;
+  config._u.pCLK.eAVSyncPolicy = AMP_CLK_POLICY_OMX;
+  AMP_RPC(err, AMP_CLK_Open, mAmpHandle, &config);
+  CHECKAMPERRLOG(err, "Failed to open CLK compoenent");
+
+  // Disable audio/video port if it is not tunneled
+  if (!mAudioPort->isTunneled()) {
+    mAudioPort->disablePort();
+  } else {
+    // Clock always start state transistion first, so comment the below block
+    // to leave connection after other components have finished preparation.
+    /*
+    OMX_COMPONENTTYPE *omx_tunnel =
+          static_cast<OMX_COMPONENTTYPE *>(mAudioPort->getTunnelComponent());
+    AMP_COMPONENT amp_tunnel = static_cast<OmxComponentImpl *>(
+        omx_tunnel->pComponentPrivate)->getAmpHandle();
+    if (amp_tunnel) {
+      AMP_ConnectComp(mAmpHandle, 1, amp_tunnel, 0);
+    }
+    */
+  }
+  if (!mVideoPort->isTunneled()) {
+    mVideoPort->disablePort();
+  } else {
+    /*
+    OMX_COMPONENTTYPE *omx_tunnel =
+          static_cast<OMX_COMPONENTTYPE *>(mVideoPort->getTunnelComponent());
+    AMP_COMPONENT amp_tunnel = static_cast<OmxComponentImpl *>(
+        omx_tunnel->pComponentPrivate)->getAmpHandle();
+    if (amp_tunnel) {
+      AMP_ConnectComp(mAmpHandle, 0, amp_tunnel, 1);
+    }
+    */
+  }
+  OMX_LOG_FUNCTION_EXIT;
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11110540.cpp!!!	preroll() : OMX_ERRORTYPE
+  OMX_ERRORTYPE err = OMX_ErrorNone;
+  return err;
+!!!11110668.cpp!!!	start() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  HRESULT err = SUCCESS;
+#ifdef OMX_CoreExt_h
+  mFpsTimerLock = kdThreadMutexCreate(KD_NULL);
+  kdThreadMutexLock(mFpsTimerLock);
+  mFpsTimer.start();
+  mFpsTimerStarted = OMX_TRUE;
+  kdThreadMutexUnlock(mFpsTimerLock);
+#endif
+  setStartTime(mStartTime);
+  if (mAmpHandle) {
+    AMP_RPC(err, AMP_CLK_SetState, mAmpHandle, AMP_EXECUTING);
+    CHECKAMPERRLOG(err, "Failed to set CLK state to executing");
+  }
+#ifdef OMX_CoreExt_h
+  if (mVideoPort->isTunneled()) {
+    OMX_LOGD("Create updating FPS thread");
+    mThread = kdThreadCreate(mThreadAttr, threadEntry,(void *)this);
+  }
+#endif
+  mClockState = OMX_TIME_ClockStateRunning;
+  OMX_LOG_FUNCTION_EXIT;
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11110796.cpp!!!	pause() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  HRESULT err = SUCCESS;
+  if (mAmpHandle) {
+    AMP_RPC(err, AMP_CLK_SetState, mAmpHandle, AMP_PAUSED);
+    CHECKAMPERRLOG(err, "Failed to set CLK state to pause");
+  }
+  OMX_LOG_FUNCTION_EXIT;
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11110924.cpp!!!	resume() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  HRESULT err = SUCCESS;
+  if (mAmpHandle) {
+    AMP_RPC(err, AMP_CLK_SetState, mAmpHandle, AMP_EXECUTING);
+    CHECKAMPERRLOG(err, "Failed to set CLK state to executing");
+  }
+  OMX_LOG_FUNCTION_EXIT;
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11111052.cpp!!!	stop() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  HRESULT err = SUCCESS;
+  mIsStopping = OMX_TRUE;
+#ifdef OMX_CoreExt_h
+  mShouldExit = OMX_TRUE;
+  if (mThread) {
+    void *retval;
+    KDint ret;
+    ret = kdThreadJoin(mThread, &retval);
+    OMX_LOGD("Stop updating FPS thread");
+    mThread = NULL;
+  }
+  if (mFpsTimerLock) {
+    kdThreadMutexFree(mFpsTimerLock);
+    mFpsTimerLock = NULL;
+  }
+#endif
+  if (mAmpHandle) {
+    AMP_RPC(err, AMP_CLK_SetState, mAmpHandle, AMP_IDLE);
+    CHECKAMPERRLOG(err, "Failed to set CLK state to idle");
+  }
+  OMX_LOG_FUNCTION_EXIT;
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11111180.cpp!!!	release() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  HRESULT err = SUCCESS;
+  if (NULL == mAmpHandle) {
+    OMX_LOGD("mAmpHandle has been destroyed.");
+    return static_cast<OMX_ERRORTYPE>(err);
+  }
+  // AREN connect and AREN disconnect
+  #if 0
+  if (mAudioPort->isTunneled()) {
+    OMX_COMPONENTTYPE *omx_tunnel =
+          static_cast<OMX_COMPONENTTYPE *>(mAudioPort->getTunnelComponent());
+    AMP_COMPONENT amp_tunnel = static_cast<OmxComponentImpl *>(
+        omx_tunnel->pComponentPrivate)->getAmpHandle();
+    if (amp_tunnel) {
+      err = AMP_DisconnectComp(mAmpHandle, 1, amp_tunnel, 0);
+      CHECKAMPERRLOG(err, "Failed to disconnect audio port with CLK");
+    }
+  }
+  #endif
+  if (mVideoPort->isTunneled()) {
+    OMX_COMPONENTTYPE *omx_tunnel =
+          static_cast<OMX_COMPONENTTYPE *>(mVideoPort->getTunnelComponent());
+    AMP_COMPONENT amp_tunnel = static_cast<OmxComponentImpl *>(
+        omx_tunnel->pComponentPrivate)->getAmpHandle();
+    if (amp_tunnel) {
+      err = AMP_DisconnectComp(mAmpHandle, 0, amp_tunnel, 1);
+      CHECKAMPERRLOG(err, "Failed to disconnect video port with CLK");
+    }
+  }
+
+  AMP_RPC(err, AMP_CLK_Close, mAmpHandle);
+  CHECKAMPERRLOG(err, "Failed to close CLK");
+
+  AMP_RPC(err, AMP_CLK_Destroy, mAmpHandle);
+  CHECKAMPERRLOG(err, "Failed to desctroy CLK");
+
+  AMP_FACTORY_Release(mAmpHandle);
+  mAmpHandle = NULL;
+  OMX_LOG_FUNCTION_EXIT;
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11111308.cpp!!!	flush() : OMX_ERRORTYPE
+  OMX_LOG_FUNCTION_ENTER;
+  OMX_ERRORTYPE err = OMX_ErrorNone;
+  OMX_LOG_FUNCTION_EXIT;
+  return err;
+!!!11111436.cpp!!!	getFpsTimestamp() : OMX_U64
+  kdThreadMutexLock(mFpsTimerLock);
+  OMX_U64 duration;
+  if (mFpsTimerStarted) {
+    mFpsTimer.stop();
+    duration = mFpsTimer.durationUsecs();
+    OMX_LOGV("Fps timestamp %lld", duration);
+    kdThreadMutexUnlock(mFpsTimerLock);
+    return duration;
+  } else {
+    kdThreadMutexUnlock(mFpsTimerLock);
+    return 0;
+  }
+!!!11111564.cpp!!!	setUpFpsCalculator(in startTime : OMX_U64) : void
+  OMX_LOGD("setUpFpsCalculator startTime %lld", startTime);
+  mInputFpsCalculator.start(startTime);
+  mDisplayedFpsCalculator.start(startTime);
+  mDroppedFpsCalculator.start(startTime);
+  mDelayedFpsCalculator.start(startTime);
+!!!11111692.cpp!!!	doComputeFps() : void
+  HRESULT err = SUCCESS;
+  while (!mShouldExit) {
+    if (mAmpHandle) {
+      AMP_RND_STAT rendererStatistics;
+      AMP_RPC(err, AMP_CLK_GetRndStatistics, mAmpHandle, 3, &rendererStatistics);
+      if (SUCCESS != err) {
+        OMX_LOGD("Get RenderStatistics err %d", err);
+        usleep(5000);
+        continue;
+      }
+      OMX_LOGV("RenderStatus: Input=%d Ready=%d Display=%d Drop=%d Delay=%d Repeat=%d",
+          rendererStatistics.uiNumVidInputFrames, rendererStatistics.uiNumVidReadyFrames,
+          rendererStatistics.uiNumVidDisplayedFrames, rendererStatistics.uiNumVidDroppedFrames,
+          rendererStatistics.uiNumVidDelayedFrames, rendererStatistics.uiNumVidRepeatedFrames);
+      mInputFpsCalculator.setTotalFrameCount(rendererStatistics.uiNumVidInputFrames);
+      mDisplayedFpsCalculator.setTotalFrameCount(rendererStatistics.uiNumVidDisplayedFrames);
+      mDroppedFpsCalculator.setTotalFrameCount(rendererStatistics.uiNumVidDroppedFrames);
+      mDelayedFpsCalculator.setTotalFrameCount(rendererStatistics.uiNumVidDelayedFrames);
+    }
+    OMX_U64 currentTime = getFpsTimestamp();
+    OMX_BOOL isFpsUpdated = mInputFpsCalculator.checkCurrentTimeAndRefreshFps(currentTime);
+    CHECK(isFpsUpdated == mDisplayedFpsCalculator.checkCurrentTimeAndRefreshFps(currentTime));
+    CHECK(isFpsUpdated == mDroppedFpsCalculator.checkCurrentTimeAndRefreshFps(currentTime));
+    CHECK(isFpsUpdated == mDelayedFpsCalculator.checkCurrentTimeAndRefreshFps(currentTime));
+    if (isFpsUpdated) {
+      OMX_U32 inputFrames = mDisplayedFpsCalculator.getLatestFps() +
+          mDroppedFpsCalculator.getLatestFps();
+      postEvent(static_cast<OMX_EVENTTYPE>(OMX_EventRendererFpsInfo),
+          (inputFrames << 16) | mDisplayedFpsCalculator.getLatestFps(),
+          (mDroppedFpsCalculator.getLatestFps() << 16)
+          | mDelayedFpsCalculator.getLatestFps());
+      OMX_LOGD("Update Fps: Input %d, Displayed %d, Dropped %d, Delayed %d",
+          inputFrames, mDisplayedFpsCalculator.getLatestFps(),
+          mDroppedFpsCalculator.getLatestFps(), mDelayedFpsCalculator.getLatestFps());
+    }
+    usleep(5000);
+  }
+!!!11111820.cpp!!!	threadEntry(inout args : void) : void
+  OmxAmpClock *clock = (OmxAmpClock *)args;
+  clock->doComputeFps();
+  return NULL;
+!!!11111948.cpp!!!	createComponent(inout handle : OMX_HANDLETYPE, in componentName : OMX_STRING, in appData : OMX_PTR, inout callBacks : OMX_CALLBACKTYPE) : OMX_ERRORTYPE
+  OmxAmpClock* comp = new OmxAmpClock(componentName);
+  *handle = comp->makeComponent(comp);
+  comp->setCallbacks(callBacks, appData);
+  comp->componentInit();
+  return OMX_ErrorNone;
+!!!11112076.cpp!!!	getCurrentMediaTime(inout pts : OMX_TICKS) : OMX_ERRORTYPE
+  HRESULT err = SUCCESS;
+  AMP_CLK_PTS amp_pts;
+  kdMemset(&amp_pts, 0, sizeof(amp_pts));
+  if (mAmpHandle) {
+    AMP_RPC(err, AMP_CLK_GetSTC, mAmpHandle, &amp_pts);
+    CHECKAMPERRLOG(err, "Failed to get CLK stc");
+  }
+  *pts = convert90KtoUs(amp_pts.m_uiHigh, amp_pts.m_uiLow);
+  OMX_LOGV("CurrentTime "TIME_FORMAT " mv_pts %x-%x",
+      TIME_ARGS(*pts), amp_pts.m_uiHigh, amp_pts.m_uiLow);
+  return OMX_ErrorNone;
+!!!11112204.cpp!!!	setScale(in scale : OMX_S32) : OMX_ERRORTYPE
+  HRESULT err = SUCCESS;
+  OMX_LOGD("SetScale 0x%x", scale);
+  if (mAmpHandle && !mIsStopping) {
+    AMP_RPC(err, AMP_CLK_SetClockRate, mAmpHandle, scale, 0x10000);
+    CHECKAMPERRLOG(err, "Failed to set clock rate");
+  }
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11112332.cpp!!!	setStartTime(in startTime : OMX_TICKS) : OMX_ERRORTYPE
+  HRESULT err = SUCCESS;
+  AMP_CLK_PTS pts;
+  convertUsto90K(startTime, &pts.m_uiHigh, &pts.m_uiLow);
+  if (mAmpHandle && !mIsStopping) {
+    AMP_RPC(err, AMP_CLK_SetSTC, mAmpHandle, &pts);
+    CHECKAMPERRLOG(err, "Failed to set CLK stc");
+#ifdef OMX_CoreExt_h
+    OMX_U64 currentTime = getFpsTimestamp();
+    setUpFpsCalculator(currentTime);
+#endif
+  }
+  return static_cast<OMX_ERRORTYPE>(err);
+!!!11112460.cpp!!!	setAmpState(in state : AMP_STATE) : OMX_ERRORTYPE
+  HRESULT err = SUCCESS;
+  OMX_LOGD("setAmpState %s", AmpState2String(state));
+  if (mAmpHandle && !mIsStopping) {
+    AMP_RPC(err, AMP_CLK_SetState, mAmpHandle, state);
+  }
+  return static_cast<OMX_ERRORTYPE>(err);

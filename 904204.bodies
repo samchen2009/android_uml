@@ -1,0 +1,233 @@
+class Searchables
+!!!4102668.java!!!	Searchables(inout context : Context, in userId : int)
+        mContext = context;
+        mUserId = userId;
+        mPm = AppGlobals.getPackageManager();
+!!!4102796.java!!!	getSearchableInfo(inout activity : ComponentName) : SearchableInfo
+        // Step 1.  Is the result already hashed?  (case 1)
+        SearchableInfo result;
+        synchronized (this) {
+            result = mSearchablesMap.get(activity);
+            if (result != null) return result;
+        }
+
+        // Step 2.  See if the current activity references a searchable.
+        // Note:  Conceptually, this could be a while(true) loop, but there's
+        // no point in implementing reference chaining here and risking a loop.
+        // References must point directly to searchable activities.
+
+        ActivityInfo ai = null;
+        try {
+            ai = mPm.getActivityInfo(activity, PackageManager.GET_META_DATA, mUserId);
+        } catch (RemoteException re) {
+            Log.e(LOG_TAG, "Error getting activity info " + re);
+            return null;
+        }
+        String refActivityName = null;
+
+        // First look for activity-specific reference
+        Bundle md = ai.metaData;
+        if (md != null) {
+            refActivityName = md.getString(MD_LABEL_DEFAULT_SEARCHABLE);
+        }
+        // If not found, try for app-wide reference
+        if (refActivityName == null) {
+            md = ai.applicationInfo.metaData;
+            if (md != null) {
+                refActivityName = md.getString(MD_LABEL_DEFAULT_SEARCHABLE);
+            }
+        }
+
+        // Irrespective of source, if a reference was found, follow it.
+        if (refActivityName != null)
+        {
+            // This value is deprecated, return null
+            if (refActivityName.equals(MD_SEARCHABLE_SYSTEM_SEARCH)) {
+                return null;
+            }
+            String pkg = activity.getPackageName();
+            ComponentName referredActivity;
+            if (refActivityName.charAt(0) == '.') {
+                referredActivity = new ComponentName(pkg, pkg + refActivityName);
+            } else {
+                referredActivity = new ComponentName(pkg, refActivityName);
+            }
+
+            // Now try the referred activity, and if found, cache
+            // it against the original name so we can skip the check
+            synchronized (this) {
+                result = mSearchablesMap.get(referredActivity);
+                if (result != null) {
+                    mSearchablesMap.put(activity, result);
+                    return result;
+                }
+            }
+        }
+
+        // Step 3.  None found. Return null.
+        return null;
+
+!!!4102924.java!!!	buildSearchableList() : void
+        // These will become the new values at the end of the method
+        HashMap<ComponentName, SearchableInfo> newSearchablesMap
+                                = new HashMap<ComponentName, SearchableInfo>();
+        ArrayList<SearchableInfo> newSearchablesList
+                                = new ArrayList<SearchableInfo>();
+        ArrayList<SearchableInfo> newSearchablesInGlobalSearchList
+                                = new ArrayList<SearchableInfo>();
+
+        // Use intent resolver to generate list of ACTION_SEARCH & ACTION_WEB_SEARCH receivers.
+        List<ResolveInfo> searchList;
+        final Intent intent = new Intent(Intent.ACTION_SEARCH);
+
+        long ident = Binder.clearCallingIdentity();
+        try {
+            searchList = queryIntentActivities(intent, PackageManager.GET_META_DATA);
+
+            List<ResolveInfo> webSearchInfoList;
+            final Intent webSearchIntent = new Intent(Intent.ACTION_WEB_SEARCH);
+            webSearchInfoList = queryIntentActivities(webSearchIntent, PackageManager.GET_META_DATA);
+
+            // analyze each one, generate a Searchables record, and record
+            if (searchList != null || webSearchInfoList != null) {
+                int search_count = (searchList == null ? 0 : searchList.size());
+                int web_search_count = (webSearchInfoList == null ? 0 : webSearchInfoList.size());
+                int count = search_count + web_search_count;
+                for (int ii = 0; ii < count; ii++) {
+                    // for each component, try to find metadata
+                    ResolveInfo info = (ii < search_count)
+                            ? searchList.get(ii)
+                            : webSearchInfoList.get(ii - search_count);
+                    ActivityInfo ai = info.activityInfo;
+                    // Check first to avoid duplicate entries.
+                    if (newSearchablesMap.get(new ComponentName(ai.packageName, ai.name)) == null) {
+                        SearchableInfo searchable = SearchableInfo.getActivityMetaData(mContext, ai,
+                                mUserId);
+                        if (searchable != null) {
+                            newSearchablesList.add(searchable);
+                            newSearchablesMap.put(searchable.getSearchActivity(), searchable);
+                            if (searchable.shouldIncludeInGlobalSearch()) {
+                                newSearchablesInGlobalSearchList.add(searchable);
+                            }
+                        }
+                    }
+                }
+            }
+
+            List<ResolveInfo> newGlobalSearchActivities = findGlobalSearchActivities();
+
+            // Find the global search activity
+            ComponentName newGlobalSearchActivity = findGlobalSearchActivity(
+                    newGlobalSearchActivities);
+
+            // Find the web search activity
+            ComponentName newWebSearchActivity = findWebSearchActivity(newGlobalSearchActivity);
+
+            // Store a consistent set of new values
+            synchronized (this) {
+                mSearchablesMap = newSearchablesMap;
+                mSearchablesList = newSearchablesList;
+                mSearchablesInGlobalSearchList = newSearchablesInGlobalSearchList;
+                mGlobalSearchActivities = newGlobalSearchActivities;
+                mCurrentGlobalSearchActivity = newGlobalSearchActivity;
+                mWebSearchActivity = newWebSearchActivity;
+            }
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!4103052.java!!!	findGlobalSearchActivities() : ResolveInfo
+        // Step 1 : Query the package manager for a list
+        // of activities that can handle the GLOBAL_SEARCH intent.
+        Intent intent = new Intent(SearchManager.INTENT_ACTION_GLOBAL_SEARCH);
+        List<ResolveInfo> activities =
+                    queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY);
+        if (activities != null && !activities.isEmpty()) {
+            // Step 2: Rank matching activities according to our heuristics.
+            Collections.sort(activities, GLOBAL_SEARCH_RANKER);
+        }
+
+        return activities;
+!!!4103180.java!!!	findGlobalSearchActivity(inout installed : List<ResolveInfo>) : ComponentName
+        // Fetch the global search provider from the system settings,
+        // and if it's still installed, return it.
+        final String searchProviderSetting = getGlobalSearchProviderSetting();
+        if (!TextUtils.isEmpty(searchProviderSetting)) {
+            final ComponentName globalSearchComponent = ComponentName.unflattenFromString(
+                    searchProviderSetting);
+            if (globalSearchComponent != null && isInstalled(globalSearchComponent)) {
+                return globalSearchComponent;
+            }
+        }
+
+        return getDefaultGlobalSearchProvider(installed);
+!!!4103308.java!!!	isInstalled(inout globalSearch : ComponentName) : boolean
+        Intent intent = new Intent(SearchManager.INTENT_ACTION_GLOBAL_SEARCH);
+        intent.setComponent(globalSearch);
+
+        List<ResolveInfo> activities = queryIntentActivities(intent,
+                PackageManager.MATCH_DEFAULT_ONLY);
+        if (activities != null && !activities.isEmpty()) {
+            return true;
+        }
+
+        return false;
+!!!4103436.java!!!	isSystemApp(inout res : ResolveInfo) : boolean
+        return (res.activityInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+!!!4103564.java!!!	getDefaultGlobalSearchProvider(inout providerList : List<ResolveInfo>) : ComponentName
+        if (providerList != null && !providerList.isEmpty()) {
+            ActivityInfo ai = providerList.get(0).activityInfo;
+            return new ComponentName(ai.packageName, ai.name);
+        }
+
+        Log.w(LOG_TAG, "No global search activity found");
+        return null;
+!!!4103692.java!!!	getGlobalSearchProviderSetting() : String
+        return Settings.Secure.getString(mContext.getContentResolver(),
+                Settings.Secure.SEARCH_GLOBAL_SEARCH_ACTIVITY);
+!!!4103820.java!!!	findWebSearchActivity(inout globalSearchActivity : ComponentName) : ComponentName
+        if (globalSearchActivity == null) {
+            return null;
+        }
+        Intent intent = new Intent(Intent.ACTION_WEB_SEARCH);
+        intent.setPackage(globalSearchActivity.getPackageName());
+        List<ResolveInfo> activities =
+                queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY);
+
+        if (activities != null && !activities.isEmpty()) {
+            ActivityInfo ai = activities.get(0).activityInfo;
+            // TODO: do some sanity checks here?
+            return new ComponentName(ai.packageName, ai.name);
+        }
+        Log.w(LOG_TAG, "No web search activity found");
+        return null;
+!!!4103948.java!!!	queryIntentActivities(inout intent : Intent, in flags : int) : ResolveInfo
+        List<ResolveInfo> activities = null;
+        try {
+            activities =
+                    mPm.queryIntentActivities(intent,
+                    intent.resolveTypeIfNeeded(mContext.getContentResolver()),
+                    flags, mUserId);
+        } catch (RemoteException re) {
+            // Local call
+        }
+        return activities;
+!!!4104076.java!!!	getSearchablesList() : SearchableInfo
+        ArrayList<SearchableInfo> result = new ArrayList<SearchableInfo>(mSearchablesList);
+        return result;
+!!!4104204.java!!!	getSearchablesInGlobalSearchList() : SearchableInfo
+        return new ArrayList<SearchableInfo>(mSearchablesInGlobalSearchList);
+!!!4104332.java!!!	getGlobalSearchActivities() : ResolveInfo
+        return new ArrayList<ResolveInfo>(mGlobalSearchActivities);
+!!!4104460.java!!!	getGlobalSearchActivity() : ComponentName
+        return mCurrentGlobalSearchActivity;
+!!!4104588.java!!!	getWebSearchActivity() : ComponentName
+        return mWebSearchActivity;
+!!!4104716.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        pw.println("Searchable authorities:");
+        synchronized (this) {
+            if (mSearchablesList != null) {
+                for (SearchableInfo info: mSearchablesList) {
+                    pw.print("  "); pw.println(info.getSuggestAuthority());
+                }
+            }
+        }

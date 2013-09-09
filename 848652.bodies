@@ -1,0 +1,334 @@
+class Connection
+!!!3721100.java!!!	Connection(inout context : Context, inout host : HttpHost, inout requestFeeder : RequestFeeder)
+        mContext = context;
+        mHost = host;
+        mRequestFeeder = requestFeeder;
+
+        mCanPersist = false;
+        mHttpContext = new BasicHttpContext(null);
+!!!3721228.java!!!	getHost() : HttpHost
+        return mHost;
+!!!3721356.java!!!	getConnection(inout context : Context, inout host : HttpHost, inout proxy : HttpHost, inout requestFeeder : RequestFeeder) : Connection
+
+        if (host.getSchemeName().equals("http")) {
+            return new HttpConnection(context, host, requestFeeder);
+        }
+
+        // Otherwise, default to https
+        return new HttpsConnection(context, host, proxy, requestFeeder);
+!!!3721484.java!!!	getCertificate() : SslCertificate
+        return mCertificate;
+!!!3721612.java!!!	cancel() : void
+        mActive = STATE_CANCEL_REQUESTED;
+        closeConnection();
+        if (HttpLog.LOGV) HttpLog.v(
+            "Connection.cancel(): connection closed " + mHost);
+!!!3721740.java!!!	processRequests(inout firstRequest : Request) : void
+        Request req = null;
+        boolean empty;
+        int error = EventHandler.OK;
+        Exception exception = null;
+
+        LinkedList<Request> pipe = new LinkedList<Request>();
+
+        int minPipe = MIN_PIPE, maxPipe = MAX_PIPE;
+        int state = SEND;
+
+        while (state != DONE) {
+            if (HttpLog.LOGV) HttpLog.v(
+                    states[state] + " pipe " + pipe.size());
+
+            /* If a request was cancelled, give other cancel requests
+               some time to go through so we don't uselessly restart
+               connections */
+            if (mActive == STATE_CANCEL_REQUESTED) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException x) { /* ignore */ }
+                mActive = STATE_NORMAL;
+            }
+
+            switch (state) {
+                case SEND: {
+                    if (pipe.size() == maxPipe) {
+                        state = READ;
+                        break;
+                    }
+                    /* get a request */
+                    if (firstRequest == null) {
+                        req = mRequestFeeder.getRequest(mHost);
+                    } else {
+                        req = firstRequest;
+                        firstRequest = null;
+                    }
+                    if (req == null) {
+                        state = DRAIN;
+                        break;
+                    }
+                    req.setConnection(this);
+
+                    /* Don't work on cancelled requests. */
+                    if (req.mCancelled) {
+                        if (HttpLog.LOGV) HttpLog.v(
+                                "processRequests(): skipping cancelled request "
+                                + req);
+                        req.complete();
+                        break;
+                    }
+
+                    if (mHttpClientConnection == null ||
+                        !mHttpClientConnection.isOpen()) {
+                        /* If this call fails, the address is bad or
+                           the net is down.  Punt for now.
+
+                           FIXME: blow out entire queue here on
+                           connection failure if net up? */
+
+                        if (!openHttpConnection(req)) {
+                            state = DONE;
+                            break;
+                        }
+                    }
+
+                    /* we have a connection, let the event handler
+                     * know of any associated certificate,
+                     * potentially none.
+                     */
+                    req.mEventHandler.certificate(mCertificate);
+
+                    try {
+                        /* FIXME: don't increment failure count if old
+                           connection?  There should not be a penalty for
+                           attempting to reuse an old connection */
+                        req.sendRequest(mHttpClientConnection);
+                    } catch (HttpException e) {
+                        exception = e;
+                        error = EventHandler.ERROR;
+                    } catch (IOException e) {
+                        exception = e;
+                        error = EventHandler.ERROR_IO;
+                    } catch (IllegalStateException e) {
+                        exception = e;
+                        error = EventHandler.ERROR_IO;
+                    }
+                    if (exception != null) {
+                        if (httpFailure(req, error, exception) &&
+                            !req.mCancelled) {
+                            /* retry request if not permanent failure
+                               or cancelled */
+                            pipe.addLast(req);
+                        }
+                        exception = null;
+                        state = clearPipe(pipe) ? DONE : SEND;
+                        minPipe = maxPipe = 1;
+                        break;
+                    }
+
+                    pipe.addLast(req);
+                    if (!mCanPersist) state = READ;
+                    break;
+
+                }
+                case DRAIN:
+                case READ: {
+                    empty = !mRequestFeeder.haveRequest(mHost);
+                    int pipeSize = pipe.size();
+                    if (state != DRAIN && pipeSize < minPipe &&
+                        !empty && mCanPersist) {
+                        state = SEND;
+                        break;
+                    } else if (pipeSize == 0) {
+                        /* Done if no other work to do */
+                        state = empty ? DONE : SEND;
+                        break;
+                    }
+
+                    req = (Request)pipe.removeFirst();
+                    if (HttpLog.LOGV) HttpLog.v(
+                            "processRequests() reading " + req);
+
+                    try {
+                        req.readResponse(mHttpClientConnection);
+                    } catch (ParseException e) {
+                        exception = e;
+                        error = EventHandler.ERROR_IO;
+                    } catch (IOException e) {
+                        exception = e;
+                        error = EventHandler.ERROR_IO;
+                    } catch (IllegalStateException e) {
+                        exception = e;
+                        error = EventHandler.ERROR_IO;
+                    }
+                    if (exception != null) {
+                        if (httpFailure(req, error, exception) &&
+                            !req.mCancelled) {
+                            /* retry request if not permanent failure
+                               or cancelled */
+                            req.reset();
+                            pipe.addFirst(req);
+                        }
+                        exception = null;
+                        mCanPersist = false;
+                    }
+                    if (!mCanPersist) {
+                        if (HttpLog.LOGV) HttpLog.v(
+                                "processRequests(): no persist, closing " +
+                                mHost);
+
+                        closeConnection();
+
+                        mHttpContext.removeAttribute(HTTP_CONNECTION);
+                        clearPipe(pipe);
+                        minPipe = maxPipe = 1;
+                        state = SEND;
+                    }
+                    break;
+                }
+            }
+        }
+!!!3721868.java!!!	clearPipe(inout pipe : LinkedList<Request>) : boolean
+        boolean empty = true;
+        if (HttpLog.LOGV) HttpLog.v(
+                "Connection.clearPipe(): clearing pipe " + pipe.size());
+        synchronized (mRequestFeeder) {
+            Request tReq;
+            while (!pipe.isEmpty()) {
+                tReq = (Request)pipe.removeLast();
+                if (HttpLog.LOGV) HttpLog.v(
+                        "clearPipe() adding back " + mHost + " " + tReq);
+                mRequestFeeder.requeueRequest(tReq);
+                empty = false;
+            }
+            if (empty) empty = !mRequestFeeder.haveRequest(mHost);
+        }
+        return empty;
+!!!3721996.java!!!	openHttpConnection(inout req : Request) : boolean
+
+        long now = SystemClock.uptimeMillis();
+        int error = EventHandler.OK;
+        Exception exception = null;
+
+        try {
+            // reset the certificate to null before opening a connection
+            mCertificate = null;
+            mHttpClientConnection = openConnection(req);
+            if (mHttpClientConnection != null) {
+                mHttpClientConnection.setSocketTimeout(SOCKET_TIMEOUT);
+                mHttpContext.setAttribute(HTTP_CONNECTION,
+                                          mHttpClientConnection);
+            } else {
+                // we tried to do SSL tunneling, failed,
+                // and need to drop the request;
+                // we have already informed the handler
+                req.mFailCount = RETRY_REQUEST_LIMIT;
+                return false;
+            }
+        } catch (UnknownHostException e) {
+            if (HttpLog.LOGV) HttpLog.v("Failed to open connection");
+            error = EventHandler.ERROR_LOOKUP;
+            exception = e;
+        } catch (IllegalArgumentException e) {
+            if (HttpLog.LOGV) HttpLog.v("Illegal argument exception");
+            error = EventHandler.ERROR_CONNECT;
+            req.mFailCount = RETRY_REQUEST_LIMIT;
+            exception = e;
+        } catch (SSLConnectionClosedByUserException e) {
+            // hack: if we have an SSL connection failure,
+            // we don't want to reconnect
+            req.mFailCount = RETRY_REQUEST_LIMIT;
+            // no error message
+            return false;
+        } catch (SSLHandshakeException e) {
+            // hack: if we have an SSL connection failure,
+            // we don't want to reconnect
+            req.mFailCount = RETRY_REQUEST_LIMIT;
+            if (HttpLog.LOGV) HttpLog.v(
+                    "SSL exception performing handshake");
+            error = EventHandler.ERROR_FAILED_SSL_HANDSHAKE;
+            exception = e;
+        } catch (IOException e) {
+            error = EventHandler.ERROR_CONNECT;
+            exception = e;
+        }
+
+        if (HttpLog.LOGV) {
+            long now2 = SystemClock.uptimeMillis();
+            HttpLog.v("Connection.openHttpConnection() " +
+                      (now2 - now) + " " + mHost);
+        }
+
+        if (error == EventHandler.OK) {
+            return true;
+        } else {
+            if (req.mFailCount < RETRY_REQUEST_LIMIT) {
+                // requeue
+                mRequestFeeder.requeueRequest(req);
+                req.mFailCount++;
+            } else {
+                httpFailure(req, error, exception);
+            }
+            return error == EventHandler.OK;
+        }
+!!!3722124.java!!!	httpFailure(inout req : Request, in errorId : int, inout e : Exception) : boolean
+        boolean ret = true;
+
+        // e.printStackTrace();
+        if (HttpLog.LOGV) HttpLog.v(
+                "httpFailure() ******* " + e + " count " + req.mFailCount +
+                " " + mHost + " " + req.getUri());
+
+        if (++req.mFailCount >= RETRY_REQUEST_LIMIT) {
+            ret = false;
+            String error;
+            if (errorId < 0) {
+                error = ErrorStrings.getString(errorId, mContext);
+            } else {
+                Throwable cause = e.getCause();
+                error = cause != null ? cause.toString() : e.getMessage();
+            }
+            req.mEventHandler.error(errorId, error);
+            req.complete();
+        }
+
+        closeConnection();
+        mHttpContext.removeAttribute(HTTP_CONNECTION);
+
+        return ret;
+!!!3722252.java!!!	getHttpContext() : HttpContext
+        return mHttpContext;
+!!!3722380.java!!!	keepAlive(inout entity : HttpEntity, inout ver : ProtocolVersion, in connType : int, in context : HttpContext) : boolean
+        org.apache.http.HttpConnection conn = (org.apache.http.HttpConnection)
+            context.getAttribute(ExecutionContext.HTTP_CONNECTION);
+
+        if (conn != null && !conn.isOpen())
+            return false;
+        // do NOT check for stale connection, that is an expensive operation
+
+        if (entity != null) {
+            if (entity.getContentLength() < 0) {
+                if (!entity.isChunked() || ver.lessEquals(HttpVersion.HTTP_1_0)) {
+                    // if the content length is not known and is not chunk
+                    // encoded, the connection cannot be reused
+                    return false;
+                }
+            }
+        }
+        // Check for 'Connection' directive
+        if (connType == Headers.CONN_CLOSE) {
+            return false;
+        } else if (connType == Headers.CONN_KEEP_ALIVE) {
+            return true;
+        }
+        // Resorting to protocol version default close connection policy
+        return !ver.lessEquals(HttpVersion.HTTP_1_0);
+!!!3722508.java!!!	setCanPersist(inout entity : HttpEntity, inout ver : ProtocolVersion, in connType : int) : void
+        mCanPersist = keepAlive(entity, ver, connType, mHttpContext);
+!!!3722636.java!!!	setCanPersist(inout canPersist : boolean) : void
+        mCanPersist = canPersist;
+!!!3722764.java!!!	getCanPersist() : boolean
+        return mCanPersist;
+!!!3723276.java!!!	toString() : String
+        return mHost.toString();
+!!!3723404.java!!!	getBuf() : byte
+        if (mBuf == null) mBuf = new byte[8192];
+        return mBuf;

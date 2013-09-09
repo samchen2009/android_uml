@@ -1,0 +1,163 @@
+class MediaPuller
+!!!737804.cpp!!!	MediaPuller(in source : sp<MediaSource>, in notify : sp<AMessage>)
+    sp<MetaData> meta = source->getFormat();
+    const char *mime;
+    CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+    mIsAudio = !strncasecmp(mime, "audio/", 6);
+!!!737932.cpp!!!	start() : status_t
+    return postSynchronouslyAndReturnError(new AMessage(kWhatStart, id()));
+!!!738060.cpp!!!	stopAsync(in notify : sp<AMessage>) : void
+    sp<AMessage> msg = new AMessage(kWhatStop, id());
+    msg->setMessage("notify", notify);
+    msg->post();
+!!!738188.cpp!!!	pause() : void
+    (new AMessage(kWhatPause, id()))->post();
+!!!738316.cpp!!!	resume() : void
+    (new AMessage(kWhatResume, id()))->post();
+!!!738444.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatStart:
+        {
+            status_t err;
+            if (mIsAudio) {
+                // This atrocity causes AudioSource to deliver absolute
+                // systemTime() based timestamps (off by 1 us).
+                sp<MetaData> params = new MetaData;
+                params->setInt64(kKeyTime, 1ll);
+                err = mSource->start(params.get());
+            } else {
+                err = mSource->start();
+            }
+
+            if (err == OK) {
+                schedulePull();
+            }
+
+            sp<AMessage> response = new AMessage;
+            response->setInt32("err", err);
+
+            uint32_t replyID;
+            CHECK(msg->senderAwaitsResponse(&replyID));
+            response->postReply(replyID);
+            break;
+        }
+
+        case kWhatStop:
+        {
+            sp<MetaData> meta = mSource->getFormat();
+            const char *tmp;
+            CHECK(meta->findCString(kKeyMIMEType, &tmp));
+            AString mime = tmp;
+
+            ALOGI("MediaPuller(%s) stopping.", mime.c_str());
+            mSource->stop();
+            ALOGI("MediaPuller(%s) stopped.", mime.c_str());
+            ++mPullGeneration;
+
+            sp<AMessage> notify;
+            CHECK(msg->findMessage("notify", &notify));
+            notify->post();
+            break;
+        }
+
+        case kWhatPull:
+        {
+            int32_t generation;
+            CHECK(msg->findInt32("generation", &generation));
+
+            if (generation != mPullGeneration) {
+                break;
+            }
+
+            MediaBuffer *mbuf;
+            status_t err = mSource->read(&mbuf);
+
+            if (mPaused) {
+                if (err == OK) {
+                    mbuf->release();
+                    mbuf = NULL;
+                }
+
+                schedulePull();
+                break;
+            }
+
+            if (err != OK) {
+                if (err == ERROR_END_OF_STREAM) {
+                    ALOGI("stream ended.");
+                } else {
+                    ALOGE("error %d reading stream.", err);
+                }
+
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("what", kWhatEOS);
+                notify->post();
+            } else {
+                int64_t timeUs;
+                CHECK(mbuf->meta_data()->findInt64(kKeyTime, &timeUs));
+
+                sp<ABuffer> accessUnit = new ABuffer(mbuf->range_length());
+
+                memcpy(accessUnit->data(),
+                       (const uint8_t *)mbuf->data() + mbuf->range_offset(),
+                       mbuf->range_length());
+
+                accessUnit->meta()->setInt64("timeUs", timeUs);
+
+                if (mIsAudio) {
+                    mbuf->release();
+                    mbuf = NULL;
+                } else {
+                    // video encoder will release MediaBuffer when done
+                    // with underlying data.
+                    accessUnit->meta()->setPointer("mediaBuffer", mbuf);
+                }
+
+                sp<AMessage> notify = mNotify->dup();
+
+                notify->setInt32("what", kWhatAccessUnit);
+                notify->setBuffer("accessUnit", accessUnit);
+                notify->post();
+
+                if (mbuf != NULL) {
+                    ALOGV("posted mbuf %p", mbuf);
+                }
+
+                schedulePull();
+            }
+            break;
+        }
+
+        case kWhatPause:
+        {
+            mPaused = true;
+            break;
+        }
+
+        case kWhatResume:
+        {
+            mPaused = false;
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!738700.cpp!!!	postSynchronouslyAndReturnError(in msg : sp<AMessage>) : status_t
+    sp<AMessage> response;
+    status_t err = msg->postAndAwaitResponse(&response);
+
+    if (err != OK) {
+        return err;
+    }
+
+    if (!response->findInt32("err", &err)) {
+        err = OK;
+    }
+
+    return err;
+!!!738828.cpp!!!	schedulePull() : void
+    sp<AMessage> msg = new AMessage(kWhatPull, id());
+    msg->setInt32("generation", mPullGeneration);
+    msg->post();

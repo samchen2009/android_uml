@@ -1,0 +1,137 @@
+class ConnectModeState
+!!!9758604.java!!!	enter() : void
+            if (DBG) log(getName() + "\n");
+            EventLog.writeEvent(EVENTLOG_WIFI_STATE_CHANGED, getName());
+!!!9758732.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) log(getName() + message.toString() + "\n");
+            StateChangeResult stateChangeResult;
+            switch(message.what) {
+                case WifiMonitor.AUTHENTICATION_FAILURE_EVENT:
+                    mSupplicantStateTracker.sendMessage(WifiMonitor.AUTHENTICATION_FAILURE_EVENT);
+                    break;
+                case WifiMonitor.SUPPLICANT_STATE_CHANGE_EVENT:
+                    SupplicantState state = handleSupplicantStateChange(message);
+                    // A driver/firmware hang can now put the interface in a down state.
+                    // We detect the interface going down and recover from it
+                    if (!SupplicantState.isDriverActive(state)) {
+                        if (mNetworkInfo.getState() != NetworkInfo.State.DISCONNECTED) {
+                            handleNetworkDisconnect();
+                        }
+                        log("Detected an interface down, restart driver");
+                        transitionTo(mDriverStoppedState);
+                        sendMessage(CMD_START_DRIVER);
+                        break;
+                    }
+
+                    // Supplicant can fail to report a NETWORK_DISCONNECTION_EVENT
+                    // when authentication times out after a successful connection,
+                    // we can figure this from the supplicant state. If supplicant
+                    // state is DISCONNECTED, but the mNetworkInfo says we are not
+                    // disconnected, we need to handle a disconnection
+                    if (state == SupplicantState.DISCONNECTED &&
+                            mNetworkInfo.getState() != NetworkInfo.State.DISCONNECTED) {
+                        if (DBG) log("Missed CTRL-EVENT-DISCONNECTED, disconnect");
+                        handleNetworkDisconnect();
+                        transitionTo(mDisconnectedState);
+                    }
+                    break;
+                case WifiP2pService.DISCONNECT_WIFI_REQUEST:
+                    if (message.arg1 == 1) {
+                        mWifiNative.disconnect();
+                        mTemporarilyDisconnectWifi = true;
+                    } else {
+                        mWifiNative.reconnect();
+                        mTemporarilyDisconnectWifi = false;
+                    }
+                    break;
+                    /* Do a redundant disconnect without transition */
+                case CMD_DISCONNECT:
+                    mWifiNative.disconnect();
+                    break;
+                case CMD_RECONNECT:
+                    mWifiNative.reconnect();
+                    break;
+                case CMD_REASSOCIATE:
+                    mWifiNative.reassociate();
+                    break;
+                case WifiManager.CONNECT_NETWORK:
+                    /* The connect message can contain a network id passed as arg1 on message or
+                     * or a config passed as obj on message.
+                     * For a new network, a config is passed to create and connect.
+                     * For an existing network, a network id is passed
+                     */
+                    int netId = message.arg1;
+                    WifiConfiguration config = (WifiConfiguration) message.obj;
+
+                    /* Save the network config */
+                    if (config != null) {
+                        NetworkUpdateResult result = mWifiConfigStore.saveNetwork(config);
+                        netId = result.getNetworkId();
+                    }
+
+                    if (mWifiConfigStore.selectNetwork(netId) &&
+                            mWifiNative.reconnect()) {
+                        /* The state tracker handles enabling networks upon completion/failure */
+                        mSupplicantStateTracker.sendMessage(WifiManager.CONNECT_NETWORK);
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_SUCCEEDED);
+                        /* Expect a disconnection from the old connection */
+                        transitionTo(mDisconnectingState);
+                    } else {
+                        loge("Failed to connect config: " + config + " netId: " + netId);
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                        break;
+                    }
+                    break;
+                case WifiManager.START_WPS:
+                    WpsInfo wpsInfo = (WpsInfo) message.obj;
+                    WpsResult result;
+                    switch (wpsInfo.setup) {
+                        case WpsInfo.PBC:
+                            result = mWifiConfigStore.startWpsPbc(wpsInfo);
+                            break;
+                        case WpsInfo.KEYPAD:
+                            result = mWifiConfigStore.startWpsWithPinFromAccessPoint(wpsInfo);
+                            break;
+                        case WpsInfo.DISPLAY:
+                            result = mWifiConfigStore.startWpsWithPinFromDevice(wpsInfo);
+                            break;
+                        default:
+                            result = new WpsResult(Status.FAILURE);
+                            Log.e(TAG, "Invalid setup for WPS");
+                            break;
+                    }
+                    if (result.status == Status.SUCCESS) {
+                        replyToMessage(message, WifiManager.START_WPS_SUCCEEDED, result);
+                        transitionTo(mWpsRunningState);
+                    } else {
+                        Log.e(TAG, "Failed to start WPS with config " + wpsInfo.toString());
+                        replyToMessage(message, WifiManager.WPS_FAILED, WifiManager.ERROR);
+                    }
+                    break;
+                case WifiMonitor.SCAN_RESULTS_EVENT:
+                    /* Set the scan setting back to "connect" mode */
+                    mWifiNative.setScanResultHandling(CONNECT_MODE);
+                    /* Handle scan results */
+                    return NOT_HANDLED;
+                case WifiMonitor.NETWORK_CONNECTION_EVENT:
+                    if (DBG) log("Network connection established");
+                    mLastNetworkId = message.arg1;
+                    mLastBssid = (String) message.obj;
+
+                    mWifiInfo.setBSSID(mLastBssid);
+                    mWifiInfo.setNetworkId(mLastNetworkId);
+                    /* send event to CM & network change broadcast */
+                    setNetworkDetailedState(DetailedState.OBTAINING_IPADDR);
+                    sendNetworkStateChangeBroadcast(mLastBssid);
+                    transitionTo(mObtainingIpState);
+                    break;
+                case WifiMonitor.NETWORK_DISCONNECTION_EVENT:
+                    if (DBG) log("Network connection lost");
+                    handleNetworkDisconnect();
+                    transitionTo(mDisconnectedState);
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;

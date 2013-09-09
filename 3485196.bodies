@@ -1,0 +1,236 @@
+class SsaConverter
+!!!15203340.java!!!	convertToSsaMethod(inout rmeth : RopMethod, in paramWidth : int, inout isStatic : boolean) : SsaMethod
+        SsaMethod result
+            = SsaMethod.newFromRopMethod(rmeth, paramWidth, isStatic);
+
+        edgeSplit(result);
+
+        LocalVariableInfo localInfo = LocalVariableExtractor.extract(result);
+
+        placePhiFunctions(result, localInfo, 0);
+        new SsaRenamer(result).run();
+
+        /*
+         * The exit block, added here, is not considered for edge splitting
+         * or phi placement since no actual control flows to it.
+         */
+        result.makeExitBlock();
+
+        return result;
+!!!15203468.java!!!	updateSsaMethod(inout ssaMeth : SsaMethod, in threshold : int) : void
+        LocalVariableInfo localInfo = LocalVariableExtractor.extract(ssaMeth);
+        placePhiFunctions(ssaMeth, localInfo, threshold);
+        new SsaRenamer(ssaMeth, threshold).run();
+!!!15203596.java!!!	testEdgeSplit(inout rmeth : RopMethod, in paramWidth : int, inout isStatic : boolean) : SsaMethod
+        SsaMethod result;
+
+        result = SsaMethod.newFromRopMethod(rmeth, paramWidth, isStatic);
+
+        edgeSplit(result);
+        return result;
+!!!15203724.java!!!	testPhiPlacement(inout rmeth : RopMethod, in paramWidth : int, inout isStatic : boolean) : SsaMethod
+        SsaMethod result;
+
+        result = SsaMethod.newFromRopMethod(rmeth, paramWidth, isStatic);
+
+        edgeSplit(result);
+
+        LocalVariableInfo localInfo = LocalVariableExtractor.extract(result);
+
+        placePhiFunctions(result, localInfo, 0);
+        return result;
+!!!15203852.java!!!	edgeSplit(inout result : SsaMethod) : void
+        edgeSplitPredecessors(result);
+        edgeSplitMoveExceptionsAndResults(result);
+        edgeSplitSuccessors(result);
+!!!15203980.java!!!	edgeSplitPredecessors(inout result : SsaMethod) : void
+        ArrayList<SsaBasicBlock> blocks = result.getBlocks();
+
+        /*
+         * New blocks are added to the end of the block list during
+         * this iteration.
+         */
+        for (int i = blocks.size() - 1; i >= 0; i-- ) {
+            SsaBasicBlock block = blocks.get(i);
+            if (nodeNeedsUniquePredecessor(block)) {
+                block.insertNewPredecessor();
+            }
+        }
+!!!15204108.java!!!	nodeNeedsUniquePredecessor(inout block : SsaBasicBlock) : boolean
+        /*
+         * Any block with that has both multiple successors and multiple
+         * predecessors needs a new predecessor node.
+         */
+
+        int countPredecessors = block.getPredecessors().cardinality();
+        int countSuccessors = block.getSuccessors().cardinality();
+
+        return  (countPredecessors > 1 && countSuccessors > 1);
+!!!15204236.java!!!	edgeSplitMoveExceptionsAndResults(inout ssaMeth : SsaMethod) : void
+        ArrayList<SsaBasicBlock> blocks = ssaMeth.getBlocks();
+
+        /*
+         * New blocks are added to the end of the block list during
+         * this iteration.
+         */
+        for (int i = blocks.size() - 1; i >= 0; i-- ) {
+            SsaBasicBlock block = blocks.get(i);
+
+            /*
+             * Any block that starts with a move-exception and has more than
+             * one predecessor...
+             */
+            if (!block.isExitBlock()
+                    && block.getPredecessors().cardinality() > 1
+                    && block.getInsns().get(0).isMoveException()) {
+
+                // block.getPredecessors() is changed in the loop below.
+                BitSet preds = (BitSet)block.getPredecessors().clone();
+                for (int j = preds.nextSetBit(0); j >= 0;
+                     j = preds.nextSetBit(j + 1)) {
+                    SsaBasicBlock predecessor = blocks.get(j);
+                    SsaBasicBlock zNode
+                        = predecessor.insertNewSuccessor(block);
+
+                    /*
+                     * Make sure to place the move-exception as the
+                     * first insn.
+                     */
+                    zNode.getInsns().add(0, block.getInsns().get(0).clone());
+                }
+
+                // Remove the move-exception from the original block.
+                block.getInsns().remove(0);
+            }
+        }
+!!!15204364.java!!!	edgeSplitSuccessors(inout result : SsaMethod) : void
+        ArrayList<SsaBasicBlock> blocks = result.getBlocks();
+
+        /*
+         * New blocks are added to the end of the block list during
+         * this iteration.
+         */
+        for (int i = blocks.size() - 1; i >= 0; i-- ) {
+            SsaBasicBlock block = blocks.get(i);
+
+            // Successors list is modified in loop below.
+            BitSet successors = (BitSet)block.getSuccessors().clone();
+            for (int j = successors.nextSetBit(0);
+                 j >= 0; j = successors.nextSetBit(j+1)) {
+
+                SsaBasicBlock succ = blocks.get(j);
+
+                if (needsNewSuccessor(block, succ)) {
+                    block.insertNewSuccessor(succ);
+                }
+            }
+        }
+!!!15204492.java!!!	needsNewSuccessor(inout block : SsaBasicBlock, inout succ : SsaBasicBlock) : boolean
+        ArrayList<SsaInsn> insns = block.getInsns();
+        SsaInsn lastInsn = insns.get(insns.size() - 1);
+
+        return ((lastInsn.getResult() != null)
+                    || (lastInsn.getSources().size() > 0))
+                && succ.getPredecessors().cardinality() > 1;
+!!!15204620.java!!!	placePhiFunctions(inout ssaMeth : SsaMethod, inout localInfo : LocalVariableInfo, in threshold : int) : void
+        ArrayList<SsaBasicBlock> ssaBlocks;
+        int regCount;
+        int blockCount;
+
+        ssaBlocks = ssaMeth.getBlocks();
+        blockCount = ssaBlocks.size();
+        regCount = ssaMeth.getRegCount() - threshold;
+
+        DomFront df = new DomFront(ssaMeth);
+        DomFront.DomInfo[] domInfos = df.run();
+
+        // Bit set of registers vs block index "definition sites"
+        BitSet[] defsites = new BitSet[regCount];
+
+        // Bit set of registers vs block index "phi placement sites"
+        BitSet[] phisites = new BitSet[regCount];
+
+        for (int i = 0; i < regCount; i++) {
+            defsites[i] = new BitSet(blockCount);
+            phisites[i] = new BitSet(blockCount);
+        }
+
+        /*
+         * For each register, build a set of all basic blocks where
+         * containing an assignment to that register.
+         */
+        for (int bi = 0, s = ssaBlocks.size(); bi < s; bi++) {
+            SsaBasicBlock b = ssaBlocks.get(bi);
+
+            for (SsaInsn insn : b.getInsns()) {
+                RegisterSpec rs = insn.getResult();
+
+                if (rs != null && rs.getReg() - threshold >= 0) {
+                    defsites[rs.getReg() - threshold].set(bi);
+                }
+            }
+        }
+
+        if (DEBUG) {
+            System.out.println("defsites");
+
+            for (int i = 0; i < regCount; i++) {
+                StringBuilder sb = new StringBuilder();
+                sb.append('v').append(i).append(": ");
+                sb.append(defsites[i].toString());
+                System.out.println(sb);
+            }
+        }
+
+        BitSet worklist;
+
+        /*
+         * For each register, compute all locations for phi placement
+         * based on dominance-frontier algorithm.
+         */
+        for (int reg = 0, s = regCount; reg < s; reg++) {
+            int workBlockIndex;
+
+            /* Worklist set starts out with each node where reg is assigned. */
+
+            worklist = (BitSet) (defsites[reg].clone());
+
+            while (0 <= (workBlockIndex = worklist.nextSetBit(0))) {
+                worklist.clear(workBlockIndex);
+                IntIterator dfIterator
+                    = domInfos[workBlockIndex].dominanceFrontiers.iterator();
+
+                while (dfIterator.hasNext()) {
+                    int dfBlockIndex = dfIterator.next();
+
+                    if (!phisites[reg].get(dfBlockIndex)) {
+                        phisites[reg].set(dfBlockIndex);
+
+                        int tReg = reg + threshold;
+                        RegisterSpec rs
+                            = localInfo.getStarts(dfBlockIndex).get(tReg);
+
+                        if (rs == null) {
+                            ssaBlocks.get(dfBlockIndex).addPhiInsnForReg(tReg);
+                        } else {
+                            ssaBlocks.get(dfBlockIndex).addPhiInsnForReg(rs);
+                        }
+
+                        if (!defsites[reg].get(dfBlockIndex)) {
+                            worklist.set(dfBlockIndex);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (DEBUG) {
+            System.out.println("phisites");
+
+            for (int i = 0; i < regCount; i++) {
+                StringBuilder sb = new StringBuilder();
+                sb.append('v').append(i).append(": ");
+                sb.append(phisites[i].toString());
+                System.out.println(sb);
+            }
+        }

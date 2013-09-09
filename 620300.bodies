@@ -1,0 +1,138 @@
+class MP3Source
+!!!1865484.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    CHECK(!mStarted);
+
+    mGroup = new MediaBufferGroup;
+
+    mGroup->add_buffer(new MediaBuffer(kMaxFrameSize));
+
+    mCurrentPos = mFirstFramePos;
+    mCurrentTimeUs = 0;
+
+    mBasisTimeUs = mCurrentTimeUs;
+    mSamplesRead = 0;
+
+    mStarted = true;
+
+    return OK;
+!!!1865612.cpp!!!	stop() : status_t
+    CHECK(mStarted);
+
+    delete mGroup;
+    mGroup = NULL;
+
+    mStarted = false;
+
+    return OK;
+!!!1865740.cpp!!!	getFormat() : sp<MetaData>
+    return mMeta;
+!!!1865868.cpp!!!	read(inout out : MediaBuffer, in options : ReadOptions = NULL) : status_t
+    *out = NULL;
+
+    int64_t seekTimeUs;
+    ReadOptions::SeekMode mode;
+    bool seekCBR = false;
+
+    if (options != NULL && options->getSeekTo(&seekTimeUs, &mode)) {
+        int64_t actualSeekTimeUs = seekTimeUs;
+        if (mSeeker == NULL
+                || !mSeeker->getOffsetForTime(&actualSeekTimeUs, &mCurrentPos)) {
+            int32_t bitrate;
+            if (!mMeta->findInt32(kKeyBitRate, &bitrate)) {
+                // bitrate is in bits/sec.
+                ALOGI("no bitrate");
+
+                return ERROR_UNSUPPORTED;
+            }
+
+            mCurrentTimeUs = seekTimeUs;
+            mCurrentPos = mFirstFramePos + seekTimeUs * bitrate / 8000000;
+            seekCBR = true;
+        } else {
+            mCurrentTimeUs = actualSeekTimeUs;
+        }
+
+        mBasisTimeUs = mCurrentTimeUs;
+        mSamplesRead = 0;
+    }
+
+    MediaBuffer *buffer;
+    status_t err = mGroup->acquire_buffer(&buffer);
+    if (err != OK) {
+        return err;
+    }
+
+    size_t frame_size;
+    int bitrate;
+    int num_samples;
+    int sample_rate;
+    for (;;) {
+        ssize_t n = mDataSource->readAt(mCurrentPos, buffer->data(), 4);
+        if (n < 4) {
+            buffer->release();
+            buffer = NULL;
+
+            return ERROR_END_OF_STREAM;
+        }
+
+        uint32_t header = U32_AT((const uint8_t *)buffer->data());
+
+        if ((header & kMask) == (mFixedHeader & kMask)
+            && GetMPEGAudioFrameSize(
+                header, &frame_size, &sample_rate, NULL,
+                &bitrate, &num_samples)) {
+
+            // re-calculate mCurrentTimeUs because we might have called Resync()
+            if (seekCBR) {
+                mCurrentTimeUs = (mCurrentPos - mFirstFramePos) * 8000 / bitrate;
+                mBasisTimeUs = mCurrentTimeUs;
+            }
+
+            break;
+        }
+
+        // Lost sync.
+        ALOGV("lost sync! header = 0x%08x, old header = 0x%08x\n", header, mFixedHeader);
+
+        off64_t pos = mCurrentPos;
+        if (!Resync(mDataSource, mFixedHeader, &pos, NULL, NULL)) {
+            ALOGE("Unable to resync. Signalling end of stream.");
+
+            buffer->release();
+            buffer = NULL;
+
+            return ERROR_END_OF_STREAM;
+        }
+
+        mCurrentPos = pos;
+
+        // Try again with the new position.
+    }
+
+    CHECK(frame_size <= buffer->size());
+
+    ssize_t n = mDataSource->readAt(mCurrentPos, buffer->data(), frame_size);
+    if (n < (ssize_t)frame_size) {
+        buffer->release();
+        buffer = NULL;
+
+        return ERROR_END_OF_STREAM;
+    }
+
+    buffer->set_range(0, frame_size);
+
+    buffer->meta_data()->setInt64(kKeyTime, mCurrentTimeUs);
+    buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+
+    mCurrentPos += frame_size;
+
+    mSamplesRead += num_samples;
+    mCurrentTimeUs = mBasisTimeUs + ((mSamplesRead * 1000000) / sample_rate);
+
+    *out = buffer;
+
+    return OK;
+!!!1865996.cpp!!!	~MP3Source()
+    if (mStarted) {
+        stop();
+    }

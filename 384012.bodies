@@ -1,0 +1,204 @@
+class OutputTrack
+!!!816780.cpp!!!	OutputTrack(inout playbackThread : PlaybackThread, inout sourceThread : DuplicatingThread, in sampleRate : uint32_t, in format : audio_format_t, in channelMask : audio_channel_mask_t, in frameCount : int)
+
+    if (mCblk != NULL) {
+        mCblk->flags |= CBLK_DIRECTION_OUT;
+        mCblk->buffers = (char*)mCblk + sizeof(audio_track_cblk_t);
+        mOutBuffer.frameCount = 0;
+        playbackThread->mTracks.add(this);
+        ALOGV("OutputTrack constructor mCblk %p, mBuffer %p, mCblk->buffers %p, " \
+                "mCblk->frameCount %d, mCblk->sampleRate %d, mChannelMask 0x%08x mBufferEnd %p",
+                mCblk, mBuffer, mCblk->buffers,
+                mCblk->frameCount, mCblk->sampleRate, mChannelMask, mBufferEnd);
+    } else {
+        ALOGW("Error creating output track on thread %p", playbackThread);
+    }
+!!!816908.cpp!!!	~OutputTrack()
+    clearBufferQueue();
+!!!817036.cpp!!!	start(in event : sync_event_t = AudioSystem::SYNC_EVENT_NONE, in triggerSession : int = 0) : status_t
+    status_t status = Track::start(event, triggerSession);
+    if (status != NO_ERROR) {
+        return status;
+    }
+
+    mActive = true;
+    mRetryCount = 127;
+    return status;
+!!!817164.cpp!!!	stop() : void
+    Track::stop();
+    clearBufferQueue();
+    mOutBuffer.frameCount = 0;
+    mActive = false;
+!!!817292.cpp!!!	write(inout data : int16_t, in frames : uint32_t) : bool
+    Buffer *pInBuffer;
+    Buffer inBuffer;
+    uint32_t channelCount = mChannelCount;
+    bool outputBufferFull = false;
+    inBuffer.frameCount = frames;
+    inBuffer.i16 = data;
+
+    uint32_t waitTimeLeftMs = mSourceThread->waitTimeMs();
+
+    if (!mActive && frames != 0) {
+        start();
+        sp<ThreadBase> thread = mThread.promote();
+        if (thread != 0) {
+            MixerThread *mixerThread = (MixerThread *)thread.get();
+            if (mCblk->frameCount > frames){
+                if (mBufferQueue.size() < kMaxOverFlowBuffers) {
+                    uint32_t startFrames = (mCblk->frameCount - frames);
+                    pInBuffer = new Buffer;
+                    pInBuffer->mBuffer = new int16_t[startFrames * channelCount];
+                    pInBuffer->frameCount = startFrames;
+                    pInBuffer->i16 = pInBuffer->mBuffer;
+                    memset(pInBuffer->raw, 0, startFrames * channelCount * sizeof(int16_t));
+                    mBufferQueue.add(pInBuffer);
+                } else {
+                    ALOGW ("OutputTrack::write() %p no more buffers in queue", this);
+                }
+            }
+        }
+    }
+
+    while (waitTimeLeftMs) {
+        // First write pending buffers, then new data
+        if (mBufferQueue.size()) {
+            pInBuffer = mBufferQueue.itemAt(0);
+        } else {
+            pInBuffer = &inBuffer;
+        }
+
+        if (pInBuffer->frameCount == 0) {
+            break;
+        }
+
+        if (mOutBuffer.frameCount == 0) {
+            mOutBuffer.frameCount = pInBuffer->frameCount;
+            nsecs_t startTime = systemTime();
+            if (obtainBuffer(&mOutBuffer, waitTimeLeftMs) == (status_t)NO_MORE_BUFFERS) {
+                ALOGV ("OutputTrack::write() %p thread %p no more output buffers", this, mThread.unsafe_get());
+                outputBufferFull = true;
+                break;
+            }
+            uint32_t waitTimeMs = (uint32_t)ns2ms(systemTime() - startTime);
+            if (waitTimeLeftMs >= waitTimeMs) {
+                waitTimeLeftMs -= waitTimeMs;
+            } else {
+                waitTimeLeftMs = 0;
+            }
+        }
+
+        uint32_t outFrames = pInBuffer->frameCount > mOutBuffer.frameCount ? mOutBuffer.frameCount : pInBuffer->frameCount;
+        memcpy(mOutBuffer.raw, pInBuffer->raw, outFrames * channelCount * sizeof(int16_t));
+        mCblk->stepUser(outFrames);
+        pInBuffer->frameCount -= outFrames;
+        pInBuffer->i16 += outFrames * channelCount;
+        mOutBuffer.frameCount -= outFrames;
+        mOutBuffer.i16 += outFrames * channelCount;
+
+        if (pInBuffer->frameCount == 0) {
+            if (mBufferQueue.size()) {
+                mBufferQueue.removeAt(0);
+                delete [] pInBuffer->mBuffer;
+                delete pInBuffer;
+                ALOGV("OutputTrack::write() %p thread %p released overflow buffer %d", this, mThread.unsafe_get(), mBufferQueue.size());
+            } else {
+                break;
+            }
+        }
+    }
+
+    // If we could not write all frames, allocate a buffer and queue it for next time.
+    if (inBuffer.frameCount) {
+        sp<ThreadBase> thread = mThread.promote();
+        if (thread != 0 && !thread->standby()) {
+            if (mBufferQueue.size() < kMaxOverFlowBuffers) {
+                pInBuffer = new Buffer;
+                pInBuffer->mBuffer = new int16_t[inBuffer.frameCount * channelCount];
+                pInBuffer->frameCount = inBuffer.frameCount;
+                pInBuffer->i16 = pInBuffer->mBuffer;
+                memcpy(pInBuffer->raw, inBuffer.raw, inBuffer.frameCount * channelCount * sizeof(int16_t));
+                mBufferQueue.add(pInBuffer);
+                ALOGV("OutputTrack::write() %p thread %p adding overflow buffer %d", this, mThread.unsafe_get(), mBufferQueue.size());
+            } else {
+                ALOGW("OutputTrack::write() %p thread %p no more overflow buffers", mThread.unsafe_get(), this);
+            }
+        }
+    }
+
+    // Calling write() with a 0 length buffer, means that no more data will be written:
+    // If no more buffers are pending, fill output track buffer to make sure it is started
+    // by output mixer.
+    if (frames == 0 && mBufferQueue.size() == 0) {
+        if (mCblk->user < mCblk->frameCount) {
+            frames = mCblk->frameCount - mCblk->user;
+            pInBuffer = new Buffer;
+            pInBuffer->mBuffer = new int16_t[frames * channelCount];
+            pInBuffer->frameCount = frames;
+            pInBuffer->i16 = pInBuffer->mBuffer;
+            memset(pInBuffer->raw, 0, frames * channelCount * sizeof(int16_t));
+            mBufferQueue.add(pInBuffer);
+        } else if (mActive) {
+            stop();
+        }
+    }
+
+    return outputBufferFull;
+!!!817804.cpp!!!	obtainBuffer(inout buffer : Buffer, in waitTimeMs : uint32_t) : status_t
+    int active;
+    status_t result;
+    audio_track_cblk_t* cblk = mCblk;
+    uint32_t framesReq = buffer->frameCount;
+
+//    ALOGV("OutputTrack::obtainBuffer user %d, server %d", cblk->user, cblk->server);
+    buffer->frameCount  = 0;
+
+    uint32_t framesAvail = cblk->framesAvailable();
+
+
+    if (framesAvail == 0) {
+        Mutex::Autolock _l(cblk->lock);
+        goto start_loop_here;
+        while (framesAvail == 0) {
+            active = mActive;
+            if (CC_UNLIKELY(!active)) {
+                ALOGV("Not active and NO_MORE_BUFFERS");
+                return NO_MORE_BUFFERS;
+            }
+            result = cblk->cv.waitRelative(cblk->lock, milliseconds(waitTimeMs));
+            if (result != NO_ERROR) {
+                return NO_MORE_BUFFERS;
+            }
+            // read the server count again
+        start_loop_here:
+            framesAvail = cblk->framesAvailable_l();
+        }
+    }
+
+//    if (framesAvail < framesReq) {
+//        return NO_MORE_BUFFERS;
+//    }
+
+    if (framesReq > framesAvail) {
+        framesReq = framesAvail;
+    }
+
+    uint32_t u = cblk->user;
+    uint32_t bufferEnd = cblk->userBase + cblk->frameCount;
+
+    if (framesReq > bufferEnd - u) {
+        framesReq = bufferEnd - u;
+    }
+
+    buffer->frameCount  = framesReq;
+    buffer->raw         = (void *)cblk->buffer(u);
+    return NO_ERROR;
+!!!817932.cpp!!!	clearBufferQueue() : void
+    size_t size = mBufferQueue.size();
+
+    for (size_t i = 0; i < size; i++) {
+        Buffer *pBuffer = mBufferQueue.itemAt(i);
+        delete [] pBuffer->mBuffer;
+        delete pBuffer;
+    }
+    mBufferQueue.clear();

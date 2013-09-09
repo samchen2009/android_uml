@@ -1,0 +1,438 @@
+class ForkJoinTask
+!!!1546523.java!!!	setCompletion(in completion : int) : int
+        for (int s;;) {
+            if ((s = status) < 0)
+                return s;
+            if (UNSAFE.compareAndSwapInt(this, statusOffset, s, completion)) {
+                if (s != 0)
+                    synchronized (this) { notifyAll(); }
+                return completion;
+            }
+        }
+!!!1546651.java!!!	tryAwaitDone(in millis : long) : void
+        int s;
+        try {
+            if (((s = status) > 0 ||
+                 (s == 0 &&
+                  UNSAFE.compareAndSwapInt(this, statusOffset, 0, SIGNAL))) &&
+                status > 0) {
+                synchronized (this) {
+                    if (status > 0)
+                        wait(millis);
+                }
+            }
+        } catch (InterruptedException ie) {
+            // caller must check termination
+        }
+!!!1546779.java!!!	externalAwaitDone() : int
+        int s;
+        if ((s = status) >= 0) {
+            boolean interrupted = false;
+            synchronized (this) {
+                while ((s = status) >= 0) {
+                    if (s == 0)
+                        UNSAFE.compareAndSwapInt(this, statusOffset,
+                                                 0, SIGNAL);
+                    else {
+                        try {
+                            wait();
+                        } catch (InterruptedException ie) {
+                            interrupted = true;
+                        }
+                    }
+                }
+            }
+            if (interrupted)
+                Thread.currentThread().interrupt();
+        }
+        return s;
+!!!1546907.java!!!	externalInterruptibleAwaitDone(in millis : long) : int
+        int s;
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        if ((s = status) >= 0) {
+            synchronized (this) {
+                while ((s = status) >= 0) {
+                    if (s == 0)
+                        UNSAFE.compareAndSwapInt(this, statusOffset,
+                                                 0, SIGNAL);
+                    else {
+                        wait(millis);
+                        if (millis > 0L)
+                            break;
+                    }
+                }
+            }
+        }
+        return s;
+!!!1547035.java!!!	doExec() : void
+        if (status >= 0) {
+            boolean completed;
+            try {
+                completed = exec();
+            } catch (Throwable rex) {
+                setExceptionalCompletion(rex);
+                return;
+            }
+            if (completed)
+                setCompletion(NORMAL); // must be outside try block
+        }
+!!!1547163.java!!!	doJoin() : int
+        Thread t; ForkJoinWorkerThread w; int s; boolean completed;
+        if ((t = Thread.currentThread()) instanceof ForkJoinWorkerThread) {
+            if ((s = status) < 0)
+                return s;
+            if ((w = (ForkJoinWorkerThread)t).unpushTask(this)) {
+                try {
+                    completed = exec();
+                } catch (Throwable rex) {
+                    return setExceptionalCompletion(rex);
+                }
+                if (completed)
+                    return setCompletion(NORMAL);
+            }
+            return w.joinTask(this);
+        }
+        else
+            return externalAwaitDone();
+!!!1547291.java!!!	doInvoke() : int
+        int s; boolean completed;
+        if ((s = status) < 0)
+            return s;
+        try {
+            completed = exec();
+        } catch (Throwable rex) {
+            return setExceptionalCompletion(rex);
+        }
+        if (completed)
+            return setCompletion(NORMAL);
+        else
+            return doJoin();
+!!!1547547.java!!!	setExceptionalCompletion(inout ex : Throwable) : int
+        int h = System.identityHashCode(this);
+        final ReentrantLock lock = exceptionTableLock;
+        lock.lock();
+        try {
+            expungeStaleExceptions();
+            ExceptionNode[] t = exceptionTable;
+            int i = h & (t.length - 1);
+            for (ExceptionNode e = t[i]; ; e = e.next) {
+                if (e == null) {
+                    t[i] = new ExceptionNode(this, ex, t[i]);
+                    break;
+                }
+                if (e.get() == this) // already present
+                    break;
+            }
+        } finally {
+            lock.unlock();
+        }
+        return setCompletion(EXCEPTIONAL);
+!!!1547675.java!!!	clearExceptionalCompletion() : void
+        int h = System.identityHashCode(this);
+        final ReentrantLock lock = exceptionTableLock;
+        lock.lock();
+        try {
+            ExceptionNode[] t = exceptionTable;
+            int i = h & (t.length - 1);
+            ExceptionNode e = t[i];
+            ExceptionNode pred = null;
+            while (e != null) {
+                ExceptionNode next = e.next;
+                if (e.get() == this) {
+                    if (pred == null)
+                        t[i] = next;
+                    else
+                        pred.next = next;
+                    break;
+                }
+                pred = e;
+                e = next;
+            }
+            expungeStaleExceptions();
+            status = 0;
+        } finally {
+            lock.unlock();
+        }
+!!!1547803.java!!!	getThrowableException() : Throwable
+        if (status != EXCEPTIONAL)
+            return null;
+        int h = System.identityHashCode(this);
+        ExceptionNode e;
+        final ReentrantLock lock = exceptionTableLock;
+        lock.lock();
+        try {
+            expungeStaleExceptions();
+            ExceptionNode[] t = exceptionTable;
+            e = t[h & (t.length - 1)];
+            while (e != null && e.get() != this)
+                e = e.next;
+        } finally {
+            lock.unlock();
+        }
+        Throwable ex;
+        if (e == null || (ex = e.ex) == null)
+            return null;
+        if (e.thrower != Thread.currentThread().getId()) {
+            Class<? extends Throwable> ec = ex.getClass();
+            try {
+                Constructor<?> noArgCtor = null;
+                Constructor<?>[] cs = ec.getConstructors();// public ctors only
+                for (int i = 0; i < cs.length; ++i) {
+                    Constructor<?> c = cs[i];
+                    Class<?>[] ps = c.getParameterTypes();
+                    if (ps.length == 0)
+                        noArgCtor = c;
+                    else if (ps.length == 1 && ps[0] == Throwable.class)
+                        return (Throwable)(c.newInstance(ex));
+                }
+                if (noArgCtor != null) {
+                    Throwable wx = (Throwable)(noArgCtor.newInstance());
+                    wx.initCause(ex);
+                    return wx;
+                }
+            } catch (Exception ignore) {
+            }
+        }
+        return ex;
+!!!1547931.java!!!	expungeStaleExceptions() : void
+        for (Object x; (x = exceptionTableRefQueue.poll()) != null;) {
+            if (x instanceof ExceptionNode) {
+                ForkJoinTask<?> key = ((ExceptionNode)x).get();
+                ExceptionNode[] t = exceptionTable;
+                int i = System.identityHashCode(key) & (t.length - 1);
+                ExceptionNode e = t[i];
+                ExceptionNode pred = null;
+                while (e != null) {
+                    ExceptionNode next = e.next;
+                    if (e == x) {
+                        if (pred == null)
+                            t[i] = next;
+                        else
+                            pred.next = next;
+                        break;
+                    }
+                    pred = e;
+                    e = next;
+                }
+            }
+        }
+!!!1548059.java!!!	helpExpungeStaleExceptions() : void
+        final ReentrantLock lock = exceptionTableLock;
+        if (lock.tryLock()) {
+            try {
+                expungeStaleExceptions();
+            } finally {
+                lock.unlock();
+            }
+        }
+!!!1548187.java!!!	reportResult() : V
+        int s; Throwable ex;
+        if ((s = status) == CANCELLED)
+            throw new CancellationException();
+        if (s == EXCEPTIONAL && (ex = getThrowableException()) != null)
+            SneakyThrow.sneakyThrow(ex); // android-changed
+        return getRawResult();
+!!!1548315.java!!!	fork() : ForkJoinTask
+        ((ForkJoinWorkerThread) Thread.currentThread())
+            .pushTask(this);
+        return this;
+!!!1548443.java!!!	join() : V
+        if (doJoin() != NORMAL)
+            return reportResult();
+        else
+            return getRawResult();
+!!!1548571.java!!!	invoke() : V
+        if (doInvoke() != NORMAL)
+            return reportResult();
+        else
+            return getRawResult();
+!!!1548699.java!!!	invokeAll(inout t1 : ForkJoinTask, inout t2 : ForkJoinTask) : void
+        t2.fork();
+        t1.invoke();
+        t2.join();
+!!!1548827.java!!!	invokeAll(inout tasks : ForkJoinTask<?>...) : void
+        Throwable ex = null;
+        int last = tasks.length - 1;
+        for (int i = last; i >= 0; --i) {
+            ForkJoinTask<?> t = tasks[i];
+            if (t == null) {
+                if (ex == null)
+                    ex = new NullPointerException();
+            }
+            else if (i != 0)
+                t.fork();
+            else if (t.doInvoke() < NORMAL && ex == null)
+                ex = t.getException();
+        }
+        for (int i = 1; i <= last; ++i) {
+            ForkJoinTask<?> t = tasks[i];
+            if (t != null) {
+                if (ex != null)
+                    t.cancel(false);
+                else if (t.doJoin() < NORMAL)
+                    ex = t.getException();
+            }
+        }
+        if (ex != null)
+            SneakyThrow.sneakyThrow(ex); // android-changed
+!!!1548955.java!!!	invokeAll(inout tasks : Collection) : Collection
+        if (!(tasks instanceof RandomAccess) || !(tasks instanceof List<?>)) {
+            invokeAll(tasks.toArray(new ForkJoinTask<?>[tasks.size()]));
+            return tasks;
+        }
+        @SuppressWarnings("unchecked")
+        List<? extends ForkJoinTask<?>> ts =
+            (List<? extends ForkJoinTask<?>>) tasks;
+        Throwable ex = null;
+        int last = ts.size() - 1;
+        for (int i = last; i >= 0; --i) {
+            ForkJoinTask<?> t = ts.get(i);
+            if (t == null) {
+                if (ex == null)
+                    ex = new NullPointerException();
+            }
+            else if (i != 0)
+                t.fork();
+            else if (t.doInvoke() < NORMAL && ex == null)
+                ex = t.getException();
+        }
+        for (int i = 1; i <= last; ++i) {
+            ForkJoinTask<?> t = ts.get(i);
+            if (t != null) {
+                if (ex != null)
+                    t.cancel(false);
+                else if (t.doJoin() < NORMAL)
+                    ex = t.getException();
+            }
+        }
+        if (ex != null)
+            SneakyThrow.sneakyThrow(ex); // android-changed
+        return tasks;
+!!!1549083.java!!!	cancel(inout mayInterruptIfRunning : boolean) : boolean
+        return setCompletion(CANCELLED) == CANCELLED;
+!!!1549211.java!!!	cancelIgnoringExceptions() : void
+        try {
+            cancel(false);
+        } catch (Throwable ignore) {
+        }
+!!!1549339.java!!!	isDone() : boolean
+        return status < 0;
+!!!1549467.java!!!	isCancelled() : boolean
+        return status == CANCELLED;
+!!!1549595.java!!!	isCompletedAbnormally() : boolean
+        return status < NORMAL;
+!!!1549723.java!!!	isCompletedNormally() : boolean
+        return status == NORMAL;
+!!!1549851.java!!!	getException() : Throwable
+        int s = status;
+        return ((s >= NORMAL)    ? null :
+                (s == CANCELLED) ? new CancellationException() :
+                getThrowableException());
+!!!1549979.java!!!	completeExceptionally(inout ex : Throwable) : void
+        setExceptionalCompletion((ex instanceof RuntimeException) ||
+                                 (ex instanceof Error) ? ex :
+                                 new RuntimeException(ex));
+!!!1550107.java!!!	complete(inout value : V) : void
+        try {
+            setRawResult(value);
+        } catch (Throwable rex) {
+            setExceptionalCompletion(rex);
+            return;
+        }
+        setCompletion(NORMAL);
+!!!1550235.java!!!	get() : V
+        int s = (Thread.currentThread() instanceof ForkJoinWorkerThread) ?
+            doJoin() : externalInterruptibleAwaitDone(0L);
+        Throwable ex;
+        if (s == CANCELLED)
+            throw new CancellationException();
+        if (s == EXCEPTIONAL && (ex = getThrowableException()) != null)
+            throw new ExecutionException(ex);
+        return getRawResult();
+!!!1550363.java!!!	get(in timeout : long, inout unit : TimeUnit) : V
+        Thread t = Thread.currentThread();
+        if (t instanceof ForkJoinWorkerThread) {
+            ForkJoinWorkerThread w = (ForkJoinWorkerThread) t;
+            long nanos = unit.toNanos(timeout);
+            if (status >= 0) {
+                boolean completed = false;
+                if (w.unpushTask(this)) {
+                    try {
+                        completed = exec();
+                    } catch (Throwable rex) {
+                        setExceptionalCompletion(rex);
+                    }
+                }
+                if (completed)
+                    setCompletion(NORMAL);
+                else if (status >= 0 && nanos > 0)
+                    w.pool.timedAwaitJoin(this, nanos);
+            }
+        }
+        else {
+            long millis = unit.toMillis(timeout);
+            if (millis > 0)
+                externalInterruptibleAwaitDone(millis);
+        }
+        int s = status;
+        if (s != NORMAL) {
+            Throwable ex;
+            if (s == CANCELLED)
+                throw new CancellationException();
+            if (s != EXCEPTIONAL)
+                throw new TimeoutException();
+            if ((ex = getThrowableException()) != null)
+                throw new ExecutionException(ex);
+        }
+        return getRawResult();
+!!!1550491.java!!!	quietlyJoin() : void
+        doJoin();
+!!!1550619.java!!!	quietlyInvoke() : void
+        doInvoke();
+!!!1550747.java!!!	helpQuiesce() : void
+        ((ForkJoinWorkerThread) Thread.currentThread())
+            .helpQuiescePool();
+!!!1550875.java!!!	reinitialize() : void
+        if (status == EXCEPTIONAL)
+            clearExceptionalCompletion();
+        else
+            status = 0;
+!!!1551003.java!!!	getPool() : ForkJoinPool
+        Thread t = Thread.currentThread();
+        return (t instanceof ForkJoinWorkerThread) ?
+            ((ForkJoinWorkerThread) t).pool : null;
+!!!1551131.java!!!	inForkJoinPool() : boolean
+        return Thread.currentThread() instanceof ForkJoinWorkerThread;
+!!!1551259.java!!!	tryUnfork() : boolean
+        return ((ForkJoinWorkerThread) Thread.currentThread())
+            .unpushTask(this);
+!!!1551387.java!!!	getQueuedTaskCount() : int
+        return ((ForkJoinWorkerThread) Thread.currentThread())
+            .getQueueSize();
+!!!1551515.java!!!	getSurplusQueuedTaskCount() : int
+        return ((ForkJoinWorkerThread) Thread.currentThread())
+            .getEstimatedSurplusTaskCount();
+!!!1552027.java!!!	peekNextLocalTask() : ForkJoinTask
+        return ((ForkJoinWorkerThread) Thread.currentThread())
+            .peekTask();
+!!!1552155.java!!!	pollNextLocalTask() : ForkJoinTask
+        return ((ForkJoinWorkerThread) Thread.currentThread())
+            .pollLocalTask();
+!!!1552283.java!!!	pollTask() : ForkJoinTask
+        return ((ForkJoinWorkerThread) Thread.currentThread())
+            .pollTask();
+!!!1553691.java!!!	adapt(inout runnable : Runnable) : ForkJoinTask
+        return new AdaptedRunnable<Void>(runnable, null);
+!!!1553819.java!!!	adapt(inout runnable : Runnable, inout result : T) : ForkJoinTask
+        return new AdaptedRunnable<T>(runnable, result);
+!!!1553947.java!!!	adapt(inout callable : Callable) : ForkJoinTask
+        return new AdaptedCallable<T>(callable);
+!!!1554075.java!!!	writeObject(inout s : ObjectOutputStream) : void
+        s.defaultWriteObject();
+        s.writeObject(getException());
+!!!1554203.java!!!	readObject(inout s : ObjectInputStream) : void
+        s.defaultReadObject();
+        Object ex = s.readObject();
+        if (ex != null)
+            setExceptionalCompletion((Throwable)ex);

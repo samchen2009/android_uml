@@ -1,0 +1,193 @@
+class DriverStartedState
+!!!9757196.java!!!	enter() : void
+            if (DBG) log(getName() + "\n");
+            EventLog.writeEvent(EVENTLOG_WIFI_STATE_CHANGED, getName());
+
+            mIsRunning = true;
+            mInDelayedStop = false;
+            updateBatteryWorkSource(null);
+
+            /**
+             * Enable bluetooth coexistence scan mode when bluetooth connection is active.
+             * When this mode is on, some of the low-level scan parameters used by the
+             * driver are changed to reduce interference with bluetooth
+             */
+            mWifiNative.setBluetoothCoexistenceScanMode(mBluetoothConnectionActive);
+            /* set country code */
+            setCountryCode();
+            /* set frequency band of operation */
+            setFrequencyBand();
+            /* initialize network state */
+            setNetworkDetailedState(DetailedState.DISCONNECTED);
+
+            /* Remove any filtering on Multicast v6 at start */
+            mWifiNative.stopFilteringMulticastV6Packets();
+
+            /* Reset Multicast v4 filtering state */
+            if (mFilteringMulticastV4Packets.get()) {
+                mWifiNative.startFilteringMulticastV4Packets();
+            } else {
+                mWifiNative.stopFilteringMulticastV4Packets();
+            }
+
+            if (mIsScanMode) {
+                mWifiNative.setScanResultHandling(SCAN_ONLY_MODE);
+                mWifiNative.disconnect();
+                transitionTo(mScanModeState);
+            } else {
+                mWifiNative.setScanResultHandling(CONNECT_MODE);
+                mWifiNative.reconnect();
+                // Status pulls in the current supplicant state and network connection state
+                // events over the monitor connection. This helps framework sync up with
+                // current supplicant state
+                mWifiNative.status();
+                transitionTo(mDisconnectedState);
+            }
+
+            // We may have missed screen update at boot
+            if (mScreenBroadcastReceived.get() == false) {
+                PowerManager powerManager = (PowerManager)mContext.getSystemService(
+                        Context.POWER_SERVICE);
+                handleScreenStateChanged(powerManager.isScreenOn());
+            } else {
+                // Set the right suspend mode settings
+                mWifiNative.setSuspendOptimizations(mSuspendOptNeedsDisabled == 0
+                        && mUserWantsSuspendOpt.get());
+            }
+            mWifiNative.setPowerSave(true);
+
+            if (mP2pSupported) mWifiP2pChannel.sendMessage(WifiStateMachine.CMD_ENABLE_P2P);
+!!!9757324.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) log(getName() + message.toString() + "\n");
+            switch(message.what) {
+               case CMD_SET_SCAN_TYPE:
+                    mSetScanActive = (message.arg1 == SCAN_ACTIVE);
+                    mWifiNative.setScanMode(mSetScanActive);
+                    break;
+                case CMD_START_SCAN:
+                    boolean forceActive = (message.arg1 == SCAN_ACTIVE);
+                    if (forceActive && !mSetScanActive) {
+                        mWifiNative.setScanMode(forceActive);
+                    }
+                    mWifiNative.scan();
+                    if (forceActive && !mSetScanActive) {
+                        mWifiNative.setScanMode(mSetScanActive);
+                    }
+                    mScanResultIsPending = true;
+                    break;
+                case CMD_SET_COUNTRY_CODE:
+                    String country = (String) message.obj;
+                    if (DBG) log("set country code " + country);
+                    if (!mWifiNative.setCountryCode(country.toUpperCase())) {
+                        loge("Failed to set country code " + country);
+                    }
+                    break;
+                case CMD_SET_FREQUENCY_BAND:
+                    int band =  message.arg1;
+                    if (DBG) log("set frequency band " + band);
+                    if (mWifiNative.setBand(band)) {
+                        mFrequencyBand.set(band);
+                        //Fetch the latest scan results when frequency band is set
+                        startScan(true);
+                    } else {
+                        loge("Failed to set frequency band " + band);
+                    }
+                    break;
+                case CMD_BLUETOOTH_ADAPTER_STATE_CHANGE:
+                    mBluetoothConnectionActive = (message.arg1 !=
+                            BluetoothAdapter.STATE_DISCONNECTED);
+                    mWifiNative.setBluetoothCoexistenceScanMode(mBluetoothConnectionActive);
+                    break;
+                case CMD_STOP_DRIVER:
+                    int mode = message.arg1;
+
+                    /* Already doing a delayed stop && not in ecm state */
+                    if (mInDelayedStop && mode != IN_ECM_STATE) {
+                        if (DBG) log("Already in delayed stop");
+                        break;
+                    }
+                    mInDelayedStop = true;
+                    mDelayedStopCounter++;
+                    if (DBG) log("Delayed stop message " + mDelayedStopCounter);
+
+                    if (mode == IN_ECM_STATE) {
+                        /* send a shut down immediately */
+                        sendMessage(obtainMessage(CMD_DELAYED_STOP_DRIVER, mDelayedStopCounter, 0));
+                    } else {
+                        /* send regular delayed shut down */
+                        Intent driverStopIntent = new Intent(ACTION_DELAYED_DRIVER_STOP, null);
+                        driverStopIntent.putExtra(DELAYED_STOP_COUNTER, mDelayedStopCounter);
+                        mDriverStopIntent = PendingIntent.getBroadcast(mContext,
+                                DRIVER_STOP_REQUEST, driverStopIntent,
+                                PendingIntent.FLAG_UPDATE_CURRENT);
+
+                        mAlarmManager.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis()
+                                + mDriverStopDelayMs, mDriverStopIntent);
+                    }
+                    break;
+                case CMD_START_DRIVER:
+                    if (mInDelayedStop) {
+                        mInDelayedStop = false;
+                        mDelayedStopCounter++;
+                        mAlarmManager.cancel(mDriverStopIntent);
+                        if (DBG) log("Delayed stop ignored due to start");
+                    }
+                    break;
+                case CMD_DELAYED_STOP_DRIVER:
+                    if (DBG) log("delayed stop " + message.arg1 + " " + mDelayedStopCounter);
+                    if (message.arg1 != mDelayedStopCounter) break;
+                    if (getCurrentState() != mDisconnectedState) {
+                        mWifiNative.disconnect();
+                        handleNetworkDisconnect();
+                    }
+                    mWakeLock.acquire();
+                    mWifiNative.stopDriver();
+                    mWakeLock.release();
+                    if (mP2pSupported) {
+                        transitionTo(mWaitForP2pDisableState);
+                    } else {
+                        transitionTo(mDriverStoppingState);
+                    }
+                    break;
+                case CMD_START_PACKET_FILTERING:
+                    if (message.arg1 == MULTICAST_V6) {
+                        mWifiNative.startFilteringMulticastV6Packets();
+                    } else if (message.arg1 == MULTICAST_V4) {
+                        mWifiNative.startFilteringMulticastV4Packets();
+                    } else {
+                        loge("Illegal arugments to CMD_START_PACKET_FILTERING");
+                    }
+                    break;
+                case CMD_STOP_PACKET_FILTERING:
+                    if (message.arg1 == MULTICAST_V6) {
+                        mWifiNative.stopFilteringMulticastV6Packets();
+                    } else if (message.arg1 == MULTICAST_V4) {
+                        mWifiNative.stopFilteringMulticastV4Packets();
+                    } else {
+                        loge("Illegal arugments to CMD_STOP_PACKET_FILTERING");
+                    }
+                    break;
+                case CMD_SET_SUSPEND_OPT_ENABLED:
+                    if (message.arg1 == 1) {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, true);
+                        mSuspendWakeLock.release();
+                    } else {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, false);
+                    }
+                    break;
+                case CMD_SET_HIGH_PERF_MODE:
+                    if (message.arg1 == 1) {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, false);
+                    } else {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, true);
+                    }
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+!!!9757452.java!!!	exit() : void
+            if (DBG) log(getName() + "\n");
+            mIsRunning = false;
+            updateBatteryWorkSource(null);
+            mScanResults = new ArrayList<ScanResult>();

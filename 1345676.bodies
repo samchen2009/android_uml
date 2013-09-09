@@ -1,0 +1,377 @@
+class Vpn
+!!!8489868.java!!!	Vpn(inout context : Context, inout callback : VpnCallback, inout netService : INetworkManagementService)
+        // TODO: create dedicated TYPE_VPN network type
+        super(ConnectivityManager.TYPE_DUMMY);
+        mContext = context;
+        mCallback = callback;
+
+        try {
+            netService.registerObserver(mObserver);
+        } catch (RemoteException e) {
+            Log.wtf(TAG, "Problem registering observer", e);
+        }
+!!!8489996.java!!!	setEnableNotifications(inout enableNotif : boolean) : void
+        mEnableNotif = enableNotif;
+!!!8490124.java!!!	startMonitoringInternal() : void
+        // Ignored; events are sent through callbacks for now
+!!!8490252.java!!!	teardown() : boolean
+        // TODO: finish migration to unique tracker for each VPN
+        throw new UnsupportedOperationException();
+!!!8490380.java!!!	reconnect() : boolean
+        // TODO: finish migration to unique tracker for each VPN
+        throw new UnsupportedOperationException();
+!!!8490508.java!!!	getTcpBufferSizesPropName() : String
+        return PROP_TCP_BUFFER_UNKNOWN;
+!!!8490636.java!!!	updateState(inout detailedState : DetailedState, in reason : String) : void
+        if (LOGD) Log.d(TAG, "setting state=" + detailedState + ", reason=" + reason);
+        mNetworkInfo.setDetailedState(detailedState, reason, null);
+        mCallback.onStateChanged(new NetworkInfo(mNetworkInfo));
+!!!8490764.java!!!	prepare(in oldPackage : String, in newPackage : String) : boolean
+        // Return false if the package does not match.
+        if (oldPackage != null && !oldPackage.equals(mPackage)) {
+            return false;
+        }
+
+        // Return true if we do not need to revoke.
+        if (newPackage == null ||
+                (newPackage.equals(mPackage) && !newPackage.equals(VpnConfig.LEGACY_VPN))) {
+            return true;
+        }
+
+        // Check if the caller is authorized.
+        enforceControlPermission();
+
+        // Reset the interface and hide the notification.
+        if (mInterface != null) {
+            jniReset(mInterface);
+            final long token = Binder.clearCallingIdentity();
+            try {
+                mCallback.restore();
+                hideNotification();
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+            mInterface = null;
+        }
+
+        // Revoke the connection or stop LegacyVpnRunner.
+        if (mConnection != null) {
+            try {
+                mConnection.mService.transact(IBinder.LAST_CALL_TRANSACTION,
+                        Parcel.obtain(), null, IBinder.FLAG_ONEWAY);
+            } catch (Exception e) {
+                // ignore
+            }
+            mContext.unbindService(mConnection);
+            mConnection = null;
+        } else if (mLegacyVpnRunner != null) {
+            mLegacyVpnRunner.exit();
+            mLegacyVpnRunner = null;
+        }
+
+        Log.i(TAG, "Switched from " + mPackage + " to " + newPackage);
+        mPackage = newPackage;
+        updateState(DetailedState.IDLE, "prepare");
+        return true;
+!!!8490892.java!!!	protect(inout socket : ParcelFileDescriptor, in interfaze : String) : void
+        PackageManager pm = mContext.getPackageManager();
+        ApplicationInfo app = pm.getApplicationInfo(mPackage, 0);
+        if (Binder.getCallingUid() != app.uid) {
+            throw new SecurityException("Unauthorized Caller");
+        }
+        jniProtect(socket.getFd(), interfaze);
+!!!8491020.java!!!	establish(inout config : VpnConfig) : ParcelFileDescriptor
+        // Check if the caller is already prepared.
+        PackageManager pm = mContext.getPackageManager();
+        ApplicationInfo app = null;
+        try {
+            app = pm.getApplicationInfo(mPackage, 0);
+        } catch (Exception e) {
+            return null;
+        }
+        if (Binder.getCallingUid() != app.uid) {
+            return null;
+        }
+
+        // Check if the service is properly declared.
+        Intent intent = new Intent(VpnConfig.SERVICE_INTERFACE);
+        intent.setClassName(mPackage, config.user);
+        ResolveInfo info = pm.resolveService(intent, 0);
+        if (info == null) {
+            throw new SecurityException("Cannot find " + config.user);
+        }
+        if (!BIND_VPN_SERVICE.equals(info.serviceInfo.permission)) {
+            throw new SecurityException(config.user + " does not require " + BIND_VPN_SERVICE);
+        }
+
+        // Load the label.
+        String label = app.loadLabel(pm).toString();
+
+        // Load the icon and convert it into a bitmap.
+        Drawable icon = app.loadIcon(pm);
+        Bitmap bitmap = null;
+        if (icon.getIntrinsicWidth() > 0 && icon.getIntrinsicHeight() > 0) {
+            int width = mContext.getResources().getDimensionPixelSize(
+                    android.R.dimen.notification_large_icon_width);
+            int height = mContext.getResources().getDimensionPixelSize(
+                    android.R.dimen.notification_large_icon_height);
+            icon.setBounds(0, 0, width, height);
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(bitmap);
+            icon.draw(c);
+            c.setBitmap(null);
+        }
+
+        // Configure the interface. Abort if any of these steps fails.
+        ParcelFileDescriptor tun = ParcelFileDescriptor.adoptFd(jniCreate(config.mtu));
+        try {
+            updateState(DetailedState.CONNECTING, "establish");
+            String interfaze = jniGetName(tun.getFd());
+            if (jniSetAddresses(interfaze, config.addresses) < 1) {
+                throw new IllegalArgumentException("At least one address must be specified");
+            }
+            if (config.routes != null) {
+                jniSetRoutes(interfaze, config.routes);
+            }
+            Connection connection = new Connection();
+            if (!mContext.bindService(intent, connection, Context.BIND_AUTO_CREATE)) {
+                throw new IllegalStateException("Cannot bind " + config.user);
+            }
+            if (mConnection != null) {
+                mContext.unbindService(mConnection);
+            }
+            if (mInterface != null && !mInterface.equals(interfaze)) {
+                jniReset(mInterface);
+            }
+            mConnection = connection;
+            mInterface = interfaze;
+        } catch (RuntimeException e) {
+            updateState(DetailedState.FAILED, "establish");
+            IoUtils.closeQuietly(tun);
+            throw e;
+        }
+        Log.i(TAG, "Established by " + config.user + " on " + mInterface);
+
+        // Fill more values.
+        config.user = mPackage;
+        config.interfaze = mInterface;
+
+        // Override DNS servers and show the notification.
+        final long token = Binder.clearCallingIdentity();
+        try {
+            mCallback.override(config.dnsServers, config.searchDomains);
+            showNotification(config, label, bitmap);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+        // TODO: ensure that contract class eventually marks as connected
+        updateState(DetailedState.AUTHENTICATING, "establish");
+        return tun;
+!!!8491148.java!!!	interfaceStatusChanged(in iface : String, inout up : boolean) : void
+        try {
+            mObserver.interfaceStatusChanged(iface, up);
+        } catch (RemoteException e) {
+            // ignored; target is local
+        }
+!!!8491276.java!!!	enforceControlPermission() : void
+        // System user is allowed to control VPN.
+        if (Binder.getCallingUid() == Process.SYSTEM_UID) {
+            return;
+        }
+
+        try {
+            // System dialogs are also allowed to control VPN.
+            PackageManager pm = mContext.getPackageManager();
+            ApplicationInfo app = pm.getApplicationInfo(VpnConfig.DIALOGS_PACKAGE, 0);
+            if (Binder.getCallingUid() == app.uid) {
+                return;
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+
+        throw new SecurityException("Unauthorized Caller");
+!!!8491660.java!!!	showNotification(inout config : VpnConfig, in label : String, inout icon : Bitmap) : void
+        if (!mEnableNotif) return;
+        mStatusIntent = VpnConfig.getIntentForStatusPanel(mContext, config);
+
+        NotificationManager nm = (NotificationManager)
+                mContext.getSystemService(Context.NOTIFICATION_SERVICE);
+
+        if (nm != null) {
+            String title = (label == null) ? mContext.getString(R.string.vpn_title) :
+                    mContext.getString(R.string.vpn_title_long, label);
+            String text = (config.session == null) ? mContext.getString(R.string.vpn_text) :
+                    mContext.getString(R.string.vpn_text_long, config.session);
+            config.startTime = SystemClock.elapsedRealtime();
+
+            Notification notification = new Notification.Builder(mContext)
+                    .setSmallIcon(R.drawable.vpn_connected)
+                    .setLargeIcon(icon)
+                    .setContentTitle(title)
+                    .setContentText(text)
+                    .setContentIntent(mStatusIntent)
+                    .setDefaults(0)
+                    .setOngoing(true)
+                    .build();
+            nm.notifyAsUser(null, R.drawable.vpn_connected, notification, UserHandle.ALL);
+        }
+!!!8491788.java!!!	hideNotification() : void
+        if (!mEnableNotif) return;
+        mStatusIntent = null;
+
+        NotificationManager nm = (NotificationManager)
+                mContext.getSystemService(Context.NOTIFICATION_SERVICE);
+
+        if (nm != null) {
+            nm.cancelAsUser(null, R.drawable.vpn_connected, UserHandle.ALL);
+        }
+!!!8492812.java!!!	findLegacyVpnGateway(inout prop : LinkProperties) : String
+        for (RouteInfo route : prop.getRoutes()) {
+            // Currently legacy VPN only works on IPv4.
+            if (route.isDefaultRoute() && route.getGateway() instanceof Inet4Address) {
+                return route.getGateway().getHostAddress();
+            }
+        }
+
+        throw new IllegalStateException("Unable to find suitable gateway");
+!!!8492940.java!!!	startLegacyVpn(inout profile : VpnProfile, inout keyStore : KeyStore, inout egress : LinkProperties) : void
+        if (keyStore.state() != KeyStore.State.UNLOCKED) {
+            throw new IllegalStateException("KeyStore isn't unlocked");
+        }
+
+        final String iface = egress.getInterfaceName();
+        final String gateway = findLegacyVpnGateway(egress);
+
+        // Load certificates.
+        String privateKey = "";
+        String userCert = "";
+        String caCert = "";
+        String serverCert = "";
+        if (!profile.ipsecUserCert.isEmpty()) {
+            privateKey = Credentials.USER_PRIVATE_KEY + profile.ipsecUserCert;
+            byte[] value = keyStore.get(Credentials.USER_CERTIFICATE + profile.ipsecUserCert);
+            userCert = (value == null) ? null : new String(value, Charsets.UTF_8);
+        }
+        if (!profile.ipsecCaCert.isEmpty()) {
+            byte[] value = keyStore.get(Credentials.CA_CERTIFICATE + profile.ipsecCaCert);
+            caCert = (value == null) ? null : new String(value, Charsets.UTF_8);
+        }
+        if (!profile.ipsecServerCert.isEmpty()) {
+            byte[] value = keyStore.get(Credentials.USER_CERTIFICATE + profile.ipsecServerCert);
+            serverCert = (value == null) ? null : new String(value, Charsets.UTF_8);
+        }
+        if (privateKey == null || userCert == null || caCert == null || serverCert == null) {
+            throw new IllegalStateException("Cannot load credentials");
+        }
+
+        // Prepare arguments for racoon.
+        String[] racoon = null;
+        switch (profile.type) {
+            case VpnProfile.TYPE_L2TP_IPSEC_PSK:
+                racoon = new String[] {
+                    iface, profile.server, "udppsk", profile.ipsecIdentifier,
+                    profile.ipsecSecret, "1701",
+                };
+                break;
+            case VpnProfile.TYPE_L2TP_IPSEC_RSA:
+                racoon = new String[] {
+                    iface, profile.server, "udprsa", privateKey, userCert,
+                    caCert, serverCert, "1701",
+                };
+                break;
+            case VpnProfile.TYPE_IPSEC_XAUTH_PSK:
+                racoon = new String[] {
+                    iface, profile.server, "xauthpsk", profile.ipsecIdentifier,
+                    profile.ipsecSecret, profile.username, profile.password, "", gateway,
+                };
+                break;
+            case VpnProfile.TYPE_IPSEC_XAUTH_RSA:
+                racoon = new String[] {
+                    iface, profile.server, "xauthrsa", privateKey, userCert,
+                    caCert, serverCert, profile.username, profile.password, "", gateway,
+                };
+                break;
+            case VpnProfile.TYPE_IPSEC_HYBRID_RSA:
+                racoon = new String[] {
+                    iface, profile.server, "hybridrsa",
+                    caCert, serverCert, profile.username, profile.password, "", gateway,
+                };
+                break;
+        }
+
+        // Prepare arguments for mtpd.
+        String[] mtpd = null;
+        switch (profile.type) {
+            case VpnProfile.TYPE_PPTP:
+                mtpd = new String[] {
+                    iface, "pptp", profile.server, "1723",
+                    "name", profile.username, "password", profile.password,
+                    "linkname", "vpn", "refuse-eap", "nodefaultroute",
+                    "usepeerdns", "idle", "1800", "mtu", "1400", "mru", "1400",
+                    (profile.mppe ? "+mppe" : "nomppe"),
+                };
+                break;
+            case VpnProfile.TYPE_L2TP_IPSEC_PSK:
+            case VpnProfile.TYPE_L2TP_IPSEC_RSA:
+                mtpd = new String[] {
+                    iface, "l2tp", profile.server, "1701", profile.l2tpSecret,
+                    "name", profile.username, "password", profile.password,
+                    "linkname", "vpn", "refuse-eap", "nodefaultroute",
+                    "usepeerdns", "idle", "1800", "mtu", "1400", "mru", "1400",
+                };
+                break;
+        }
+
+        VpnConfig config = new VpnConfig();
+        config.legacy = true;
+        config.user = profile.key;
+        config.interfaze = iface;
+        config.session = profile.name;
+        config.routes = profile.routes;
+        if (!profile.dnsServers.isEmpty()) {
+            config.dnsServers = Arrays.asList(profile.dnsServers.split(" +"));
+        }
+        if (!profile.searchDomains.isEmpty()) {
+            config.searchDomains = Arrays.asList(profile.searchDomains.split(" +"));
+        }
+
+        startLegacyVpn(config, racoon, mtpd);
+!!!8493068.java!!!	startLegacyVpn(inout config : VpnConfig, inout racoon : String, inout mtpd : String) : void
+        stopLegacyVpn();
+
+        // Prepare for the new request. This also checks the caller.
+        prepare(null, VpnConfig.LEGACY_VPN);
+        updateState(DetailedState.CONNECTING, "startLegacyVpn");
+
+        // Start a new LegacyVpnRunner and we are done!
+        mLegacyVpnRunner = new LegacyVpnRunner(config, racoon, mtpd);
+        mLegacyVpnRunner.start();
+!!!8493196.java!!!	stopLegacyVpn() : void
+        if (mLegacyVpnRunner != null) {
+            mLegacyVpnRunner.exit();
+            mLegacyVpnRunner = null;
+
+            synchronized (LegacyVpnRunner.TAG) {
+                // wait for old thread to completely finish before spinning up
+                // new instance, otherwise state updates can be out of order.
+            }
+        }
+!!!8493324.java!!!	getLegacyVpnInfo() : LegacyVpnInfo
+        // Check if the caller is authorized.
+        enforceControlPermission();
+        if (mLegacyVpnRunner == null) return null;
+
+        final LegacyVpnInfo info = new LegacyVpnInfo();
+        info.key = mLegacyVpnRunner.mConfig.user;
+        info.state = LegacyVpnInfo.stateFromNetworkInfo(mNetworkInfo);
+        if (mNetworkInfo.isConnected()) {
+            info.intent = mStatusIntent;
+        }
+        return info;
+!!!8493452.java!!!	getLegacyVpnConfig() : VpnConfig
+        if (mLegacyVpnRunner != null) {
+            return mLegacyVpnRunner.mConfig;
+        } else {
+            return null;
+        }

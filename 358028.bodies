@@ -1,0 +1,342 @@
+class StagefrightMetadataRetriever
+!!!666508.cpp!!!	StagefrightMetadataRetriever()
+    ALOGV("StagefrightMetadataRetriever()");
+
+    DataSource::RegisterDefaultSniffers();
+    CHECK_EQ(mClient.connect(), (status_t)OK);
+!!!666636.cpp!!!	~StagefrightMetadataRetriever()
+    ALOGV("~StagefrightMetadataRetriever()");
+
+    delete mAlbumArt;
+    mAlbumArt = NULL;
+
+    mClient.disconnect();
+!!!666764.cpp!!!	setDataSource(in uri : char, in headers : KeyedVector<String8, String8>) : status_t
+    ALOGV("setDataSource(%s)", uri);
+
+    mParsedMetaData = false;
+    mMetaData.clear();
+    delete mAlbumArt;
+    mAlbumArt = NULL;
+
+    mSource = DataSource::CreateFromURI(uri, headers);
+
+    if (mSource == NULL) {
+        ALOGE("Unable to create data source for '%s'.", uri);
+        return UNKNOWN_ERROR;
+    }
+
+    mExtractor = MediaExtractor::Create(mSource);
+
+    if (mExtractor == NULL) {
+        ALOGE("Unable to instantiate an extractor for '%s'.", uri);
+
+        mSource.clear();
+
+        return UNKNOWN_ERROR;
+    }
+
+    return OK;
+!!!666892.cpp!!!	setDataSource(in fd : int, in offset : int64_t, in length : int64_t) : status_t
+    fd = dup(fd);
+
+    ALOGV("setDataSource(%d, %lld, %lld)", fd, offset, length);
+
+    mParsedMetaData = false;
+    mMetaData.clear();
+    delete mAlbumArt;
+    mAlbumArt = NULL;
+
+    mSource = new FileSource(fd, offset, length);
+
+    status_t err;
+    if ((err = mSource->initCheck()) != OK) {
+        mSource.clear();
+
+        return err;
+    }
+
+    mExtractor = MediaExtractor::Create(mSource);
+
+    if (mExtractor == NULL) {
+        mSource.clear();
+
+        return UNKNOWN_ERROR;
+    }
+
+    return OK;
+!!!667020.cpp!!!	getFrameAtTime(in timeUs : int64_t, in option : int) : VideoFrame
+
+    ALOGV("getFrameAtTime: %lld us option: %d", timeUs, option);
+
+    if (mExtractor.get() == NULL) {
+        ALOGV("no extractor.");
+        return NULL;
+    }
+
+    sp<MetaData> fileMeta = mExtractor->getMetaData();
+
+    if (fileMeta == NULL) {
+        ALOGV("extractor doesn't publish metadata, failed to initialize?");
+        return NULL;
+    }
+
+    int32_t drm = 0;
+    if (fileMeta->findInt32(kKeyIsDRM, &drm) && drm != 0) {
+        ALOGE("frame grab not allowed.");
+        return NULL;
+    }
+
+    size_t n = mExtractor->countTracks();
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        sp<MetaData> meta = mExtractor->getTrackMetaData(i);
+
+        const char *mime;
+        CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+        if (!strncasecmp(mime, "video/", 6)) {
+            break;
+        }
+    }
+
+    if (i == n) {
+        ALOGV("no video track found.");
+        return NULL;
+    }
+
+    sp<MetaData> trackMeta = mExtractor->getTrackMetaData(
+            i, MediaExtractor::kIncludeExtensiveMetaData);
+
+    sp<MediaSource> source = mExtractor->getTrack(i);
+
+    if (source.get() == NULL) {
+        ALOGV("unable to instantiate video track.");
+        return NULL;
+    }
+
+    const void *data;
+    uint32_t type;
+    size_t dataSize;
+    if (fileMeta->findData(kKeyAlbumArt, &type, &data, &dataSize)
+            && mAlbumArt == NULL) {
+        mAlbumArt = new MediaAlbumArt;
+        mAlbumArt->mSize = dataSize;
+        mAlbumArt->mData = new uint8_t[dataSize];
+        memcpy(mAlbumArt->mData, data, dataSize);
+    }
+
+    VideoFrame *frame =
+        extractVideoFrameWithCodecFlags(
+                &mClient, trackMeta, source, OMXCodec::kPreferSoftwareCodecs,
+                timeUs, option);
+
+    if (frame == NULL) {
+        ALOGV("Software decoder failed to extract thumbnail, "
+             "trying hardware decoder.");
+
+        frame = extractVideoFrameWithCodecFlags(&mClient, trackMeta, source, 0,
+                        timeUs, option);
+    }
+
+    return frame;
+!!!667148.cpp!!!	extractAlbumArt() : MediaAlbumArt
+    ALOGV("extractAlbumArt (extractor: %s)", mExtractor.get() != NULL ? "YES" : "NO");
+
+    if (mExtractor == NULL) {
+        return NULL;
+    }
+
+    if (!mParsedMetaData) {
+        parseMetaData();
+
+        mParsedMetaData = true;
+    }
+
+    if (mAlbumArt) {
+        return new MediaAlbumArt(*mAlbumArt);
+    }
+
+    return NULL;
+!!!667276.cpp!!!	extractMetadata(in keyCode : int) : char
+    if (mExtractor == NULL) {
+        return NULL;
+    }
+
+    if (!mParsedMetaData) {
+        parseMetaData();
+
+        mParsedMetaData = true;
+    }
+
+    ssize_t index = mMetaData.indexOfKey(keyCode);
+
+    if (index < 0) {
+        return NULL;
+    }
+
+    return strdup(mMetaData.valueAt(index).string());
+!!!667404.cpp!!!	parseMetaData() : void
+    sp<MetaData> meta = mExtractor->getMetaData();
+
+    if (meta == NULL) {
+        ALOGV("extractor doesn't publish metadata, failed to initialize?");
+        return;
+    }
+
+    struct Map {
+        int from;
+        int to;
+    };
+    static const Map kMap[] = {
+        { kKeyMIMEType, METADATA_KEY_MIMETYPE },
+        { kKeyCDTrackNumber, METADATA_KEY_CD_TRACK_NUMBER },
+        { kKeyDiscNumber, METADATA_KEY_DISC_NUMBER },
+        { kKeyAlbum, METADATA_KEY_ALBUM },
+        { kKeyArtist, METADATA_KEY_ARTIST },
+        { kKeyAlbumArtist, METADATA_KEY_ALBUMARTIST },
+        { kKeyAuthor, METADATA_KEY_AUTHOR },
+        { kKeyComposer, METADATA_KEY_COMPOSER },
+        { kKeyDate, METADATA_KEY_DATE },
+        { kKeyGenre, METADATA_KEY_GENRE },
+        { kKeyTitle, METADATA_KEY_TITLE },
+        { kKeyYear, METADATA_KEY_YEAR },
+        { kKeyWriter, METADATA_KEY_WRITER },
+        { kKeyCompilation, METADATA_KEY_COMPILATION },
+        { kKeyLocation, METADATA_KEY_LOCATION },
+    };
+    static const size_t kNumMapEntries = sizeof(kMap) / sizeof(kMap[0]);
+
+    for (size_t i = 0; i < kNumMapEntries; ++i) {
+        const char *value;
+        if (meta->findCString(kMap[i].from, &value)) {
+            mMetaData.add(kMap[i].to, String8(value));
+        }
+    }
+
+    const void *data;
+    uint32_t type;
+    size_t dataSize;
+    if (meta->findData(kKeyAlbumArt, &type, &data, &dataSize)
+            && mAlbumArt == NULL) {
+        mAlbumArt = new MediaAlbumArt;
+        mAlbumArt->mSize = dataSize;
+        mAlbumArt->mData = new uint8_t[dataSize];
+        memcpy(mAlbumArt->mData, data, dataSize);
+    }
+
+    size_t numTracks = mExtractor->countTracks();
+
+    char tmp[32];
+    sprintf(tmp, "%d", numTracks);
+
+    mMetaData.add(METADATA_KEY_NUM_TRACKS, String8(tmp));
+
+    bool hasAudio = false;
+    bool hasVideo = false;
+    int32_t videoWidth = -1;
+    int32_t videoHeight = -1;
+    int32_t audioBitrate = -1;
+    int32_t rotationAngle = -1;
+
+    // The overall duration is the duration of the longest track.
+    int64_t maxDurationUs = 0;
+    String8 timedTextLang;
+    for (size_t i = 0; i < numTracks; ++i) {
+        sp<MetaData> trackMeta = mExtractor->getTrackMetaData(i);
+
+        int64_t durationUs;
+        if (trackMeta->findInt64(kKeyDuration, &durationUs)) {
+            if (durationUs > maxDurationUs) {
+                maxDurationUs = durationUs;
+            }
+        }
+
+        const char *mime;
+        if (trackMeta->findCString(kKeyMIMEType, &mime)) {
+            if (!hasAudio && !strncasecmp("audio/", mime, 6)) {
+                hasAudio = true;
+
+                if (!trackMeta->findInt32(kKeyBitRate, &audioBitrate)) {
+                    audioBitrate = -1;
+                }
+            } else if (!hasVideo && !strncasecmp("video/", mime, 6)) {
+                hasVideo = true;
+
+                CHECK(trackMeta->findInt32(kKeyWidth, &videoWidth));
+                CHECK(trackMeta->findInt32(kKeyHeight, &videoHeight));
+                if (!trackMeta->findInt32(kKeyRotation, &rotationAngle)) {
+                    rotationAngle = 0;
+                }
+            } else if (!strcasecmp(mime, MEDIA_MIMETYPE_TEXT_3GPP)) {
+                const char *lang;
+                trackMeta->findCString(kKeyMediaLanguage, &lang);
+                timedTextLang.append(String8(lang));
+                timedTextLang.append(String8(":"));
+            }
+        }
+    }
+
+    // To save the language codes for all timed text tracks
+    // If multiple text tracks present, the format will look
+    // like "eng:chi"
+    if (!timedTextLang.isEmpty()) {
+        mMetaData.add(METADATA_KEY_TIMED_TEXT_LANGUAGES, timedTextLang);
+    }
+
+    // The duration value is a string representing the duration in ms.
+    sprintf(tmp, "%lld", (maxDurationUs + 500) / 1000);
+    mMetaData.add(METADATA_KEY_DURATION, String8(tmp));
+
+    if (hasAudio) {
+        mMetaData.add(METADATA_KEY_HAS_AUDIO, String8("yes"));
+    }
+
+    if (hasVideo) {
+        mMetaData.add(METADATA_KEY_HAS_VIDEO, String8("yes"));
+
+        sprintf(tmp, "%d", videoWidth);
+        mMetaData.add(METADATA_KEY_VIDEO_WIDTH, String8(tmp));
+
+        sprintf(tmp, "%d", videoHeight);
+        mMetaData.add(METADATA_KEY_VIDEO_HEIGHT, String8(tmp));
+
+        sprintf(tmp, "%d", rotationAngle);
+        mMetaData.add(METADATA_KEY_VIDEO_ROTATION, String8(tmp));
+    }
+
+    if (numTracks == 1 && hasAudio && audioBitrate >= 0) {
+        sprintf(tmp, "%d", audioBitrate);
+        mMetaData.add(METADATA_KEY_BITRATE, String8(tmp));
+    } else {
+        off64_t sourceSize;
+        if (mSource->getSize(&sourceSize) == OK) {
+            int64_t avgBitRate = (int64_t)(sourceSize * 8E6 / maxDurationUs);
+
+            sprintf(tmp, "%lld", avgBitRate);
+            mMetaData.add(METADATA_KEY_BITRATE, String8(tmp));
+        }
+    }
+
+    if (numTracks == 1) {
+        const char *fileMIME;
+        CHECK(meta->findCString(kKeyMIMEType, &fileMIME));
+
+        if (!strcasecmp(fileMIME, "video/x-matroska")) {
+            sp<MetaData> trackMeta = mExtractor->getTrackMetaData(0);
+            const char *trackMIME;
+            CHECK(trackMeta->findCString(kKeyMIMEType, &trackMIME));
+
+            if (!strncasecmp("audio/", trackMIME, 6)) {
+                // The matroska file only contains a single audio track,
+                // rewrite its mime type.
+                mMetaData.add(
+                        METADATA_KEY_MIMETYPE, String8("audio/x-matroska"));
+            }
+        }
+    }
+
+    // To check whether the media file is drm-protected
+    if (mExtractor->getDrmFlag()) {
+        mMetaData.add(METADATA_KEY_IS_DRM, String8("1"));
+    }

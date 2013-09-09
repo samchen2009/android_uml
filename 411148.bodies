@@ -1,0 +1,157 @@
+class _CompressedAsset
+!!!968204.cpp!!!	~_CompressedAsset(in  : void)
+    close();
+!!!968332.cpp!!!	openChunk(in fd : int, in offset : off64_t, in compressionMethod : int, in uncompressedLen : size_t, in compressedLen : size_t) : status_t
+    assert(mFd < 0);        // no re-open
+    assert(mMap == NULL);
+    assert(fd >= 0);
+    assert(offset >= 0);
+    assert(compressedLen > 0);
+
+    if (compressionMethod != ZipFileRO::kCompressDeflated) {
+        assert(false);
+        return UNKNOWN_ERROR;
+    }
+
+    mStart = offset;
+    mCompressedLen = compressedLen;
+    mUncompressedLen = uncompressedLen;
+    assert(mOffset == 0);
+    mFd = fd;
+    assert(mBuf == NULL);
+
+    if (uncompressedLen > StreamingZipInflater::OUTPUT_CHUNK_SIZE) {
+        mZipInflater = new StreamingZipInflater(mFd, offset, uncompressedLen, compressedLen);
+    }
+
+    return NO_ERROR;
+!!!968460.cpp!!!	openChunk(inout dataMap : FileMap, in compressionMethod : int, in uncompressedLen : size_t) : status_t
+    assert(mFd < 0);        // no re-open
+    assert(mMap == NULL);
+    assert(dataMap != NULL);
+
+    if (compressionMethod != ZipFileRO::kCompressDeflated) {
+        assert(false);
+        return UNKNOWN_ERROR;
+    }
+
+    mMap = dataMap;
+    mStart = -1;        // not used
+    mCompressedLen = dataMap->getDataLength();
+    mUncompressedLen = uncompressedLen;
+    assert(mOffset == 0);
+
+    if (uncompressedLen > StreamingZipInflater::OUTPUT_CHUNK_SIZE) {
+        mZipInflater = new StreamingZipInflater(dataMap, uncompressedLen);
+    }
+    return NO_ERROR;
+!!!968588.cpp!!!	read(inout buf : void, in count : size_t) : ssize_t
+    size_t maxLen;
+    size_t actual;
+
+    assert(mOffset >= 0 && mOffset <= mUncompressedLen);
+
+    /* If we're relying on a streaming inflater, go through that */
+    if (mZipInflater) {
+        actual = mZipInflater->read(buf, count);
+    } else {
+        if (mBuf == NULL) {
+            if (getBuffer(false) == NULL)
+                return -1;
+        }
+        assert(mBuf != NULL);
+
+        /* adjust count if we're near EOF */
+        maxLen = mUncompressedLen - mOffset;
+        if (count > maxLen)
+            count = maxLen;
+
+        if (!count)
+            return 0;
+
+        /* copy from buffer */
+        //printf("comp buf read\n");
+        memcpy(buf, (char*)mBuf + mOffset, count);
+        actual = count;
+    }
+
+    mOffset += actual;
+    return actual;
+!!!968716.cpp!!!	seek(in offset : off64_t, in whence : int) : off64_t
+    off64_t newPosn;
+
+    // compute new position within chunk
+    newPosn = handleSeek(offset, whence, mOffset, mUncompressedLen);
+    if (newPosn == (off64_t) -1)
+        return newPosn;
+
+    if (mZipInflater) {
+        mZipInflater->seekAbsolute(newPosn);
+    }
+    mOffset = newPosn;
+    return mOffset;
+!!!968844.cpp!!!	close(in  : void) : void
+    if (mMap != NULL) {
+        mMap->release();
+        mMap = NULL;
+    }
+
+    delete[] mBuf;
+    mBuf = NULL;
+
+    delete mZipInflater;
+    mZipInflater = NULL;
+
+    if (mFd > 0) {
+        ::close(mFd);
+        mFd = -1;
+    }
+!!!968972.cpp!!!	getBuffer(in wordAligned : bool) : void
+    unsigned char* buf = NULL;
+
+    if (mBuf != NULL)
+        return mBuf;
+
+    /*
+     * Allocate a buffer and read the file into it.
+     */
+    buf = new unsigned char[mUncompressedLen];
+    if (buf == NULL) {
+        ALOGW("alloc %ld bytes failed\n", (long) mUncompressedLen);
+        goto bail;
+    }
+
+    if (mMap != NULL) {
+        if (!ZipFileRO::inflateBuffer(buf, mMap->getDataPtr(),
+                mUncompressedLen, mCompressedLen))
+            goto bail;
+    } else {
+        assert(mFd >= 0);
+
+        /*
+         * Seek to the start of the compressed data.
+         */
+        if (lseek(mFd, mStart, SEEK_SET) != mStart)
+            goto bail;
+
+        /*
+         * Expand the data into it.
+         */
+        if (!ZipUtils::inflateToBuffer(mFd, buf, mUncompressedLen,
+                mCompressedLen))
+            goto bail;
+    }
+
+    /*
+     * Success - now that we have the full asset in RAM we
+     * no longer need the streaming inflater
+     */
+    delete mZipInflater;
+    mZipInflater = NULL;
+
+    mBuf = buf;
+    buf = NULL;
+
+bail:
+    delete[] buf;
+    return mBuf;

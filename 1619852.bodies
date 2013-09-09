@@ -1,0 +1,297 @@
+class ARMAssembler
+!!!9861132.cpp!!!	ARMAssembler(in assembly : sp<Assembly>)
+    mBase = mPC = (uint32_t *)assembly->base();
+    mDuration = ggl_system_time();
+#if defined(WITH_LIB_HARDWARE)
+    mQemuTracing = true;
+#endif
+!!!9861388.cpp!!!	base() : uint32_t
+    return mBase;
+!!!9861516.cpp!!!	pc() : uint32_t
+    return mPC;
+!!!9861644.cpp!!!	disassemble(in name : char) : void
+    if (name) {
+        printf("%s:\n", name);
+    }
+    size_t count = pc()-base();
+    uint32_t* i = base();
+    while (count--) {
+        ssize_t label = mLabelsInverseMapping.indexOfKey(i);
+        if (label >= 0) {
+            printf("%s:\n", mLabelsInverseMapping.valueAt(label));
+        }
+        ssize_t comment = mComments.indexOfKey(i);
+        if (comment >= 0) {
+            printf("; %s\n", mComments.valueAt(comment));
+        }
+        printf("%08x:    %08x    ", int(i), int(i[0]));
+        ::disassemble((u_int)i);
+        i++;
+    }
+!!!9861772.cpp!!!	reset() : void
+    mBase = mPC = (uint32_t *)mAssembly->base();
+    mBranchTargets.clear();
+    mLabels.clear();
+    mLabelsInverseMapping.clear();
+    mComments.clear();
+!!!9861900.cpp!!!	generate(in name : char) : int
+    // fixup all the branches
+    size_t count = mBranchTargets.size();
+    while (count--) {
+        const branch_target_t& bt = mBranchTargets[count];
+        uint32_t* target_pc = mLabels.valueFor(bt.label);
+        LOG_ALWAYS_FATAL_IF(!target_pc,
+                "error resolving branch targets, target_pc is null");
+        int32_t offset = int32_t(target_pc - (bt.pc+2));
+        *bt.pc |= offset & 0xFFFFFF;
+    }
+
+    mAssembly->resize( int(pc()-base())*4 );
+    
+    // the instruction cache is flushed by CodeCache
+    const int64_t duration = ggl_system_time() - mDuration;
+    const char * const format = "generated %s (%d ins) at [%p:%p] in %lld ns\n";
+    ALOGI(format, name, int(pc()-base()), base(), pc(), duration);
+
+#if defined(WITH_LIB_HARDWARE)
+    if (__builtin_expect(mQemuTracing, 0)) {
+        int err = qemu_add_mapping(int(base()), name);
+        mQemuTracing = (err >= 0);
+    }
+#endif
+
+    char value[PROPERTY_VALUE_MAX];
+    property_get("debug.pf.disasm", value, "0");
+    if (atoi(value) != 0) {
+        printf(format, name, int(pc()-base()), base(), pc(), duration);
+        disassemble(name);
+    }
+    
+    return NO_ERROR;
+!!!9862028.cpp!!!	getCodegenArch() : int
+    return CODEGEN_ARCH_ARM;
+!!!9862156.cpp!!!	prolog() : void
+    // write dummy prolog code
+    mPrologPC = mPC;
+    STM(AL, FD, SP, 1, LSAVED);
+!!!9862284.cpp!!!	epilog(in touched : uint32_t) : void
+    touched &= LSAVED;
+    if (touched) {
+        // write prolog code
+        uint32_t* pc = mPC;
+        mPC = mPrologPC;
+        STM(AL, FD, SP, 1, touched | LLR);
+        mPC = pc;
+        // write epilog code
+        LDM(AL, FD, SP, 1, touched | LLR);
+        BX(AL, LR);
+    } else {   // heh, no registers to save!
+        // write prolog code
+        uint32_t* pc = mPC;
+        mPC = mPrologPC;
+        MOV(AL, 0, R0, R0); // NOP
+        mPC = pc;
+        // write epilog code
+        BX(AL, LR);
+    }
+!!!9862412.cpp!!!	comment(in string : char) : void
+    mComments.add(mPC, string);
+!!!9862540.cpp!!!	isValidImmediate(in immediate : uint32_t) : bool
+    uint32_t rot, imm;
+    return buildImmediate(immediate, rot, imm) == 0;
+!!!9862668.cpp!!!	buildImmediate(in immediate : uint32_t, inout rot : uint32_t, inout imm : uint32_t) : int
+    rot = 0;
+    imm = immediate;
+    if (imm > 0x7F) { // skip the easy cases
+        while (!(imm&3)  || (imm&0xFC000000)) {
+            uint32_t newval;
+            newval = imm >> 2;
+            newval |= (imm&3) << 30;
+            imm = newval;
+            rot += 2;
+            if (rot == 32) {
+                rot = 0;
+                break;
+            }
+        }
+    }
+    rot = (16 - (rot>>1)) & 0xF;
+
+    if (imm>=0x100)
+        return -EINVAL;
+
+    if (((imm>>(rot<<1)) | (imm<<(32-(rot<<1)))) != immediate)
+        return -1;
+
+    return 0;
+!!!9862796.cpp!!!	imm(in immediate : uint32_t) : uint32_t
+    uint32_t rot, imm;
+    int err = buildImmediate(immediate, rot, imm);
+
+    LOG_ALWAYS_FATAL_IF(err==-EINVAL,
+                        "immediate %08x cannot be encoded",
+                        immediate);
+
+    LOG_ALWAYS_FATAL_IF(err,
+                        "immediate (%08x) encoding bogus!",
+                        immediate);
+
+    return (1<<25) | (rot<<8) | imm;
+!!!9862924.cpp!!!	reg_imm(in Rm : int, in type : int, in shift : uint32_t) : uint32_t
+    return ((shift&0x1F)<<7) | ((type&0x3)<<5) | (Rm&0xF);
+!!!9863052.cpp!!!	reg_rrx(in Rm : int) : uint32_t
+    return (ROR<<5) | (Rm&0xF);
+!!!9863180.cpp!!!	reg_reg(in Rm : int, in type : int, in Rs : int) : uint32_t
+    return ((Rs&0xF)<<8) | ((type&0x3)<<5) | (1<<4) | (Rm&0xF);
+!!!9863308.cpp!!!	immed12_pre(in immed12 : int32_t, in W : int = 0) : uint32_t
+    LOG_ALWAYS_FATAL_IF(abs(immed12) >= 0x800,
+                        "LDR(B)/STR(B)/PLD immediate too big (%08x)",
+                        immed12);
+    return (1<<24) | (((uint32_t(immed12)>>31)^1)<<23) |
+            ((W&1)<<21) | (abs(immed12)&0x7FF);
+!!!9863436.cpp!!!	immed12_post(in immed12 : int32_t) : uint32_t
+    LOG_ALWAYS_FATAL_IF(abs(immed12) >= 0x800,
+                        "LDR(B)/STR(B)/PLD immediate too big (%08x)",
+                        immed12);
+
+    return (((uint32_t(immed12)>>31)^1)<<23) | (abs(immed12)&0x7FF);
+!!!9863564.cpp!!!	reg_scale_pre(in Rm : int, in type : int = 0, in shift : uint32_t = 0, in W : int = 0) : uint32_t
+    return  (1<<25) | (1<<24) |
+            (((uint32_t(Rm)>>31)^1)<<23) | ((W&1)<<21) |
+            reg_imm(abs(Rm), type, shift);
+!!!9863692.cpp!!!	reg_scale_post(in Rm : int, in type : int = 0, in shift : uint32_t = 0) : uint32_t
+    return (1<<25) | (((uint32_t(Rm)>>31)^1)<<23) | reg_imm(abs(Rm), type, shift);
+!!!9863820.cpp!!!	immed8_pre(in immed8 : int32_t, in W : int = 0) : uint32_t
+    uint32_t offset = abs(immed8);
+
+    LOG_ALWAYS_FATAL_IF(abs(immed8) >= 0x100,
+                        "LDRH/LDRSB/LDRSH/STRH immediate too big (%08x)",
+                        immed8);
+
+    return  (1<<24) | (1<<22) | (((uint32_t(immed8)>>31)^1)<<23) |
+            ((W&1)<<21) | (((offset&0xF0)<<4)|(offset&0xF));
+!!!9863948.cpp!!!	immed8_post(in immed8 : int32_t) : uint32_t
+    uint32_t offset = abs(immed8);
+
+    LOG_ALWAYS_FATAL_IF(abs(immed8) >= 0x100,
+                        "LDRH/LDRSB/LDRSH/STRH immediate too big (%08x)",
+                        immed8);
+
+    return (1<<22) | (((uint32_t(immed8)>>31)^1)<<23) |
+            (((offset&0xF0)<<4) | (offset&0xF));
+!!!9864076.cpp!!!	reg_pre(in Rm : int, in W : int = 0) : uint32_t
+    return (1<<24) | (((uint32_t(Rm)>>31)^1)<<23) | ((W&1)<<21) | (abs(Rm)&0xF);
+!!!9864204.cpp!!!	reg_post(in Rm : int) : uint32_t
+    return (((uint32_t(Rm)>>31)^1)<<23) | (abs(Rm)&0xF);
+!!!9864332.cpp!!!	dataProcessing(in opcode : int, in cc : int, in s : int, in Rd : int, in Rn : int, in Op2 : uint32_t) : void
+    *mPC++ = (cc<<28) | (opcode<<21) | (s<<20) | (Rn<<16) | (Rd<<12) | Op2;
+!!!9864460.cpp!!!	MLA(in cc : int, in s : int, in Rd : int, in Rm : int, in Rs : int, in Rn : int) : void
+    if (Rd == Rm) { int t = Rm; Rm=Rs; Rs=t; } 
+    LOG_FATAL_IF(Rd==Rm, "MLA(r%u,r%u,r%u,r%u)", Rd,Rm,Rs,Rn);
+    *mPC++ =    (cc<<28) | (1<<21) | (s<<20) |
+                (Rd<<16) | (Rn<<12) | (Rs<<8) | 0x90 | Rm;
+!!!9864588.cpp!!!	MUL(in cc : int, in s : int, in Rd : int, in Rm : int, in Rs : int) : void
+    if (Rd == Rm) { int t = Rm; Rm=Rs; Rs=t; } 
+    LOG_FATAL_IF(Rd==Rm, "MUL(r%u,r%u,r%u)", Rd,Rm,Rs);
+    *mPC++ = (cc<<28) | (s<<20) | (Rd<<16) | (Rs<<8) | 0x90 | Rm;
+!!!9864716.cpp!!!	UMULL(in cc : int, in s : int, in RdLo : int, in RdHi : int, in Rm : int, in Rs : int) : void
+    LOG_FATAL_IF(RdLo==Rm || RdHi==Rm || RdLo==RdHi,
+                        "UMULL(r%u,r%u,r%u,r%u)", RdLo,RdHi,Rm,Rs);
+    *mPC++ =    (cc<<28) | (1<<23) | (s<<20) |
+                (RdHi<<16) | (RdLo<<12) | (Rs<<8) | 0x90 | Rm;
+!!!9864844.cpp!!!	UMUAL(in cc : int, in s : int, in RdLo : int, in RdHi : int, in Rm : int, in Rs : int) : void
+    LOG_FATAL_IF(RdLo==Rm || RdHi==Rm || RdLo==RdHi,
+                        "UMUAL(r%u,r%u,r%u,r%u)", RdLo,RdHi,Rm,Rs);
+    *mPC++ =    (cc<<28) | (1<<23) | (1<<21) | (s<<20) |
+                (RdHi<<16) | (RdLo<<12) | (Rs<<8) | 0x90 | Rm;
+!!!9864972.cpp!!!	SMULL(in cc : int, in s : int, in RdLo : int, in RdHi : int, in Rm : int, in Rs : int) : void
+    LOG_FATAL_IF(RdLo==Rm || RdHi==Rm || RdLo==RdHi,
+                        "SMULL(r%u,r%u,r%u,r%u)", RdLo,RdHi,Rm,Rs);
+    *mPC++ =    (cc<<28) | (1<<23) | (1<<22) | (s<<20) |
+                (RdHi<<16) | (RdLo<<12) | (Rs<<8) | 0x90 | Rm;
+!!!9865100.cpp!!!	SMUAL(in cc : int, in s : int, in RdLo : int, in RdHi : int, in Rm : int, in Rs : int) : void
+    LOG_FATAL_IF(RdLo==Rm || RdHi==Rm || RdLo==RdHi,
+                        "SMUAL(r%u,r%u,r%u,r%u)", RdLo,RdHi,Rm,Rs);
+    *mPC++ =    (cc<<28) | (1<<23) | (1<<22) | (1<<21) | (s<<20) |
+                (RdHi<<16) | (RdLo<<12) | (Rs<<8) | 0x90 | Rm;
+!!!9865228.cpp!!!	B(in cc : int, inout pc : uint32_t) : void
+    int32_t offset = int32_t(pc - (mPC+2));
+    *mPC++ = (cc<<28) | (0xA<<24) | (offset & 0xFFFFFF);
+!!!9865356.cpp!!!	BL(in cc : int, inout pc : uint32_t) : void
+    int32_t offset = int32_t(pc - (mPC+2));
+    *mPC++ = (cc<<28) | (0xB<<24) | (offset & 0xFFFFFF);
+!!!9865484.cpp!!!	BX(in cc : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x12FFF10 | Rn;
+!!!9865612.cpp!!!	label(in theLabel : char) : void
+    mLabels.add(theLabel, mPC);
+    mLabelsInverseMapping.add(mPC, theLabel);
+!!!9865740.cpp!!!	B(in cc : int, in label : char) : void
+    mBranchTargets.add(branch_target_t(label, mPC));
+    *mPC++ = (cc<<28) | (0xA<<24) | 0;
+!!!9865868.cpp!!!	BL(in cc : int, in label : char) : void
+    mBranchTargets.add(branch_target_t(label, mPC));
+    *mPC++ = (cc<<28) | (0xB<<24) | 0;
+!!!9865996.cpp!!!	pcForLabel(in label : char) : uint32_t
+    return mLabels.valueFor(label);
+!!!9866124.cpp!!!	LDR(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed12_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<26) | (1<<20) | (Rn<<16) | (Rd<<12) | offset;
+!!!9866252.cpp!!!	LDRB(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed12_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<26) | (1<<22) | (1<<20) | (Rn<<16) | (Rd<<12) | offset;
+!!!9866380.cpp!!!	STR(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed12_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<26) | (Rn<<16) | (Rd<<12) | offset;
+!!!9866508.cpp!!!	STRB(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed12_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<26) | (1<<22) | (Rn<<16) | (Rd<<12) | offset;
+!!!9866636.cpp!!!	LDRH(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed8_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<20) | (Rn<<16) | (Rd<<12) | 0xB0 | offset;
+!!!9866764.cpp!!!	LDRSB(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed8_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<20) | (Rn<<16) | (Rd<<12) | 0xD0 | offset;
+!!!9866892.cpp!!!	LDRSH(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed8_pre(0)) : void
+    *mPC++ = (cc<<28) | (1<<20) | (Rn<<16) | (Rd<<12) | 0xF0 | offset;
+!!!9867020.cpp!!!	STRH(in cc : int, in Rd : int, in Rn : int, in offset : uint32_t = __immed8_pre(0)) : void
+    *mPC++ = (cc<<28) | (Rn<<16) | (Rd<<12) | 0xB0 | offset;
+!!!9867148.cpp!!!	LDM(in cc : int, in dir : int, in Rn : int, in W : int, in reg_list : uint32_t) : void
+   //                    ED FD EA FA      IB IA DB DA
+    const uint8_t P[8] = { 1, 0, 1, 0,      1, 0, 1, 0 };
+    const uint8_t U[8] = { 1, 1, 0, 0,      1, 1, 0, 0 };
+    *mPC++ = (cc<<28) | (4<<25) | (uint32_t(P[dir])<<24) |
+            (uint32_t(U[dir])<<23) | (1<<20) | (W<<21) | (Rn<<16) | reg_list;
+!!!9867276.cpp!!!	STM(in cc : int, in dir : int, in Rn : int, in W : int, in reg_list : uint32_t) : void
+   //                    ED FD EA FA      IB IA DB DA
+    const uint8_t P[8] = { 0, 1, 0, 1,      1, 0, 1, 0 };
+    const uint8_t U[8] = { 0, 0, 1, 1,      1, 1, 0, 0 };
+    *mPC++ = (cc<<28) | (4<<25) | (uint32_t(P[dir])<<24) |
+            (uint32_t(U[dir])<<23) | (0<<20) | (W<<21) | (Rn<<16) | reg_list;
+!!!9867404.cpp!!!	SWP(in cc : int, in Rn : int, in Rd : int, in Rm : int) : void
+    *mPC++ = (cc<<28) | (2<<23) | (Rn<<16) | (Rd << 12) | 0x90 | Rm;
+!!!9867532.cpp!!!	SWPB(in cc : int, in Rn : int, in Rd : int, in Rm : int) : void
+    *mPC++ = (cc<<28) | (2<<23) | (1<<22) | (Rn<<16) | (Rd << 12) | 0x90 | Rm;
+!!!9867660.cpp!!!	SWI(in cc : int, in comment : uint32_t) : void
+    *mPC++ = (cc<<28) | (0xF<<24) | comment;
+!!!9867788.cpp!!!	PLD(in Rn : int, in offset : uint32_t) : void
+    LOG_ALWAYS_FATAL_IF(!((offset&(1<<24)) && !(offset&(1<<21))),
+                        "PLD only P=1, W=0");
+    *mPC++ = 0xF550F000 | (Rn<<16) | offset;
+!!!9867916.cpp!!!	CLZ(in cc : int, in Rd : int, in Rm : int) : void
+    *mPC++ = (cc<<28) | 0x16F0F10| (Rd<<12) | Rm;
+!!!9868044.cpp!!!	QADD(in cc : int, in Rd : int, in Rm : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x1000050 | (Rn<<16) | (Rd<<12) | Rm;
+!!!9868172.cpp!!!	QDADD(in cc : int, in Rd : int, in Rm : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x1400050 | (Rn<<16) | (Rd<<12) | Rm;
+!!!9868300.cpp!!!	QSUB(in cc : int, in Rd : int, in Rm : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x1200050 | (Rn<<16) | (Rd<<12) | Rm;
+!!!9868428.cpp!!!	QDSUB(in cc : int, in Rd : int, in Rm : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x1600050 | (Rn<<16) | (Rd<<12) | Rm;
+!!!9868556.cpp!!!	SMUL(in cc : int, in xy : int, in Rd : int, in Rm : int, in Rs : int) : void
+    *mPC++ = (cc<<28) | 0x1600080 | (Rd<<16) | (Rs<<8) | (xy<<4) | Rm;
+!!!9868684.cpp!!!	SMULW(in cc : int, in y : int, in Rd : int, in Rm : int, in Rs : int) : void
+    *mPC++ = (cc<<28) | 0x12000A0 | (Rd<<16) | (Rs<<8) | (y<<4) | Rm;
+!!!9868812.cpp!!!	SMLA(in cc : int, in xy : int, in Rd : int, in Rm : int, in Rs : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x1000080 | (Rd<<16) | (Rn<<12) | (Rs<<8) | (xy<<4) | Rm;
+!!!9868940.cpp!!!	SMLAL(in cc : int, in xy : int, in RdHi : int, in RdLo : int, in Rs : int, in Rm : int) : void
+    *mPC++ = (cc<<28) | 0x1400080 | (RdHi<<16) | (RdLo<<12) | (Rs<<8) | (xy<<4) | Rm;
+!!!9869068.cpp!!!	SMLAW(in cc : int, in y : int, in Rd : int, in Rm : int, in Rs : int, in Rn : int) : void
+    *mPC++ = (cc<<28) | 0x1200080 | (Rd<<16) | (Rn<<12) | (Rs<<8) | (y<<4) | Rm;
+!!!9869196.cpp!!!	UXTB16(in cc : int, in Rd : int, in Rm : int, in rotate : int) : void
+    *mPC++ = (cc<<28) | 0x6CF0070 | (Rd<<12) | ((rotate >> 3) << 10) | Rm;
+!!!9869324.cpp!!!	UBFX(in cc : int, in Rd : int, in Rn : int, in lsb : int, in width : int) : void
+    *mPC++ = (cc<<28) | 0x7E00000 | ((width-1)<<16) | (Rd<<12) | (lsb<<7) | 0x50 | Rn;

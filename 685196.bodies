@@ -1,0 +1,819 @@
+class ContentResolver
+!!!2663820.java!!!	ContentResolver(inout context : Context)
+        mContext = context;
+!!!2664076.java!!!	acquireExistingProvider(inout c : Context, in name : String) : IContentProvider
+        return acquireProvider(c, name);
+!!!2664716.java!!!	getType(inout url : Uri) : String
+        // XXX would like to have an acquireExistingUnstableProvider for this.
+        IContentProvider provider = acquireExistingProvider(url);
+        if (provider != null) {
+            try {
+                return provider.getType(url);
+            } catch (RemoteException e) {
+                return null;
+            } catch (java.lang.Exception e) {
+                Log.w(TAG, "Failed to get type for: " + url + " (" + e.getMessage() + ")");
+                return null;
+            } finally {
+                releaseProvider(provider);
+            }
+        }
+
+        if (!SCHEME_CONTENT.equals(url.getScheme())) {
+            return null;
+        }
+
+        try {
+            String type = ActivityManagerNative.getDefault().getProviderMimeType(
+                    url, UserHandle.myUserId());
+            return type;
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return null;
+        } catch (java.lang.Exception e) {
+            Log.w(TAG, "Failed to get type for: " + url + " (" + e.getMessage() + ")");
+            return null;
+        }
+!!!2664844.java!!!	getStreamTypes(inout url : Uri, in mimeTypeFilter : String) : String
+        IContentProvider provider = acquireProvider(url);
+        if (provider == null) {
+            return null;
+        }
+
+        try {
+            return provider.getStreamTypes(url, mimeTypeFilter);
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return null;
+        } finally {
+            releaseProvider(provider);
+        }
+!!!2664972.java!!!	query(inout uri : Uri, inout projection : String, in selection : String, inout selectionArgs : String, in sortOrder : String) : Cursor
+        return query(uri, projection, selection, selectionArgs, sortOrder, null);
+!!!2665100.java!!!	query(in uri : Uri, inout projection : String, in selection : String, inout selectionArgs : String, in sortOrder : String, inout cancellationSignal : CancellationSignal) : Cursor
+        IContentProvider unstableProvider = acquireUnstableProvider(uri);
+        if (unstableProvider == null) {
+            return null;
+        }
+        IContentProvider stableProvider = null;
+        try {
+            long startTime = SystemClock.uptimeMillis();
+
+            ICancellationSignal remoteCancellationSignal = null;
+            if (cancellationSignal != null) {
+                cancellationSignal.throwIfCanceled();
+                remoteCancellationSignal = unstableProvider.createCancellationSignal();
+                cancellationSignal.setRemote(remoteCancellationSignal);
+            }
+            Cursor qCursor;
+            try {
+                qCursor = unstableProvider.query(uri, projection,
+                        selection, selectionArgs, sortOrder, remoteCancellationSignal);
+            } catch (DeadObjectException e) {
+                // The remote process has died...  but we only hold an unstable
+                // reference though, so we might recover!!!  Let's try!!!!
+                // This is exciting!!1!!1!!!!1
+                unstableProviderDied(unstableProvider);
+                stableProvider = acquireProvider(uri);
+                if (stableProvider == null) {
+                    return null;
+                }
+                qCursor = stableProvider.query(uri, projection,
+                        selection, selectionArgs, sortOrder, remoteCancellationSignal);
+            }
+            if (qCursor == null) {
+                return null;
+            }
+            // force query execution
+            qCursor.getCount();
+            long durationMillis = SystemClock.uptimeMillis() - startTime;
+            maybeLogQueryToEventLog(durationMillis, uri, projection, selection, sortOrder);
+            // Wrap the cursor object into CursorWrapperInner object
+            CursorWrapperInner wrapper = new CursorWrapperInner(qCursor,
+                    stableProvider != null ? stableProvider : acquireProvider(uri));
+            stableProvider = null;
+            return wrapper;
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return null;
+        } finally {
+            if (unstableProvider != null) {
+                releaseUnstableProvider(unstableProvider);
+            }
+            if (stableProvider != null) {
+                releaseProvider(stableProvider);
+            }
+        }
+!!!2665228.java!!!	openInputStream(inout uri : Uri) : InputStream
+        String scheme = uri.getScheme();
+        if (SCHEME_ANDROID_RESOURCE.equals(scheme)) {
+            // Note: left here to avoid breaking compatibility.  May be removed
+            // with sufficient testing.
+            OpenResourceIdResult r = getResourceId(uri);
+            try {
+                InputStream stream = r.r.openRawResource(r.id);
+                return stream;
+            } catch (Resources.NotFoundException ex) {
+                throw new FileNotFoundException("Resource does not exist: " + uri);
+            }
+        } else if (SCHEME_FILE.equals(scheme)) {
+            // Note: left here to avoid breaking compatibility.  May be removed
+            // with sufficient testing.
+            return new FileInputStream(uri.getPath());
+        } else {
+            AssetFileDescriptor fd = openAssetFileDescriptor(uri, "r");
+            try {
+                return fd != null ? fd.createInputStream() : null;
+            } catch (IOException e) {
+                throw new FileNotFoundException("Unable to create stream");
+            }
+        }
+!!!2665356.java!!!	openOutputStream(inout uri : Uri) : OutputStream
+        return openOutputStream(uri, "w");
+!!!2665484.java!!!	openOutputStream(inout uri : Uri, in mode : String) : OutputStream
+        AssetFileDescriptor fd = openAssetFileDescriptor(uri, mode);
+        try {
+            return fd != null ? fd.createOutputStream() : null;
+        } catch (IOException e) {
+            throw new FileNotFoundException("Unable to create stream");
+        }
+!!!2665612.java!!!	openFileDescriptor(inout uri : Uri, in mode : String) : ParcelFileDescriptor
+        AssetFileDescriptor afd = openAssetFileDescriptor(uri, mode);
+        if (afd == null) {
+            return null;
+        }
+
+        if (afd.getDeclaredLength() < 0) {
+            // This is a full file!
+            return afd.getParcelFileDescriptor();
+        }
+
+        // Client can't handle a sub-section of a file, so close what
+        // we got and bail with an exception.
+        try {
+            afd.close();
+        } catch (IOException e) {
+        }
+
+        throw new FileNotFoundException("Not a whole file");
+!!!2665740.java!!!	openAssetFileDescriptor(inout uri : Uri, in mode : String) : AssetFileDescriptor
+        String scheme = uri.getScheme();
+        if (SCHEME_ANDROID_RESOURCE.equals(scheme)) {
+            if (!"r".equals(mode)) {
+                throw new FileNotFoundException("Can't write resources: " + uri);
+            }
+            OpenResourceIdResult r = getResourceId(uri);
+            try {
+                return r.r.openRawResourceFd(r.id);
+            } catch (Resources.NotFoundException ex) {
+                throw new FileNotFoundException("Resource does not exist: " + uri);
+            }
+        } else if (SCHEME_FILE.equals(scheme)) {
+            ParcelFileDescriptor pfd = ParcelFileDescriptor.open(
+                    new File(uri.getPath()), modeToMode(uri, mode));
+            return new AssetFileDescriptor(pfd, 0, -1);
+        } else {
+            if ("r".equals(mode)) {
+                return openTypedAssetFileDescriptor(uri, "*/*", null);
+            } else {
+                IContentProvider unstableProvider = acquireUnstableProvider(uri);
+                if (unstableProvider == null) {
+                    throw new FileNotFoundException("No content provider: " + uri);
+                }
+                IContentProvider stableProvider = null;
+                AssetFileDescriptor fd = null;
+
+                try {
+                    try {
+                        fd = unstableProvider.openAssetFile(uri, mode);
+                        if (fd == null) {
+                            // The provider will be released by the finally{} clause
+                            return null;
+                        }
+                    } catch (DeadObjectException e) {
+                        // The remote process has died...  but we only hold an unstable
+                        // reference though, so we might recover!!!  Let's try!!!!
+                        // This is exciting!!1!!1!!!!1
+                        unstableProviderDied(unstableProvider);
+                        stableProvider = acquireProvider(uri);
+                        if (stableProvider == null) {
+                            throw new FileNotFoundException("No content provider: " + uri);
+                        }
+                        fd = stableProvider.openAssetFile(uri, mode);
+                        if (fd == null) {
+                            // The provider will be released by the finally{} clause
+                            return null;
+                        }
+                    }
+
+                    if (stableProvider == null) {
+                        stableProvider = acquireProvider(uri);
+                    }
+                    releaseUnstableProvider(unstableProvider);
+                    ParcelFileDescriptor pfd = new ParcelFileDescriptorInner(
+                            fd.getParcelFileDescriptor(), stableProvider);
+
+                    // Success!  Don't release the provider when exiting, let
+                    // ParcelFileDescriptorInner do that when it is closed.
+                    stableProvider = null;
+
+                    return new AssetFileDescriptor(pfd, fd.getStartOffset(),
+                            fd.getDeclaredLength());
+
+                } catch (RemoteException e) {
+                    // Whatever, whatever, we'll go away.
+                    throw new FileNotFoundException(
+                            "Failed opening content provider: " + uri);
+                } catch (FileNotFoundException e) {
+                    throw e;
+                } finally {
+                    if (stableProvider != null) {
+                        releaseProvider(stableProvider);
+                    }
+                    if (unstableProvider != null) {
+                        releaseUnstableProvider(unstableProvider);
+                    }
+                }
+            }
+        }
+!!!2665868.java!!!	openTypedAssetFileDescriptor(inout uri : Uri, in mimeType : String, inout opts : Bundle) : AssetFileDescriptor
+        IContentProvider unstableProvider = acquireUnstableProvider(uri);
+        if (unstableProvider == null) {
+            throw new FileNotFoundException("No content provider: " + uri);
+        }
+        IContentProvider stableProvider = null;
+        AssetFileDescriptor fd = null;
+
+        try {
+            try {
+                fd = unstableProvider.openTypedAssetFile(uri, mimeType, opts);
+                if (fd == null) {
+                    // The provider will be released by the finally{} clause
+                    return null;
+                }
+            } catch (DeadObjectException e) {
+                // The remote process has died...  but we only hold an unstable
+                // reference though, so we might recover!!!  Let's try!!!!
+                // This is exciting!!1!!1!!!!1
+                unstableProviderDied(unstableProvider);
+                stableProvider = acquireProvider(uri);
+                if (stableProvider == null) {
+                    throw new FileNotFoundException("No content provider: " + uri);
+                }
+                fd = stableProvider.openTypedAssetFile(uri, mimeType, opts);
+                if (fd == null) {
+                    // The provider will be released by the finally{} clause
+                    return null;
+                }
+            }
+
+            if (stableProvider == null) {
+                stableProvider = acquireProvider(uri);
+            }
+            releaseUnstableProvider(unstableProvider);
+            ParcelFileDescriptor pfd = new ParcelFileDescriptorInner(
+                    fd.getParcelFileDescriptor(), stableProvider);
+
+            // Success!  Don't release the provider when exiting, let
+            // ParcelFileDescriptorInner do that when it is closed.
+            stableProvider = null;
+
+            return new AssetFileDescriptor(pfd, fd.getStartOffset(),
+                    fd.getDeclaredLength());
+
+        } catch (RemoteException e) {
+            // Whatever, whatever, we'll go away.
+            throw new FileNotFoundException(
+                    "Failed opening content provider: " + uri);
+        } catch (FileNotFoundException e) {
+            throw e;
+        } finally {
+            if (stableProvider != null) {
+                releaseProvider(stableProvider);
+            }
+            if (unstableProvider != null) {
+                releaseUnstableProvider(unstableProvider);
+            }
+        }
+!!!2665996.java!!!	getResourceId(inout uri : Uri) : OpenResourceIdResult
+        String authority = uri.getAuthority();
+        Resources r;
+        if (TextUtils.isEmpty(authority)) {
+            throw new FileNotFoundException("No authority: " + uri);
+        } else {
+            try {
+                r = mContext.getPackageManager().getResourcesForApplication(authority);
+            } catch (NameNotFoundException ex) {
+                throw new FileNotFoundException("No package found for authority: " + uri);
+            }
+        }
+        List<String> path = uri.getPathSegments();
+        if (path == null) {
+            throw new FileNotFoundException("No path: " + uri);
+        }
+        int len = path.size();
+        int id;
+        if (len == 1) {
+            try {
+                id = Integer.parseInt(path.get(0));
+            } catch (NumberFormatException e) {
+                throw new FileNotFoundException("Single path segment is not a resource ID: " + uri);
+            }
+        } else if (len == 2) {
+            id = r.getIdentifier(path.get(1), path.get(0), authority);
+        } else {
+            throw new FileNotFoundException("More than two path segments: " + uri);
+        }
+        if (id == 0) {
+            throw new FileNotFoundException("No resource found for: " + uri);
+        }
+        OpenResourceIdResult res = new OpenResourceIdResult();
+        res.r = r;
+        res.id = id;
+        return res;
+!!!2666124.java!!!	modeToMode(inout uri : Uri, in mode : String) : int
+        int modeBits;
+        if ("r".equals(mode)) {
+            modeBits = ParcelFileDescriptor.MODE_READ_ONLY;
+        } else if ("w".equals(mode) || "wt".equals(mode)) {
+            modeBits = ParcelFileDescriptor.MODE_WRITE_ONLY
+                    | ParcelFileDescriptor.MODE_CREATE
+                    | ParcelFileDescriptor.MODE_TRUNCATE;
+        } else if ("wa".equals(mode)) {
+            modeBits = ParcelFileDescriptor.MODE_WRITE_ONLY
+                    | ParcelFileDescriptor.MODE_CREATE
+                    | ParcelFileDescriptor.MODE_APPEND;
+        } else if ("rw".equals(mode)) {
+            modeBits = ParcelFileDescriptor.MODE_READ_WRITE
+                    | ParcelFileDescriptor.MODE_CREATE;
+        } else if ("rwt".equals(mode)) {
+            modeBits = ParcelFileDescriptor.MODE_READ_WRITE
+                    | ParcelFileDescriptor.MODE_CREATE
+                    | ParcelFileDescriptor.MODE_TRUNCATE;
+        } else {
+            throw new FileNotFoundException("Bad mode for " + uri + ": "
+                    + mode);
+        }
+        return modeBits;
+!!!2666252.java!!!	insert(inout url : Uri, inout values : ContentValues) : Uri
+        IContentProvider provider = acquireProvider(url);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown URL " + url);
+        }
+        try {
+            long startTime = SystemClock.uptimeMillis();
+            Uri createdRow = provider.insert(url, values);
+            long durationMillis = SystemClock.uptimeMillis() - startTime;
+            maybeLogUpdateToEventLog(durationMillis, url, "insert", null /* where */);
+            return createdRow;
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return null;
+        } finally {
+            releaseProvider(provider);
+        }
+!!!2666380.java!!!	applyBatch(in authority : String, inout operations : ArrayList<ContentProviderOperation>) : ContentProviderResult
+        ContentProviderClient provider = acquireContentProviderClient(authority);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown authority " + authority);
+        }
+        try {
+            return provider.applyBatch(operations);
+        } finally {
+            provider.release();
+        }
+!!!2666508.java!!!	bulkInsert(inout url : Uri, inout values : ContentValues) : int
+        IContentProvider provider = acquireProvider(url);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown URL " + url);
+        }
+        try {
+            long startTime = SystemClock.uptimeMillis();
+            int rowsCreated = provider.bulkInsert(url, values);
+            long durationMillis = SystemClock.uptimeMillis() - startTime;
+            maybeLogUpdateToEventLog(durationMillis, url, "bulkinsert", null /* where */);
+            return rowsCreated;
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return 0;
+        } finally {
+            releaseProvider(provider);
+        }
+!!!2666636.java!!!	delete(inout url : Uri, in where : String, inout selectionArgs : String) : int
+        IContentProvider provider = acquireProvider(url);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown URL " + url);
+        }
+        try {
+            long startTime = SystemClock.uptimeMillis();
+            int rowsDeleted = provider.delete(url, where, selectionArgs);
+            long durationMillis = SystemClock.uptimeMillis() - startTime;
+            maybeLogUpdateToEventLog(durationMillis, url, "delete", where);
+            return rowsDeleted;
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return -1;
+        } finally {
+            releaseProvider(provider);
+        }
+!!!2666764.java!!!	update(inout uri : Uri, inout values : ContentValues, in where : String, inout selectionArgs : String) : int
+        IContentProvider provider = acquireProvider(uri);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown URI " + uri);
+        }
+        try {
+            long startTime = SystemClock.uptimeMillis();
+            int rowsUpdated = provider.update(uri, values, where, selectionArgs);
+            long durationMillis = SystemClock.uptimeMillis() - startTime;
+            maybeLogUpdateToEventLog(durationMillis, uri, "update", where);
+            return rowsUpdated;
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return -1;
+        } finally {
+            releaseProvider(provider);
+        }
+!!!2666892.java!!!	call(inout uri : Uri, in method : String, in arg : String, inout extras : Bundle) : Bundle
+        if (uri == null) {
+            throw new NullPointerException("uri == null");
+        }
+        if (method == null) {
+            throw new NullPointerException("method == null");
+        }
+        IContentProvider provider = acquireProvider(uri);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown URI " + uri);
+        }
+        try {
+            return provider.call(method, arg, extras);
+        } catch (RemoteException e) {
+            // Arbitrary and not worth documenting, as Activity
+            // Manager will kill this process shortly anyway.
+            return null;
+        } finally {
+            releaseProvider(provider);
+        }
+!!!2667020.java!!!	acquireProvider(inout uri : Uri) : IContentProvider
+        if (!SCHEME_CONTENT.equals(uri.getScheme())) {
+            return null;
+        }
+        String auth = uri.getAuthority();
+        if (auth != null) {
+            return acquireProvider(mContext, uri.getAuthority());
+        }
+        return null;
+!!!2667148.java!!!	acquireExistingProvider(inout uri : Uri) : IContentProvider
+        if (!SCHEME_CONTENT.equals(uri.getScheme())) {
+            return null;
+        }
+        String auth = uri.getAuthority();
+        if (auth != null) {
+            return acquireExistingProvider(mContext, uri.getAuthority());
+        }
+        return null;
+!!!2667276.java!!!	acquireProvider(in name : String) : IContentProvider
+        if (name == null) {
+            return null;
+        }
+        return acquireProvider(mContext, name);
+!!!2667404.java!!!	acquireUnstableProvider(inout uri : Uri) : IContentProvider
+        if (!SCHEME_CONTENT.equals(uri.getScheme())) {
+            return null;
+        }
+        String auth = uri.getAuthority();
+        if (auth != null) {
+            return acquireUnstableProvider(mContext, uri.getAuthority());
+        }
+        return null;
+!!!2667532.java!!!	acquireUnstableProvider(in name : String) : IContentProvider
+        if (name == null) {
+            return null;
+        }
+        return acquireUnstableProvider(mContext, name);
+!!!2667660.java!!!	acquireContentProviderClient(inout uri : Uri) : ContentProviderClient
+        IContentProvider provider = acquireProvider(uri);
+        if (provider != null) {
+            return new ContentProviderClient(this, provider, true);
+        }
+
+        return null;
+!!!2667788.java!!!	acquireContentProviderClient(in name : String) : ContentProviderClient
+        IContentProvider provider = acquireProvider(name);
+        if (provider != null) {
+            return new ContentProviderClient(this, provider, true);
+        }
+
+        return null;
+!!!2667916.java!!!	acquireUnstableContentProviderClient(inout uri : Uri) : ContentProviderClient
+        IContentProvider provider = acquireUnstableProvider(uri);
+        if (provider != null) {
+            return new ContentProviderClient(this, provider, false);
+        }
+
+        return null;
+!!!2668044.java!!!	acquireUnstableContentProviderClient(in name : String) : ContentProviderClient
+        IContentProvider provider = acquireUnstableProvider(name);
+        if (provider != null) {
+            return new ContentProviderClient(this, provider, false);
+        }
+
+        return null;
+!!!2668172.java!!!	registerContentObserver(inout uri : Uri, inout notifyForDescendents : boolean, inout observer : ContentObserver) : void
+        registerContentObserver(uri, notifyForDescendents, observer, UserHandle.myUserId());
+!!!2668300.java!!!	registerContentObserver(inout uri : Uri, inout notifyForDescendents : boolean, inout observer : ContentObserver, in userHandle : int) : void
+        try {
+            getContentService().registerContentObserver(uri, notifyForDescendents,
+                    observer.getContentObserver(), userHandle);
+        } catch (RemoteException e) {
+        }
+!!!2668428.java!!!	unregisterContentObserver(inout observer : ContentObserver) : void
+        try {
+            IContentObserver contentObserver = observer.releaseContentObserver();
+            if (contentObserver != null) {
+                getContentService().unregisterContentObserver(
+                        contentObserver);
+            }
+        } catch (RemoteException e) {
+        }
+!!!2668556.java!!!	notifyChange(inout uri : Uri, inout observer : ContentObserver) : void
+        notifyChange(uri, observer, true /* sync to network */);
+!!!2668684.java!!!	notifyChange(inout uri : Uri, inout observer : ContentObserver, inout syncToNetwork : boolean) : void
+        notifyChange(uri, observer, syncToNetwork, UserHandle.getCallingUserId());
+!!!2668812.java!!!	notifyChange(inout uri : Uri, inout observer : ContentObserver, inout syncToNetwork : boolean, in userHandle : int) : void
+        try {
+            getContentService().notifyChange(
+                    uri, observer == null ? null : observer.getContentObserver(),
+                    observer != null && observer.deliverSelfNotifications(), syncToNetwork,
+                    userHandle);
+        } catch (RemoteException e) {
+        }
+!!!2668940.java!!!	startSync(inout uri : Uri, inout extras : Bundle) : void
+        Account account = null;
+        if (extras != null) {
+            String accountName = extras.getString(SYNC_EXTRAS_ACCOUNT);
+            if (!TextUtils.isEmpty(accountName)) {
+                account = new Account(accountName, "com.google");
+            }
+            extras.remove(SYNC_EXTRAS_ACCOUNT);
+        }
+        requestSync(account, uri != null ? uri.getAuthority() : null, extras);
+!!!2669068.java!!!	requestSync(inout account : Account, in authority : String, inout extras : Bundle) : void
+        validateSyncExtrasBundle(extras);
+        try {
+            getContentService().requestSync(account, authority, extras);
+        } catch (RemoteException e) {
+        }
+!!!2669196.java!!!	validateSyncExtrasBundle(inout extras : Bundle) : void
+        try {
+            for (String key : extras.keySet()) {
+                Object value = extras.get(key);
+                if (value == null) continue;
+                if (value instanceof Long) continue;
+                if (value instanceof Integer) continue;
+                if (value instanceof Boolean) continue;
+                if (value instanceof Float) continue;
+                if (value instanceof Double) continue;
+                if (value instanceof String) continue;
+                if (value instanceof Account) continue;
+                throw new IllegalArgumentException("unexpected value type: "
+                        + value.getClass().getName());
+            }
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (RuntimeException exc) {
+            throw new IllegalArgumentException("error unparceling Bundle", exc);
+        }
+!!!2669324.java!!!	cancelSync(inout uri : Uri) : void
+        cancelSync(null /* all accounts */, uri != null ? uri.getAuthority() : null);
+!!!2669452.java!!!	cancelSync(inout account : Account, in authority : String) : void
+        try {
+            getContentService().cancelSync(account, authority);
+        } catch (RemoteException e) {
+        }
+!!!2669580.java!!!	getSyncAdapterTypes() : SyncAdapterType
+        try {
+            return getContentService().getSyncAdapterTypes();
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2669708.java!!!	getSyncAutomatically(inout account : Account, in authority : String) : boolean
+        try {
+            return getContentService().getSyncAutomatically(account, authority);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2669836.java!!!	setSyncAutomatically(inout account : Account, in authority : String, inout sync : boolean) : void
+        try {
+            getContentService().setSyncAutomatically(account, authority, sync);
+        } catch (RemoteException e) {
+            // exception ignored; if this is thrown then it means the runtime is in the midst of
+            // being restarted
+        }
+!!!2669964.java!!!	addPeriodicSync(inout account : Account, in authority : String, inout extras : Bundle, in pollFrequency : long) : void
+        validateSyncExtrasBundle(extras);
+        if (account == null) {
+            throw new IllegalArgumentException("account must not be null");
+        }
+        if (authority == null) {
+            throw new IllegalArgumentException("authority must not be null");
+        }
+        if (extras.getBoolean(SYNC_EXTRAS_MANUAL, false)
+                || extras.getBoolean(SYNC_EXTRAS_DO_NOT_RETRY, false)
+                || extras.getBoolean(SYNC_EXTRAS_IGNORE_BACKOFF, false)
+                || extras.getBoolean(SYNC_EXTRAS_IGNORE_SETTINGS, false)
+                || extras.getBoolean(SYNC_EXTRAS_INITIALIZE, false)
+                || extras.getBoolean(SYNC_EXTRAS_FORCE, false)
+                || extras.getBoolean(SYNC_EXTRAS_EXPEDITED, false)) {
+            throw new IllegalArgumentException("illegal extras were set");
+        }
+        try {
+            getContentService().addPeriodicSync(account, authority, extras, pollFrequency);
+        } catch (RemoteException e) {
+            // exception ignored; if this is thrown then it means the runtime is in the midst of
+            // being restarted
+        }
+!!!2670092.java!!!	removePeriodicSync(inout account : Account, in authority : String, inout extras : Bundle) : void
+        validateSyncExtrasBundle(extras);
+        if (account == null) {
+            throw new IllegalArgumentException("account must not be null");
+        }
+        if (authority == null) {
+            throw new IllegalArgumentException("authority must not be null");
+        }
+        try {
+            getContentService().removePeriodicSync(account, authority, extras);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2670220.java!!!	getPeriodicSyncs(inout account : Account, in authority : String) : PeriodicSync
+        if (account == null) {
+            throw new IllegalArgumentException("account must not be null");
+        }
+        if (authority == null) {
+            throw new IllegalArgumentException("authority must not be null");
+        }
+        try {
+            return getContentService().getPeriodicSyncs(account, authority);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2670348.java!!!	getIsSyncable(inout account : Account, in authority : String) : int
+        try {
+            return getContentService().getIsSyncable(account, authority);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2670476.java!!!	setIsSyncable(inout account : Account, in authority : String, in syncable : int) : void
+        try {
+            getContentService().setIsSyncable(account, authority, syncable);
+        } catch (RemoteException e) {
+            // exception ignored; if this is thrown then it means the runtime is in the midst of
+            // being restarted
+        }
+!!!2670604.java!!!	getMasterSyncAutomatically() : boolean
+        try {
+            return getContentService().getMasterSyncAutomatically();
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2670732.java!!!	setMasterSyncAutomatically(inout sync : boolean) : void
+        try {
+            getContentService().setMasterSyncAutomatically(sync);
+        } catch (RemoteException e) {
+            // exception ignored; if this is thrown then it means the runtime is in the midst of
+            // being restarted
+        }
+!!!2670860.java!!!	isSyncActive(inout account : Account, in authority : String) : boolean
+        try {
+            return getContentService().isSyncActive(account, authority);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2670988.java!!!	getCurrentSync() : SyncInfo
+        try {
+            final List<SyncInfo> syncs = getContentService().getCurrentSyncs();
+            if (syncs.isEmpty()) {
+                return null;
+            }
+            return syncs.get(0);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2671116.java!!!	getCurrentSyncs() : SyncInfo
+        try {
+            return getContentService().getCurrentSyncs();
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2671244.java!!!	getSyncStatus(inout account : Account, in authority : String) : SyncStatusInfo
+        try {
+            return getContentService().getSyncStatus(account, authority);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2671372.java!!!	isSyncPending(inout account : Account, in authority : String) : boolean
+        try {
+            return getContentService().isSyncPending(account, authority);
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2671500.java!!!	addStatusChangeListener(in mask : int, in callback : SyncStatusObserver) : Object
+        if (callback == null) {
+            throw new IllegalArgumentException("you passed in a null callback");
+        }
+        try {
+            ISyncStatusObserver.Stub observer = new ISyncStatusObserver.Stub() {
+                public void onStatusChanged(int which) throws RemoteException {
+                    callback.onStatusChanged(which);
+                }
+            };
+            getContentService().addStatusChangeListener(mask, observer);
+            return observer;
+        } catch (RemoteException e) {
+            throw new RuntimeException("the ContentService should always be reachable", e);
+        }
+!!!2671628.java!!!	removeStatusChangeListener(inout handle : Object) : void
+        if (handle == null) {
+            throw new IllegalArgumentException("you passed in a null handle");
+        }
+        try {
+            getContentService().removeStatusChangeListener((ISyncStatusObserver.Stub) handle);
+        } catch (RemoteException e) {
+            // exception ignored; if this is thrown then it means the runtime is in the midst of
+            // being restarted
+        }
+!!!2671756.java!!!	samplePercentForDuration(in durationMillis : long) : int
+        if (durationMillis >= SLOW_THRESHOLD_MILLIS) {
+            return 100;
+        }
+        return (int) (100 * durationMillis / SLOW_THRESHOLD_MILLIS) + 1;
+!!!2671884.java!!!	maybeLogQueryToEventLog(in durationMillis : long, inout uri : Uri, inout projection : String, in selection : String, in sortOrder : String) : void
+        int samplePercent = samplePercentForDuration(durationMillis);
+        if (samplePercent < 100) {
+            synchronized (mRandom) {
+                if (mRandom.nextInt(100) >= samplePercent) {
+                    return;
+                }
+            }
+        }
+
+        StringBuilder projectionBuffer = new StringBuilder(100);
+        if (projection != null) {
+            for (int i = 0; i < projection.length; ++i) {
+                // Note: not using a comma delimiter here, as the
+                // multiple arguments to EventLog.writeEvent later
+                // stringify with a comma delimiter, which would make
+                // parsing uglier later.
+                if (i != 0) projectionBuffer.append('/');
+                projectionBuffer.append(projection[i]);
+            }
+        }
+
+        // ActivityThread.currentPackageName() only returns non-null if the
+        // current thread is an application main thread.  This parameter tells
+        // us whether an event loop is blocked, and if so, which app it is.
+        String blockingPackage = AppGlobals.getInitialPackage();
+
+        EventLog.writeEvent(
+            EventLogTags.CONTENT_QUERY_SAMPLE,
+            uri.toString(),
+            projectionBuffer.toString(),
+            selection != null ? selection : "",
+            sortOrder != null ? sortOrder : "",
+            durationMillis,
+            blockingPackage != null ? blockingPackage : "",
+            samplePercent);
+!!!2672012.java!!!	maybeLogUpdateToEventLog(in durationMillis : long, inout uri : Uri, in operation : String, in selection : String) : void
+        int samplePercent = samplePercentForDuration(durationMillis);
+        if (samplePercent < 100) {
+            synchronized (mRandom) {
+                if (mRandom.nextInt(100) >= samplePercent) {
+                    return;
+                }
+            }
+        }
+        String blockingPackage = AppGlobals.getInitialPackage();
+        EventLog.writeEvent(
+            EventLogTags.CONTENT_UPDATE_SAMPLE,
+            uri.toString(),
+            operation,
+            selection != null ? selection : "",
+            durationMillis,
+            blockingPackage != null ? blockingPackage : "",
+            samplePercent);
+!!!2687756.java!!!	getContentService() : IContentService
+        if (sContentService != null) {
+            return sContentService;
+        }
+        IBinder b = ServiceManager.getService(CONTENT_SERVICE_NAME);
+        if (false) Log.v("ContentService", "default service binder = " + b);
+        sContentService = IContentService.Stub.asInterface(b);
+        if (false) Log.v("ContentService", "default service = " + sContentService);
+        return sContentService;

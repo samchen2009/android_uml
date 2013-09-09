@@ -1,0 +1,127 @@
+class TrackBase
+!!!796812.cpp!!!	TrackBase(inout thread : ThreadBase, in client : sp<Client>, in sampleRate : uint32_t, in format : audio_format_t, in channelMask : audio_channel_mask_t, in frameCount : int, in sharedBuffer : sp<IMemory>, in sessionId : int)
+    ALOGV_IF(sharedBuffer != 0, "sharedBuffer: %p, size: %d", sharedBuffer->pointer(), sharedBuffer->size());
+
+    // ALOGD("Creating track with %d buffers @ %d bytes", bufferCount, bufferSize);
+    size_t size = sizeof(audio_track_cblk_t);
+    uint8_t channelCount = popcount(channelMask);
+    size_t bufferSize = frameCount*channelCount*sizeof(int16_t);
+    if (sharedBuffer == 0) {
+        size += bufferSize;
+    }
+
+    if (client != NULL) {
+        mCblkMemory = client->heap()->allocate(size);
+        if (mCblkMemory != 0) {
+            mCblk = static_cast<audio_track_cblk_t *>(mCblkMemory->pointer());
+            if (mCblk != NULL) { // construct the shared structure in-place.
+                new(mCblk) audio_track_cblk_t();
+                // clear all buffers
+                mCblk->frameCount = frameCount;
+                mCblk->sampleRate = sampleRate;
+// uncomment the following lines to quickly test 32-bit wraparound
+//                mCblk->user = 0xffff0000;
+//                mCblk->server = 0xffff0000;
+//                mCblk->userBase = 0xffff0000;
+//                mCblk->serverBase = 0xffff0000;
+                mChannelCount = channelCount;
+                mChannelMask = channelMask;
+                if (sharedBuffer == 0) {
+                    mBuffer = (char*)mCblk + sizeof(audio_track_cblk_t);
+                    memset(mBuffer, 0, frameCount*channelCount*sizeof(int16_t));
+                    // Force underrun condition to avoid false underrun callback until first data is
+                    // written to buffer (other flags are cleared)
+                    mCblk->flags = CBLK_UNDERRUN_ON;
+                } else {
+                    mBuffer = sharedBuffer->pointer();
+                }
+                mBufferEnd = (uint8_t *)mBuffer + bufferSize;
+            }
+        } else {
+            ALOGE("not enough memory for AudioTrack size=%u", size);
+            client->heap()->dump("AudioTrack");
+            return;
+        }
+    } else {
+        mCblk = (audio_track_cblk_t *)(new uint8_t[size]);
+        // construct the shared structure in-place.
+        new(mCblk) audio_track_cblk_t();
+        // clear all buffers
+        mCblk->frameCount = frameCount;
+        mCblk->sampleRate = sampleRate;
+// uncomment the following lines to quickly test 32-bit wraparound
+//        mCblk->user = 0xffff0000;
+//        mCblk->server = 0xffff0000;
+//        mCblk->userBase = 0xffff0000;
+//        mCblk->serverBase = 0xffff0000;
+        mChannelCount = channelCount;
+        mChannelMask = channelMask;
+        mBuffer = (char*)mCblk + sizeof(audio_track_cblk_t);
+        memset(mBuffer, 0, frameCount*channelCount*sizeof(int16_t));
+        // Force underrun condition to avoid false underrun callback until first data is
+        // written to buffer (other flags are cleared)
+        mCblk->flags = CBLK_UNDERRUN_ON;
+        mBufferEnd = (uint8_t *)mBuffer + bufferSize;
+    }
+!!!796940.cpp!!!	~TrackBase()
+    if (mCblk != NULL) {
+        if (mClient == 0) {
+            delete mCblk;
+        } else {
+            mCblk->~audio_track_cblk_t();   // destroy our shared-structure.
+        }
+    }
+    mCblkMemory.clear();    // free the shared memory before releasing the heap it belongs to
+    if (mClient != 0) {
+        // Client destructor must run with AudioFlinger mutex locked
+        Mutex::Autolock _l(mClient->audioFlinger()->mLock);
+        // If the client's reference count drops to zero, the associated destructor
+        // must run with AudioFlinger lock held. Thus the explicit clear() rather than
+        // relying on the automatic clear() at end of scope.
+        mClient.clear();
+    }
+!!!797708.cpp!!!	setSyncEvent(in event : sp<SyncEvent>) : status_t
+    mSyncEvents.add(event);
+    return NO_ERROR;
+!!!798220.cpp!!!	releaseBuffer(inout buffer : Buffer) : void
+    buffer->raw = NULL;
+    mFrameCount = buffer->frameCount;
+    // FIXME See note at getNextBuffer()
+    (void) step();      // ignore return value of step()
+    buffer->frameCount = 0;
+!!!798860.cpp!!!	sampleRate() : int
+    return (int)mCblk->sampleRate;
+!!!798988.cpp!!!	getBuffer(in offset : uint32_t, in frames : uint32_t) : void
+    audio_track_cblk_t* cblk = this->cblk();
+    size_t frameSize = cblk->frameSize;
+    int8_t *bufferStart = (int8_t *)mBuffer + (offset-cblk->serverBase)*frameSize;
+    int8_t *bufferEnd = bufferStart + frames * frameSize;
+
+    // Check validity of returned pointer in case the track control block would have been corrupted.
+    ALOG_ASSERT(!(bufferStart < mBuffer || bufferStart > bufferEnd || bufferEnd > mBufferEnd),
+            "TrackBase::getBuffer buffer out of range:\n"
+                "    start: %p, end %p , mBuffer %p mBufferEnd %p\n"
+                "    server %u, serverBase %u, user %u, userBase %u, frameSize %d",
+                bufferStart, bufferEnd, mBuffer, mBufferEnd,
+                cblk->server, cblk->serverBase, cblk->user, cblk->userBase, frameSize);
+
+    return bufferStart;
+!!!799756.cpp!!!	step() : bool
+    bool result;
+    audio_track_cblk_t* cblk = this->cblk();
+
+    result = cblk->stepServer(mFrameCount);
+    if (!result) {
+        ALOGV("stepServer failed acquiring cblk mutex");
+        mStepServerFailed = true;
+    }
+    return result;
+!!!799884.cpp!!!	reset() : void
+    audio_track_cblk_t* cblk = this->cblk();
+
+    cblk->user = 0;
+    cblk->server = 0;
+    cblk->userBase = 0;
+    cblk->serverBase = 0;
+    mStepServerFailed = false;
+    ALOGV("TrackBase::reset");

@@ -1,0 +1,374 @@
+class NativeWindowRenderer
+!!!450956.cpp!!!	NativeWindowRenderer(in nativeWindow : sp<ANativeWindow>, in width : int, in height : int)
+    createThread(threadStart, this);
+!!!451084.cpp!!!	~NativeWindowRenderer()
+    CHECK(mActiveInputs == 0);
+    startRequest(CMD_QUIT);
+    sendRequest();
+!!!451212.cpp!!!	createRenderInput() : RenderInput
+    ALOGD("new render input %d", mNextTextureId);
+    RenderInput* input = new RenderInput(this, mNextTextureId);
+
+    startRequest(CMD_RESERVE_TEXTURE);
+    mThreadTextureId = mNextTextureId;
+    sendRequest();
+
+    mNextTextureId++;
+    mActiveInputs++;
+    return input;
+!!!451340.cpp!!!	destroyRenderInput(inout input : RenderInput) : void
+    ALOGD("destroy render input %d", input->mTextureId);
+    GLuint textureId = input->mTextureId;
+    delete input;
+
+    startRequest(CMD_DELETE_TEXTURE);
+    mThreadTextureId = textureId;
+    sendRequest();
+
+    mActiveInputs--;
+!!!451724.cpp!!!	initializeEGL() : void
+    mEglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    CHECK_EGL_ERROR;
+
+    EGLint majorVersion;
+    EGLint minorVersion;
+    eglInitialize(mEglDisplay, &majorVersion, &minorVersion);
+    CHECK_EGL_ERROR;
+
+    EGLConfig config;
+    EGLint numConfigs = -1;
+    EGLint configAttribs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_NONE
+    };
+    eglChooseConfig(mEglDisplay, configAttribs, &config, 1, &numConfigs);
+    CHECK_EGL_ERROR;
+
+    mEglSurface = eglCreateWindowSurface(mEglDisplay, config,
+        mNativeWindow.get(), NULL);
+    CHECK_EGL_ERROR;
+
+    EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    mEglContext = eglCreateContext(mEglDisplay, config, EGL_NO_CONTEXT,
+        contextAttribs);
+    CHECK_EGL_ERROR;
+
+    eglMakeCurrent(mEglDisplay, mEglSurface, mEglSurface, mEglContext);
+    CHECK_EGL_ERROR;
+!!!451852.cpp!!!	terminateEGL() : void
+    eglDestroyContext(mEglDisplay, mEglContext);
+    eglDestroySurface(mEglDisplay, mEglSurface);
+    eglMakeCurrent(mEglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglTerminate(mEglDisplay);
+!!!451980.cpp!!!	createPrograms() : void
+    GLuint vShader;
+    loadShader(GL_VERTEX_SHADER, vSrcNormal, &vShader);
+
+    const char* fSrc[NUMBER_OF_EFFECTS] = {
+        fSrcNormal, fSrcSepia, fSrcNegative, fSrcGradient
+    };
+
+    for (int i = 0; i < NUMBER_OF_EFFECTS; i++) {
+        GLuint fShader;
+        loadShader(GL_FRAGMENT_SHADER, fSrc[i], &fShader);
+        createProgram(vShader, fShader, &mProgram[i]);
+        glDeleteShader(fShader);
+        CHECK_GL_ERROR;
+    }
+
+    glDeleteShader(vShader);
+    CHECK_GL_ERROR;
+!!!452108.cpp!!!	createProgram(in vertexShader : GLuint, in fragmentShader : GLuint, inout outPgm : GLuint) : void
+
+    GLuint program = glCreateProgram();
+    CHECK_GL_ERROR;
+
+    glAttachShader(program, vertexShader);
+    CHECK_GL_ERROR;
+
+    glAttachShader(program, fragmentShader);
+    CHECK_GL_ERROR;
+
+    glLinkProgram(program);
+    CHECK_GL_ERROR;
+
+    GLint linkStatus = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    if (linkStatus != GL_TRUE) {
+        GLint infoLen = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLen);
+        if (infoLen) {
+            char* buf = (char*) malloc(infoLen);
+            if (buf) {
+                glGetProgramInfoLog(program, infoLen, NULL, buf);
+                ALOGE("Program link log:\n%s\n", buf);
+                free(buf);
+            }
+        }
+        glDeleteProgram(program);
+        program = 0;
+    }
+
+    *outPgm = program;
+!!!452236.cpp!!!	loadShader(in shaderType : GLenum, in pSource : char, inout outShader : GLuint) : void
+    GLuint shader = glCreateShader(shaderType);
+    CHECK_GL_ERROR;
+
+    glShaderSource(shader, 1, &pSource, NULL);
+    CHECK_GL_ERROR;
+
+    glCompileShader(shader);
+    CHECK_GL_ERROR;
+
+    GLint compiled = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (!compiled) {
+        GLint infoLen = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &infoLen);
+        char* buf = (char*) malloc(infoLen);
+        if (buf) {
+            glGetShaderInfoLog(shader, infoLen, NULL, buf);
+            ALOGE("Shader compile log:\n%s\n", buf);
+            free(buf);
+        }
+        glDeleteShader(shader);
+        shader = 0;
+    }
+    *outShader = shader;
+!!!452364.cpp!!!	render(inout input : RenderInput) : void
+    sp<SurfaceTexture> ST = input->mST;
+    sp<SurfaceTextureClient> STC = input->mSTC;
+
+    if (input->mIsExternalBuffer) {
+        queueExternalBuffer(STC.get(), input->mBuffer,
+            input->mWidth, input->mHeight);
+    } else {
+        queueInternalBuffer(STC.get(), input->mBuffer);
+    }
+
+    ST->updateTexImage();
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    calculatePositionCoordinates(input->mRenderingMode,
+        input->mWidth, input->mHeight);
+
+    const GLfloat textureCoordinates[] = {
+         0.0f,  1.0f,
+         0.0f,  0.0f,
+         1.0f,  0.0f,
+         1.0f,  1.0f,
+    };
+
+    updateProgramAndHandle(input->mVideoEffect);
+
+    glVertexAttribPointer(mPositionHandle, 2, GL_FLOAT, GL_FALSE, 0,
+        mPositionCoordinates);
+    CHECK_GL_ERROR;
+
+    glEnableVertexAttribArray(mPositionHandle);
+    CHECK_GL_ERROR;
+
+    glVertexAttribPointer(mTexPosHandle, 2, GL_FLOAT, GL_FALSE, 0,
+        textureCoordinates);
+    CHECK_GL_ERROR;
+
+    glEnableVertexAttribArray(mTexPosHandle);
+    CHECK_GL_ERROR;
+
+    GLfloat texMatrix[16];
+    ST->getTransformMatrix(texMatrix);
+    glUniformMatrix4fv(mTexMatrixHandle, 1, GL_FALSE, texMatrix);
+    CHECK_GL_ERROR;
+
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, input->mTextureId);
+    CHECK_GL_ERROR;
+
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(
+        GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(
+        GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    CHECK_GL_ERROR;
+
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    CHECK_GL_ERROR;
+
+    eglSwapBuffers(mEglDisplay, mEglSurface);
+!!!452492.cpp!!!	queueInternalBuffer(inout anw : ANativeWindow, inout buffer : MediaBuffer) : void
+    int64_t timeUs;
+    CHECK(buffer->meta_data()->findInt64(kKeyTime, &timeUs));
+    native_window_set_buffers_timestamp(anw, timeUs * 1000);
+    status_t err = anw->queueBuffer(anw, buffer->graphicBuffer().get(), -1);
+    if (err != 0) {
+        ALOGE("queueBuffer failed with error %s (%d)", strerror(-err), -err);
+        return;
+    }
+
+    sp<MetaData> metaData = buffer->meta_data();
+    metaData->setInt32(kKeyRendered, 1);
+!!!452620.cpp!!!	queueExternalBuffer(inout anw : ANativeWindow, inout buffer : MediaBuffer, in width : int, in height : int) : void
+    native_window_set_buffers_geometry(anw, width, height,
+            HAL_PIXEL_FORMAT_YV12);
+    native_window_set_usage(anw, GRALLOC_USAGE_SW_WRITE_OFTEN);
+
+    ANativeWindowBuffer* anb;
+    CHECK(NO_ERROR == native_window_dequeue_buffer_and_wait(anw, &anb));
+    CHECK(anb != NULL);
+
+    // Copy the buffer
+    uint8_t* img = NULL;
+    sp<GraphicBuffer> buf(new GraphicBuffer(anb, false));
+    buf->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, (void**)(&img));
+    copyI420Buffer(buffer, img, width, height, buf->getStride());
+    buf->unlock();
+    CHECK(NO_ERROR == anw->queueBuffer(anw, buf->getNativeBuffer(), -1));
+!!!452748.cpp!!!	copyI420Buffer(inout src : MediaBuffer, inout dst : uint8_t, in srcWidth : int, in srcHeight : int, in stride : int) : void
+    int strideUV = (stride / 2 + 0xf) & ~0xf;
+    uint8_t* p = (uint8_t*)src->data() + src->range_offset();
+    // Y
+    for (int i = srcHeight; i > 0; i--) {
+        memcpy(dst, p, srcWidth);
+        dst += stride;
+        p += srcWidth;
+    }
+    // The src is I420, the dst is YV12.
+    // U
+    p += srcWidth * srcHeight / 4;
+    for (int i = srcHeight / 2; i > 0; i--) {
+        memcpy(dst, p, srcWidth / 2);
+        dst += strideUV;
+        p += srcWidth / 2;
+    }
+    // V
+    p -= srcWidth * srcHeight / 2;
+    for (int i = srcHeight / 2; i > 0; i--) {
+        memcpy(dst, p, srcWidth / 2);
+        dst += strideUV;
+        p += srcWidth / 2;
+    }
+!!!452876.cpp!!!	updateProgramAndHandle(in videoEffect : uint32_t) : void
+    if (mLastVideoEffect == videoEffect) {
+        return;
+    }
+
+    mLastVideoEffect = videoEffect;
+    int i;
+    switch (mLastVideoEffect) {
+        case VIDEO_EFFECT_NONE:
+            i = 0;
+            break;
+        case VIDEO_EFFECT_SEPIA:
+            i = 1;
+            break;
+        case VIDEO_EFFECT_NEGATIVE:
+            i = 2;
+            break;
+        case VIDEO_EFFECT_GRADIENT:
+            i = 3;
+            break;
+        default:
+            i = 0;
+            break;
+    }
+    glUseProgram(mProgram[i]);
+    CHECK_GL_ERROR;
+
+    mPositionHandle = glGetAttribLocation(mProgram[i], "vPosition");
+    mTexPosHandle = glGetAttribLocation(mProgram[i], "vTexPos");
+    mTexMatrixHandle = glGetUniformLocation(mProgram[i], "texMatrix");
+    CHECK_GL_ERROR;
+!!!453004.cpp!!!	calculatePositionCoordinates(in renderingMode : M4xVSS_MediaRendering, in srcWidth : int, in srcHeight : int) : void
+    float x, y;
+    switch (renderingMode) {
+        case M4xVSS_kResizing:
+        default:
+            x = 1;
+            y = 1;
+            break;
+        case M4xVSS_kCropping:
+            x = float(srcWidth) / mDstWidth;
+            y = float(srcHeight) / mDstHeight;
+            // Make the smaller side 1
+            if (x > y) {
+                x /= y;
+                y = 1;
+            } else {
+                y /= x;
+                x = 1;
+            }
+            break;
+        case M4xVSS_kBlackBorders:
+            x = float(srcWidth) / mDstWidth;
+            y = float(srcHeight) / mDstHeight;
+            // Make the larger side 1
+            if (x > y) {
+                y /= x;
+                x = 1;
+            } else {
+                x /= y;
+                y = 1;
+            }
+            break;
+    }
+
+    mPositionCoordinates[0] = -x;
+    mPositionCoordinates[1] = y;
+    mPositionCoordinates[2] = -x;
+    mPositionCoordinates[3] = -y;
+    mPositionCoordinates[4] = x;
+    mPositionCoordinates[5] = -y;
+    mPositionCoordinates[6] = x;
+    mPositionCoordinates[7] = y;
+!!!453132.cpp!!!	threadStart(inout self : void) : int
+    ALOGD("create thread");
+    ((NativeWindowRenderer*)self)->glThread();
+    return 0;
+!!!453260.cpp!!!	glThread() : void
+    initializeEGL();
+    createPrograms();
+
+    Mutex::Autolock autoLock(mLock);
+    bool quit = false;
+    while (!quit) {
+        switch (mThreadCmd) {
+            case CMD_IDLE:
+                mCond.wait(mLock);
+                continue;
+            case CMD_RENDER_INPUT:
+                render(mThreadRenderInput);
+                break;
+            case CMD_RESERVE_TEXTURE:
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, mThreadTextureId);
+                CHECK_GL_ERROR;
+                break;
+            case CMD_DELETE_TEXTURE:
+                glDeleteTextures(1, &mThreadTextureId);
+                break;
+            case CMD_QUIT:
+                terminateEGL();
+                quit = true;
+                break;
+        }
+        // Tell the requester that the command is finished.
+        mThreadCmd = CMD_IDLE;
+        mCond.broadcast();
+    }
+    ALOGD("quit");
+!!!453388.cpp!!!	startRequest(in cmd : int) : void
+    mLock.lock();
+    while (mThreadCmd != CMD_IDLE) {
+        mCond.wait(mLock);
+    }
+    mThreadCmd = cmd;
+!!!453516.cpp!!!	sendRequest() : void
+    mCond.broadcast();
+    while (mThreadCmd != CMD_IDLE) {
+        mCond.wait(mLock);
+    }
+    mLock.unlock();

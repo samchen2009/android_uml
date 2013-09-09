@@ -1,0 +1,203 @@
+class InputDevice
+!!!1279500.cpp!!!	~InputDevice()
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        delete mMappers[i];
+    }
+    mMappers.clear();
+!!!1280780.cpp!!!	dump(inout dump : String8) : void
+    InputDeviceInfo deviceInfo;
+    getDeviceInfo(& deviceInfo);
+
+    dump.appendFormat(INDENT "Device %d: %s\n", deviceInfo.getId(),
+            deviceInfo.getDisplayName().string());
+    dump.appendFormat(INDENT2 "Generation: %d\n", mGeneration);
+    dump.appendFormat(INDENT2 "IsExternal: %s\n", toString(mIsExternal));
+    dump.appendFormat(INDENT2 "Sources: 0x%08x\n", deviceInfo.getSources());
+    dump.appendFormat(INDENT2 "KeyboardType: %d\n", deviceInfo.getKeyboardType());
+
+    const Vector<InputDeviceInfo::MotionRange>& ranges = deviceInfo.getMotionRanges();
+    if (!ranges.isEmpty()) {
+        dump.append(INDENT2 "Motion Ranges:\n");
+        for (size_t i = 0; i < ranges.size(); i++) {
+            const InputDeviceInfo::MotionRange& range = ranges.itemAt(i);
+            const char* label = getAxisLabel(range.axis);
+            char name[32];
+            if (label) {
+                strncpy(name, label, sizeof(name));
+                name[sizeof(name) - 1] = '\0';
+            } else {
+                snprintf(name, sizeof(name), "%d", range.axis);
+            }
+            dump.appendFormat(INDENT3 "%s: source=0x%08x, "
+                    "min=%0.3f, max=%0.3f, flat=%0.3f, fuzz=%0.3f\n",
+                    name, range.source, range.min, range.max, range.flat, range.fuzz);
+        }
+    }
+
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->dump(dump);
+    }
+!!!1280908.cpp!!!	addMapper(inout mapper : InputMapper) : void
+    mMappers.add(mapper);
+!!!1281036.cpp!!!	configure(in when : nsecs_t, in config : InputReaderConfiguration, in changes : uint32_t) : void
+    mSources = 0;
+
+    if (!isIgnored()) {
+        if (!changes) { // first time only
+            mContext->getEventHub()->getConfiguration(mId, &mConfiguration);
+        }
+
+        if (!changes || (changes & InputReaderConfiguration::CHANGE_KEYBOARD_LAYOUTS)) {
+            if (!(mClasses & INPUT_DEVICE_CLASS_VIRTUAL)) {
+                sp<KeyCharacterMap> keyboardLayout =
+                        mContext->getPolicy()->getKeyboardLayoutOverlay(mIdentifier.descriptor);
+                if (mContext->getEventHub()->setKeyboardLayoutOverlay(mId, keyboardLayout)) {
+                    bumpGeneration();
+                }
+            }
+        }
+
+        if (!changes || (changes & InputReaderConfiguration::CHANGE_DEVICE_ALIAS)) {
+            if (!(mClasses & INPUT_DEVICE_CLASS_VIRTUAL)) {
+                String8 alias = mContext->getPolicy()->getDeviceAlias(mIdentifier);
+                if (mAlias != alias) {
+                    mAlias = alias;
+                    bumpGeneration();
+                }
+            }
+        }
+
+        size_t numMappers = mMappers.size();
+        for (size_t i = 0; i < numMappers; i++) {
+            InputMapper* mapper = mMappers[i];
+            mapper->configure(when, config, changes);
+            mSources |= mapper->getSources();
+        }
+    }
+!!!1281164.cpp!!!	reset(in when : nsecs_t) : void
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->reset(when);
+    }
+
+    mContext->updateGlobalMetaState();
+
+    notifyReset(when);
+!!!1281292.cpp!!!	process(in rawEvents : RawEvent, in count : size_t) : void
+    // Process all of the events in order for each mapper.
+    // We cannot simply ask each mapper to process them in bulk because mappers may
+    // have side-effects that must be interleaved.  For example, joystick movement events and
+    // gamepad button presses are handled by different mappers but they should be dispatched
+    // in the order received.
+    size_t numMappers = mMappers.size();
+    for (const RawEvent* rawEvent = rawEvents; count--; rawEvent++) {
+#if DEBUG_RAW_EVENTS
+        ALOGD("Input event: device=%d type=0x%04x code=0x%04x value=0x%08x when=%lld",
+                rawEvent->deviceId, rawEvent->type, rawEvent->code, rawEvent->value,
+                rawEvent->when);
+#endif
+
+        if (mDropUntilNextSync) {
+            if (rawEvent->type == EV_SYN && rawEvent->code == SYN_REPORT) {
+                mDropUntilNextSync = false;
+#if DEBUG_RAW_EVENTS
+                ALOGD("Recovered from input event buffer overrun.");
+#endif
+            } else {
+#if DEBUG_RAW_EVENTS
+                ALOGD("Dropped input event while waiting for next input sync.");
+#endif
+            }
+        } else if (rawEvent->type == EV_SYN && rawEvent->code == SYN_DROPPED) {
+            ALOGI("Detected input event buffer overrun for device %s.", getName().string());
+            mDropUntilNextSync = true;
+            reset(rawEvent->when);
+        } else {
+            for (size_t i = 0; i < numMappers; i++) {
+                InputMapper* mapper = mMappers[i];
+                mapper->process(rawEvent);
+            }
+        }
+    }
+!!!1281420.cpp!!!	timeoutExpired(in when : nsecs_t) : void
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->timeoutExpired(when);
+    }
+!!!1281548.cpp!!!	getDeviceInfo(inout outDeviceInfo : InputDeviceInfo) : void
+    outDeviceInfo->initialize(mId, mGeneration, mIdentifier, mAlias, mIsExternal);
+
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->populateDeviceInfo(outDeviceInfo);
+    }
+!!!1281676.cpp!!!	getKeyCodeState(in sourceMask : uint32_t, in keyCode : int32_t) : int32_t
+    return getState(sourceMask, keyCode, & InputMapper::getKeyCodeState);
+!!!1281804.cpp!!!	getScanCodeState(in sourceMask : uint32_t, in scanCode : int32_t) : int32_t
+    return getState(sourceMask, scanCode, & InputMapper::getScanCodeState);
+!!!1281932.cpp!!!	getSwitchState(in sourceMask : uint32_t, in switchCode : int32_t) : int32_t
+    return getState(sourceMask, switchCode, & InputMapper::getSwitchState);
+!!!1282060.cpp!!!	markSupportedKeyCodes(in sourceMask : uint32_t, in numCodes : size_t, in keyCodes : int32_t, inout outFlags : uint8_t) : bool
+    bool result = false;
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        if (sourcesMatchMask(mapper->getSources(), sourceMask)) {
+            result |= mapper->markSupportedKeyCodes(sourceMask, numCodes, keyCodes, outFlags);
+        }
+    }
+    return result;
+!!!1282188.cpp!!!	vibrate(in pattern : nsecs_t, in patternSize : size_t, in repeat : ssize_t, in token : int32_t) : void
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->vibrate(pattern, patternSize, repeat, token);
+    }
+!!!1282316.cpp!!!	cancelVibrate(in token : int32_t) : void
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->cancelVibrate(token);
+    }
+!!!1282444.cpp!!!	getMetaState() : int32_t
+    int32_t result = 0;
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        result |= mapper->getMetaState();
+    }
+    return result;
+!!!1282572.cpp!!!	fadePointer() : void
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        mapper->fadePointer();
+    }
+!!!1282700.cpp!!!	bumpGeneration() : void
+    mGeneration = mContext->bumpGeneration();
+!!!1282828.cpp!!!	notifyReset(in when : nsecs_t) : void
+    NotifyDeviceResetArgs args(when, mId);
+    mContext->getListener()->notifyDeviceReset(&args);
+!!!1283724.cpp!!!	getState(in sourceMask : uint32_t, in code : int32_t, in getStateFunc : GetStateFunc) : int32_t
+    int32_t result = AKEY_STATE_UNKNOWN;
+    size_t numMappers = mMappers.size();
+    for (size_t i = 0; i < numMappers; i++) {
+        InputMapper* mapper = mMappers[i];
+        if (sourcesMatchMask(mapper->getSources(), sourceMask)) {
+            // If any mapper reports AKEY_STATE_DOWN or AKEY_STATE_VIRTUAL, return that
+            // value.  Otherwise, return AKEY_STATE_UP as long as one mapper reports it.
+            int32_t currentResult = (mapper->*getStateFunc)(sourceMask, code);
+            if (currentResult >= AKEY_STATE_DOWN) {
+                return currentResult;
+            } else if (currentResult == AKEY_STATE_UP) {
+                result = currentResult;
+            }
+        }
+    }
+    return result;

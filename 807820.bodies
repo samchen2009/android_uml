@@ -1,0 +1,731 @@
+class SQLiteConnectionPool
+!!!3315724.java!!!	SQLiteConnectionPool(inout configuration : SQLiteDatabaseConfiguration)
+        mConfiguration = new SQLiteDatabaseConfiguration(configuration);
+        setMaxConnectionPoolSizeLocked();
+!!!3315852.java!!!	finalize() : void
+        try {
+            dispose(true);
+        } finally {
+            super.finalize();
+        }
+!!!3315980.java!!!	open(inout configuration : SQLiteDatabaseConfiguration) : SQLiteConnectionPool
+        if (configuration == null) {
+            throw new IllegalArgumentException("configuration must not be null.");
+        }
+
+        // Create the pool.
+        SQLiteConnectionPool pool = new SQLiteConnectionPool(configuration);
+        pool.open(); // might throw
+        return pool;
+!!!3316108.java!!!	open() : void
+        // Open the primary connection.
+        // This might throw if the database is corrupt.
+        mAvailablePrimaryConnection = openConnectionLocked(mConfiguration,
+                true /*primaryConnection*/); // might throw
+
+        // Mark the pool as being open for business.
+        mIsOpen = true;
+        mCloseGuard.open("close");
+!!!3316236.java!!!	close() : void
+        dispose(false);
+!!!3316364.java!!!	dispose(inout finalized : boolean) : void
+        if (mCloseGuard != null) {
+            if (finalized) {
+                mCloseGuard.warnIfOpen();
+            }
+            mCloseGuard.close();
+        }
+
+        if (!finalized) {
+            // Close all connections.  We don't need (or want) to do this
+            // when finalized because we don't know what state the connections
+            // themselves will be in.  The finalizer is really just here for CloseGuard.
+            // The connections will take care of themselves when their own finalizers run.
+            synchronized (mLock) {
+                throwIfClosedLocked();
+
+                mIsOpen = false;
+
+                closeAvailableConnectionsAndLogExceptionsLocked();
+
+                final int pendingCount = mAcquiredConnections.size();
+                if (pendingCount != 0) {
+                    Log.i(TAG, "The connection pool for " + mConfiguration.label
+                            + " has been closed but there are still "
+                            + pendingCount + " connections in use.  They will be closed "
+                            + "as they are released back to the pool.");
+                }
+
+                wakeConnectionWaitersLocked();
+            }
+        }
+!!!3316492.java!!!	reconfigure(inout configuration : SQLiteDatabaseConfiguration) : void
+        if (configuration == null) {
+            throw new IllegalArgumentException("configuration must not be null.");
+        }
+
+        synchronized (mLock) {
+            throwIfClosedLocked();
+
+            boolean walModeChanged = ((configuration.openFlags ^ mConfiguration.openFlags)
+                    & SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING) != 0;
+            if (walModeChanged) {
+                // WAL mode can only be changed if there are no acquired connections
+                // because we need to close all but the primary connection first.
+                if (!mAcquiredConnections.isEmpty()) {
+                    throw new IllegalStateException("Write Ahead Logging (WAL) mode cannot "
+                            + "be enabled or disabled while there are transactions in "
+                            + "progress.  Finish all transactions and release all active "
+                            + "database connections first.");
+                }
+
+                // Close all non-primary connections.  This should happen immediately
+                // because none of them are in use.
+                closeAvailableNonPrimaryConnectionsAndLogExceptionsLocked();
+                assert mAvailableNonPrimaryConnections.isEmpty();
+            }
+
+            boolean foreignKeyModeChanged = configuration.foreignKeyConstraintsEnabled
+                    != mConfiguration.foreignKeyConstraintsEnabled;
+            if (foreignKeyModeChanged) {
+                // Foreign key constraints can only be changed if there are no transactions
+                // in progress.  To make this clear, we throw an exception if there are
+                // any acquired connections.
+                if (!mAcquiredConnections.isEmpty()) {
+                    throw new IllegalStateException("Foreign Key Constraints cannot "
+                            + "be enabled or disabled while there are transactions in "
+                            + "progress.  Finish all transactions and release all active "
+                            + "database connections first.");
+                }
+            }
+
+            if (mConfiguration.openFlags != configuration.openFlags) {
+                // If we are changing open flags and WAL mode at the same time, then
+                // we have no choice but to close the primary connection beforehand
+                // because there can only be one connection open when we change WAL mode.
+                if (walModeChanged) {
+                    closeAvailableConnectionsAndLogExceptionsLocked();
+                }
+
+                // Try to reopen the primary connection using the new open flags then
+                // close and discard all existing connections.
+                // This might throw if the database is corrupt or cannot be opened in
+                // the new mode in which case existing connections will remain untouched.
+                SQLiteConnection newPrimaryConnection = openConnectionLocked(configuration,
+                        true /*primaryConnection*/); // might throw
+
+                closeAvailableConnectionsAndLogExceptionsLocked();
+                discardAcquiredConnectionsLocked();
+
+                mAvailablePrimaryConnection = newPrimaryConnection;
+                mConfiguration.updateParametersFrom(configuration);
+                setMaxConnectionPoolSizeLocked();
+            } else {
+                // Reconfigure the database connections in place.
+                mConfiguration.updateParametersFrom(configuration);
+                setMaxConnectionPoolSizeLocked();
+
+                closeExcessConnectionsAndLogExceptionsLocked();
+                reconfigureAllConnectionsLocked();
+            }
+
+            wakeConnectionWaitersLocked();
+        }
+!!!3316620.java!!!	acquireConnection(in sql : String, in connectionFlags : int, inout cancellationSignal : CancellationSignal) : SQLiteConnection
+        return waitForConnection(sql, connectionFlags, cancellationSignal);
+!!!3316748.java!!!	releaseConnection(inout connection : SQLiteConnection) : void
+        synchronized (mLock) {
+            AcquiredConnectionStatus status = mAcquiredConnections.remove(connection);
+            if (status == null) {
+                throw new IllegalStateException("Cannot perform this operation "
+                        + "because the specified connection was not acquired "
+                        + "from this pool or has already been released.");
+            }
+
+            if (!mIsOpen) {
+                closeConnectionAndLogExceptionsLocked(connection);
+            } else if (connection.isPrimaryConnection()) {
+                if (recycleConnectionLocked(connection, status)) {
+                    assert mAvailablePrimaryConnection == null;
+                    mAvailablePrimaryConnection = connection;
+                }
+                wakeConnectionWaitersLocked();
+            } else if (mAvailableNonPrimaryConnections.size() >= mMaxConnectionPoolSize - 1) {
+                closeConnectionAndLogExceptionsLocked(connection);
+            } else {
+                if (recycleConnectionLocked(connection, status)) {
+                    mAvailableNonPrimaryConnections.add(connection);
+                }
+                wakeConnectionWaitersLocked();
+            }
+        }
+!!!3316876.java!!!	recycleConnectionLocked(inout connection : SQLiteConnection, inout status : AcquiredConnectionStatus) : boolean
+        if (status == AcquiredConnectionStatus.RECONFIGURE) {
+            try {
+                connection.reconfigure(mConfiguration); // might throw
+            } catch (RuntimeException ex) {
+                Log.e(TAG, "Failed to reconfigure released connection, closing it: "
+                        + connection, ex);
+                status = AcquiredConnectionStatus.DISCARD;
+            }
+        }
+        if (status == AcquiredConnectionStatus.DISCARD) {
+            closeConnectionAndLogExceptionsLocked(connection);
+            return false;
+        }
+        return true;
+!!!3317004.java!!!	shouldYieldConnection(inout connection : SQLiteConnection, in connectionFlags : int) : boolean
+        synchronized (mLock) {
+            if (!mAcquiredConnections.containsKey(connection)) {
+                throw new IllegalStateException("Cannot perform this operation "
+                        + "because the specified connection was not acquired "
+                        + "from this pool or has already been released.");
+            }
+
+            if (!mIsOpen) {
+                return false;
+            }
+
+            return isSessionBlockingImportantConnectionWaitersLocked(
+                    connection.isPrimaryConnection(), connectionFlags);
+        }
+!!!3317132.java!!!	collectDbStats(inout dbStatsList : ArrayList<DbStats>) : void
+        synchronized (mLock) {
+            if (mAvailablePrimaryConnection != null) {
+                mAvailablePrimaryConnection.collectDbStats(dbStatsList);
+            }
+
+            for (SQLiteConnection connection : mAvailableNonPrimaryConnections) {
+                connection.collectDbStats(dbStatsList);
+            }
+
+            for (SQLiteConnection connection : mAcquiredConnections.keySet()) {
+                connection.collectDbStatsUnsafe(dbStatsList);
+            }
+        }
+!!!3317260.java!!!	openConnectionLocked(inout configuration : SQLiteDatabaseConfiguration, inout primaryConnection : boolean) : SQLiteConnection
+        final int connectionId = mNextConnectionId++;
+        return SQLiteConnection.open(this, configuration,
+                connectionId, primaryConnection); // might throw
+!!!3317388.java!!!	onConnectionLeaked() : void
+        // This code is running inside of the SQLiteConnection finalizer.
+        //
+        // We don't know whether it is just the connection that has been finalized (and leaked)
+        // or whether the connection pool has also been or is about to be finalized.
+        // Consequently, it would be a bad idea to try to grab any locks or to
+        // do any significant work here.  So we do the simplest possible thing and
+        // set a flag.  waitForConnection() periodically checks this flag (when it
+        // times out) so that it can recover from leaked connections and wake
+        // itself or other threads up if necessary.
+        //
+        // You might still wonder why we don't try to do more to wake up the waiters
+        // immediately.  First, as explained above, it would be hard to do safely
+        // unless we started an extra Thread to function as a reference queue.  Second,
+        // this is never supposed to happen in normal operation.  Third, there is no
+        // guarantee that the GC will actually detect the leak in a timely manner so
+        // it's not all that important that we recover from the leak in a timely manner
+        // either.  Fourth, if a badly behaved application finds itself hung waiting for
+        // several seconds while waiting for a leaked connection to be detected and recreated,
+        // then perhaps its authors will have added incentive to fix the problem!
+
+        Log.w(TAG, "A SQLiteConnection object for database '"
+                + mConfiguration.label + "' was leaked!  Please fix your application "
+                + "to end transactions in progress properly and to close the database "
+                + "when it is no longer needed.");
+
+        mConnectionLeaked.set(true);
+!!!3317516.java!!!	closeAvailableConnectionsAndLogExceptionsLocked() : void
+        closeAvailableNonPrimaryConnectionsAndLogExceptionsLocked();
+
+        if (mAvailablePrimaryConnection != null) {
+            closeConnectionAndLogExceptionsLocked(mAvailablePrimaryConnection);
+            mAvailablePrimaryConnection = null;
+        }
+!!!3317644.java!!!	closeAvailableNonPrimaryConnectionsAndLogExceptionsLocked() : void
+        final int count = mAvailableNonPrimaryConnections.size();
+        for (int i = 0; i < count; i++) {
+            closeConnectionAndLogExceptionsLocked(mAvailableNonPrimaryConnections.get(i));
+        }
+        mAvailableNonPrimaryConnections.clear();
+!!!3317772.java!!!	closeExcessConnectionsAndLogExceptionsLocked() : void
+        int availableCount = mAvailableNonPrimaryConnections.size();
+        while (availableCount-- > mMaxConnectionPoolSize - 1) {
+            SQLiteConnection connection =
+                    mAvailableNonPrimaryConnections.remove(availableCount);
+            closeConnectionAndLogExceptionsLocked(connection);
+        }
+!!!3317900.java!!!	closeConnectionAndLogExceptionsLocked(inout connection : SQLiteConnection) : void
+        try {
+            connection.close(); // might throw
+        } catch (RuntimeException ex) {
+            Log.e(TAG, "Failed to close connection, its fate is now in the hands "
+                    + "of the merciful GC: " + connection, ex);
+        }
+!!!3318028.java!!!	discardAcquiredConnectionsLocked() : void
+        markAcquiredConnectionsLocked(AcquiredConnectionStatus.DISCARD);
+!!!3318156.java!!!	reconfigureAllConnectionsLocked() : void
+        if (mAvailablePrimaryConnection != null) {
+            try {
+                mAvailablePrimaryConnection.reconfigure(mConfiguration); // might throw
+            } catch (RuntimeException ex) {
+                Log.e(TAG, "Failed to reconfigure available primary connection, closing it: "
+                        + mAvailablePrimaryConnection, ex);
+                closeConnectionAndLogExceptionsLocked(mAvailablePrimaryConnection);
+                mAvailablePrimaryConnection = null;
+            }
+        }
+
+        int count = mAvailableNonPrimaryConnections.size();
+        for (int i = 0; i < count; i++) {
+            final SQLiteConnection connection = mAvailableNonPrimaryConnections.get(i);
+            try {
+                connection.reconfigure(mConfiguration); // might throw
+            } catch (RuntimeException ex) {
+                Log.e(TAG, "Failed to reconfigure available non-primary connection, closing it: "
+                        + connection, ex);
+                closeConnectionAndLogExceptionsLocked(connection);
+                mAvailableNonPrimaryConnections.remove(i--);
+                count -= 1;
+            }
+        }
+
+        markAcquiredConnectionsLocked(AcquiredConnectionStatus.RECONFIGURE);
+!!!3318284.java!!!	markAcquiredConnectionsLocked(inout status : AcquiredConnectionStatus) : void
+        if (!mAcquiredConnections.isEmpty()) {
+            ArrayList<SQLiteConnection> keysToUpdate = new ArrayList<SQLiteConnection>(
+                    mAcquiredConnections.size());
+            for (Map.Entry<SQLiteConnection, AcquiredConnectionStatus> entry
+                    : mAcquiredConnections.entrySet()) {
+                AcquiredConnectionStatus oldStatus = entry.getValue();
+                if (status != oldStatus
+                        && oldStatus != AcquiredConnectionStatus.DISCARD) {
+                    keysToUpdate.add(entry.getKey());
+                }
+            }
+            final int updateCount = keysToUpdate.size();
+            for (int i = 0; i < updateCount; i++) {
+                mAcquiredConnections.put(keysToUpdate.get(i), status);
+            }
+        }
+!!!3318412.java!!!	waitForConnection(in sql : String, in connectionFlags : int, inout cancellationSignal : CancellationSignal) : SQLiteConnection
+        final boolean wantPrimaryConnection =
+                (connectionFlags & CONNECTION_FLAG_PRIMARY_CONNECTION_AFFINITY) != 0;
+
+        final ConnectionWaiter waiter;
+        final int nonce;
+        synchronized (mLock) {
+            throwIfClosedLocked();
+
+            // Abort if canceled.
+            if (cancellationSignal != null) {
+                cancellationSignal.throwIfCanceled();
+            }
+
+            // Try to acquire a connection.
+            SQLiteConnection connection = null;
+            if (!wantPrimaryConnection) {
+                connection = tryAcquireNonPrimaryConnectionLocked(
+                        sql, connectionFlags); // might throw
+            }
+            if (connection == null) {
+                connection = tryAcquirePrimaryConnectionLocked(connectionFlags); // might throw
+            }
+            if (connection != null) {
+                return connection;
+            }
+
+            // No connections available.  Enqueue a waiter in priority order.
+            final int priority = getPriority(connectionFlags);
+            final long startTime = SystemClock.uptimeMillis();
+            waiter = obtainConnectionWaiterLocked(Thread.currentThread(), startTime,
+                    priority, wantPrimaryConnection, sql, connectionFlags);
+            ConnectionWaiter predecessor = null;
+            ConnectionWaiter successor = mConnectionWaiterQueue;
+            while (successor != null) {
+                if (priority > successor.mPriority) {
+                    waiter.mNext = successor;
+                    break;
+                }
+                predecessor = successor;
+                successor = successor.mNext;
+            }
+            if (predecessor != null) {
+                predecessor.mNext = waiter;
+            } else {
+                mConnectionWaiterQueue = waiter;
+            }
+
+            nonce = waiter.mNonce;
+        }
+
+        // Set up the cancellation listener.
+        if (cancellationSignal != null) {
+            cancellationSignal.setOnCancelListener(new CancellationSignal.OnCancelListener() {
+                @Override
+                public void onCancel() {
+                    synchronized (mLock) {
+                        if (waiter.mNonce == nonce) {
+                            cancelConnectionWaiterLocked(waiter);
+                        }
+                    }
+                }
+            });
+        }
+        try {
+            // Park the thread until a connection is assigned or the pool is closed.
+            // Rethrow an exception from the wait, if we got one.
+            long busyTimeoutMillis = CONNECTION_POOL_BUSY_MILLIS;
+            long nextBusyTimeoutTime = waiter.mStartTime + busyTimeoutMillis;
+            for (;;) {
+                // Detect and recover from connection leaks.
+                if (mConnectionLeaked.compareAndSet(true, false)) {
+                    synchronized (mLock) {
+                        wakeConnectionWaitersLocked();
+                    }
+                }
+
+                // Wait to be unparked (may already have happened), a timeout, or interruption.
+                LockSupport.parkNanos(this, busyTimeoutMillis * 1000000L);
+
+                // Clear the interrupted flag, just in case.
+                Thread.interrupted();
+
+                // Check whether we are done waiting yet.
+                synchronized (mLock) {
+                    throwIfClosedLocked();
+
+                    final SQLiteConnection connection = waiter.mAssignedConnection;
+                    final RuntimeException ex = waiter.mException;
+                    if (connection != null || ex != null) {
+                        recycleConnectionWaiterLocked(waiter);
+                        if (connection != null) {
+                            return connection;
+                        }
+                        throw ex; // rethrow!
+                    }
+
+                    final long now = SystemClock.uptimeMillis();
+                    if (now < nextBusyTimeoutTime) {
+                        busyTimeoutMillis = now - nextBusyTimeoutTime;
+                    } else {
+                        logConnectionPoolBusyLocked(now - waiter.mStartTime, connectionFlags);
+                        busyTimeoutMillis = CONNECTION_POOL_BUSY_MILLIS;
+                        nextBusyTimeoutTime = now + busyTimeoutMillis;
+                    }
+                }
+            }
+        } finally {
+            // Remove the cancellation listener.
+            if (cancellationSignal != null) {
+                cancellationSignal.setOnCancelListener(null);
+            }
+        }
+!!!3318540.java!!!	cancelConnectionWaiterLocked(inout waiter : ConnectionWaiter) : void
+        if (waiter.mAssignedConnection != null || waiter.mException != null) {
+            // Waiter is done waiting but has not woken up yet.
+            return;
+        }
+
+        // Waiter must still be waiting.  Dequeue it.
+        ConnectionWaiter predecessor = null;
+        ConnectionWaiter current = mConnectionWaiterQueue;
+        while (current != waiter) {
+            assert current != null;
+            predecessor = current;
+            current = current.mNext;
+        }
+        if (predecessor != null) {
+            predecessor.mNext = waiter.mNext;
+        } else {
+            mConnectionWaiterQueue = waiter.mNext;
+        }
+
+        // Send the waiter an exception and unpark it.
+        waiter.mException = new OperationCanceledException();
+        LockSupport.unpark(waiter.mThread);
+
+        // Check whether removing this waiter will enable other waiters to make progress.
+        wakeConnectionWaitersLocked();
+!!!3318668.java!!!	logConnectionPoolBusyLocked(in waitMillis : long, in connectionFlags : int) : void
+        final Thread thread = Thread.currentThread();
+        StringBuilder msg = new StringBuilder();
+        msg.append("The connection pool for database '").append(mConfiguration.label);
+        msg.append("' has been unable to grant a connection to thread ");
+        msg.append(thread.getId()).append(" (").append(thread.getName()).append(") ");
+        msg.append("with flags 0x").append(Integer.toHexString(connectionFlags));
+        msg.append(" for ").append(waitMillis * 0.001f).append(" seconds.\n");
+
+        ArrayList<String> requests = new ArrayList<String>();
+        int activeConnections = 0;
+        int idleConnections = 0;
+        if (!mAcquiredConnections.isEmpty()) {
+            for (SQLiteConnection connection : mAcquiredConnections.keySet()) {
+                String description = connection.describeCurrentOperationUnsafe();
+                if (description != null) {
+                    requests.add(description);
+                    activeConnections += 1;
+                } else {
+                    idleConnections += 1;
+                }
+            }
+        }
+        int availableConnections = mAvailableNonPrimaryConnections.size();
+        if (mAvailablePrimaryConnection != null) {
+            availableConnections += 1;
+        }
+
+        msg.append("Connections: ").append(activeConnections).append(" active, ");
+        msg.append(idleConnections).append(" idle, ");
+        msg.append(availableConnections).append(" available.\n");
+
+        if (!requests.isEmpty()) {
+            msg.append("\nRequests in progress:\n");
+            for (String request : requests) {
+                msg.append("  ").append(request).append("\n");
+            }
+        }
+
+        Log.w(TAG, msg.toString());
+!!!3318796.java!!!	wakeConnectionWaitersLocked() : void
+        // Unpark all waiters that have requests that we can fulfill.
+        // This method is designed to not throw runtime exceptions, although we might send
+        // a waiter an exception for it to rethrow.
+        ConnectionWaiter predecessor = null;
+        ConnectionWaiter waiter = mConnectionWaiterQueue;
+        boolean primaryConnectionNotAvailable = false;
+        boolean nonPrimaryConnectionNotAvailable = false;
+        while (waiter != null) {
+            boolean unpark = false;
+            if (!mIsOpen) {
+                unpark = true;
+            } else {
+                try {
+                    SQLiteConnection connection = null;
+                    if (!waiter.mWantPrimaryConnection && !nonPrimaryConnectionNotAvailable) {
+                        connection = tryAcquireNonPrimaryConnectionLocked(
+                                waiter.mSql, waiter.mConnectionFlags); // might throw
+                        if (connection == null) {
+                            nonPrimaryConnectionNotAvailable = true;
+                        }
+                    }
+                    if (connection == null && !primaryConnectionNotAvailable) {
+                        connection = tryAcquirePrimaryConnectionLocked(
+                                waiter.mConnectionFlags); // might throw
+                        if (connection == null) {
+                            primaryConnectionNotAvailable = true;
+                        }
+                    }
+                    if (connection != null) {
+                        waiter.mAssignedConnection = connection;
+                        unpark = true;
+                    } else if (nonPrimaryConnectionNotAvailable && primaryConnectionNotAvailable) {
+                        // There are no connections available and the pool is still open.
+                        // We cannot fulfill any more connection requests, so stop here.
+                        break;
+                    }
+                } catch (RuntimeException ex) {
+                    // Let the waiter handle the exception from acquiring a connection.
+                    waiter.mException = ex;
+                    unpark = true;
+                }
+            }
+
+            final ConnectionWaiter successor = waiter.mNext;
+            if (unpark) {
+                if (predecessor != null) {
+                    predecessor.mNext = successor;
+                } else {
+                    mConnectionWaiterQueue = successor;
+                }
+                waiter.mNext = null;
+
+                LockSupport.unpark(waiter.mThread);
+            } else {
+                predecessor = waiter;
+            }
+            waiter = successor;
+        }
+!!!3318924.java!!!	tryAcquirePrimaryConnectionLocked(in connectionFlags : int) : SQLiteConnection
+        // If the primary connection is available, acquire it now.
+        SQLiteConnection connection = mAvailablePrimaryConnection;
+        if (connection != null) {
+            mAvailablePrimaryConnection = null;
+            finishAcquireConnectionLocked(connection, connectionFlags); // might throw
+            return connection;
+        }
+
+        // Make sure that the primary connection actually exists and has just been acquired.
+        for (SQLiteConnection acquiredConnection : mAcquiredConnections.keySet()) {
+            if (acquiredConnection.isPrimaryConnection()) {
+                return null;
+            }
+        }
+
+        // Uhoh.  No primary connection!  Either this is the first time we asked
+        // for it, or maybe it leaked?
+        connection = openConnectionLocked(mConfiguration,
+                true /*primaryConnection*/); // might throw
+        finishAcquireConnectionLocked(connection, connectionFlags); // might throw
+        return connection;
+!!!3319052.java!!!	tryAcquireNonPrimaryConnectionLocked(in sql : String, in connectionFlags : int) : SQLiteConnection
+        // Try to acquire the next connection in the queue.
+        SQLiteConnection connection;
+        final int availableCount = mAvailableNonPrimaryConnections.size();
+        if (availableCount > 1 && sql != null) {
+            // If we have a choice, then prefer a connection that has the
+            // prepared statement in its cache.
+            for (int i = 0; i < availableCount; i++) {
+                connection = mAvailableNonPrimaryConnections.get(i);
+                if (connection.isPreparedStatementInCache(sql)) {
+                    mAvailableNonPrimaryConnections.remove(i);
+                    finishAcquireConnectionLocked(connection, connectionFlags); // might throw
+                    return connection;
+                }
+            }
+        }
+        if (availableCount > 0) {
+            // Otherwise, just grab the next one.
+            connection = mAvailableNonPrimaryConnections.remove(availableCount - 1);
+            finishAcquireConnectionLocked(connection, connectionFlags); // might throw
+            return connection;
+        }
+
+        // Expand the pool if needed.
+        int openConnections = mAcquiredConnections.size();
+        if (mAvailablePrimaryConnection != null) {
+            openConnections += 1;
+        }
+        if (openConnections >= mMaxConnectionPoolSize) {
+            return null;
+        }
+        connection = openConnectionLocked(mConfiguration,
+                false /*primaryConnection*/); // might throw
+        finishAcquireConnectionLocked(connection, connectionFlags); // might throw
+        return connection;
+!!!3319180.java!!!	finishAcquireConnectionLocked(inout connection : SQLiteConnection, in connectionFlags : int) : void
+        try {
+            final boolean readOnly = (connectionFlags & CONNECTION_FLAG_READ_ONLY) != 0;
+            connection.setOnlyAllowReadOnlyOperations(readOnly);
+
+            mAcquiredConnections.put(connection, AcquiredConnectionStatus.NORMAL);
+        } catch (RuntimeException ex) {
+            Log.e(TAG, "Failed to prepare acquired connection for session, closing it: "
+                    + connection +", connectionFlags=" + connectionFlags);
+            closeConnectionAndLogExceptionsLocked(connection);
+            throw ex; // rethrow!
+        }
+!!!3319308.java!!!	isSessionBlockingImportantConnectionWaitersLocked(inout holdingPrimaryConnection : boolean, in connectionFlags : int) : boolean
+        ConnectionWaiter waiter = mConnectionWaiterQueue;
+        if (waiter != null) {
+            final int priority = getPriority(connectionFlags);
+            do {
+                // Only worry about blocked connections that have same or lower priority.
+                if (priority > waiter.mPriority) {
+                    break;
+                }
+
+                // If we are holding the primary connection then we are blocking the waiter.
+                // Likewise, if we are holding a non-primary connection and the waiter
+                // would accept a non-primary connection, then we are blocking the waier.
+                if (holdingPrimaryConnection || !waiter.mWantPrimaryConnection) {
+                    return true;
+                }
+
+                waiter = waiter.mNext;
+            } while (waiter != null);
+        }
+        return false;
+!!!3319436.java!!!	getPriority(in connectionFlags : int) : int
+        return (connectionFlags & CONNECTION_FLAG_INTERACTIVE) != 0 ? 1 : 0;
+!!!3319564.java!!!	setMaxConnectionPoolSizeLocked() : void
+        if ((mConfiguration.openFlags & SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING) != 0) {
+            mMaxConnectionPoolSize = SQLiteGlobal.getWALConnectionPoolSize();
+        } else {
+            // TODO: We don't actually need to restrict the connection pool size to 1
+            // for non-WAL databases.  There might be reasons to use connection pooling
+            // with other journal modes.  For now, enabling connection pooling and
+            // using WAL are the same thing in the API.
+            mMaxConnectionPoolSize = 1;
+        }
+!!!3319692.java!!!	throwIfClosedLocked() : void
+        if (!mIsOpen) {
+            throw new IllegalStateException("Cannot perform this operation "
+                    + "because the connection pool has been closed.");
+        }
+!!!3319820.java!!!	obtainConnectionWaiterLocked(inout thread : Thread, in startTime : long, in priority : int, inout wantPrimaryConnection : boolean, in sql : String, in connectionFlags : int) : ConnectionWaiter
+        ConnectionWaiter waiter = mConnectionWaiterPool;
+        if (waiter != null) {
+            mConnectionWaiterPool = waiter.mNext;
+            waiter.mNext = null;
+        } else {
+            waiter = new ConnectionWaiter();
+        }
+        waiter.mThread = thread;
+        waiter.mStartTime = startTime;
+        waiter.mPriority = priority;
+        waiter.mWantPrimaryConnection = wantPrimaryConnection;
+        waiter.mSql = sql;
+        waiter.mConnectionFlags = connectionFlags;
+        return waiter;
+!!!3319948.java!!!	recycleConnectionWaiterLocked(inout waiter : ConnectionWaiter) : void
+        waiter.mNext = mConnectionWaiterPool;
+        waiter.mThread = null;
+        waiter.mSql = null;
+        waiter.mAssignedConnection = null;
+        waiter.mException = null;
+        waiter.mNonce += 1;
+        mConnectionWaiterPool = waiter;
+!!!3320076.java!!!	dump(inout printer : Printer, inout verbose : boolean) : void
+        Printer indentedPrinter = PrefixPrinter.create(printer, "    ");
+        synchronized (mLock) {
+            printer.println("Connection pool for " + mConfiguration.path + ":");
+            printer.println("  Open: " + mIsOpen);
+            printer.println("  Max connections: " + mMaxConnectionPoolSize);
+
+            printer.println("  Available primary connection:");
+            if (mAvailablePrimaryConnection != null) {
+                mAvailablePrimaryConnection.dump(indentedPrinter, verbose);
+            } else {
+                indentedPrinter.println("<none>");
+            }
+
+            printer.println("  Available non-primary connections:");
+            if (!mAvailableNonPrimaryConnections.isEmpty()) {
+                final int count = mAvailableNonPrimaryConnections.size();
+                for (int i = 0; i < count; i++) {
+                    mAvailableNonPrimaryConnections.get(i).dump(indentedPrinter, verbose);
+                }
+            } else {
+                indentedPrinter.println("<none>");
+            }
+
+            printer.println("  Acquired connections:");
+            if (!mAcquiredConnections.isEmpty()) {
+                for (Map.Entry<SQLiteConnection, AcquiredConnectionStatus> entry :
+                        mAcquiredConnections.entrySet()) {
+                    final SQLiteConnection connection = entry.getKey();
+                    connection.dumpUnsafe(indentedPrinter, verbose);
+                    indentedPrinter.println("  Status: " + entry.getValue());
+                }
+            } else {
+                indentedPrinter.println("<none>");
+            }
+
+            printer.println("  Connection waiters:");
+            if (mConnectionWaiterQueue != null) {
+                int i = 0;
+                final long now = SystemClock.uptimeMillis();
+                for (ConnectionWaiter waiter = mConnectionWaiterQueue; waiter != null;
+                        waiter = waiter.mNext, i++) {
+                    indentedPrinter.println(i + ": waited for "
+                            + ((now - waiter.mStartTime) * 0.001f)
+                            + " ms - thread=" + waiter.mThread
+                            + ", priority=" + waiter.mPriority
+                            + ", sql='" + waiter.mSql + "'");
+                }
+            } else {
+                indentedPrinter.println("<none>");
+            }
+        }
+!!!3320204.java!!!	toString() : String
+        return "SQLiteConnectionPool: " + mConfiguration.path;

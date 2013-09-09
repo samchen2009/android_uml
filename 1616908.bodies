@@ -1,0 +1,148 @@
+class NetlinkEvent
+!!!9854604.cpp!!!	NetlinkEvent()
+    mAction = NlActionUnknown;
+    memset(mParams, 0, sizeof(mParams));
+    mPath = NULL;
+    mSubsystem = NULL;
+!!!9854732.cpp!!!	~NetlinkEvent()
+    int i;
+    if (mPath)
+        free(mPath);
+    if (mSubsystem)
+        free(mSubsystem);
+    for (i = 0; i < NL_PARAMS_MAX; i++) {
+        if (!mParams[i])
+            break;
+        free(mParams[i]);
+    }
+!!!9854860.cpp!!!	decode(inout buffer : char, in size : int, in format : int = NetlinkListener::NETLINK_FORMAT_ASCII) : bool
+    if (format == NetlinkListener::NETLINK_FORMAT_BINARY) {
+        return parseBinaryNetlinkMessage(buffer, size);
+    } else {
+        return parseAsciiNetlinkMessage(buffer, size);
+    }
+!!!9854988.cpp!!!	findParam(in paramName : char) : char
+    size_t len = strlen(paramName);
+    for (int i = 0; i < NL_PARAMS_MAX && mParams[i] != NULL; ++i) {
+        const char *ptr = mParams[i] + len;
+        if (!strncmp(mParams[i], paramName, len) && *ptr == '=')
+            return ++ptr;
+    }
+
+    SLOGE("NetlinkEvent::FindParam(): Parameter '%s' not found", paramName);
+    return NULL;
+!!!9855372.cpp!!!	dump() : void
+    int i;
+
+    for (i = 0; i < NL_PARAMS_MAX; i++) {
+        if (!mParams[i])
+            break;
+        SLOGD("NL param '%s'\n", mParams[i]);
+    }
+!!!9855500.cpp!!!	parseBinaryNetlinkMessage(inout buffer : char, in size : int) : bool
+    size_t sz = size;
+    const struct nlmsghdr *nh = (struct nlmsghdr *) buffer;
+
+    while (NLMSG_OK(nh, sz) && (nh->nlmsg_type != NLMSG_DONE)) {
+
+        if (nh->nlmsg_type == RTM_NEWLINK) {
+            int len = nh->nlmsg_len - sizeof(*nh);
+            struct ifinfomsg *ifi;
+
+            if (sizeof(*ifi) > (size_t) len) {
+                SLOGE("Got a short RTM_NEWLINK message\n");
+                continue;
+            }
+
+            ifi = (ifinfomsg *)NLMSG_DATA(nh);
+            if ((ifi->ifi_flags & IFF_LOOPBACK) != 0) {
+                continue;
+            }
+
+            struct rtattr *rta = (struct rtattr *)
+              ((char *) ifi + NLMSG_ALIGN(sizeof(*ifi)));
+            len = NLMSG_PAYLOAD(nh, sizeof(*ifi));
+
+            while(RTA_OK(rta, len)) {
+                switch(rta->rta_type) {
+                case IFLA_IFNAME:
+                    char buffer[16 + IFNAMSIZ];
+                    snprintf(buffer, sizeof(buffer), "INTERFACE=%s",
+                             (char *) RTA_DATA(rta));
+                    mParams[0] = strdup(buffer);
+                    mAction = (ifi->ifi_flags & IFF_LOWER_UP) ?
+                      NlActionLinkUp : NlActionLinkDown;
+                    mSubsystem = strdup("net");
+                    break;
+                }
+
+                rta = RTA_NEXT(rta, len);
+            }
+
+        } else if (nh->nlmsg_type == QLOG_NL_EVENT) {
+            char *devname;
+            ulog_packet_msg_t *pm;
+            size_t len = nh->nlmsg_len - sizeof(*nh);
+            if (sizeof(*pm) > len) {
+                SLOGE("Got a short QLOG message\n");
+                continue;
+            }
+            pm = (ulog_packet_msg_t *)NLMSG_DATA(nh);
+            devname = pm->indev_name[0] ? pm->indev_name : pm->outdev_name;
+            asprintf(&mParams[0], "ALERT_NAME=%s", pm->prefix);
+            asprintf(&mParams[1], "INTERFACE=%s", devname);
+            mSubsystem = strdup("qlog");
+            mAction = NlActionChange;
+
+        } else {
+                SLOGD("Unexpected netlink message. type=0x%x\n", nh->nlmsg_type);
+        }
+        nh = NLMSG_NEXT(nh, size);
+    }
+
+    return true;
+!!!9855628.cpp!!!	parseAsciiNetlinkMessage(inout buffer : char, in size : int) : bool
+    const char *s = buffer;
+    const char *end;
+    int param_idx = 0;
+    int i;
+    int first = 1;
+
+    if (size == 0)
+        return false;
+
+    /* Ensure the buffer is zero-terminated, the code below depends on this */
+    buffer[size-1] = '\0';
+
+    end = s + size;
+    while (s < end) {
+        if (first) {
+            const char *p;
+            /* buffer is 0-terminated, no need to check p < end */
+            for (p = s; *p != '@'; p++) {
+                if (!*p) { /* no '@', should not happen */
+                    return false;
+                }
+            }
+            mPath = strdup(p+1);
+            first = 0;
+        } else {
+            const char* a;
+            if ((a = HAS_CONST_PREFIX(s, end, "ACTION=")) != NULL) {
+                if (!strcmp(a, "add"))
+                    mAction = NlActionAdd;
+                else if (!strcmp(a, "remove"))
+                    mAction = NlActionRemove;
+                else if (!strcmp(a, "change"))
+                    mAction = NlActionChange;
+            } else if ((a = HAS_CONST_PREFIX(s, end, "SEQNUM=")) != NULL) {
+                mSeq = atoi(a);
+            } else if ((a = HAS_CONST_PREFIX(s, end, "SUBSYSTEM=")) != NULL) {
+                mSubsystem = strdup(a);
+            } else if (param_idx < NL_PARAMS_MAX) {
+                mParams[param_idx++] = strdup(s);
+            }
+        }
+        s += strlen(s) + 1;
+    }
+    return true;

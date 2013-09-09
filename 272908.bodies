@@ -1,0 +1,182 @@
+class AnotherPacketSource
+!!!681484.cpp!!!	AnotherPacketSource(in meta : sp<MetaData>)
+    const char *mime;
+    CHECK(meta->findCString(kKeyMIMEType, &mime));
+
+    if (!strncasecmp("audio/", mime, 6)) {
+        mIsAudio = true;
+    } else {
+        CHECK(!strncasecmp("video/", mime, 6));
+    }
+!!!681612.cpp!!!	setFormat(in meta : sp<MetaData>) : void
+    CHECK(mFormat == NULL);
+    mFormat = meta;
+!!!681740.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    return OK;
+!!!681868.cpp!!!	stop() : status_t
+    return OK;
+!!!681996.cpp!!!	getFormat() : sp<MetaData>
+    return mFormat;
+!!!682124.cpp!!!	read(inout out : MediaBuffer, in options : ReadOptions = NULL) : status_t
+    *out = NULL;
+
+    Mutex::Autolock autoLock(mLock);
+    while (mEOSResult == OK && mBuffers.empty()) {
+        mCondition.wait(mLock);
+    }
+
+    if (!mBuffers.empty()) {
+        const sp<ABuffer> buffer = *mBuffers.begin();
+        mBuffers.erase(mBuffers.begin());
+
+        int32_t discontinuity;
+        if (buffer->meta()->findInt32("discontinuity", &discontinuity)) {
+            if (wasFormatChange(discontinuity)) {
+                mFormat.clear();
+            }
+
+            return INFO_DISCONTINUITY;
+        } else {
+            int64_t timeUs;
+            CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
+
+            MediaBuffer *mediaBuffer = new MediaBuffer(buffer);
+
+            mediaBuffer->meta_data()->setInt64(kKeyTime, timeUs);
+
+            *out = mediaBuffer;
+            return OK;
+        }
+    }
+
+    return mEOSResult;
+!!!682252.cpp!!!	hasBufferAvailable(inout finalResult : status_t) : bool
+    Mutex::Autolock autoLock(mLock);
+    if (!mBuffers.empty()) {
+        return true;
+    }
+
+    *finalResult = mEOSResult;
+    return false;
+!!!682380.cpp!!!	getBufferedDurationUs(inout finalResult : status_t) : int64_t
+    Mutex::Autolock autoLock(mLock);
+
+    *finalResult = mEOSResult;
+
+    if (mBuffers.empty()) {
+        return 0;
+    }
+
+    int64_t time1 = -1;
+    int64_t time2 = -1;
+
+    List<sp<ABuffer> >::iterator it = mBuffers.begin();
+    while (it != mBuffers.end()) {
+        const sp<ABuffer> &buffer = *it;
+
+        int64_t timeUs;
+        if (buffer->meta()->findInt64("timeUs", &timeUs)) {
+            if (time1 < 0) {
+                time1 = timeUs;
+            }
+
+            time2 = timeUs;
+        } else {
+            // This is a discontinuity, reset everything.
+            time1 = time2 = -1;
+        }
+
+        ++it;
+    }
+
+    return time2 - time1;
+!!!682508.cpp!!!	nextBufferTime(inout timeUs : int64_t) : status_t
+    *timeUs = 0;
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (mBuffers.empty()) {
+        return mEOSResult != OK ? mEOSResult : -EWOULDBLOCK;
+    }
+
+    sp<ABuffer> buffer = *mBuffers.begin();
+    CHECK(buffer->meta()->findInt64("timeUs", timeUs));
+
+    return OK;
+!!!682636.cpp!!!	queueAccessUnit(in buffer : sp<ABuffer>) : void
+    int32_t damaged;
+    if (buffer->meta()->findInt32("damaged", &damaged) && damaged) {
+        // LOG(VERBOSE) << "discarding damaged AU";
+        return;
+    }
+
+    int64_t timeUs;
+    CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
+    ALOGV("queueAccessUnit timeUs=%lld us (%.2f secs)", timeUs, timeUs / 1E6);
+
+    Mutex::Autolock autoLock(mLock);
+    mBuffers.push_back(buffer);
+    mCondition.signal();
+!!!682764.cpp!!!	queueDiscontinuity(in type : DiscontinuityType, in extra : sp<AMessage>) : void
+    Mutex::Autolock autoLock(mLock);
+
+    // Leave only discontinuities in the queue.
+    List<sp<ABuffer> >::iterator it = mBuffers.begin();
+    while (it != mBuffers.end()) {
+        sp<ABuffer> oldBuffer = *it;
+
+        int32_t oldDiscontinuityType;
+        if (!oldBuffer->meta()->findInt32(
+                    "discontinuity", &oldDiscontinuityType)) {
+            it = mBuffers.erase(it);
+            continue;
+        }
+
+        ++it;
+    }
+
+    mEOSResult = OK;
+
+    sp<ABuffer> buffer = new ABuffer(0);
+    buffer->meta()->setInt32("discontinuity", static_cast<int32_t>(type));
+    buffer->meta()->setMessage("extra", extra);
+
+    mBuffers.push_back(buffer);
+    mCondition.signal();
+!!!682892.cpp!!!	signalEOS(in result : status_t) : void
+    CHECK(result != OK);
+
+    Mutex::Autolock autoLock(mLock);
+    mEOSResult = result;
+    mCondition.signal();
+!!!683020.cpp!!!	dequeueAccessUnit(inout buffer : sp<ABuffer>) : status_t
+    buffer->clear();
+
+    Mutex::Autolock autoLock(mLock);
+    while (mEOSResult == OK && mBuffers.empty()) {
+        mCondition.wait(mLock);
+    }
+
+    if (!mBuffers.empty()) {
+        *buffer = *mBuffers.begin();
+        mBuffers.erase(mBuffers.begin());
+
+        int32_t discontinuity;
+        if ((*buffer)->meta()->findInt32("discontinuity", &discontinuity)) {
+            if (wasFormatChange(discontinuity)) {
+                mFormat.clear();
+            }
+
+            return INFO_DISCONTINUITY;
+        }
+
+        return OK;
+    }
+
+    return mEOSResult;
+!!!683276.cpp!!!	wasFormatChange(in discontinuityType : int32_t) : bool
+    if (mIsAudio) {
+        return (discontinuityType & ATSParser::DISCONTINUITY_AUDIO_FORMAT) != 0;
+    }
+
+    return (discontinuityType & ATSParser::DISCONTINUITY_VIDEO_FORMAT) != 0;

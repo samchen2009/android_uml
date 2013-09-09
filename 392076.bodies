@@ -1,0 +1,459 @@
+class Camera2Device
+!!!887948.cpp!!!	Camera2Device(in id : int)
+    ATRACE_CALL();
+    ALOGV("%s: Created device for camera %d", __FUNCTION__, id);
+!!!888076.cpp!!!	~Camera2Device()
+    ATRACE_CALL();
+    ALOGV("%s: Tearing down for camera id %d", __FUNCTION__, mId);
+    disconnect();
+!!!888204.cpp!!!	initialize(inout module : camera_module_t) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: Initializing device for camera %d", __FUNCTION__, mId);
+    if (mDevice != NULL) {
+        ALOGE("%s: Already initialized!", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    status_t res;
+    char name[10];
+    snprintf(name, sizeof(name), "%d", mId);
+
+    camera2_device_t *device;
+
+    res = module->common.methods->open(&module->common, name,
+            reinterpret_cast<hw_device_t**>(&device));
+
+    if (res != OK) {
+        ALOGE("%s: Could not open camera %d: %s (%d)", __FUNCTION__,
+                mId, strerror(-res), res);
+        return res;
+    }
+
+    if (device->common.version != CAMERA_DEVICE_API_VERSION_2_0) {
+        ALOGE("%s: Could not open camera %d: "
+                "Camera device is not version %x, reports %x instead",
+                __FUNCTION__, mId, CAMERA_DEVICE_API_VERSION_2_0,
+                device->common.version);
+        device->common.close(&device->common);
+        return BAD_VALUE;
+    }
+
+    camera_info info;
+    res = module->get_camera_info(mId, &info);
+    if (res != OK ) return res;
+
+    if (info.device_version != device->common.version) {
+        ALOGE("%s: HAL reporting mismatched camera_info version (%x)"
+                " and device version (%x).", __FUNCTION__,
+                device->common.version, info.device_version);
+        device->common.close(&device->common);
+        return BAD_VALUE;
+    }
+
+    res = mRequestQueue.setConsumerDevice(device);
+    if (res != OK) {
+        ALOGE("%s: Camera %d: Unable to connect request queue to device: %s (%d)",
+                __FUNCTION__, mId, strerror(-res), res);
+        device->common.close(&device->common);
+        return res;
+    }
+    res = mFrameQueue.setProducerDevice(device);
+    if (res != OK) {
+        ALOGE("%s: Camera %d: Unable to connect frame queue to device: %s (%d)",
+                __FUNCTION__, mId, strerror(-res), res);
+        device->common.close(&device->common);
+        return res;
+    }
+
+    res = device->ops->get_metadata_vendor_tag_ops(device, &mVendorTagOps);
+    if (res != OK ) {
+        ALOGE("%s: Camera %d: Unable to retrieve tag ops from device: %s (%d)",
+                __FUNCTION__, mId, strerror(-res), res);
+        device->common.close(&device->common);
+        return res;
+    }
+    res = set_camera_metadata_vendor_tag_ops(mVendorTagOps);
+    if (res != OK) {
+        ALOGE("%s: Camera %d: Unable to set tag ops: %s (%d)",
+            __FUNCTION__, mId, strerror(-res), res);
+        device->common.close(&device->common);
+        return res;
+    }
+    res = device->ops->set_notify_callback(device, notificationCallback,
+            NULL);
+    if (res != OK) {
+        ALOGE("%s: Camera %d: Unable to initialize notification callback!",
+                __FUNCTION__, mId);
+        device->common.close(&device->common);
+        return res;
+    }
+
+    mDeviceInfo = info.static_camera_characteristics;
+    mDevice = device;
+
+    return OK;
+!!!888332.cpp!!!	disconnect() : status_t
+    ATRACE_CALL();
+    status_t res = OK;
+    if (mDevice) {
+        ALOGV("%s: Closing device for camera %d", __FUNCTION__, mId);
+
+        int inProgressCount = mDevice->ops->get_in_progress_count(mDevice);
+        if (inProgressCount > 0) {
+            ALOGW("%s: Closing camera device %d with %d requests in flight!",
+                    __FUNCTION__, mId, inProgressCount);
+        }
+        mReprocessStreams.clear();
+        mStreams.clear();
+        res = mDevice->common.close(&mDevice->common);
+        if (res != OK) {
+            ALOGE("%s: Could not close camera %d: %s (%d)",
+                    __FUNCTION__,
+                    mId, strerror(-res), res);
+        }
+        mDevice = NULL;
+        ALOGV("%s: Shutdown complete", __FUNCTION__);
+    }
+    return res;
+!!!888460.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    ATRACE_CALL();
+    String8 result;
+    int detailLevel = 0;
+    int n = args.size();
+    String16 detailOption("-d");
+    for (int i = 0; i + 1 < n; i++) {
+        if (args[i] == detailOption) {
+            String8 levelStr(args[i+1]);
+            detailLevel = atoi(levelStr.string());
+        }
+    }
+
+    result.appendFormat("  Camera2Device[%d] dump (detail level %d):\n",
+            mId, detailLevel);
+
+    if (detailLevel > 0) {
+        result = "    Request queue contents:\n";
+        write(fd, result.string(), result.size());
+        mRequestQueue.dump(fd, args);
+
+        result = "    Frame queue contents:\n";
+        write(fd, result.string(), result.size());
+        mFrameQueue.dump(fd, args);
+    }
+
+    result = "    Active streams:\n";
+    write(fd, result.string(), result.size());
+    for (StreamList::iterator s = mStreams.begin(); s != mStreams.end(); s++) {
+        (*s)->dump(fd, args);
+    }
+
+    result = "    HAL device dump:\n";
+    write(fd, result.string(), result.size());
+
+    status_t res;
+    res = mDevice->ops->dump(mDevice, fd);
+
+    return res;
+!!!888588.cpp!!!	info() : CameraMetadata
+    ALOGVV("%s: E", __FUNCTION__);
+
+    return mDeviceInfo;
+!!!888716.cpp!!!	capture(inout request : CameraMetadata) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+
+    mRequestQueue.enqueue(request.release());
+    return OK;
+!!!888844.cpp!!!	setStreamingRequest(in request : CameraMetadata) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    CameraMetadata streamRequest(request);
+    return mRequestQueue.setStreamSlot(streamRequest.release());
+!!!888972.cpp!!!	clearStreamingRequest() : status_t
+    ATRACE_CALL();
+    return mRequestQueue.setStreamSlot(NULL);
+!!!889100.cpp!!!	waitUntilRequestReceived(in requestId : int32_t, in timeout : nsecs_t) : status_t
+    ATRACE_CALL();
+    return mRequestQueue.waitForDequeue(requestId, timeout);
+!!!889228.cpp!!!	createStream(in consumer : sp<ANativeWindow>, in width : uint32_t, in height : uint32_t, in format : int, in size : size_t, inout id : int) : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: E", __FUNCTION__);
+
+    sp<StreamAdapter> stream = new StreamAdapter(mDevice);
+
+    res = stream->connectToDevice(consumer, width, height, format, size);
+    if (res != OK) {
+        ALOGE("%s: Camera %d: Unable to create stream (%d x %d, format %x):"
+                "%s (%d)",
+                __FUNCTION__, mId, width, height, format, strerror(-res), res);
+        return res;
+    }
+
+    *id = stream->getId();
+
+    mStreams.push_back(stream);
+    return OK;
+!!!889356.cpp!!!	createReprocessStreamFromStream(in outputId : int, inout id : int) : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: E", __FUNCTION__);
+
+    bool found = false;
+    StreamList::iterator streamI;
+    for (streamI = mStreams.begin();
+         streamI != mStreams.end(); streamI++) {
+        if ((*streamI)->getId() == outputId) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("%s: Camera %d: Output stream %d doesn't exist; can't create "
+                "reprocess stream from it!", __FUNCTION__, mId, outputId);
+        return BAD_VALUE;
+    }
+
+    sp<ReprocessStreamAdapter> stream = new ReprocessStreamAdapter(mDevice);
+
+    res = stream->connectToDevice((*streamI));
+    if (res != OK) {
+        ALOGE("%s: Camera %d: Unable to create reprocessing stream from "\
+                "stream %d: %s (%d)", __FUNCTION__, mId, outputId,
+                strerror(-res), res);
+        return res;
+    }
+
+    *id = stream->getId();
+
+    mReprocessStreams.push_back(stream);
+    return OK;
+!!!889484.cpp!!!	getStreamInfo(in id : int, inout width : uint32_t, inout height : uint32_t, inout format : uint32_t) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    bool found = false;
+    StreamList::iterator streamI;
+    for (streamI = mStreams.begin();
+         streamI != mStreams.end(); streamI++) {
+        if ((*streamI)->getId() == id) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("%s: Camera %d: Stream %d does not exist",
+                __FUNCTION__, mId, id);
+        return BAD_VALUE;
+    }
+
+    if (width) *width = (*streamI)->getWidth();
+    if (height) *height = (*streamI)->getHeight();
+    if (format) *format = (*streamI)->getFormat();
+
+    return OK;
+!!!889612.cpp!!!	setStreamTransform(in id : int, in transform : int) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    bool found = false;
+    StreamList::iterator streamI;
+    for (streamI = mStreams.begin();
+         streamI != mStreams.end(); streamI++) {
+        if ((*streamI)->getId() == id) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("%s: Camera %d: Stream %d does not exist",
+                __FUNCTION__, mId, id);
+        return BAD_VALUE;
+    }
+
+    return (*streamI)->setTransform(transform);
+!!!889740.cpp!!!	deleteStream(in id : int) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    bool found = false;
+    for (StreamList::iterator streamI = mStreams.begin();
+         streamI != mStreams.end(); streamI++) {
+        if ((*streamI)->getId() == id) {
+            status_t res = (*streamI)->release();
+            if (res != OK) {
+                ALOGE("%s: Unable to release stream %d from HAL device: "
+                        "%s (%d)", __FUNCTION__, id, strerror(-res), res);
+                return res;
+            }
+            mStreams.erase(streamI);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("%s: Camera %d: Unable to find stream %d to delete",
+                __FUNCTION__, mId, id);
+        return BAD_VALUE;
+    }
+    return OK;
+!!!889868.cpp!!!	deleteReprocessStream(in id : int) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    bool found = false;
+    for (ReprocessStreamList::iterator streamI = mReprocessStreams.begin();
+         streamI != mReprocessStreams.end(); streamI++) {
+        if ((*streamI)->getId() == id) {
+            status_t res = (*streamI)->release();
+            if (res != OK) {
+                ALOGE("%s: Unable to release reprocess stream %d from "
+                        "HAL device: %s (%d)", __FUNCTION__, id,
+                        strerror(-res), res);
+                return res;
+            }
+            mReprocessStreams.erase(streamI);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("%s: Camera %d: Unable to find stream %d to delete",
+                __FUNCTION__, mId, id);
+        return BAD_VALUE;
+    }
+    return OK;
+!!!889996.cpp!!!	createDefaultRequest(in templateId : int, inout request : CameraMetadata) : status_t
+    ATRACE_CALL();
+    status_t err;
+    ALOGV("%s: E", __FUNCTION__);
+    camera_metadata_t *rawRequest;
+    err = mDevice->ops->construct_default_request(
+        mDevice, templateId, &rawRequest);
+    request->acquire(rawRequest);
+    return err;
+!!!890124.cpp!!!	waitUntilDrained() : status_t
+    ATRACE_CALL();
+    static const uint32_t kSleepTime = 50000; // 50 ms
+    static const uint32_t kMaxSleepTime = 10000000; // 10 s
+    ALOGV("%s: Camera %d: Starting wait", __FUNCTION__, mId);
+    if (mRequestQueue.getBufferCount() ==
+            CAMERA2_REQUEST_QUEUE_IS_BOTTOMLESS) return INVALID_OPERATION;
+
+    // TODO: Set up notifications from HAL, instead of sleeping here
+    uint32_t totalTime = 0;
+    while (mDevice->ops->get_in_progress_count(mDevice) > 0) {
+        usleep(kSleepTime);
+        totalTime += kSleepTime;
+        if (totalTime > kMaxSleepTime) {
+            ALOGE("%s: Waited %d us, %d requests still in flight", __FUNCTION__,
+                    mDevice->ops->get_in_progress_count(mDevice), totalTime);
+            return TIMED_OUT;
+        }
+    }
+    ALOGV("%s: Camera %d: HAL is idle", __FUNCTION__, mId);
+    return OK;
+!!!891020.cpp!!!	setNotifyCallback(inout listener : NotificationListener) : status_t
+    ATRACE_CALL();
+    status_t res;
+    res = mDevice->ops->set_notify_callback(mDevice, notificationCallback,
+            reinterpret_cast<void*>(listener) );
+    if (res != OK) {
+        ALOGE("%s: Unable to set notification callback!", __FUNCTION__);
+    }
+    return res;
+!!!891148.cpp!!!	waitForNextFrame(in timeout : nsecs_t) : status_t
+    return mFrameQueue.waitForBuffer(timeout);
+!!!891276.cpp!!!	getNextFrame(inout frame : CameraMetadata) : status_t
+    ATRACE_CALL();
+    status_t res;
+    camera_metadata_t *rawFrame;
+    res = mFrameQueue.dequeue(&rawFrame);
+    if (rawFrame  == NULL) {
+        return NOT_ENOUGH_DATA;
+    } else if (res == OK) {
+        frame->acquire(rawFrame);
+    }
+    return res;
+!!!891404.cpp!!!	triggerAutofocus(in id : uint32_t) : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: Triggering autofocus, id %d", __FUNCTION__, id);
+    res = mDevice->ops->trigger_action(mDevice,
+            CAMERA2_TRIGGER_AUTOFOCUS, id, 0);
+    if (res != OK) {
+        ALOGE("%s: Error triggering autofocus (id %d)",
+                __FUNCTION__, id);
+    }
+    return res;
+!!!891532.cpp!!!	triggerCancelAutofocus(in id : uint32_t) : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: Canceling autofocus, id %d", __FUNCTION__, id);
+    res = mDevice->ops->trigger_action(mDevice,
+            CAMERA2_TRIGGER_CANCEL_AUTOFOCUS, id, 0);
+    if (res != OK) {
+        ALOGE("%s: Error canceling autofocus (id %d)",
+                __FUNCTION__, id);
+    }
+    return res;
+!!!891660.cpp!!!	triggerPrecaptureMetering(in id : uint32_t) : status_t
+    ATRACE_CALL();
+    status_t res;
+    ALOGV("%s: Triggering precapture metering, id %d", __FUNCTION__, id);
+    res = mDevice->ops->trigger_action(mDevice,
+            CAMERA2_TRIGGER_PRECAPTURE_METERING, id, 0);
+    if (res != OK) {
+        ALOGE("%s: Error triggering precapture metering (id %d)",
+                __FUNCTION__, id);
+    }
+    return res;
+!!!891916.cpp!!!	pushReprocessBuffer(in reprocessStreamId : int, inout buffer : buffer_handle_t, in listener : wp<BufferReleasedListener>) : status_t
+    ATRACE_CALL();
+    ALOGV("%s: E", __FUNCTION__);
+    bool found = false;
+    status_t res = OK;
+    for (ReprocessStreamList::iterator streamI = mReprocessStreams.begin();
+         streamI != mReprocessStreams.end(); streamI++) {
+        if ((*streamI)->getId() == reprocessStreamId) {
+            res = (*streamI)->pushIntoStream(buffer, listener);
+            if (res != OK) {
+                ALOGE("%s: Unable to push buffer to reprocess stream %d: %s (%d)",
+                        __FUNCTION__, reprocessStreamId, strerror(-res), res);
+                return res;
+            }
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("%s: Camera %d: Unable to find reprocess stream %d",
+                __FUNCTION__, mId, reprocessStreamId);
+        res = BAD_VALUE;
+    }
+    return res;
+!!!898956.cpp!!!	notificationCallback(in msg_type : int32_t, in ext1 : int32_t, in ext2 : int32_t, in ext3 : int32_t, inout user : void) : void
+    ATRACE_CALL();
+    NotificationListener *listener = reinterpret_cast<NotificationListener*>(user);
+    ALOGV("%s: Notification %d, arguments %d, %d, %d", __FUNCTION__, msg_type,
+            ext1, ext2, ext3);
+    if (listener != NULL) {
+        switch (msg_type) {
+            case CAMERA2_MSG_ERROR:
+                listener->notifyError(ext1, ext2, ext3);
+                break;
+            case CAMERA2_MSG_SHUTTER: {
+                nsecs_t timestamp = (nsecs_t)ext2 | ((nsecs_t)(ext3) << 32 );
+                listener->notifyShutter(ext1, timestamp);
+                break;
+            }
+            case CAMERA2_MSG_AUTOFOCUS:
+                listener->notifyAutoFocus(ext1, ext2);
+                break;
+            case CAMERA2_MSG_AUTOEXPOSURE:
+                listener->notifyAutoExposure(ext1, ext2);
+                break;
+            case CAMERA2_MSG_AUTOWB:
+                listener->notifyAutoWhitebalance(ext1, ext2);
+                break;
+            default:
+                ALOGE("%s: Unknown notification %d (arguments %d, %d, %d)!",
+                        __FUNCTION__, msg_type, ext1, ext2, ext3);
+        }
+    }

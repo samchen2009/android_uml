@@ -1,0 +1,617 @@
+class ConcurrentLinkedDeque
+!!!1462043.java!!!	prevTerminator() : Node
+        return (Node<E>) PREV_TERMINATOR;
+!!!1462171.java!!!	nextTerminator() : Node
+        return (Node<E>) NEXT_TERMINATOR;
+!!!1463195.java!!!	linkFirst(inout e : E) : void
+        checkNotNull(e);
+        final Node<E> newNode = new Node<E>(e);
+
+        restartFromHead:
+        for (;;)
+            for (Node<E> h = head, p = h, q;;) {
+                if ((q = p.prev) != null &&
+                    (q = (p = q).prev) != null)
+                    // Check for head updates every other hop.
+                    // If p == q, we are sure to follow head instead.
+                    p = (h != (h = head)) ? h : q;
+                else if (p.next == p) // PREV_TERMINATOR
+                    continue restartFromHead;
+                else {
+                    // p is first node
+                    newNode.lazySetNext(p); // CAS piggyback
+                    if (p.casPrev(null, newNode)) {
+                        // Successful CAS is the linearization point
+                        // for e to become an element of this deque,
+                        // and for newNode to become "live".
+                        if (p != h) // hop two nodes at a time
+                            casHead(h, newNode);  // Failure is OK.
+                        return;
+                    }
+                    // Lost CAS race to another thread; re-read prev
+                }
+            }
+!!!1463323.java!!!	linkLast(inout e : E) : void
+        checkNotNull(e);
+        final Node<E> newNode = new Node<E>(e);
+
+        restartFromTail:
+        for (;;)
+            for (Node<E> t = tail, p = t, q;;) {
+                if ((q = p.next) != null &&
+                    (q = (p = q).next) != null)
+                    // Check for tail updates every other hop.
+                    // If p == q, we are sure to follow tail instead.
+                    p = (t != (t = tail)) ? t : q;
+                else if (p.prev == p) // NEXT_TERMINATOR
+                    continue restartFromTail;
+                else {
+                    // p is last node
+                    newNode.lazySetPrev(p); // CAS piggyback
+                    if (p.casNext(null, newNode)) {
+                        // Successful CAS is the linearization point
+                        // for e to become an element of this deque,
+                        // and for newNode to become "live".
+                        if (p != t) // hop two nodes at a time
+                            casTail(t, newNode);  // Failure is OK.
+                        return;
+                    }
+                    // Lost CAS race to another thread; re-read next
+                }
+            }
+!!!1463451.java!!!	unlink(inout x : Node) : void
+        // assert x != null;
+        // assert x.item == null;
+        // assert x != PREV_TERMINATOR;
+        // assert x != NEXT_TERMINATOR;
+
+        final Node<E> prev = x.prev;
+        final Node<E> next = x.next;
+        if (prev == null) {
+            unlinkFirst(x, next);
+        } else if (next == null) {
+            unlinkLast(x, prev);
+        } else {
+            // Unlink interior node.
+            //
+            // This is the common case, since a series of polls at the
+            // same end will be "interior" removes, except perhaps for
+            // the first one, since end nodes cannot be unlinked.
+            //
+            // At any time, all active nodes are mutually reachable by
+            // following a sequence of either next or prev pointers.
+            //
+            // Our strategy is to find the unique active predecessor
+            // and successor of x.  Try to fix up their links so that
+            // they point to each other, leaving x unreachable from
+            // active nodes.  If successful, and if x has no live
+            // predecessor/successor, we additionally try to gc-unlink,
+            // leaving active nodes unreachable from x, by rechecking
+            // that the status of predecessor and successor are
+            // unchanged and ensuring that x is not reachable from
+            // tail/head, before setting x's prev/next links to their
+            // logical approximate replacements, self/TERMINATOR.
+            Node<E> activePred, activeSucc;
+            boolean isFirst, isLast;
+            int hops = 1;
+
+            // Find active predecessor
+            for (Node<E> p = prev; ; ++hops) {
+                if (p.item != null) {
+                    activePred = p;
+                    isFirst = false;
+                    break;
+                }
+                Node<E> q = p.prev;
+                if (q == null) {
+                    if (p.next == p)
+                        return;
+                    activePred = p;
+                    isFirst = true;
+                    break;
+                }
+                else if (p == q)
+                    return;
+                else
+                    p = q;
+            }
+
+            // Find active successor
+            for (Node<E> p = next; ; ++hops) {
+                if (p.item != null) {
+                    activeSucc = p;
+                    isLast = false;
+                    break;
+                }
+                Node<E> q = p.next;
+                if (q == null) {
+                    if (p.prev == p)
+                        return;
+                    activeSucc = p;
+                    isLast = true;
+                    break;
+                }
+                else if (p == q)
+                    return;
+                else
+                    p = q;
+            }
+
+            // TODO: better HOP heuristics
+            if (hops < HOPS
+                // always squeeze out interior deleted nodes
+                && (isFirst | isLast))
+                return;
+
+            // Squeeze out deleted nodes between activePred and
+            // activeSucc, including x.
+            skipDeletedSuccessors(activePred);
+            skipDeletedPredecessors(activeSucc);
+
+            // Try to gc-unlink, if possible
+            if ((isFirst | isLast) &&
+
+                // Recheck expected state of predecessor and successor
+                (activePred.next == activeSucc) &&
+                (activeSucc.prev == activePred) &&
+                (isFirst ? activePred.prev == null : activePred.item != null) &&
+                (isLast  ? activeSucc.next == null : activeSucc.item != null)) {
+
+                updateHead(); // Ensure x is not reachable from head
+                updateTail(); // Ensure x is not reachable from tail
+
+                // Finally, actually gc-unlink
+                x.lazySetPrev(isFirst ? prevTerminator() : x);
+                x.lazySetNext(isLast  ? nextTerminator() : x);
+            }
+        }
+!!!1463579.java!!!	unlinkFirst(inout first : Node, inout next : Node) : void
+        // assert first != null;
+        // assert next != null;
+        // assert first.item == null;
+        for (Node<E> o = null, p = next, q;;) {
+            if (p.item != null || (q = p.next) == null) {
+                if (o != null && p.prev != p && first.casNext(next, p)) {
+                    skipDeletedPredecessors(p);
+                    if (first.prev == null &&
+                        (p.next == null || p.item != null) &&
+                        p.prev == first) {
+
+                        updateHead(); // Ensure o is not reachable from head
+                        updateTail(); // Ensure o is not reachable from tail
+
+                        // Finally, actually gc-unlink
+                        o.lazySetNext(o);
+                        o.lazySetPrev(prevTerminator());
+                    }
+                }
+                return;
+            }
+            else if (p == q)
+                return;
+            else {
+                o = p;
+                p = q;
+            }
+        }
+!!!1463707.java!!!	unlinkLast(inout last : Node, inout prev : Node) : void
+        // assert last != null;
+        // assert prev != null;
+        // assert last.item == null;
+        for (Node<E> o = null, p = prev, q;;) {
+            if (p.item != null || (q = p.prev) == null) {
+                if (o != null && p.next != p && last.casPrev(prev, p)) {
+                    skipDeletedSuccessors(p);
+                    if (last.next == null &&
+                        (p.prev == null || p.item != null) &&
+                        p.next == last) {
+
+                        updateHead(); // Ensure o is not reachable from head
+                        updateTail(); // Ensure o is not reachable from tail
+
+                        // Finally, actually gc-unlink
+                        o.lazySetPrev(o);
+                        o.lazySetNext(nextTerminator());
+                    }
+                }
+                return;
+            }
+            else if (p == q)
+                return;
+            else {
+                o = p;
+                p = q;
+            }
+        }
+!!!1463835.java!!!	updateHead() : void
+        // Either head already points to an active node, or we keep
+        // trying to cas it to the first node until it does.
+        Node<E> h, p, q;
+        restartFromHead:
+        while ((h = head).item == null && (p = h.prev) != null) {
+            for (;;) {
+                if ((q = p.prev) == null ||
+                    (q = (p = q).prev) == null) {
+                    // It is possible that p is PREV_TERMINATOR,
+                    // but if so, the CAS is guaranteed to fail.
+                    if (casHead(h, p))
+                        return;
+                    else
+                        continue restartFromHead;
+                }
+                else if (h != head)
+                    continue restartFromHead;
+                else
+                    p = q;
+            }
+        }
+!!!1463963.java!!!	updateTail() : void
+        // Either tail already points to an active node, or we keep
+        // trying to cas it to the last node until it does.
+        Node<E> t, p, q;
+        restartFromTail:
+        while ((t = tail).item == null && (p = t.next) != null) {
+            for (;;) {
+                if ((q = p.next) == null ||
+                    (q = (p = q).next) == null) {
+                    // It is possible that p is NEXT_TERMINATOR,
+                    // but if so, the CAS is guaranteed to fail.
+                    if (casTail(t, p))
+                        return;
+                    else
+                        continue restartFromTail;
+                }
+                else if (t != tail)
+                    continue restartFromTail;
+                else
+                    p = q;
+            }
+        }
+!!!1464091.java!!!	skipDeletedPredecessors(inout x : Node) : void
+        whileActive:
+        do {
+            Node<E> prev = x.prev;
+            // assert prev != null;
+            // assert x != NEXT_TERMINATOR;
+            // assert x != PREV_TERMINATOR;
+            Node<E> p = prev;
+            findActive:
+            for (;;) {
+                if (p.item != null)
+                    break findActive;
+                Node<E> q = p.prev;
+                if (q == null) {
+                    if (p.next == p)
+                        continue whileActive;
+                    break findActive;
+                }
+                else if (p == q)
+                    continue whileActive;
+                else
+                    p = q;
+            }
+
+            // found active CAS target
+            if (prev == p || x.casPrev(prev, p))
+                return;
+
+        } while (x.item != null || x.next == null);
+!!!1464219.java!!!	skipDeletedSuccessors(inout x : Node) : void
+        whileActive:
+        do {
+            Node<E> next = x.next;
+            // assert next != null;
+            // assert x != NEXT_TERMINATOR;
+            // assert x != PREV_TERMINATOR;
+            Node<E> p = next;
+            findActive:
+            for (;;) {
+                if (p.item != null)
+                    break findActive;
+                Node<E> q = p.next;
+                if (q == null) {
+                    if (p.prev == p)
+                        continue whileActive;
+                    break findActive;
+                }
+                else if (p == q)
+                    continue whileActive;
+                else
+                    p = q;
+            }
+
+            // found active CAS target
+            if (next == p || x.casNext(next, p))
+                return;
+
+        } while (x.item != null || x.prev == null);
+!!!1464347.java!!!	succ(inout p : Node) : Node
+        // TODO: should we skip deleted nodes here?
+        Node<E> q = p.next;
+        return (p == q) ? first() : q;
+!!!1464475.java!!!	pred(inout p : Node) : Node
+        Node<E> q = p.prev;
+        return (p == q) ? last() : q;
+!!!1464603.java!!!	first() : Node
+        restartFromHead:
+        for (;;)
+            for (Node<E> h = head, p = h, q;;) {
+                if ((q = p.prev) != null &&
+                    (q = (p = q).prev) != null)
+                    // Check for head updates every other hop.
+                    // If p == q, we are sure to follow head instead.
+                    p = (h != (h = head)) ? h : q;
+                else if (p == h
+                         // It is possible that p is PREV_TERMINATOR,
+                         // but if so, the CAS is guaranteed to fail.
+                         || casHead(h, p))
+                    return p;
+                else
+                    continue restartFromHead;
+            }
+!!!1464731.java!!!	last() : Node
+        restartFromTail:
+        for (;;)
+            for (Node<E> t = tail, p = t, q;;) {
+                if ((q = p.next) != null &&
+                    (q = (p = q).next) != null)
+                    // Check for tail updates every other hop.
+                    // If p == q, we are sure to follow tail instead.
+                    p = (t != (t = tail)) ? t : q;
+                else if (p == t
+                         // It is possible that p is NEXT_TERMINATOR,
+                         // but if so, the CAS is guaranteed to fail.
+                         || casTail(t, p))
+                    return p;
+                else
+                    continue restartFromTail;
+            }
+!!!1464859.java!!!	checkNotNull(inout v : Object) : void
+        if (v == null)
+            throw new NullPointerException();
+!!!1464987.java!!!	screenNullResult(inout v : E) : E
+        if (v == null)
+            throw new NoSuchElementException();
+        return v;
+!!!1465115.java!!!	toArrayList() : ArrayList
+        ArrayList<E> list = new ArrayList<E>();
+        for (Node<E> p = first(); p != null; p = succ(p)) {
+            E item = p.item;
+            if (item != null)
+                list.add(item);
+        }
+        return list;
+!!!1465243.java!!!	ConcurrentLinkedDeque()
+        head = tail = new Node<E>(null);
+!!!1465371.java!!!	ConcurrentLinkedDeque(inout c : Collection)
+        // Copy c into a private chain of Nodes
+        Node<E> h = null, t = null;
+        for (E e : c) {
+            checkNotNull(e);
+            Node<E> newNode = new Node<E>(e);
+            if (h == null)
+                h = t = newNode;
+            else {
+                t.lazySetNext(newNode);
+                newNode.lazySetPrev(t);
+                t = newNode;
+            }
+        }
+        initHeadTail(h, t);
+!!!1465499.java!!!	initHeadTail(inout h : Node, inout t : Node) : void
+        if (h == t) {
+            if (h == null)
+                h = t = new Node<E>(null);
+            else {
+                // Avoid edge case of a single Node with non-null item.
+                Node<E> newNode = new Node<E>(null);
+                t.lazySetNext(newNode);
+                newNode.lazySetPrev(t);
+                t = newNode;
+            }
+        }
+        head = h;
+        tail = t;
+!!!1465627.java!!!	addFirst(inout e : E) : void
+        linkFirst(e);
+!!!1465755.java!!!	addLast(inout e : E) : void
+        linkLast(e);
+!!!1465883.java!!!	offerFirst(inout e : E) : boolean
+        linkFirst(e);
+        return true;
+!!!1466011.java!!!	offerLast(inout e : E) : boolean
+        linkLast(e);
+        return true;
+!!!1466139.java!!!	peekFirst() : E
+        for (Node<E> p = first(); p != null; p = succ(p)) {
+            E item = p.item;
+            if (item != null)
+                return item;
+        }
+        return null;
+!!!1466267.java!!!	peekLast() : E
+        for (Node<E> p = last(); p != null; p = pred(p)) {
+            E item = p.item;
+            if (item != null)
+                return item;
+        }
+        return null;
+!!!1466395.java!!!	getFirst() : E
+        return screenNullResult(peekFirst());
+!!!1466523.java!!!	getLast() : E
+        return screenNullResult(peekLast());
+!!!1466651.java!!!	pollFirst() : E
+        for (Node<E> p = first(); p != null; p = succ(p)) {
+            E item = p.item;
+            if (item != null && p.casItem(item, null)) {
+                unlink(p);
+                return item;
+            }
+        }
+        return null;
+!!!1466779.java!!!	pollLast() : E
+        for (Node<E> p = last(); p != null; p = pred(p)) {
+            E item = p.item;
+            if (item != null && p.casItem(item, null)) {
+                unlink(p);
+                return item;
+            }
+        }
+        return null;
+!!!1466907.java!!!	removeFirst() : E
+        return screenNullResult(pollFirst());
+!!!1467035.java!!!	removeLast() : E
+        return screenNullResult(pollLast());
+!!!1467163.java!!!	offer(inout e : E) : boolean
+        return offerLast(e);
+!!!1467291.java!!!	add(inout e : E) : boolean
+        return offerLast(e);
+!!!1467419.java!!!	poll() : E
+ return pollFirst();
+!!!1467547.java!!!	remove() : E
+ return removeFirst();
+!!!1467675.java!!!	peek() : E
+ return peekFirst();
+!!!1467803.java!!!	element() : E
+ return getFirst();
+!!!1467931.java!!!	push(inout e : E) : void
+ addFirst(e);
+!!!1468059.java!!!	pop() : E
+ return removeFirst();
+!!!1468187.java!!!	removeFirstOccurrence(inout o : Object) : boolean
+        checkNotNull(o);
+        for (Node<E> p = first(); p != null; p = succ(p)) {
+            E item = p.item;
+            if (item != null && o.equals(item) && p.casItem(item, null)) {
+                unlink(p);
+                return true;
+            }
+        }
+        return false;
+!!!1468315.java!!!	removeLastOccurrence(inout o : Object) : boolean
+        checkNotNull(o);
+        for (Node<E> p = last(); p != null; p = pred(p)) {
+            E item = p.item;
+            if (item != null && o.equals(item) && p.casItem(item, null)) {
+                unlink(p);
+                return true;
+            }
+        }
+        return false;
+!!!1468443.java!!!	contains(inout o : Object) : boolean
+        if (o == null) return false;
+        for (Node<E> p = first(); p != null; p = succ(p)) {
+            E item = p.item;
+            if (item != null && o.equals(item))
+                return true;
+        }
+        return false;
+!!!1468571.java!!!	isEmpty() : boolean
+        return peekFirst() == null;
+!!!1468699.java!!!	size() : int
+        int count = 0;
+        for (Node<E> p = first(); p != null; p = succ(p))
+            if (p.item != null)
+                // Collection.size() spec says to max out
+                if (++count == Integer.MAX_VALUE)
+                    break;
+        return count;
+!!!1468827.java!!!	remove(inout o : Object) : boolean
+        return removeFirstOccurrence(o);
+!!!1468955.java!!!	addAll(inout c : Collection) : boolean
+        if (c == this)
+            // As historically specified in AbstractQueue#addAll
+            throw new IllegalArgumentException();
+
+        // Copy c into a private chain of Nodes
+        Node<E> beginningOfTheEnd = null, last = null;
+        for (E e : c) {
+            checkNotNull(e);
+            Node<E> newNode = new Node<E>(e);
+            if (beginningOfTheEnd == null)
+                beginningOfTheEnd = last = newNode;
+            else {
+                last.lazySetNext(newNode);
+                newNode.lazySetPrev(last);
+                last = newNode;
+            }
+        }
+        if (beginningOfTheEnd == null)
+            return false;
+
+        // Atomically append the chain at the tail of this collection
+        restartFromTail:
+        for (;;)
+            for (Node<E> t = tail, p = t, q;;) {
+                if ((q = p.next) != null &&
+                    (q = (p = q).next) != null)
+                    // Check for tail updates every other hop.
+                    // If p == q, we are sure to follow tail instead.
+                    p = (t != (t = tail)) ? t : q;
+                else if (p.prev == p) // NEXT_TERMINATOR
+                    continue restartFromTail;
+                else {
+                    // p is last node
+                    beginningOfTheEnd.lazySetPrev(p); // CAS piggyback
+                    if (p.casNext(null, beginningOfTheEnd)) {
+                        // Successful CAS is the linearization point
+                        // for all elements to be added to this deque.
+                        if (!casTail(t, last)) {
+                            // Try a little harder to update tail,
+                            // since we may be adding many elements.
+                            t = tail;
+                            if (last.next == null)
+                                casTail(t, last);
+                        }
+                        return true;
+                    }
+                    // Lost CAS race to another thread; re-read next
+                }
+            }
+!!!1469083.java!!!	clear() : void
+        while (pollFirst() != null)
+            ;
+!!!1469211.java!!!	toArray() : Object
+        return toArrayList().toArray();
+!!!1469339.java!!!	toArray(inout a : T) : T
+        return toArrayList().toArray(a);
+!!!1469467.java!!!	iterator() : Iterator
+        return new Itr();
+!!!1469595.java!!!	descendingIterator() : Iterator
+        return new DescendingItr();
+!!!1471131.java!!!	writeObject(inout s : ObjectOutputStream) : void
+
+        // Write out any hidden stuff
+        s.defaultWriteObject();
+
+        // Write out all elements in the proper order.
+        for (Node<E> p = first(); p != null; p = succ(p)) {
+            E item = p.item;
+            if (item != null)
+                s.writeObject(item);
+        }
+
+        // Use trailing null as sentinel
+        s.writeObject(null);
+!!!1471259.java!!!	readObject(inout s : ObjectInputStream) : void
+        s.defaultReadObject();
+
+        // Read in elements until trailing null sentinel found
+        Node<E> h = null, t = null;
+        Object item;
+        while ((item = s.readObject()) != null) {
+            @SuppressWarnings("unchecked")
+            Node<E> newNode = new Node<E>((E) item);
+            if (h == null)
+                h = t = newNode;
+            else {
+                t.lazySetNext(newNode);
+                newNode.lazySetPrev(t);
+                t = newNode;
+            }
+        }
+        initHeadTail(h, t);
+!!!1471387.java!!!	casHead(inout cmp : Node, inout val : Node) : boolean
+        return UNSAFE.compareAndSwapObject(this, headOffset, cmp, val);
+!!!1471515.java!!!	casTail(inout cmp : Node, inout val : Node) : boolean
+        return UNSAFE.compareAndSwapObject(this, tailOffset, cmp, val);

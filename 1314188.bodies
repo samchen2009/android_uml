@@ -1,0 +1,634 @@
+class KeyguardViewMediator
+!!!7897100.java!!!	wakeUp() : void
+        mPM.wakeUp(SystemClock.uptimeMillis());
+!!!7897228.java!!!	userActivity() : void
+        userActivity(AWAKE_INTERVAL_DEFAULT_MS);
+!!!7897356.java!!!	userActivity(in holdMs : long) : void
+        // We ignore the hold time.  Eventually we should remove it.
+        // Instead, the keyguard window has an explicit user activity timeout set on it.
+        mPM.userActivity(SystemClock.uptimeMillis(), false);
+!!!7897484.java!!!	KeyguardViewMediator(inout context : Context, inout lockPatternUtils : LockPatternUtils)
+        mContext = context;
+        mPM = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mUserManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
+        mShowKeyguardWakeLock = mPM.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "show keyguard");
+        mShowKeyguardWakeLock.setReferenceCounted(false);
+
+        mWakeAndHandOff = mPM.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "keyguardWakeAndHandOff");
+        mWakeAndHandOff.setReferenceCounted(false);
+
+        mContext.registerReceiver(mBroadcastReceiver, new IntentFilter(DELAYED_KEYGUARD_ACTION));
+
+        mAlarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+
+        mUpdateMonitor = KeyguardUpdateMonitor.getInstance(context);
+
+        mLockPatternUtils = lockPatternUtils != null
+                ? lockPatternUtils : new LockPatternUtils(mContext);
+        mLockPatternUtils.setCurrentUser(UserHandle.USER_OWNER);
+
+        WindowManager wm = (WindowManager)context.getSystemService(Context.WINDOW_SERVICE);
+
+        mKeyguardViewManager = new KeyguardViewManager(context, wm, mViewMediatorCallback,
+                mLockPatternUtils);
+
+        mUserPresentIntent = new Intent(Intent.ACTION_USER_PRESENT);
+        mUserPresentIntent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING
+                | Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+
+        final ContentResolver cr = mContext.getContentResolver();
+        mShowLockIcon = (Settings.System.getInt(cr, "show_status_bar_lock", 0) == 1);
+
+        mScreenOn = mPM.isScreenOn();
+
+        mLockSounds = new SoundPool(1, AudioManager.STREAM_SYSTEM, 0);
+        String soundPath = Settings.Global.getString(cr, Settings.Global.LOCK_SOUND);
+        if (soundPath != null) {
+            mLockSoundId = mLockSounds.load(soundPath, 1);
+        }
+        if (soundPath == null || mLockSoundId == 0) {
+            Log.w(TAG, "failed to load lock sound from " + soundPath);
+        }
+        soundPath = Settings.Global.getString(cr, Settings.Global.UNLOCK_SOUND);
+        if (soundPath != null) {
+            mUnlockSoundId = mLockSounds.load(soundPath, 1);
+        }
+        if (soundPath == null || mUnlockSoundId == 0) {
+            Log.w(TAG, "failed to load unlock sound from " + soundPath);
+        }
+        int lockSoundDefaultAttenuation = context.getResources().getInteger(
+                com.android.internal.R.integer.config_lockSoundVolumeDb);
+        mLockSoundVolume = (float)Math.pow(10, (float)lockSoundDefaultAttenuation/20);
+!!!7897612.java!!!	onSystemReady() : void
+        mSearchManager = (SearchManager) mContext.getSystemService(Context.SEARCH_SERVICE);
+        synchronized (this) {
+            if (DEBUG) Log.d(TAG, "onSystemReady");
+            mSystemReady = true;
+            mUpdateMonitor.registerCallback(mUpdateCallback);
+
+            // Suppress biometric unlock right after boot until things have settled if it is the
+            // selected security method, otherwise unsuppress it.  It must be unsuppressed if it is
+            // not the selected security method for the following reason:  if the user starts
+            // without a screen lock selected, the biometric unlock would be suppressed the first
+            // time they try to use it.
+            //
+            // Note that the biometric unlock will still not show if it is not the selected method.
+            // Calling setAlternateUnlockEnabled(true) simply says don't suppress it if it is the
+            // selected method.
+            if (mLockPatternUtils.usingBiometricWeak()
+                    && mLockPatternUtils.isBiometricWeakInstalled()) {
+                if (DEBUG) Log.d(TAG, "suppressing biometric unlock during boot");
+                mUpdateMonitor.setAlternateUnlockEnabled(false);
+            } else {
+                mUpdateMonitor.setAlternateUnlockEnabled(true);
+            }
+
+            doKeyguardLocked();
+        }
+        // Most services aren't available until the system reaches the ready state, so we
+        // send it here when the device first boots.
+        maybeSendUserPresentBroadcast();
+!!!7897740.java!!!	onScreenTurnedOff(in why : int) : void
+        synchronized (this) {
+            mScreenOn = false;
+            if (DEBUG) Log.d(TAG, "onScreenTurnedOff(" + why + ")");
+
+            mKeyguardDonePending = false;
+
+            // Lock immediately based on setting if secure (user has a pin/pattern/password).
+            // This also "locks" the device when not secure to provide easy access to the
+            // camera while preventing unwanted input.
+            final boolean lockImmediately =
+                mLockPatternUtils.getPowerButtonInstantlyLocks() || !mLockPatternUtils.isSecure();
+
+            if (mExitSecureCallback != null) {
+                if (DEBUG) Log.d(TAG, "pending exit secure callback cancelled");
+                mExitSecureCallback.onKeyguardExitResult(false);
+                mExitSecureCallback = null;
+                if (!mExternallyEnabled) {
+                    hideLocked();
+                }
+            } else if (mShowing) {
+                notifyScreenOffLocked();
+                resetStateLocked(null);
+            } else if (why == WindowManagerPolicy.OFF_BECAUSE_OF_TIMEOUT
+                   || (why == WindowManagerPolicy.OFF_BECAUSE_OF_USER && !lockImmediately)) {
+                doKeyguardLaterLocked();
+            } else if (why == WindowManagerPolicy.OFF_BECAUSE_OF_PROX_SENSOR) {
+                // Do not enable the keyguard if the prox sensor forced the screen off.
+            } else {
+                doKeyguardLocked();
+            }
+        }
+!!!7897868.java!!!	doKeyguardLaterLocked() : void
+        // if the screen turned off because of timeout or the user hit the power button
+        // and we don't need to lock immediately, set an alarm
+        // to enable it a little bit later (i.e, give the user a chance
+        // to turn the screen back on within a certain window without
+        // having to unlock the screen)
+        final ContentResolver cr = mContext.getContentResolver();
+
+        // From DisplaySettings
+        long displayTimeout = Settings.System.getInt(cr, SCREEN_OFF_TIMEOUT,
+                KEYGUARD_DISPLAY_TIMEOUT_DELAY_DEFAULT);
+
+        // From SecuritySettings
+        final long lockAfterTimeout = Settings.Secure.getInt(cr,
+                Settings.Secure.LOCK_SCREEN_LOCK_AFTER_TIMEOUT,
+                KEYGUARD_LOCK_AFTER_DELAY_DEFAULT);
+
+        // From DevicePolicyAdmin
+        final long policyTimeout = mLockPatternUtils.getDevicePolicyManager()
+                .getMaximumTimeToLock(null, mLockPatternUtils.getCurrentUser());
+
+        long timeout;
+        if (policyTimeout > 0) {
+            // policy in effect. Make sure we don't go beyond policy limit.
+            displayTimeout = Math.max(displayTimeout, 0); // ignore negative values
+            timeout = Math.min(policyTimeout - displayTimeout, lockAfterTimeout);
+        } else {
+            timeout = lockAfterTimeout;
+        }
+
+        if (timeout <= 0) {
+            // Lock now
+            mSuppressNextLockSound = true;
+            doKeyguardLocked();
+        } else {
+            // Lock in the future
+            long when = SystemClock.elapsedRealtime() + timeout;
+            Intent intent = new Intent(DELAYED_KEYGUARD_ACTION);
+            intent.putExtra("seq", mDelayedShowingSequence);
+            PendingIntent sender = PendingIntent.getBroadcast(mContext,
+                    0, intent, PendingIntent.FLAG_CANCEL_CURRENT);
+            mAlarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, when, sender);
+            if (DEBUG) Log.d(TAG, "setting alarm to turn off keyguard, seq = "
+                             + mDelayedShowingSequence);
+        }
+!!!7897996.java!!!	cancelDoKeyguardLaterLocked() : void
+        mDelayedShowingSequence++;
+!!!7898124.java!!!	onScreenTurnedOn(inout showListener : ShowListener) : void
+        synchronized (this) {
+            mScreenOn = true;
+            cancelDoKeyguardLaterLocked();
+            if (DEBUG) Log.d(TAG, "onScreenTurnedOn, seq = " + mDelayedShowingSequence);
+            if (showListener != null) {
+                notifyScreenOnLocked(showListener);
+            }
+        }
+        maybeSendUserPresentBroadcast();
+!!!7898252.java!!!	maybeSendUserPresentBroadcast() : void
+        if (mSystemReady && mLockPatternUtils.isLockScreenDisabled()
+                && mUserManager.getUsers(true).size() == 1) {
+            // Lock screen is disabled because the user has set the preference to "None".
+            // In this case, send out ACTION_USER_PRESENT here instead of in
+            // handleKeyguardDone()
+            sendUserPresentBroadcast();
+        }
+!!!7898380.java!!!	onDreamingStarted() : void
+        synchronized (this) {
+            if (mScreenOn && mLockPatternUtils.isSecure()) {
+                doKeyguardLaterLocked();
+            }
+        }
+!!!7898508.java!!!	onDreamingStopped() : void
+        synchronized (this) {
+            if (mScreenOn) {
+                cancelDoKeyguardLaterLocked();
+            }
+        }
+!!!7898636.java!!!	setKeyguardEnabled(inout enabled : boolean) : void
+        synchronized (this) {
+            if (DEBUG) Log.d(TAG, "setKeyguardEnabled(" + enabled + ")");
+
+            mExternallyEnabled = enabled;
+
+            if (!enabled && mShowing) {
+                if (mExitSecureCallback != null) {
+                    if (DEBUG) Log.d(TAG, "in process of verifyUnlock request, ignoring");
+                    // we're in the process of handling a request to verify the user
+                    // can get past the keyguard. ignore extraneous requests to disable / reenable
+                    return;
+                }
+
+                // hiding keyguard that is showing, remember to reshow later
+                if (DEBUG) Log.d(TAG, "remembering to reshow, hiding keyguard, "
+                        + "disabling status bar expansion");
+                mNeedToReshowWhenReenabled = true;
+                hideLocked();
+            } else if (enabled && mNeedToReshowWhenReenabled) {
+                // reenabled after previously hidden, reshow
+                if (DEBUG) Log.d(TAG, "previously hidden, reshowing, reenabling "
+                        + "status bar expansion");
+                mNeedToReshowWhenReenabled = false;
+
+                if (mExitSecureCallback != null) {
+                    if (DEBUG) Log.d(TAG, "onKeyguardExitResult(false), resetting");
+                    mExitSecureCallback.onKeyguardExitResult(false);
+                    mExitSecureCallback = null;
+                    resetStateLocked(null);
+                } else {
+                    showLocked(null);
+
+                    // block until we know the keygaurd is done drawing (and post a message
+                    // to unblock us after a timeout so we don't risk blocking too long
+                    // and causing an ANR).
+                    mWaitingUntilKeyguardVisible = true;
+                    mHandler.sendEmptyMessageDelayed(KEYGUARD_DONE_DRAWING, KEYGUARD_DONE_DRAWING_TIMEOUT_MS);
+                    if (DEBUG) Log.d(TAG, "waiting until mWaitingUntilKeyguardVisible is false");
+                    while (mWaitingUntilKeyguardVisible) {
+                        try {
+                            wait();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    if (DEBUG) Log.d(TAG, "done waiting for mWaitingUntilKeyguardVisible");
+                }
+            }
+        }
+!!!7898764.java!!!	verifyUnlock(inout callback : OnKeyguardExitResult) : void
+        synchronized (this) {
+            if (DEBUG) Log.d(TAG, "verifyUnlock");
+            if (!mUpdateMonitor.isDeviceProvisioned()) {
+                // don't allow this api when the device isn't provisioned
+                if (DEBUG) Log.d(TAG, "ignoring because device isn't provisioned");
+                callback.onKeyguardExitResult(false);
+            } else if (mExternallyEnabled) {
+                // this only applies when the user has externally disabled the
+                // keyguard.  this is unexpected and means the user is not
+                // using the api properly.
+                Log.w(TAG, "verifyUnlock called when not externally disabled");
+                callback.onKeyguardExitResult(false);
+            } else if (mExitSecureCallback != null) {
+                // already in progress with someone else
+                callback.onKeyguardExitResult(false);
+            } else {
+                mExitSecureCallback = callback;
+                verifyUnlockLocked();
+            }
+        }
+!!!7898892.java!!!	isShowing() : boolean
+        return mShowing;
+!!!7899020.java!!!	isShowingAndNotHidden() : boolean
+        return mShowing && !mHidden;
+!!!7899148.java!!!	setHidden(inout isHidden : boolean) : void
+        if (DEBUG) Log.d(TAG, "setHidden " + isHidden);
+        mUpdateMonitor.sendKeyguardVisibilityChanged(!isHidden);
+        mHandler.removeMessages(SET_HIDDEN);
+        Message msg = mHandler.obtainMessage(SET_HIDDEN, (isHidden ? 1 : 0), 0);
+        mHandler.sendMessage(msg);
+!!!7899276.java!!!	handleSetHidden(inout isHidden : boolean) : void
+        synchronized (KeyguardViewMediator.this) {
+            if (mHidden != isHidden) {
+                mHidden = isHidden;
+                updateActivityLockScreenState();
+                adjustStatusBarLocked();
+            }
+        }
+!!!7899404.java!!!	doKeyguardTimeout(inout options : Bundle) : void
+        mHandler.removeMessages(KEYGUARD_TIMEOUT);
+        Message msg = mHandler.obtainMessage(KEYGUARD_TIMEOUT, options);
+        mHandler.sendMessage(msg);
+!!!7899532.java!!!	isInputRestricted() : boolean
+        return mShowing || mNeedToReshowWhenReenabled || !mUpdateMonitor.isDeviceProvisioned();
+!!!7899660.java!!!	doKeyguardLocked() : void
+        doKeyguardLocked(null);
+!!!7899788.java!!!	doKeyguardLocked(inout options : Bundle) : void
+        // if another app is disabling us, don't show
+        if (!mExternallyEnabled) {
+            if (DEBUG) Log.d(TAG, "doKeyguard: not showing because externally disabled");
+
+            // note: we *should* set mNeedToReshowWhenReenabled=true here, but that makes
+            // for an occasional ugly flicker in this situation:
+            // 1) receive a call with the screen on (no keyguard) or make a call
+            // 2) screen times out
+            // 3) user hits key to turn screen back on
+            // instead, we reenable the keyguard when we know the screen is off and the call
+            // ends (see the broadcast receiver below)
+            // TODO: clean this up when we have better support at the window manager level
+            // for apps that wish to be on top of the keyguard
+            return;
+        }
+
+        // if the keyguard is already showing, don't bother
+        if (mKeyguardViewManager.isShowing()) {
+            if (DEBUG) Log.d(TAG, "doKeyguard: not showing because it is already showing");
+            return;
+        }
+
+        // if the setup wizard hasn't run yet, don't show
+        final boolean requireSim = !SystemProperties.getBoolean("keyguard.no_require_sim",
+                false);
+        final boolean provisioned = mUpdateMonitor.isDeviceProvisioned();
+        final IccCardConstants.State state = mUpdateMonitor.getSimState();
+        final boolean lockedOrMissing = state.isPinLocked()
+                || ((state == IccCardConstants.State.ABSENT
+                || state == IccCardConstants.State.PERM_DISABLED)
+                && requireSim);
+
+        if (!lockedOrMissing && !provisioned) {
+            if (DEBUG) Log.d(TAG, "doKeyguard: not showing because device isn't provisioned"
+                    + " and the sim is not locked or missing");
+            return;
+        }
+
+        if (mUserManager.getUsers(true).size() < 2
+                && mLockPatternUtils.isLockScreenDisabled() && !lockedOrMissing) {
+            if (DEBUG) Log.d(TAG, "doKeyguard: not showing because lockscreen is off");
+            return;
+        }
+
+        if (DEBUG) Log.d(TAG, "doKeyguard: showing the lock screen");
+        showLocked(options);
+!!!7899916.java!!!	dismiss() : void
+        if (mShowing && !mHidden) {
+            mKeyguardViewManager.dismiss();
+        }
+!!!7900044.java!!!	resetStateLocked(inout options : Bundle) : void
+        if (DEBUG) Log.d(TAG, "resetStateLocked");
+        Message msg = mHandler.obtainMessage(RESET, options);
+        mHandler.sendMessage(msg);
+!!!7900172.java!!!	verifyUnlockLocked() : void
+        if (DEBUG) Log.d(TAG, "verifyUnlockLocked");
+        mHandler.sendEmptyMessage(VERIFY_UNLOCK);
+!!!7900300.java!!!	notifyScreenOffLocked() : void
+        if (DEBUG) Log.d(TAG, "notifyScreenOffLocked");
+        mHandler.sendEmptyMessage(NOTIFY_SCREEN_OFF);
+!!!7900428.java!!!	notifyScreenOnLocked(inout showListener : ShowListener) : void
+        if (DEBUG) Log.d(TAG, "notifyScreenOnLocked");
+        Message msg = mHandler.obtainMessage(NOTIFY_SCREEN_ON, showListener);
+        mHandler.sendMessage(msg);
+!!!7900556.java!!!	wakeWhenReady(in keyCode : int) : void
+        if (DBG_WAKE) Log.d(TAG, "wakeWhenReady(" + keyCode + ")");
+
+        /**
+         * acquire the handoff lock that will keep the cpu running.  this will
+         * be released once the keyguard has set itself up and poked the other wakelock
+         * in {@link #handleWakeWhenReady(int)}
+         */
+        mWakeAndHandOff.acquire();
+
+        Message msg = mHandler.obtainMessage(WAKE_WHEN_READY, keyCode, 0);
+        mHandler.sendMessage(msg);
+!!!7900684.java!!!	showLocked(inout options : Bundle) : void
+        if (DEBUG) Log.d(TAG, "showLocked");
+        // ensure we stay awake until we are finished displaying the keyguard
+        mShowKeyguardWakeLock.acquire();
+        Message msg = mHandler.obtainMessage(SHOW, options);
+        mHandler.sendMessage(msg);
+!!!7900812.java!!!	hideLocked() : void
+        if (DEBUG) Log.d(TAG, "hideLocked");
+        Message msg = mHandler.obtainMessage(HIDE);
+        mHandler.sendMessage(msg);
+!!!7900940.java!!!	isSecure() : boolean
+        return mLockPatternUtils.isSecure()
+            || KeyguardUpdateMonitor.getInstance(mContext).isSimPinSecure();
+!!!7901068.java!!!	setCurrentUser(in newUserId : int) : void
+        mLockPatternUtils.setCurrentUser(newUserId);
+!!!7901196.java!!!	onWakeKeyWhenKeyguardShowingTq(in keyCode : int) : void
+        if (DEBUG) Log.d(TAG, "onWakeKeyWhenKeyguardShowing(" + keyCode + ")");
+
+        // give the keyguard view manager a chance to adjust the state of the
+        // keyguard based on the key that woke the device before poking
+        // the wake lock
+        wakeWhenReady(keyCode);
+!!!7901324.java!!!	onWakeMotionWhenKeyguardShowingTq() : void
+        if (DEBUG) Log.d(TAG, "onWakeMotionWhenKeyguardShowing()");
+
+        // give the keyguard view manager a chance to adjust the state of the
+        // keyguard based on the key that woke the device before poking
+        // the wake lock
+        wakeWhenReady(KeyEvent.KEYCODE_UNKNOWN);
+!!!7901452.java!!!	keyguardDone(inout authenticated : boolean, inout wakeup : boolean) : void
+        mKeyguardDonePending = false;
+        synchronized (this) {
+            EventLog.writeEvent(70000, 2);
+            if (DEBUG) Log.d(TAG, "keyguardDone(" + authenticated + ")");
+            Message msg = mHandler.obtainMessage(KEYGUARD_DONE);
+            msg.arg1 = wakeup ? 1 : 0;
+            mHandler.sendMessage(msg);
+
+            if (authenticated) {
+                mUpdateMonitor.clearFailedUnlockAttempts();
+            }
+
+            if (mExitSecureCallback != null) {
+                mExitSecureCallback.onKeyguardExitResult(authenticated);
+                mExitSecureCallback = null;
+
+                if (authenticated) {
+                    // after succesfully exiting securely, no need to reshow
+                    // the keyguard when they've released the lock
+                    mExternallyEnabled = true;
+                    mNeedToReshowWhenReenabled = false;
+                }
+            }
+        }
+!!!7901580.java!!!	handleKeyguardDone(inout wakeup : boolean) : void
+        if (DEBUG) Log.d(TAG, "handleKeyguardDone");
+        handleHide();
+        if (wakeup) {
+            wakeUp();
+        }
+
+        sendUserPresentBroadcast();
+!!!7901708.java!!!	sendUserPresentBroadcast() : void
+        if (!(mContext instanceof Activity)) {
+            final UserHandle currentUser = new UserHandle(mLockPatternUtils.getCurrentUser());
+            mContext.sendBroadcastAsUser(mUserPresentIntent, currentUser);
+        }
+!!!7901836.java!!!	handleKeyguardDoneDrawing() : void
+        synchronized(this) {
+            if (false) Log.d(TAG, "handleKeyguardDoneDrawing");
+            if (mWaitingUntilKeyguardVisible) {
+                if (DEBUG) Log.d(TAG, "handleKeyguardDoneDrawing: notifying mWaitingUntilKeyguardVisible");
+                mWaitingUntilKeyguardVisible = false;
+                notifyAll();
+
+                // there will usually be two of these sent, one as a timeout, and one
+                // as a result of the callback, so remove any remaining messages from
+                // the queue
+                mHandler.removeMessages(KEYGUARD_DONE_DRAWING);
+            }
+        }
+!!!7901964.java!!!	playSounds(inout locked : boolean) : void
+        // User feedback for keyguard.
+
+        if (mSuppressNextLockSound) {
+            mSuppressNextLockSound = false;
+            return;
+        }
+
+        final ContentResolver cr = mContext.getContentResolver();
+        if (Settings.System.getInt(cr, Settings.System.LOCKSCREEN_SOUNDS_ENABLED, 1) == 1) {
+            final int whichSound = locked
+                ? mLockSoundId
+                : mUnlockSoundId;
+            mLockSounds.stop(mLockSoundStreamId);
+            // Init mAudioManager
+            if (mAudioManager == null) {
+                mAudioManager = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
+                if (mAudioManager == null) return;
+                mMasterStreamType = mAudioManager.getMasterStreamType();
+            }
+            // If the stream is muted, don't play the sound
+            if (mAudioManager.isStreamMute(mMasterStreamType)) return;
+
+            mLockSoundStreamId = mLockSounds.play(whichSound,
+                    mLockSoundVolume, mLockSoundVolume, 1/*priortiy*/, 0/*loop*/, 1.0f/*rate*/);
+        }
+!!!7902092.java!!!	updateActivityLockScreenState() : void
+        try {
+            ActivityManagerNative.getDefault().setLockScreenShown(
+                    mShowing && !mHidden);
+        } catch (RemoteException e) {
+        }
+!!!7902220.java!!!	handleShow(inout options : Bundle) : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DEBUG) Log.d(TAG, "handleShow");
+            if (!mSystemReady) return;
+
+            mKeyguardViewManager.show(options);
+            mShowing = true;
+            mKeyguardDonePending = false;
+            updateActivityLockScreenState();
+            adjustStatusBarLocked();
+            userActivity();
+            try {
+                ActivityManagerNative.getDefault().closeSystemDialogs("lock");
+            } catch (RemoteException e) {
+            }
+
+            // Do this at the end to not slow down display of the keyguard.
+            playSounds(true);
+
+            mShowKeyguardWakeLock.release();
+        }
+!!!7902348.java!!!	handleHide() : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DEBUG) Log.d(TAG, "handleHide");
+            if (mWakeAndHandOff.isHeld()) {
+                Log.w(TAG, "attempt to hide the keyguard while waking, ignored");
+                return;
+            }
+
+            // only play "unlock" noises if not on a call (since the incall UI
+            // disables the keyguard)
+            if (TelephonyManager.EXTRA_STATE_IDLE.equals(mPhoneState)) {
+                playSounds(false);
+            }
+
+            mKeyguardViewManager.hide();
+            mShowing = false;
+            mKeyguardDonePending = false;
+            updateActivityLockScreenState();
+            adjustStatusBarLocked();
+        }
+!!!7902476.java!!!	adjustStatusBarLocked() : void
+        if (mStatusBarManager == null) {
+            mStatusBarManager = (StatusBarManager)
+                    mContext.getSystemService(Context.STATUS_BAR_SERVICE);
+        }
+        if (mStatusBarManager == null) {
+            Log.w(TAG, "Could not get status bar manager");
+        } else {
+            if (mShowLockIcon) {
+                // Give feedback to user when secure keyguard is active and engaged
+                if (mShowing && isSecure()) {
+                    if (!mShowingLockIcon) {
+                        String contentDescription = mContext.getString(
+                                com.android.internal.R.string.status_bar_device_locked);
+                        mStatusBarManager.setIcon("secure",
+                                com.android.internal.R.drawable.stat_sys_secure, 0,
+                                contentDescription);
+                        mShowingLockIcon = true;
+                    }
+                } else {
+                    if (mShowingLockIcon) {
+                        mStatusBarManager.removeIcon("secure");
+                        mShowingLockIcon = false;
+                    }
+                }
+            }
+
+            // Disable aspects of the system/status/navigation bars that must not be re-enabled by
+            // windows that appear on top, ever
+            int flags = StatusBarManager.DISABLE_NONE;
+            if (mShowing) {
+                // Permanently disable components not available when keyguard is enabled
+                // (like recents). Temporary enable/disable (e.g. the "back" button) are
+                // done in KeyguardHostView.
+                flags |= StatusBarManager.DISABLE_RECENT;
+                if (isSecure() || !ENABLE_INSECURE_STATUS_BAR_EXPAND) {
+                    // showing secure lockscreen; disable expanding.
+                    flags |= StatusBarManager.DISABLE_EXPAND;
+                }
+                if (isSecure()) {
+                    // showing secure lockscreen; disable ticker.
+                    flags |= StatusBarManager.DISABLE_NOTIFICATION_TICKER;
+                }
+                if (!isAssistantAvailable()) {
+                    flags |= StatusBarManager.DISABLE_SEARCH;
+                }
+            }
+
+            if (DEBUG) {
+                Log.d(TAG, "adjustStatusBarLocked: mShowing=" + mShowing + " mHidden=" + mHidden
+                        + " isSecure=" + isSecure() + " --> flags=0x" + Integer.toHexString(flags));
+            }
+
+            if (!(mContext instanceof Activity)) {
+                mStatusBarManager.disable(flags);
+            }
+        }
+!!!7902604.java!!!	handleWakeWhenReady(in keyCode : int) : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DBG_WAKE) Log.d(TAG, "handleWakeWhenReady(" + keyCode + ")");
+
+            // this should result in a call to 'poke wakelock' which will set a timeout
+            // on releasing the wakelock
+            if (!mKeyguardViewManager.wakeWhenReadyTq(keyCode)) {
+                // poke wakelock ourselves if keyguard is no longer active
+                Log.w(TAG, "mKeyguardViewManager.wakeWhenReadyTq did not poke wake lock, so poke it ourselves");
+                userActivity();
+            }
+
+            /**
+             * Now that the keyguard is ready and has poked the wake lock, we can
+             * release the handoff wakelock
+             */
+            mWakeAndHandOff.release();
+        }
+!!!7902732.java!!!	handleReset(inout options : Bundle) : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DEBUG) Log.d(TAG, "handleReset");
+            mKeyguardViewManager.reset(options);
+        }
+!!!7902860.java!!!	handleVerifyUnlock() : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DEBUG) Log.d(TAG, "handleVerifyUnlock");
+            mKeyguardViewManager.verifyUnlock();
+            mShowing = true;
+            updateActivityLockScreenState();
+        }
+!!!7902988.java!!!	handleNotifyScreenOff() : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DEBUG) Log.d(TAG, "handleNotifyScreenOff");
+            mKeyguardViewManager.onScreenTurnedOff();
+        }
+!!!7903116.java!!!	handleNotifyScreenOn(inout showListener : ShowListener) : void
+        synchronized (KeyguardViewMediator.this) {
+            if (DEBUG) Log.d(TAG, "handleNotifyScreenOn");
+            mKeyguardViewManager.onScreenTurnedOn(showListener);
+        }
+!!!7903244.java!!!	isDismissable() : boolean
+        return mKeyguardDonePending || !isSecure();
+!!!7903372.java!!!	showAssistant() : void
+        Message msg = mHandler.obtainMessage(SHOW_ASSISTANT);
+        mHandler.sendMessage(msg);
+!!!7903500.java!!!	handleShowAssistant() : void
+        mKeyguardViewManager.showAssistant();
+!!!7903628.java!!!	isAssistantAvailable() : boolean
+        return mSearchManager != null
+                && mSearchManager.getAssistIntent(mContext, UserHandle.USER_CURRENT) != null;
