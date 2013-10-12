@@ -7,20 +7,20 @@ UML files/diagrams by reversing the AOSP（Android Open Source Project)(Jellybea
 What is this for?
 =================
 
-It's for understanding android framework! 
-Are you trembling in front of millions of lines of android source code? 
+It's for understanding Android framework! 
+Are you trembling in front of millions of lines of Android source code? 
 Getting started with this! Just Drap and Drop to start the Android tour!
 
 
 Installation
 =================
 
-1. Download and Install Bouml on Linux(Ubuntu),"sudo apt-get install bouml". Ubuntu 12.04 is recommended, as bouml become commercial after it.
+1. Download and Install Bouml on Linux(Ubuntu),"sudo apt-get install bouml". Ubuntu 12.04 is recommended, as bouml become commercial after 12.04.
 2. download android_uml.
 3. "Open" -> select "android/android.prj.
 
 
-And Then ?
+And then ?
 ==================
 1. View the exising diagrams (class, sequence).
 2. Add yours by "drag and drop"
