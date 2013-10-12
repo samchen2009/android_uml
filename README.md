@@ -28,6 +28,7 @@ And Then ?
 More Detail about Android framework?
 ===================================
 http://developer.android.com
+
 http://www.cnblogs.com/samchen2009/ (chinese only)
 
 
