@@ -8,8 +8,8 @@ What is this for?
 =================
 
 It's for understanding android framework! 
-Are you trembling in front of millions line of AOSP(Android Open Source Project) code? 
-Getting start with this! Just Drap and Drop to start the Android tour!
+Are you trembling in front of millions of lines of android source code? 
+Getting started with this! Just Drap and Drop to start the Android tour!
 
 
 Installation
