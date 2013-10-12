@@ -17,7 +17,8 @@ Installation
 
 1. Download and Install Bouml on Linux(Ubuntu),"sudo apt-get install bouml". Ubuntu 12.04 is recommended, as bouml become commercial after 12.04.
 2. download android_uml.
-3. "Open" -> select "android/android.prj.
+3. Launch bouml, "Open" -> select "android_uml/android/android.prj".
+4. Under "android_uml/png/", you can find some pictures exported from UML diagrams.
 
 
 And then ?
