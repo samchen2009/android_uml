@@ -1,0 +1,407 @@
+format 74
+
+classinstance 128012 class_ref 505740 // ProcessState
+  name ""   xyz 182 10 2005 life_line_z 2000
+classinstance 128140 class_ref 505612 // IPCThreadState
+  name ""   xyz 284 10 2010 life_line_z 2000
+note 128155 "BR_TRANSACTION_COMPLETE
+"
+  color lightgreen  xyzwh 718 572 2000 197 35
+classinstance 129164 class_ref 199195 // Service
+  name ""   xyz 117 11 2005 life_line_z 2000
+classinstance 130188 class_ref 662668 // PoolThread
+  name ""   xyz 420 10 2005 life_line_z 2000
+classinstance 131724 class_ref 1792908 // BinderDriver
+  name ""   xyz 534 11 2005 life_line_z 2000
+note 133388 "BC_REGISTER_LOOPER"
+  xyzwh 382 301 2030 165 35
+note 133516 "BC_ENTER_LOOPER"
+  xyzwh 355.5 211.5 2030 165 35
+classinstance 133644 class_ref 505612 // IPCThreadState
+  name ""   xyz 930 9 2005 life_line_z 2000
+classinstance 133772 class_ref 504076 // BpBinder
+  name ""   xyz 1094 11 2005 life_line_z 2000
+classinstance 133900 class_ref 3818380 // BpService
+  name ""   xyz 1200 7 2005 life_line_z 2000
+classinstance 135180 class_ref 1792908 // BinderDriver
+  name ""   xyz 801 9 2005 life_line_z 2000
+note 136332 "BC_TRANSACTION"
+  xyzwh 851 465 2000 131 35
+classinstance 136716 class_ref 3818508 // Wait
+  name ""   xyz 685 11 2005 life_line_z 2000
+note 138508 "BR_TRANSACTION"
+  color lightgreen  xyzwh 448 592 2030 135 37
+note 138892 "BR_SPAWN_LOOPER"
+  color lightgreen  xyzwh 473 635 2035 153 35
+classinstance 139404 class_ref 503564 // BBinder
+  name ""   xyz 31 10 2005 life_line_z 2000
+note 141324 "BC_REPLY"
+  xyzwh 361 938 2060 87 35
+note 141964 "BR_REPLY"
+  color lightgreen  xyzwh 847 957 2000 87 35
+note 142732 "BR_TRANSACTION_COMPLETE"
+  color lightgreen  xyzwh 441 985 2015 203 35
+durationcanvas 129292 classinstance_ref 129164 // :Service
+  color mediumyellow
+  xyzwh 139 74 2010 11 193
+end
+durationcanvas 129420 classinstance_ref 128012 // :ProcessState
+  color mediumyellow
+  xyzwh 220 73 2010 11 74
+  overlappingdurationcanvas 129676
+    color mediumyellow
+    xyzwh 226 99 2020 11 39
+  end
+end
+durationcanvas 129932 classinstance_ref 128140 // :IPCThreadState
+  color mediumyellow
+  xyzwh 329 254 2010 11 816
+  overlappingdurationcanvas 131468
+    color mediumyellow
+    xyzwh 335 274 2020 11 369
+  end
+  overlappingdurationcanvas 138636
+    color mediumyellow
+    xyzwh 335 680 2020 11 375
+    overlappingdurationcanvas 140300
+      color mediumyellow
+      xyzwh 341 862 2030 11 185
+      overlappingdurationcanvas 140556
+	color mediumyellow
+	xyzwh 347 883 2040 11 157
+	overlappingdurationcanvas 140812
+	  color mediumyellow
+	  xyzwh 353 918 2050 11 115
+	end
+      end
+    end
+  end
+end
+durationcanvas 130316 classinstance_ref 130188 // :PoolThread
+  color mediumblue
+  xyzwh 454 114 2010 11 659
+end
+durationcanvas 130700 classinstance_ref 128140 // :IPCThreadState
+  color mediumblue
+  xyzwh 329 157 2010 11 911
+  overlappingdurationcanvas 131212
+    color mediumblue
+    xyzwh 335 200 2020 11 46
+  end
+end
+durationcanvas 131852 classinstance_ref 131724 // :BinderDriver
+  color lightred
+  xyzwh 570 235 2010 11 528
+  overlappingdurationcanvas 132364
+    color lightred
+    xyzwh 576 304 2020 11 62
+  end
+  overlappingdurationcanvas 132620
+    color lightred
+    xyzwh 576 373 2020 11 190
+  end
+  overlappingdurationcanvas 132876
+    color lightred
+    xyzwh 576 245 2020 11 44
+  end
+  overlappingdurationcanvas 139148
+    color lightred
+    xyzwh 576 599 2020 11 25
+  end
+end
+durationcanvas 132108 classinstance_ref 131724 // :BinderDriver
+  color mediumyellow
+  xyzwh 570 295 2010 11 25
+end
+durationcanvas 134028 classinstance_ref 133900 // :BpService
+  color mediumgreen
+  xyzwh 1230 371 2010 11 662
+end
+durationcanvas 134156 classinstance_ref 133772 // :BpBinder
+  color mediumgreen
+  xyzwh 1121 380 2010 11 80
+end
+durationcanvas 134412 classinstance_ref 133644 // :IPCThreadState
+  color mediumgreen
+  xyzwh 975 411 2010 11 625
+  overlappingdurationcanvas 134668
+    color mediumgreen
+    xyzwh 981 423 2020 11 35
+  end
+  overlappingdurationcanvas 134924
+    color mediumgreen
+    xyzwh 981 471 2020 11 555
+    overlappingdurationcanvas 135564
+      color mediumgreen
+      xyzwh 987 495 2030 11 49
+    end
+    overlappingdurationcanvas 135820
+      color mediumgreen
+      xyzwh 987 553 2030 11 462
+    end
+  end
+end
+durationcanvas 136076 classinstance_ref 135180 // :BinderDriver
+  color lightorange
+  xyzwh 837 508 2010 11 497
+end
+durationcanvas 136844 classinstance_ref 136716 // :Wait
+  color lightred
+  xyzwh 704 401 2010 11 175
+end
+durationcanvas 137612 classinstance_ref 136716 // :Wait
+  color lightorange
+  xyzwh 704 606 2010 11 408
+  overlappingdurationcanvas 141580
+    color lightorange
+    xyzwh 710 959 2020 11 35
+  end
+end
+durationcanvas 139532 classinstance_ref 139404 // :BBinder
+  color mediumyellow
+  xyzwh 55 703 2010 11 133
+end
+durationcanvas 139788 classinstance_ref 129164 // :Service
+  color mediumyellow
+  xyzwh 139 743 2010 11 52
+end
+durationcanvas 141068 classinstance_ref 131724 // :BinderDriver
+  color lightred
+  xyzwh 570 935 2010 11 53
+end
+durationcanvas 142220 classinstance_ref 133772 // :BpBinder
+  color mediumgreen
+  xyzwh 1121 996 2010 11 31
+end
+lostfoundmsgsupport 130444 xyz 229 116 2025
+msg 128027 return
+  from durationcanvas_ref 136844
+  to durationcanvas_ref 136076
+  yz 563 2015 unspecifiedmsg
+  show_full_operations_definition default drawing_language default show_context_mode default
+msg 128283 return
+  from durationcanvas_ref 141068
+  to durationcanvas_ref 140812
+  yz 977 2055 unspecifiedmsg
+  show_full_operations_definition default drawing_language default show_context_mode default
+msg 129548 synchronous
+  from durationcanvas_ref 129292
+  to durationcanvas_ref 129420
+  yz 74 2015 msg operation_ref 1478924 // "startThreadPool() : void"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 172 58
+reflexivemsg 129804 synchronous
+  to durationcanvas_ref 129676
+  yz 99 2025 msg operation_ref 1480204 // "spawnPooledThread(in isMain : bool) : void"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 184 83
+msg 130060 synchronous
+  from durationcanvas_ref 129292
+  to durationcanvas_ref 129932
+  yz 256 2015 msg operation_ref 1456908 // "joinThreadPool(in isMain : bool = true) : void"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 256 240
+msg 130572 found_synchronous
+  from lostfoundmsgsupport_ref 130444
+  to durationcanvas_ref 130316
+  yz 114 2025 msg operation_ref 1636492 // "run(in name : char = 0, in priority : int32_t = PRIORITY_DEFAULT, in stack : size_t = 0) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 359 98
+msg 130828 synchronous
+  from durationcanvas_ref 130316
+  to durationcanvas_ref 130700
+  yz 170 2020 msg operation_ref 1456908 // "joinThreadPool(in isMain : bool = true) : void"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 356 154
+reflexivemsg 131340 synchronous
+  to durationcanvas_ref 131212
+  yz 200 2025 msg operation_ref 1459084 // "talkWithDriver(in doReceive : bool = true) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 344 184
+reflexivemsg 131596 synchronous
+  to durationcanvas_ref 131468
+  yz 274 2025 msg operation_ref 1459084 // "talkWithDriver(in doReceive : bool = true) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 347 258
+msg 131980 synchronous
+  from durationcanvas_ref 131212
+  to durationcanvas_ref 131852
+  yz 235 3005 msg operation_ref 10145804 // "ioctl()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 523 223
+msg 132236 synchronous
+  from durationcanvas_ref 131468
+  to durationcanvas_ref 132108
+  yz 295 2025 msg operation_ref 10145804 // "ioctl()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 527 284
+reflexivemsg 132492 synchronous
+  to durationcanvas_ref 132364
+  yz 304 2025 explicitmsg "binder_thread_write()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 593 288
+reflexivemsg 132748 synchronous
+  to durationcanvas_ref 132620
+  yz 373 2025 explicitmsg "binder_thread_read()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 594 354
+reflexivemsg 133004 synchronous
+  to durationcanvas_ref 132876
+  yz 245 2025 explicitmsg "copy_from_user"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 591 228
+msg 134284 synchronous
+  from durationcanvas_ref 134028
+  to durationcanvas_ref 134156
+  yz 385 2015 msg operation_ref 1446412 // "transact(in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t = 0) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 1155 369
+msg 134540 synchronous
+  from durationcanvas_ref 134156
+  to durationcanvas_ref 134412
+  yz 411 2020 msg operation_ref 1457164 // "transact(in handle : int32_t, in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 1026 395
+reflexivemsg 134796 synchronous
+  to durationcanvas_ref 134668
+  yz 423 2025 msg operation_ref 1459212 // "writeTransactionData(in cmd : int32_t, in binderFlags : uint32_t, in handle : int32_t, in code : uint32_t, in data : Parcel, inout statusBuffer : status_t) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 992 431
+reflexivemsg 135052 synchronous
+  to durationcanvas_ref 134924
+  yz 471 2025 msg operation_ref 1458956 // "waitForResponse(inout reply : Parcel, inout acquireResult : status_t = NULL) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 993 454
+reflexivemsg 135692 synchronous
+  to durationcanvas_ref 135564
+  yz 495 2035 msg operation_ref 1459084 // "talkWithDriver(in doReceive : bool = true) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 1020 490
+reflexivemsg 135948 synchronous
+  to durationcanvas_ref 135820
+  yz 553 2035 explicitmsg "excuteCommand()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 1000 539
+msg 136204 synchronous
+  from durationcanvas_ref 135564
+  to durationcanvas_ref 136076
+  yz 515 2040 msg operation_ref 10145804 // "ioctl()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 917 499
+msg 136972 synchronous
+  from durationcanvas_ref 132620
+  to durationcanvas_ref 136844
+  yz 401 2030 explicitmsg "wait_event_interruptible"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 596 411
+msg 137356 asynchronous
+  from durationcanvas_ref 136076
+  to durationcanvas_ref 136844
+  yz 531 2045 explicitmsg "wait_up_interrupt"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 726 514
+msg 137484 return
+  from durationcanvas_ref 136844
+  to durationcanvas_ref 132620
+  yz 539 2050 explicitmsg "transaction_data"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 601 523
+msg 137740 synchronous
+  from durationcanvas_ref 136076
+  to durationcanvas_ref 137612
+  yz 659 2015 explicitmsg "wait_event_interruptible"
+  show_full_operations_definition default drawing_language c++ show_context_mode default
+  label_xy 720 642
+reflexivemsg 138764 synchronous
+  to durationcanvas_ref 138636
+  yz 680 2025 msg operation_ref 1459340 // "executeCommand(in cmd : int32_t) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 351 663
+msg 139020 return
+  from durationcanvas_ref 131852
+  to durationcanvas_ref 131468
+  yz 623 2040 explicitmsg "mIn.data"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 364 609
+reflexivemsg 139276 synchronous
+  to durationcanvas_ref 139148
+  yz 599 2025 explicitmsg "copy_to_user"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 588 581
+msg 139660 synchronous
+  from durationcanvas_ref 138636
+  to durationcanvas_ref 139532
+  yz 712 2025 msg operation_ref 1442572 // "transact(in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t = 0) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 219 696
+msg 139916 synchronous
+  from durationcanvas_ref 139532
+  to durationcanvas_ref 139788
+  yz 748 2015 explicitmsg "onTransact()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 68 732
+msg 140044 return
+  from durationcanvas_ref 139788
+  to durationcanvas_ref 139532
+  yz 776 2015 explicitmsg "reply"
+  stereotype "<<parcel>>" xyz 69 784 3000
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 109 760
+msg 140172 return
+  from durationcanvas_ref 139532
+  to durationcanvas_ref 138636
+  yz 814 2025 explicitmsg "reply"
+  stereotype "<<parcel>>" xyz 214 830 3000
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 231 798
+reflexivemsg 140428 synchronous
+  to durationcanvas_ref 140300
+  yz 862 2035 msg operation_ref 1458828 // "sendReply(in reply : Parcel, in flags : uint32_t) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 349 849
+reflexivemsg 140684 synchronous
+  to durationcanvas_ref 140556
+  yz 883 2045 msg operation_ref 1459212 // "writeTransactionData(in cmd : int32_t, in binderFlags : uint32_t, in handle : int32_t, in code : uint32_t, in data : Parcel, inout statusBuffer : status_t) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 364 870
+reflexivemsg 140940 synchronous
+  to durationcanvas_ref 140812
+  yz 918 2055 msg operation_ref 1458956 // "waitForResponse(inout reply : Parcel, inout acquireResult : status_t = NULL) : status_t"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 364 900
+msg 141196 synchronous
+  from durationcanvas_ref 140812
+  to durationcanvas_ref 141068
+  yz 935 2055 msg operation_ref 10145804 // "ioctl()"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 461 919
+msg 141708 synchronous
+  from durationcanvas_ref 141068
+  to durationcanvas_ref 141580
+  yz 959 2025 explicitmsg "wait_up_interrupt"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 599 943
+msg 141836 return
+  from durationcanvas_ref 141580
+  to durationcanvas_ref 136076
+  yz 973 2025 explicitmsg "transaction_data"
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 736 958
+msg 142092 return
+  from durationcanvas_ref 136076
+  to durationcanvas_ref 135820
+  yz 987 2035 unspecifiedmsg
+  show_full_operations_definition default drawing_language default show_context_mode default
+msg 142348 return
+  from durationcanvas_ref 135820
+  to durationcanvas_ref 142220
+  yz 998 2040 explicitmsg "reply"
+  stereotype "<<parcel>>" xyz 1022 1014 3000
+  show_full_operations_definition default drawing_language default show_context_mode default
+  label_xy 1039 982
+msg 142604 return
+  from durationcanvas_ref 142220
+  to durationcanvas_ref 134028
+  yz 1011 2015 unspecifiedmsg
+  show_full_operations_definition default drawing_language default show_context_mode default
+end

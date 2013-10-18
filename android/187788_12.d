@@ -1,0 +1,610 @@
+format 74
+
+classcanvas 128012 class_ref 1354892 // WindowToken
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_attributes
+    attribute_ref 5685132 // stringName
+    attribute_ref 5685644 // waitingToShow
+    attribute_ref 5685772 // waitingToHide
+    attribute_ref 5685900 // sendingToBottom
+  hidden_operations
+    operation_ref 8709260 // WindowToken
+    operation_ref 8709388 // dump
+    operation_ref 8709516 // toString
+  xyz 150 30 2000
+end
+classcanvas 128140 class_ref 1355020 // AppWindowToken
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_attributes
+    attribute_ref 5686028 // userId
+    attribute_ref 5686284 // groupId
+    attribute_ref 5686412 // appFullscreen
+    attribute_ref 5686540 // requestedOrientation
+    attribute_ref 5686668 // showWhenLocked
+    attribute_ref 5686796 // inputDispatchingTimeoutNanos
+    attribute_ref 5686924 // lastTransactionSequence
+    attribute_ref 5687052 // numInterestingWindows
+    attribute_ref 5687180 // numDrawnWindows
+    attribute_ref 5687308 // inPendingTransaction
+    attribute_ref 5687436 // allDrawn
+    attribute_ref 5687564 // willBeHidden
+    attribute_ref 5687692 // hiddenRequested
+    attribute_ref 5687948 // reportedVisible
+    attribute_ref 5688076 // reportedDrawn
+    attribute_ref 5688204 // removed
+    attribute_ref 5688332 // startingDisplayed
+    attribute_ref 5688460 // startingMoved
+    attribute_ref 5688588 // firstWindowDrawn
+  xyz 379 43 3005
+end
+classcanvas 128780 class_ref 2303884 // IApplicationToken
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  xyz 399 243 2000
+end
+classcanvas 129036 class_ref 2306188 // IWindow
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  xyz 93 189 3005
+end
+classcanvas 129292 class_ref 1357836 // WindowList
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  xyz 18 72 3005
+end
+classcanvas 129548 class_ref 1357836 // WindowList
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  xyz 675 103 2000
+end
+classcanvas 129804 class_ref 1388684 // Token
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_operations
+    operation_ref 8422540 // Token
+    operation_ref 8422668 // windowsDrawn
+    operation_ref 8422796 // windowsVisible
+    operation_ref 8422924 // windowsGone
+    operation_ref 8423052 // keyDispatchingTimedOut
+    operation_ref 8423180 // getKeyDispatchingTimeout
+    operation_ref 8423308 // toString
+  xyz 458 421 2000
+end
+classcanvas 130188 class_ref 1383564 // ActivityRecord
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_attributes
+    attribute_ref 5472780 // launchedFromUid
+    attribute_ref 5472908 // userId
+    attribute_ref 5473036 // shortComponentName
+    attribute_ref 5473164 // resolvedType
+    attribute_ref 5473292 // packageName
+    attribute_ref 5473420 // processName
+    attribute_ref 5473548 // taskAffinity
+    attribute_ref 5473676 // stateNotNeeded
+    attribute_ref 5473804 // fullscreen
+    attribute_ref 5473932 // noDisplay
+    attribute_ref 5474060 // componentSpecified
+    attribute_ref 5474188 // isHomeActivity
+    attribute_ref 5474316 // baseDir
+    attribute_ref 5474444 // resDir
+    attribute_ref 5474572 // dataDir
+    attribute_ref 5474700 // nonLocalizedLabel
+    attribute_ref 5474828 // labelRes
+    attribute_ref 5474956 // icon
+    attribute_ref 5475084 // theme
+    attribute_ref 5475212 // realTheme
+    attribute_ref 5475340 // windowFlags
+    attribute_ref 5475468 // launchTime
+    attribute_ref 5475596 // startTime
+    attribute_ref 5475724 // lastVisibleTime
+    attribute_ref 5475852 // cpuTimeAtResume
+    attribute_ref 5475980 // pauseTime
+    attribute_ref 5476108 // launchTickTime
+    attribute_ref 5476236 // resultWho
+    attribute_ref 5476364 // requestCode
+    attribute_ref 5476492 // results
+    attribute_ref 5476620 // pendingResults
+    attribute_ref 5476748 // newIntents
+    attribute_ref 5476876 // frontOfTask
+    attribute_ref 5477004 // launchFailed
+    attribute_ref 5477132 // haveState
+    attribute_ref 5477260 // stopped
+    attribute_ref 5477388 // delayedResume
+    attribute_ref 5477516 // finishing
+    attribute_ref 5477644 // configDestroy
+    attribute_ref 5477772 // configChangeFlags
+    attribute_ref 5477900 // keysPaused
+    attribute_ref 5478028 // launchMode
+    attribute_ref 5478156 // visible
+    attribute_ref 5478284 // sleeping
+    attribute_ref 5478412 // waitingVisible
+    attribute_ref 5478540 // nowVisible
+    attribute_ref 5478668 // thumbnailNeeded
+    attribute_ref 5478796 // idle
+    attribute_ref 5478924 // hasBeenLaunched
+    attribute_ref 5479052 // frozenBeforeDestroy
+    attribute_ref 5479180 // immersive
+    attribute_ref 5479308 // forceNewConfig
+    attribute_ref 5479436 // stringName
+    attribute_ref 5479564 // inHistory
+  hidden_operations
+    operation_ref 8422412 // dump
+    operation_ref 8423436 // forToken
+    operation_ref 8423564 // ActivityRecord
+    operation_ref 8423692 // setTask
+    operation_ref 8423820 // putInHistory
+    operation_ref 8423948 // takeFromHistory
+    operation_ref 8424076 // isInHistory
+    operation_ref 8424204 // makeFinishing
+    operation_ref 8424332 // getUriPermissionsLocked
+    operation_ref 8424460 // addResultLocked
+    operation_ref 8424588 // removeResultsLocked
+    operation_ref 8424716 // addNewIntentLocked
+    operation_ref 8424844 // deliverNewIntentLocked
+    operation_ref 8424972 // updateOptionsLocked
+    operation_ref 8425100 // updateOptionsLocked
+    operation_ref 8425228 // applyOptionsLocked
+    operation_ref 8425356 // clearOptionsLocked
+    operation_ref 8425484 // takeOptionsLocked
+    operation_ref 8425612 // removeUriPermissionsLocked
+    operation_ref 8425740 // pauseKeyDispatchingLocked
+    operation_ref 8425868 // resumeKeyDispatchingLocked
+    operation_ref 8425996 // updateThumbnail
+    operation_ref 8426124 // startLaunchTickingLocked
+    operation_ref 8426252 // continueLaunchTickingLocked
+    operation_ref 8426380 // finishLaunchTickingLocked
+    operation_ref 8426508 // mayFreezeScreenLocked
+    operation_ref 8426636 // startFreezingScreenLocked
+    operation_ref 8426764 // stopFreezingScreenLocked
+    operation_ref 8426892 // windowsDrawn
+    operation_ref 8427020 // windowsVisible
+    operation_ref 8427148 // windowsGone
+    operation_ref 8427276 // getWaitingHistoryRecordLocked
+    operation_ref 8427404 // keyDispatchingTimedOut
+    operation_ref 8427532 // getKeyDispatchingTimeout
+    operation_ref 8427660 // isInterestingToUserLocked
+    operation_ref 8427788 // setSleeping
+    operation_ref 8427916 // toString
+  xyz 432 509 2000
+end
+classcanvas 130444 class_ref 958604 // W
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_operations
+    operation_ref 4656268 // W
+    operation_ref 4656396 // resized
+    operation_ref 4656524 // moved
+    operation_ref 4656652 // dispatchAppVisibility
+    operation_ref 4656780 // dispatchScreenState
+    operation_ref 4656908 // dispatchGetNewSurface
+    operation_ref 4657036 // windowFocusChanged
+    operation_ref 4657164 // checkCallingPermission
+    operation_ref 4657292 // executeCommand
+    operation_ref 4657420 // closeSystemDialogs
+    operation_ref 4657548 // dispatchWallpaperOffsets
+    operation_ref 4657676 // dispatchWallpaperCommand
+    operation_ref 4657804 // dispatchDragEvent
+    operation_ref 4657932 // dispatchSystemUiVisibilityChanged
+    operation_ref 4658060 // doneAnimating
+  xyz 170 519 2000
+end
+classcanvas 130700 class_ref 703500 // ViewRootImpl
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_attributes
+    attribute_ref 3324684 // TAG
+    attribute_ref 3324812 // DBG
+    attribute_ref 3324940 // LOCAL_LOGV
+    attribute_ref 3325068 // DEBUG_DRAW
+    attribute_ref 3325196 // DEBUG_LAYOUT
+    attribute_ref 3325324 // DEBUG_DIALOG
+    attribute_ref 3325452 // DEBUG_INPUT_RESIZE
+    attribute_ref 3325580 // DEBUG_ORIENTATION
+    attribute_ref 3325708 // DEBUG_TRACKBALL
+    attribute_ref 3325836 // DEBUG_IMF
+    attribute_ref 3325964 // DEBUG_CONFIGURATION
+    attribute_ref 3326092 // DEBUG_FPS
+    attribute_ref 3326220 // USE_RENDER_THREAD
+    attribute_ref 3326348 // PROPERTY_PROFILE_RENDERING
+    attribute_ref 3326476 // MEASURE_LATENCY
+    attribute_ref 3326604 // MAX_TRACKBALL_DELAY
+    attribute_ref 3326732 // sFirstDrawHandlers
+    attribute_ref 3326860 // sFirstDrawComplete
+    attribute_ref 3326988 // sUseRenderThread
+    attribute_ref 3327116 // sRenderThreadQueried
+    attribute_ref 3327244 // sRenderThreadQueryLock
+    attribute_ref 3327500 // mLastTrackballTime
+    attribute_ref 3327628 // mLastJoystickXDirection
+    attribute_ref 3327756 // mLastJoystickYDirection
+    attribute_ref 3327884 // mLastJoystickXKeyCode
+    attribute_ref 3328012 // mLastJoystickYKeyCode
+    attribute_ref 3328140 // mTmpLocation
+    attribute_ref 3328268 // mThread
+    attribute_ref 3328396 // mTargetSdkVersion
+    attribute_ref 3328524 // mSeq
+    attribute_ref 3328652 // mViewVisibility
+    attribute_ref 3328780 // mAppVisible
+    attribute_ref 3328908 // mOrigWindowType
+    attribute_ref 3329036 // mStopped
+    attribute_ref 3329164 // mLastInCompatMode
+    attribute_ref 3329292 // mIsCreating
+    attribute_ref 3329420 // mDrawingAllowed
+    attribute_ref 3329548 // mWidth
+    attribute_ref 3329676 // mHeight
+    attribute_ref 3329804 // mIsAnimating
+    attribute_ref 3329932 // mTraversalScheduled
+    attribute_ref 3330060 // mTraversalBarrier
+    attribute_ref 3330188 // mWillDrawSoon
+    attribute_ref 3330316 // mIsInTraversal
+    attribute_ref 3330444 // mFitSystemWindowsRequested
+    attribute_ref 3330572 // mLayoutRequested
+    attribute_ref 3330700 // mFirst
+    attribute_ref 3330828 // mReportNextDraw
+    attribute_ref 3330956 // mFullRedrawNeeded
+    attribute_ref 3331084 // mNewSurfaceNeeded
+    attribute_ref 3331212 // mHasHadWindowFocus
+    attribute_ref 3331340 // mLastWasImTarget
+    attribute_ref 3331468 // mWindowsAnimating
+    attribute_ref 3331596 // mIsDrawing
+    attribute_ref 3331724 // mLastSystemUiVisibility
+    attribute_ref 3331852 // mClientWindowLayoutFlags
+    attribute_ref 3331980 // MAX_QUEUED_INPUT_EVENT_POOL_SIZE
+    attribute_ref 3332108 // mQueuedInputEventPoolSize
+    attribute_ref 3332236 // mProcessInputEventsScheduled
+    attribute_ref 3332364 // mWindowAttributesChanged
+    attribute_ref 3332492 // mWindowAttributesChangesFlag
+    attribute_ref 3332620 // mAdded
+    attribute_ref 3332748 // mAddedTouchMode
+    attribute_ref 3332876 // mScrollMayChange
+    attribute_ref 3333004 // mSoftInputMode
+    attribute_ref 3333132 // mScrollY
+    attribute_ref 3333260 // mCurScrollY
+    attribute_ref 3333388 // mResizeBufferStartTime
+    attribute_ref 3333516 // mResizeBufferDuration
+    attribute_ref 3333644 // mLocalDragState
+    attribute_ref 3333772 // mPointerIconStyle
+    attribute_ref 3333900 // mProfileRendering
+    attribute_ref 3334028 // mRenderProfiler
+    attribute_ref 3334156 // mRenderProfilingEnabled
+    attribute_ref 3334284 // mFpsStartTime
+    attribute_ref 3334412 // mFpsPrevTime
+    attribute_ref 3334540 // mFpsNumFrames
+    attribute_ref 3334668 // mDensity
+    attribute_ref 3334796 // mNoncompatDensity
+    attribute_ref 3334924 // mViewLayoutDirectionInitial
+    attribute_ref 3335564 // mProfile
+    attribute_ref 3335692 // mHardwareYOffset
+    attribute_ref 3335820 // mResizeAlpha
+    attribute_ref 3335948 // MSG_INVALIDATE
+    attribute_ref 3336076 // MSG_INVALIDATE_RECT
+    attribute_ref 3336204 // MSG_DIE
+    attribute_ref 3336332 // MSG_RESIZED
+    attribute_ref 3336460 // MSG_RESIZED_REPORT
+    attribute_ref 3336588 // MSG_WINDOW_FOCUS_CHANGED
+    attribute_ref 3336716 // MSG_DISPATCH_KEY
+    attribute_ref 3336844 // MSG_DISPATCH_APP_VISIBILITY
+    attribute_ref 3336972 // MSG_DISPATCH_GET_NEW_SURFACE
+    attribute_ref 3337100 // MSG_IME_FINISHED_EVENT
+    attribute_ref 3337228 // MSG_DISPATCH_KEY_FROM_IME
+    attribute_ref 3337356 // MSG_FINISH_INPUT_CONNECTION
+    attribute_ref 3337484 // MSG_CHECK_FOCUS
+    attribute_ref 3337612 // MSG_CLOSE_SYSTEM_DIALOGS
+    attribute_ref 3337740 // MSG_DISPATCH_DRAG_EVENT
+    attribute_ref 3337868 // MSG_DISPATCH_DRAG_LOCATION_EVENT
+    attribute_ref 3337996 // MSG_DISPATCH_SYSTEM_UI_VISIBILITY
+    attribute_ref 3338124 // MSG_UPDATE_CONFIGURATION
+    attribute_ref 3338252 // MSG_PROCESS_INPUT_EVENTS
+    attribute_ref 3338380 // MSG_DISPATCH_SCREEN_STATE
+    attribute_ref 3338508 // MSG_INVALIDATE_DISPLAY_LIST
+    attribute_ref 3338636 // MSG_CLEAR_ACCESSIBILITY_FOCUS_HOST
+    attribute_ref 3338764 // MSG_DISPATCH_DONE_ANIMATING
+    attribute_ref 3338892 // MSG_INVALIDATE_WORLD
+    attribute_ref 3339020 // MSG_WINDOW_MOVED
+    attribute_ref 3339404 // mConsumeBatchedInputScheduled
+  hidden_operations
+    operation_ref 4630412 // ViewRootImpl
+    operation_ref 4630540 // isRenderThreadRequested
+    operation_ref 4630668 // addFirstDrawHandler
+    operation_ref 4630796 // addConfigCallback
+    operation_ref 4630924 // profile
+    operation_ref 4631052 // isInTouchMode
+    operation_ref 4631180 // setPointerIcon
+    operation_ref 4631308 // setPointerIconStyle
+    operation_ref 4631436 // getPointerIconStyle
+    operation_ref 4631564 // setView
+    operation_ref 4631692 // destroyHardwareResources
+    operation_ref 4631820 // terminateHardwareResources
+    operation_ref 4631948 // destroyHardwareLayers
+    operation_ref 4632076 // pushHardwareLayerUpdate
+    operation_ref 4632204 // attachFunctor
+    operation_ref 4632332 // detachFunctor
+    operation_ref 4632460 // enableHardwareAcceleration
+    operation_ref 4632588 // getView
+    operation_ref 4632716 // getLocation
+    operation_ref 4632844 // setLayoutParams
+    operation_ref 4632972 // handleAppVisibility
+    operation_ref 4633100 // handleGetNewSurface
+    operation_ref 4633228 // handleScreenStateChange
+    operation_ref 4633356 // requestFitSystemWindows
+    operation_ref 4633484 // requestLayout
+    operation_ref 4633612 // isLayoutRequested
+    operation_ref 4633740 // invalidate
+    operation_ref 4633868 // invalidateWorld
+    operation_ref 4633996 // invalidateChild
+    operation_ref 4634124 // invalidateChildInParent
+    operation_ref 4634252 // setStopped
+    operation_ref 4634380 // getParent
+    operation_ref 4634508 // getChildVisibleRect
+    operation_ref 4634636 // bringChildToFront
+    operation_ref 4634764 // getHostVisibility
+    operation_ref 4634892 // disposeResizeBuffer
+    operation_ref 4635020 // requestTransitionStart
+    operation_ref 4635148 // scheduleTraversals
+    operation_ref 4635276 // unscheduleTraversals
+    operation_ref 4635404 // doTraversal
+    operation_ref 4635532 // applyKeepScreenOnFlag
+    operation_ref 4635660 // collectViewAttributes
+    operation_ref 4635788 // measureHierarchy
+    operation_ref 4635916 // performTraversals
+    operation_ref 4636044 // performMeasure
+    operation_ref 4636172 // performLayout
+    operation_ref 4636300 // requestTransparentRegion
+    operation_ref 4636428 // getRootMeasureSpec
+    operation_ref 4636556 // onHardwarePreDraw
+    operation_ref 4636684 // onHardwarePostDraw
+    operation_ref 4636812 // outputDisplayList
+    operation_ref 4636940 // profileRendering
+    operation_ref 4637068 // trackFPS
+    operation_ref 4637196 // performDraw
+    operation_ref 4637324 // draw
+    operation_ref 4637452 // drawSoftware
+    operation_ref 4637580 // drawAccessibilityFocusedDrawableIfNeeded
+    operation_ref 4637708 // getAccessibilityFocusedDrawable
+    operation_ref 4637836 // invalidateDisplayLists
+    operation_ref 4637964 // scrollToRectOrFocus
+    operation_ref 4638092 // getAccessibilityFocusedHost
+    operation_ref 4638220 // getAccessibilityFocusedVirtualView
+    operation_ref 4638348 // setAccessibilityFocus
+    operation_ref 4638476 // requestChildFocus
+    operation_ref 4638604 // clearChildFocus
+    operation_ref 4638732 // getParentForAccessibility
+    operation_ref 4638860 // focusableViewAvailable
+    operation_ref 4638988 // recomputeViewAttributes
+    operation_ref 4639116 // dispatchDetachedFromWindow
+    operation_ref 4639244 // updateConfiguration
+    operation_ref 4639372 // isViewDescendantOf
+    operation_ref 4639500 // forceLayout
+    operation_ref 4639884 // ensureTouchMode
+    operation_ref 4640012 // ensureTouchModeLocally
+    operation_ref 4640140 // enterTouchMode
+    operation_ref 4640268 // findAncestorToTakeFocusInTouchMode
+    operation_ref 4640396 // leaveTouchMode
+    operation_ref 4640524 // deliverInputEvent
+    operation_ref 4640652 // deliverPointerEvent
+    operation_ref 4640780 // deliverTrackballEvent
+    operation_ref 4640908 // deliverTrackballEventPostIme
+    operation_ref 4641036 // deliverGenericMotionEvent
+    operation_ref 4641164 // deliverGenericMotionEventPostIme
+    operation_ref 4641292 // updateJoystickDirection
+    operation_ref 4641420 // joystickAxisValueToDirection
+    operation_ref 4641548 // isNavigationKey
+    operation_ref 4641676 // isTypingKey
+    operation_ref 4641804 // checkForLeavingTouchModeAndConsume
+    operation_ref 4641932 // deliverKeyEvent
+    operation_ref 4642060 // handleImeFinishedEvent
+    operation_ref 4642188 // deliverKeyEventPostIme
+    operation_ref 4642316 // setLocalDragState
+    operation_ref 4642444 // handleDragEvent
+    operation_ref 4642572 // handleDispatchSystemUiVisibilityChanged
+    operation_ref 4642700 // handleDispatchDoneAnimating
+    operation_ref 4642828 // getLastTouchPoint
+    operation_ref 4642956 // setDragFocus
+    operation_ref 4643084 // getAudioManager
+    operation_ref 4643212 // getAccessibilityInteractionController
+    operation_ref 4643340 // relayoutWindow
+    operation_ref 4643468 // playSoundEffect
+    operation_ref 4643596 // performHapticFeedback
+    operation_ref 4643724 // focusSearch
+    operation_ref 4643852 // debug
+    operation_ref 4643980 // dumpGfxInfo
+    operation_ref 4644108 // getGfxInfo
+    operation_ref 4644236 // die
+    operation_ref 4644364 // doDie
+    operation_ref 4644492 // requestUpdateConfiguration
+    operation_ref 4644620 // loadSystemProperties
+    operation_ref 4644748 // destroyHardwareRenderer
+    operation_ref 4644876 // dispatchImeFinishedEvent
+    operation_ref 4645004 // dispatchFinishInputConnection
+    operation_ref 4645132 // dispatchResized
+    operation_ref 4645260 // dispatchMoved
+    operation_ref 4645388 // obtainQueuedInputEvent
+    operation_ref 4645516 // recycleQueuedInputEvent
+    operation_ref 4645644 // enqueueInputEvent
+    operation_ref 4645772 // enqueueInputEvent
+    operation_ref 4645900 // scheduleProcessInputEvents
+    operation_ref 4646028 // doProcessInputEvents
+    operation_ref 4646156 // finishInputEvent
+    operation_ref 4646284 // scheduleConsumeBatchedInput
+    operation_ref 4646412 // unscheduleConsumeBatchedInput
+    operation_ref 4646540 // doConsumeBatchedInput
+    operation_ref 4648076 // dispatchInvalidateDelayed
+    operation_ref 4648204 // dispatchInvalidateRectDelayed
+    operation_ref 4648332 // dispatchInvalidateOnAnimation
+    operation_ref 4648460 // dispatchInvalidateRectOnAnimation
+    operation_ref 4648588 // enqueueDisplayList
+    operation_ref 4648716 // dequeueDisplayList
+    operation_ref 4648844 // cancelInvalidate
+    operation_ref 4648972 // dispatchKey
+    operation_ref 4649100 // dispatchKeyFromIme
+    operation_ref 4649228 // dispatchUnhandledKey
+    operation_ref 4649356 // dispatchAppVisibility
+    operation_ref 4649484 // dispatchScreenStateChange
+    operation_ref 4649612 // dispatchGetNewSurface
+    operation_ref 4649740 // windowFocusChanged
+    operation_ref 4649868 // dispatchCloseSystemDialogs
+    operation_ref 4649996 // dispatchDragEvent
+    operation_ref 4650124 // dispatchSystemUiVisibilityChanged
+    operation_ref 4650252 // dispatchDoneAnimating
+    operation_ref 4650380 // dispatchCheckFocus
+    operation_ref 4650508 // postSendWindowContentChangedCallback
+    operation_ref 4650636 // removeSendWindowContentChangedCallback
+    operation_ref 4650764 // showContextMenuForChild
+    operation_ref 4650892 // startActionModeForChild
+    operation_ref 4651020 // createContextMenu
+    operation_ref 4651148 // childDrawableStateChanged
+    operation_ref 4651276 // requestSendAccessibilityEvent
+    operation_ref 4651404 // childAccessibilityStateChanged
+    operation_ref 4651532 // getCommonPredecessor
+    operation_ref 4651660 // checkThread
+    operation_ref 4651788 // requestDisallowInterceptTouchEvent
+    operation_ref 4651916 // requestChildRectangleOnScreen
+    operation_ref 4652044 // childHasTransientStateChanged
+    operation_ref 4658700 // getRunQueue
+  xyz 148 601 2000
+end
+classcanvas 130956 class_ref 1357196 // WindowAnimator
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_attributes
+    attribute_ref 5705612 // TAG
+    attribute_ref 5705740 // mAnimating
+    attribute_ref 5705868 // mAnimationRunnable
+    attribute_ref 5705996 // mAdjResult
+    attribute_ref 5706124 // mDw
+    attribute_ref 5706252 // mDh
+    attribute_ref 5706380 // mInnerDw
+    attribute_ref 5706508 // mInnerDh
+    attribute_ref 5706636 // mCurrentTime
+    attribute_ref 5706764 // mAnimTransactionSequence
+    attribute_ref 5706892 // mAboveUniverseLayer
+    attribute_ref 5707020 // mBulkUpdateParams
+    attribute_ref 5707148 // WALLPAPER_ACTION_PENDING
+    attribute_ref 5707276 // mPendingActions
+    attribute_ref 5707660 // mInitialized
+    attribute_ref 5707788 // KEYGUARD_NOT_SHOWN
+    attribute_ref 5707916 // KEYGUARD_ANIMATING_IN
+    attribute_ref 5708044 // KEYGUARD_SHOWN
+    attribute_ref 5708172 // KEYGUARD_ANIMATING_OUT
+    attribute_ref 5708300 // mForceHiding
+  hidden_operations
+    operation_ref 8729740 // forceHidingToString
+    operation_ref 8729868 // WindowAnimator
+    operation_ref 8729996 // addDisplayLocked
+    operation_ref 8730124 // removeDisplayLocked
+    operation_ref 8730252 // updateAnimToLayoutLocked
+    operation_ref 8730380 // copyLayoutToAnimParamsLocked
+    operation_ref 8730508 // hideWallpapersLocked
+    operation_ref 8730636 // hideWallpapersLocked
+    operation_ref 8730764 // updateAppWindowsLocked
+    operation_ref 8730892 // updateWindowsLocked
+    operation_ref 8731020 // updateWallpaperLocked
+    operation_ref 8731148 // testTokenMayBeDrawnLocked
+    operation_ref 8731276 // performAnimationsLocked
+    operation_ref 8731404 // animateLocked
+    operation_ref 8731532 // setCurrentFocus
+    operation_ref 8731660 // setDisplayDimensions
+    operation_ref 8731788 // isDimmingLocked
+    operation_ref 8731916 // isDimmingLocked
+    operation_ref 8732044 // bulkUpdateParamsToString
+    operation_ref 8732172 // dumpLocked
+    operation_ref 8732300 // clearPendingActions
+    operation_ref 8732428 // setPendingLayoutChanges
+    operation_ref 8732556 // setAppLayoutChanges
+    operation_ref 8732684 // getDisplayContentsAnimatorLocked
+    operation_ref 8732812 // setScreenRotationAnimationLocked
+    operation_ref 8732940 // getScreenRotationAnimationLocked
+  xyz 644 183 2000
+end
+classcanvas 131212 class_ref 1356428 // AppWindowAnimator
+  draw_all_relations default hide_attributes default hide_operations default hide_getset_operations default show_members_full_definition default show_members_visibility default show_members_stereotype default show_members_context default show_members_multiplicity default show_members_initialization default show_attribute_modifiers default member_max_width 0 show_parameter_dir default show_parameter_name default package_name_in_tab default class_drawing_mode default drawing_language default show_context_mode default auto_label_position default show_relation_modifiers default show_relation_visibility default show_infonote default shadow default show_stereotype_properties default
+  hidden_attributes
+    attribute_ref 5683468 // TAG
+    attribute_ref 5683596 // animating
+    attribute_ref 5683724 // animInitialized
+    attribute_ref 5683852 // hasTransformation
+    attribute_ref 5683980 // freezingScreen
+    attribute_ref 5684108 // animLayerAdjustment
+    attribute_ref 5684236 // allDrawn
+    attribute_ref 5684364 // thumbnailTransactionSeq
+    attribute_ref 5684492 // thumbnailX
+    attribute_ref 5684620 // thumbnailY
+    attribute_ref 5684748 // thumbnailLayer
+  hidden_operations
+    operation_ref 8707724 // AppWindowAnimator
+    operation_ref 8707852 // setAnimation
+    operation_ref 8707980 // setDummyAnimation
+    operation_ref 8708108 // clearAnimation
+    operation_ref 8708236 // clearThumbnail
+    operation_ref 8708364 // updateLayers
+    operation_ref 8708492 // stepThumbnailAnimation
+    operation_ref 8708620 // stepAnimation
+    operation_ref 8708748 // stepAnimationLocked
+    operation_ref 8708876 // showAllWindowsLocked
+    operation_ref 8709004 // dump
+  xyz 623 253 2000
+end
+relationcanvas 128268 relation_ref 3062668 // <generalisation>
+  decenter_begin 435
+  decenter_end 238
+  from ref 128140 z 3006 to ref 128012
+  no_role_a no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 128396 relation_ref 3062412 // <unidirectional association>
+  decenter_begin 824
+  decenter_end 583
+  from ref 128012 z 3006 to ref 128140
+  role_a_pos 269 112 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 128908 relation_ref 7260428 // <unidirectional association>
+  from ref 128140 z 3006 to ref 128780
+  role_a_pos 487 221 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 129164 relation_ref 7250060 // <unidirectional association>
+  from ref 128012 z 3006 to ref 129036
+  role_a_pos 205 167 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 129420 relation_ref 3062540 // <unidirectional association>
+  from ref 128012 z 3006 to ref 129292
+  role_a_pos 104 71 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 129676 relation_ref 7260556 // <unidirectional association>
+  from ref 128140 z 3006 to ref 129548
+  role_a_pos 576 100 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 130060 relation_ref 7260812 // <realization>
+  from ref 129804 z 2001 to ref 128780
+  no_role_a no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 130316 relation_ref 7260940 // <directional composition>
+  from ref 130188 z 2001 to ref 129804
+  role_a_pos 491 469 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 130572 relation_ref 6254092 // <realization>
+  decenter_begin 509
+  from ref 130444 z 3006 to ref 129036
+  no_role_a no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 130828 relation_ref 1909004 // <directional composition>
+  from ref 130700 z 2001 to ref 130444
+  role_a_pos 202 567 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 131084 relation_ref 3063052 // <unidirectional association>
+  from ref 128140 z 3006 to ref 130956
+  role_a_pos 576 164 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 131340 relation_ref 3062924 // <unidirectional association>
+  from ref 128140 z 3006 to ref 131212
+  role_a_pos 569 238 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+relationcanvas 131980 relation_ref 7261196 // <unidirectional association>
+  decenter_begin 256
+  decenter_end 184
+  from ref 128140 z 3006 to ref 128780
+  role_a_pos 438 221 3000 no_role_b
+  no_multiplicity_a no_multiplicity_b
+end
+end
